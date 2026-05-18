@@ -12,7 +12,7 @@
     "start": "tsx src/bin/symphony.ts",
     "dev": "tsx watch src/bin/symphony.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx tests"
+    "test": "node --test --import tsx tests/*.test.ts"
   },
   "dependencies": {
     "chokidar": "^4.0.3",
