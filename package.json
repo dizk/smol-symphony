@@ -1,0 +1,30 @@
+{
+  "name": "smol-symphony",
+  "version": "0.1.0",
+  "description": "Symphony orchestrator (per SPEC.md), running coding agents in isolated smolvm microVMs.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "symphony": "dist/bin/symphony.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/bin/symphony.ts",
+    "dev": "tsx watch src/bin/symphony.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --import tsx tests"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "liquidjs": "^10.21.1",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
