@@ -141,6 +141,9 @@ export interface RunningEntry {
   cancel: () => void;
   recent_events: RuntimeEvent[];
   last_error: string | null;
+  // Set by reconciliation when the issue transitioned to a terminal tracker state. The
+  // workspace will be deleted by the worker-exit handler after the run has fully unwound.
+  cleanup_workspace_on_exit: boolean;
 }
 
 export interface RetryEntry {

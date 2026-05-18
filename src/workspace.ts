@@ -124,6 +124,10 @@ export async function runHookScript(
 export class WorkspaceManager {
   constructor(private cfg: ServiceConfig) {}
 
+  updateConfig(cfg: ServiceConfig): void {
+    this.cfg = cfg;
+  }
+
   workspacePathFor(identifier: string): string {
     const key = sanitizeWorkspaceKey(identifier);
     if (key.length === 0) {

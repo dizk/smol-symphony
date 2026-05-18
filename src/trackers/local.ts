@@ -90,8 +90,13 @@ function splitFrontMatter(text: string): { config: Record<string, unknown>; body
 }
 
 export class LocalMarkdownTracker implements IssueTracker {
-  constructor(private readonly cfg: TrackerConfig) {
+  constructor(private cfg: TrackerConfig) {
     if (!cfg.root) throw new TrackerError('local_no_root', 'tracker.root is required');
+  }
+
+  updateConfig(cfg: TrackerConfig): void {
+    if (!cfg.root) throw new TrackerError('local_no_root', 'tracker.root is required');
+    this.cfg = cfg;
   }
 
   private get root(): string {

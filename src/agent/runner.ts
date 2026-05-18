@@ -58,6 +58,15 @@ export class AgentRunner {
     private events: AgentRunnerEvents,
   ) {}
 
+  // Apply a freshly reloaded workflow/config so subsequent runAttempt() calls see new
+  // prompt content, sandbox/approval policy, smolvm settings, and turn/timeout values.
+  // In-flight runs already past these read points keep their original settings; that
+  // matches §6.2 "implementations are not REQUIRED to restart in-flight agent sessions".
+  updateConfig(cfg: ServiceConfig, workflow: WorkflowDefinition): void {
+    this.cfg = cfg;
+    this.workflow = workflow;
+  }
+
   vmNameFor(issue: Issue): string {
     return `symphony-${sanitizeWorkspaceKey(issue.identifier)}`.toLowerCase();
   }
