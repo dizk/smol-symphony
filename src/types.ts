@@ -60,16 +60,15 @@ export interface AgentConfig {
   max_concurrent_agents_by_state: Record<string, number>;
 }
 
-export interface CodexConfig {
+// ACP adapter configuration (replaces the codex-specific block in the spec). The launch
+// `command` names the adapter binary inside the VM — e.g. `claude-agent-acp`,
+// `codex-acp`, or `opencode acp`. `adapter` is a free-form label included in logs/snapshots
+// so operators can tell which agent ran a given session.
+export interface AcpConfig {
+  adapter: string;
   command: string;
-  // Shell binary used to invoke `command` inside the VM. SPEC §10.1 names `bash -lc` as a
-  // conforming default, but minimal Alpine images only ship POSIX `sh`. Override to `bash`
-  // when running on an image that has it.
   shell: string;
-  approval_policy: string | null;
-  thread_sandbox: string | null;
-  turn_sandbox_policy: unknown | null;
-  turn_timeout_ms: number;
+  prompt_timeout_ms: number;
   read_timeout_ms: number;
   stall_timeout_ms: number;
 }
@@ -112,7 +111,7 @@ export interface ServiceConfig {
   workspace: WorkspaceConfig;
   hooks: HooksConfig;
   agent: AgentConfig;
-  codex: CodexConfig;
+  acp: AcpConfig;
   smolvm: SmolvmConfig;
   server: ServerConfig;
 }

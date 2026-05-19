@@ -14,7 +14,7 @@ import type {
   WorkspaceConfig,
   HooksConfig,
   AgentConfig,
-  CodexConfig,
+  AcpConfig,
   SmolvmConfig,
   ServerConfig,
 } from './types.js';
@@ -220,19 +220,18 @@ export function buildServiceConfig(
     max_concurrent_agents_by_state: asMapStrPosInt(agentRaw['max_concurrent_agents_by_state']),
   };
 
-  // codex (§5.3.6)
-  const codexRaw = getObject(raw, 'codex');
-  const codex: CodexConfig = {
-    command: asString(codexRaw['command']) ?? 'codex app-server',
-    // SPEC §5.3.6/§10.1 names `bash -lc` as the canonical launch wrapper. Workflows that
-    // run on a minimal image without bash can opt into `sh` (or any other shell) explicitly.
-    shell: asString(codexRaw['shell']) ?? 'bash',
-    approval_policy: asString(codexRaw['approval_policy']),
-    thread_sandbox: asString(codexRaw['thread_sandbox']),
-    turn_sandbox_policy: codexRaw['turn_sandbox_policy'] ?? null,
-    turn_timeout_ms: asInt(codexRaw['turn_timeout_ms'], 3_600_000),
-    read_timeout_ms: asInt(codexRaw['read_timeout_ms'], 5_000),
-    stall_timeout_ms: asInt(codexRaw['stall_timeout_ms'], 300_000),
+  // acp (Symphony extension; supersedes the §5.3.6 `codex` block). The adapter binary
+  // is whatever ACP-compatible agent the workflow targets — claude-agent-acp, codex-acp,
+  // opencode acp, etc. We still wrap it through a login shell so the agent inherits the
+  // VM's $PATH and locale.
+  const acpRaw = getObject(raw, 'acp');
+  const acp: AcpConfig = {
+    adapter: asString(acpRaw['adapter']) ?? 'unknown',
+    command: asString(acpRaw['command']) ?? 'claude-agent-acp',
+    shell: asString(acpRaw['shell']) ?? 'bash',
+    prompt_timeout_ms: asInt(acpRaw['prompt_timeout_ms'], 3_600_000),
+    read_timeout_ms: asInt(acpRaw['read_timeout_ms'], 30_000),
+    stall_timeout_ms: asInt(acpRaw['stall_timeout_ms'], 300_000),
   };
 
   // smolvm extension
@@ -274,7 +273,13 @@ export function buildServiceConfig(
     net: smolvmRaw['net'] !== false,
     bin_path: asString(smolvmRaw['bin_path']),
     volumes,
-    forward_env: asStringList(smolvmRaw['forward_env'], ['OPENAI_API_KEY']),
+    // Default forwarded credentials cover all three shipped ACP adapters so workflows that
+    // do not override `smolvm.forward_env` still authenticate after the default-adapter
+    // switch to claude-agent-acp.
+    forward_env: asStringList(smolvmRaw['forward_env'], [
+      'OPENAI_API_KEY',
+      'ANTHROPIC_API_KEY',
+    ]),
     endpoint:
       asString(smolvmRaw['endpoint']) ??
       `unix://${process.env.XDG_RUNTIME_DIR ?? '/run/user/1000'}/smolvm.sock`,
@@ -295,7 +300,7 @@ export function buildServiceConfig(
     workspace,
     hooks,
     agent,
-    codex,
+    acp,
     smolvm,
     server,
   };
@@ -317,7 +322,7 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
       return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
     }
   }
-  if (!cfg.codex.command || !cfg.codex.command.trim()) return 'codex.command must be non-empty';
+  if (!cfg.acp.command || !cfg.acp.command.trim()) return 'acp.command must be non-empty';
   return null;
 }
 

@@ -5,3 +5,4 @@ dist/
 /tmp_workspaces/
 .env
 .vm
+.symphony/

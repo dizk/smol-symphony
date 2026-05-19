@@ -43,6 +43,7 @@ describe('workflow', () => {
     assert.equal(cfg.polling.interval_ms, 30000);
     assert.equal(cfg.agent.max_concurrent_agents, 10);
     assert.equal(cfg.agent.max_turns, 20);
-    assert.equal(cfg.codex.command, 'codex app-server');
+    assert.equal(cfg.acp.command, 'claude-agent-acp');
+    assert.equal(cfg.acp.shell, 'bash');
   });
 });

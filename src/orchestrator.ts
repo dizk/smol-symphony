@@ -13,8 +13,11 @@ import type {
 import type { IssueTracker } from './trackers/types.js';
 import type { WorkflowSource } from './workflow.js';
 import { validateDispatch, WorkflowError } from './workflow.js';
-import type { JsonValue } from './agent/codex.js';
 import type { AgentRunner } from './agent/runner.js';
+
+// ACP rate-limit signals are out of band today; this is kept as a generic value type so the
+// snapshot endpoint can attach whatever shape a future ACP `_meta` extension produces.
+type JsonValue = unknown;
 import type { WorkspaceManager } from './workspace.js';
 import { withIssue, log } from './logging.js';
 
@@ -183,12 +186,12 @@ export class Orchestrator {
   /** §8.5: stall detection + tracker state refresh for running issues. */
   private async reconcile(): Promise<void> {
     // Part A: stall detection.
-    if (this.cfg.codex.stall_timeout_ms > 0) {
+    if (this.cfg.acp.stall_timeout_ms > 0) {
       const now = Date.now();
       for (const [issueId, entry] of this.running) {
         const ref = entry.last_codex_timestamp ?? entry.started_at;
         const elapsed = now - Date.parse(ref);
-        if (Number.isFinite(elapsed) && elapsed > this.cfg.codex.stall_timeout_ms) {
+        if (Number.isFinite(elapsed) && elapsed > this.cfg.acp.stall_timeout_ms) {
           log.warn('stall detected', {
             issue_id: issueId,
             issue_identifier: entry.identifier,

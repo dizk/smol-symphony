@@ -23,16 +23,19 @@ agent:
   max_turns: 8
   max_retry_backoff_ms: 120000
 
-codex:
-  command: codex app-server
-  # The shipped VM image installs bash via apk, so the spec default `bash -lc` works.
-  # Override to `sh` if you bring an even more minimal image.
+acp:
+  # Choose which ACP-compatible adapter to run inside the VM. The shipped image installs:
+  #   claude   ->  claude-agent-acp        (Anthropic Claude Code)
+  #   codex    ->  codex-acp               (OpenAI Codex)
+  #   opencode ->  opencode acp            (OpenCode)
+  adapter: claude
+  command: claude-agent-acp
+  # The shipped VM has bash installed; minimal images can override to `sh`.
   shell: bash
-  approval_policy: never
-  thread_sandbox: workspace-write
-  turn_timeout_ms: 1800000
-  # Bumped from the 5000 ms spec default because the VM cold-boot + codex app-server
-  # startup typically takes 8–12 s on first use; subsequent reuses are sub-second.
+  # Total time a single ACP `session/prompt` may run (one symphony turn).
+  prompt_timeout_ms: 1800000
+  # Bumped from a small default because VM cold-boot + adapter startup can take ~10s on
+  # first use; subsequent reuses of the same VM are sub-second.
   read_timeout_ms: 30000
   stall_timeout_ms: 300000
 

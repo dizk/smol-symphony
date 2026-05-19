@@ -117,19 +117,49 @@ When `--port` (or `server.port` in `WORKFLOW.md`) is set, a small dashboard is h
 
 `POST /api/v1/refresh` triggers an immediate poll + reconciliation cycle.
 
-## Codex inside the VM
+## ACP — talking to Claude, Codex, and OpenCode
 
-`codex app-server` runs **inside** the per-issue smolvm machine. The host workspace
-directory is volume-mounted at the same absolute path so the agent's view of paths matches
-the host's.
+Symphony speaks the [Agent Client Protocol](https://agentclientprotocol.com) (Zed's open
+JSON-RPC protocol for coding agents). One client, three (and counting) compatible adapters
+shipping inside the VM image:
+
+| Adapter                   | Command inside VM         | Source                                          |
+| ------------------------- | ------------------------- | ----------------------------------------------- |
+| Claude Code               | `claude-agent-acp`        | `@agentclientprotocol/claude-agent-acp`         |
+| Codex                     | `codex-acp`               | `@zed-industries/codex-acp` (glibc prebuilt)    |
+| OpenCode                  | `opencode acp`            | `opencode-ai`                                   |
+
+Switching agents is a one-line change in `WORKFLOW.md`:
+
+```yaml
+acp:
+  adapter: claude         # label only — appears in logs
+  command: claude-agent-acp
+  shell: bash
+  prompt_timeout_ms: 1800000
+  read_timeout_ms: 30000
+  stall_timeout_ms: 300000
+```
+
+For Codex, use `command: codex-acp`. For OpenCode, use `command: opencode acp`.
+
+### Token accounting under ACP
+
+ACP's `usage_update` reports **context-window usage** (`used / size`), not cumulative
+input/output tokens. Symphony maps `used` into `total_tokens` and leaves `input_tokens` /
+`output_tokens` as zero. If you need true I/O token totals, an adapter-specific MCP server
+or `_meta` extension is the right place to surface it.
+
+## The VM image
 
 The shipped `scripts/build-vm.sh` builds a packed `.smolmachine` artifact that contains
-`node:20-alpine` + `bash`, `git`, `ripgrep`, `curl`, and the `codex` and `claude` CLIs
-installed globally via npm. Run it once:
+`node:20-bookworm-slim` + `git`, `ripgrep`, `curl`, `ca-certificates`, and the four
+agent-related npm packages above. Debian is used instead of Alpine because `codex-acp`'s
+prebuilt is glibc-linked.
 
 ```bash
 bash scripts/build-vm.sh
-# -> .vm/symphony.smolmachine.smolmachine  (~370 MiB compressed)
+# -> .vm/symphony.smolmachine.smolmachine  (~1.1 GB compressed)
 ```
 
 `WORKFLOW.md` then references it via `smolvm.from`:
@@ -141,26 +171,23 @@ smolvm:
   mem_mib: 4096
   net: true
   volumes:
-    - host: ~/.codex
-      guest: /root/.codex
-      readonly: false
-    - host: ~/.claude
+    - host: ~/.claude          # claude-agent-acp credentials + per-session SQLite
       guest: /root/.claude
+      readonly: false
+    - host: ~/.codex           # codex-acp credentials, if you use that adapter
+      guest: /root/.codex
       readonly: false
   forward_env: [OPENAI_API_KEY, ANTHROPIC_API_KEY]
 ```
 
-The credential mounts are **read-write** because both CLIs need to write per-session SQLite
-state into their respective home dirs. If you want stricter isolation, copy `auth.json` /
-`.credentials.json` into a per-workspace location and mount only that.
+The credential mounts are **read-write** because the adapters need to write per-session
+state into their respective home dirs. If you want stricter isolation, copy auth files
+into a per-workspace location and mount only that.
 
 Other ways to provide a VM image:
-- `smolvm.image: my-codex-alpine:latest` — pull from a registry.
-- `smolvm.image: null` + `smolvm.bin_path: /host/path/to/codex` — boot a bare Alpine VM and
-  mount the codex binary at `/opt/codex` (set `codex.command` accordingly).
-
-If the image only ships POSIX `sh` (no `bash`), set `codex.shell: sh` in `WORKFLOW.md` —
-the runner wraps your `codex.command` as `<shell> -lc <command>`.
+- `smolvm.image: my-agent-image:latest` — pull from a registry.
+- `smolvm.image: null` + `smolvm.bin_path: /host/path/to/agent` — boot a bare VM and mount
+  the adapter binary in.
 
 ## Trust posture
 
