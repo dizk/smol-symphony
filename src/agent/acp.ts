@@ -119,7 +119,14 @@ export class AcpClient {
     opts.stderr.setEncoding('utf8');
     opts.stderr.on('data', (chunk: string) => {
       const text = chunk.trim();
-      if (text.length > 0) this.emit('agent_stderr', summarize(text));
+      if (text.length > 0) {
+        this.emit('agent_stderr', summarize(text));
+        // Adapters shouldn't normally write to stderr; when they do it's a real
+        // condition (a failed in-VM cp, a missing binary, an SDK warning). Log
+        // at info so it lands in the symphony log alongside other lifecycle
+        // events instead of disappearing into the per-issue event ring buffer.
+        log.info('agent stderr', { text: text.slice(0, 500) });
+      }
     });
     opts.stdout.on('close', () => this.handleTransportClose('stdout_closed'));
     opts.stdin.on('error', () => {
