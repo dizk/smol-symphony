@@ -60,13 +60,15 @@ export interface AgentConfig {
   max_concurrent_agents_by_state: Record<string, number>;
 }
 
-// ACP adapter configuration (replaces the codex-specific block in the spec). The launch
-// `command` names the adapter binary inside the VM — e.g. `claude-agent-acp`,
-// `codex-acp`, or `opencode acp`. `adapter` is a free-form label included in logs/snapshots
-// so operators can tell which agent ran a given session.
+// ACP adapter configuration. `adapter` selects one of symphony's known adapter profiles
+// (currently `claude` and `codex`); the profile encodes the binary symphony launches
+// inside the VM and the credential file it copies in from the host. `command` is an
+// optional override — if set, it replaces the auto-generated `mkdir + cp + exec`
+// dance and the operator becomes responsible for staging credentials. Leave it null
+// for the supported zero-config experience.
 export interface AcpConfig {
   adapter: string;
-  command: string;
+  command: string | null;
   shell: string;
   prompt_timeout_ms: number;
   read_timeout_ms: number;
@@ -103,6 +105,23 @@ export interface ServerConfig {
   host: string;
 }
 
+// MCP server exposed to in-VM agents over HTTP. The orchestrator runs a JSON-RPC endpoint
+// scoped to each active issue at /api/v1/issues/<id>/mcp; the URL itself is the capability,
+// reinforced by a per-dispatch bearer token. Two tools live there today: mark_done and
+// request_human_steering.
+export interface McpConfig {
+  enabled: boolean;
+  // Hostname or IP the agent uses to reach the orchestrator from inside the smolvm.
+  // Defaults to the QEMU slirp host address. The port is resolved at runtime from the
+  // actually-bound HTTP server (NOT server.port at parse time), so `--port` and a workflow
+  // that omits server.port can never desync.
+  host: string;
+  // Full URL override. When set in WORKFLOW.md, this is used verbatim and `host` plus the
+  // bound HTTP port are ignored. Use this only when the VM cannot reach the orchestrator
+  // through the host gateway (e.g. bridge networking with a fixed reverse-proxy URL).
+  explicit_host_url: string | null;
+}
+
 export interface ServiceConfig {
   workflow_path: string;
   workflow_dir: string;
@@ -114,6 +133,7 @@ export interface ServiceConfig {
   acp: AcpConfig;
   smolvm: SmolvmConfig;
   server: ServerConfig;
+  mcp: McpConfig;
 }
 
 export interface Workspace {
@@ -158,6 +178,27 @@ export interface RunningEntry {
   // Set by reconciliation when the issue transitioned to a terminal tracker state. The
   // workspace will be deleted by the worker-exit handler after the run has fully unwound.
   cleanup_workspace_on_exit: boolean;
+  // MCP integration. Populated when the runner registers this entry with the McpRegistry
+  // so the agent's tool calls can be routed back. Lifecycle: set on registration, cleared
+  // when the worker exits.
+  mcp_token: string | null;
+  // Snapshots captured at dispatch time so a WORKFLOW.md reload mid-flight cannot
+  // redirect an in-flight mark_done. The orchestrator pins these in dispatchIssue
+  // BEFORE workspace setup, before_run hooks, or smolvm bring-up — anything that
+  // happens during that window (including a workflow reload that mutates
+  // tracker.root or terminal_states) must not affect where mark_done lands.
+  // McpRegistry.activate copies these into the ActiveEntry as-is.
+  tracker_root_at_dispatch: string | null;
+  terminal_target_at_dispatch: string;
+  // Tool-driven exit signals. The runner reads these between turns.
+  marked_done: boolean;
+  // The MCP request_human_steering tool sets steering_requested = true and stashes the
+  // agent's question here. The runner pauses the autonomous loop and awaits a human reply
+  // via POST /api/v1/issues/<id>/steering-reply; the reply lands in steering_reply and the
+  // next turn's prompt is built from the pair.
+  steering_requested: boolean;
+  steering_question: string | null;
+  steering_context: string | null;
 }
 
 export interface RetryEntry {

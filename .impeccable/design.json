@@ -1,0 +1,502 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-05-19T00:00:00Z",
+  "title": "Design System: smol-symphony",
+  "extensions": {
+    "colorMeta": {
+      "surface-inset": {
+        "role": "neutral",
+        "displayName": "Inset",
+        "canonical": "oklch(16% 0.008 260)",
+        "tonalRamp": [
+          "oklch(10% 0.006 260)",
+          "oklch(16% 0.008 260)",
+          "oklch(22% 0.010 260)",
+          "oklch(30% 0.010 260)",
+          "oklch(45% 0.012 260)",
+          "oklch(62% 0.014 260)",
+          "oklch(80% 0.012 260)",
+          "oklch(94% 0.006 260)"
+        ]
+      },
+      "surface-base": {
+        "role": "neutral",
+        "displayName": "Bench",
+        "canonical": "oklch(18% 0.005 260)",
+        "tonalRamp": [
+          "oklch(12% 0.005 260)",
+          "oklch(18% 0.005 260)",
+          "oklch(24% 0.007 260)",
+          "oklch(32% 0.008 260)",
+          "oklch(48% 0.010 260)",
+          "oklch(65% 0.010 260)",
+          "oklch(82% 0.008 260)",
+          "oklch(95% 0.005 260)"
+        ]
+      },
+      "surface-raised": {
+        "role": "neutral",
+        "displayName": "Raised Panel",
+        "canonical": "oklch(21% 0.012 260)",
+        "tonalRamp": [
+          "oklch(13% 0.008 260)",
+          "oklch(21% 0.012 260)",
+          "oklch(28% 0.014 260)",
+          "oklch(36% 0.014 260)",
+          "oklch(50% 0.014 260)",
+          "oklch(66% 0.012 260)",
+          "oklch(82% 0.010 260)",
+          "oklch(95% 0.005 260)"
+        ]
+      },
+      "surface-chip": {
+        "role": "neutral",
+        "displayName": "Chip",
+        "canonical": "oklch(27% 0.012 260)",
+        "tonalRamp": [
+          "oklch(15% 0.008 260)",
+          "oklch(22% 0.010 260)",
+          "oklch(27% 0.012 260)",
+          "oklch(35% 0.014 260)",
+          "oklch(48% 0.014 260)",
+          "oklch(64% 0.012 260)",
+          "oklch(80% 0.010 260)",
+          "oklch(94% 0.006 260)"
+        ]
+      },
+      "border-soft": {
+        "role": "neutral",
+        "displayName": "Soft Rule",
+        "canonical": "oklch(25% 0.010 260)",
+        "tonalRamp": [
+          "oklch(14% 0.008 260)",
+          "oklch(20% 0.010 260)",
+          "oklch(25% 0.010 260)",
+          "oklch(33% 0.012 260)",
+          "oklch(48% 0.012 260)",
+          "oklch(64% 0.010 260)",
+          "oklch(81% 0.008 260)",
+          "oklch(94% 0.006 260)"
+        ]
+      },
+      "border-firm": {
+        "role": "neutral",
+        "displayName": "Firm Rule",
+        "canonical": "oklch(31% 0.008 260)",
+        "tonalRamp": [
+          "oklch(15% 0.006 260)",
+          "oklch(22% 0.008 260)",
+          "oklch(31% 0.008 260)",
+          "oklch(40% 0.010 260)",
+          "oklch(52% 0.010 260)",
+          "oklch(66% 0.010 260)",
+          "oklch(82% 0.008 260)",
+          "oklch(94% 0.006 260)"
+        ]
+      },
+      "text-dim": {
+        "role": "neutral",
+        "displayName": "Dim Text",
+        "canonical": "oklch(55% 0.018 260)",
+        "tonalRamp": [
+          "oklch(20% 0.012 260)",
+          "oklch(32% 0.016 260)",
+          "oklch(42% 0.018 260)",
+          "oklch(55% 0.018 260)",
+          "oklch(66% 0.018 260)",
+          "oklch(76% 0.016 260)",
+          "oklch(86% 0.012 260)",
+          "oklch(94% 0.008 260)"
+        ]
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Muted Text",
+        "canonical": "oklch(71% 0.020 260)",
+        "tonalRamp": [
+          "oklch(22% 0.012 260)",
+          "oklch(36% 0.016 260)",
+          "oklch(50% 0.018 260)",
+          "oklch(62% 0.020 260)",
+          "oklch(71% 0.020 260)",
+          "oklch(80% 0.018 260)",
+          "oklch(88% 0.014 260)",
+          "oklch(95% 0.008 260)"
+        ]
+      },
+      "text-base": {
+        "role": "neutral",
+        "displayName": "Base Text",
+        "canonical": "oklch(91% 0.005 260)",
+        "tonalRamp": [
+          "oklch(28% 0.008 260)",
+          "oklch(45% 0.008 260)",
+          "oklch(60% 0.008 260)",
+          "oklch(72% 0.006 260)",
+          "oklch(82% 0.006 260)",
+          "oklch(88% 0.005 260)",
+          "oklch(91% 0.005 260)",
+          "oklch(96% 0.004 260)"
+        ]
+      },
+      "text-strong": {
+        "role": "neutral",
+        "displayName": "Strong Text",
+        "canonical": "oklch(93% 0.005 260)",
+        "tonalRamp": [
+          "oklch(30% 0.008 260)",
+          "oklch(48% 0.008 260)",
+          "oklch(64% 0.006 260)",
+          "oklch(76% 0.006 260)",
+          "oklch(85% 0.006 260)",
+          "oklch(90% 0.005 260)",
+          "oklch(93% 0.005 260)",
+          "oklch(97% 0.004 260)"
+        ]
+      },
+      "text-on-accent": {
+        "role": "neutral",
+        "displayName": "On-Accent",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "oklch(40% 0.005 260)",
+          "oklch(55% 0.005 260)",
+          "oklch(70% 0.005 260)",
+          "oklch(82% 0.004 260)",
+          "oklch(90% 0.004 260)",
+          "oklch(95% 0.003 260)",
+          "oklch(98% 0.003 260)",
+          "oklch(100% 0 260)"
+        ]
+      },
+      "dispatch-blue": {
+        "role": "primary",
+        "displayName": "Dispatch Blue",
+        "canonical": "oklch(55% 0.22 261)",
+        "tonalRamp": [
+          "oklch(20% 0.10 261)",
+          "oklch(30% 0.16 261)",
+          "oklch(40% 0.20 261)",
+          "oklch(48% 0.22 261)",
+          "oklch(55% 0.22 261)",
+          "oklch(66% 0.18 261)",
+          "oklch(78% 0.14 261)",
+          "oklch(90% 0.08 261)"
+        ]
+      },
+      "running-bg": {
+        "role": "secondary",
+        "displayName": "Running Bench",
+        "canonical": "oklch(32% 0.06 152)",
+        "tonalRamp": [
+          "oklch(18% 0.04 152)",
+          "oklch(24% 0.05 152)",
+          "oklch(32% 0.06 152)",
+          "oklch(42% 0.10 152)",
+          "oklch(55% 0.14 152)",
+          "oklch(68% 0.16 152)",
+          "oklch(80% 0.14 152)",
+          "oklch(92% 0.08 152)"
+        ]
+      },
+      "running-fg": {
+        "role": "secondary",
+        "displayName": "Running Signal",
+        "canonical": "oklch(78% 0.18 152)",
+        "tonalRamp": [
+          "oklch(28% 0.08 152)",
+          "oklch(40% 0.12 152)",
+          "oklch(52% 0.16 152)",
+          "oklch(64% 0.18 152)",
+          "oklch(78% 0.18 152)",
+          "oklch(85% 0.14 152)",
+          "oklch(91% 0.10 152)",
+          "oklch(96% 0.05 152)"
+        ]
+      },
+      "retrying-bg": {
+        "role": "tertiary",
+        "displayName": "Retrying Bench",
+        "canonical": "oklch(32% 0.04 70)",
+        "tonalRamp": [
+          "oklch(18% 0.03 70)",
+          "oklch(24% 0.04 70)",
+          "oklch(32% 0.04 70)",
+          "oklch(42% 0.08 70)",
+          "oklch(58% 0.10 70)",
+          "oklch(70% 0.12 70)",
+          "oklch(82% 0.10 70)",
+          "oklch(93% 0.06 70)"
+        ]
+      },
+      "retrying-fg": {
+        "role": "tertiary",
+        "displayName": "Retrying Signal",
+        "canonical": "oklch(81% 0.13 80)",
+        "tonalRamp": [
+          "oklch(28% 0.06 80)",
+          "oklch(42% 0.10 80)",
+          "oklch(55% 0.12 80)",
+          "oklch(68% 0.13 80)",
+          "oklch(81% 0.13 80)",
+          "oklch(88% 0.10 80)",
+          "oklch(93% 0.07 80)",
+          "oklch(97% 0.03 80)"
+        ]
+      },
+      "idle-bg": {
+        "role": "neutral",
+        "displayName": "Idle Bench",
+        "canonical": "oklch(27% 0.012 260)",
+        "tonalRamp": [
+          "oklch(15% 0.008 260)",
+          "oklch(22% 0.010 260)",
+          "oklch(27% 0.012 260)",
+          "oklch(35% 0.014 260)",
+          "oklch(48% 0.014 260)",
+          "oklch(64% 0.012 260)",
+          "oklch(80% 0.010 260)",
+          "oklch(94% 0.006 260)"
+        ]
+      },
+      "idle-fg": {
+        "role": "neutral",
+        "displayName": "Idle Signal",
+        "canonical": "oklch(71% 0.020 260)",
+        "tonalRamp": [
+          "oklch(22% 0.012 260)",
+          "oklch(36% 0.016 260)",
+          "oklch(50% 0.018 260)",
+          "oklch(62% 0.020 260)",
+          "oklch(71% 0.020 260)",
+          "oklch(80% 0.018 260)",
+          "oklch(88% 0.014 260)",
+          "oklch(95% 0.008 260)"
+        ]
+      },
+      "error-fg": {
+        "role": "tertiary",
+        "displayName": "Error",
+        "canonical": "oklch(70% 0.18 22)",
+        "tonalRamp": [
+          "oklch(24% 0.10 22)",
+          "oklch(38% 0.14 22)",
+          "oklch(52% 0.18 22)",
+          "oklch(62% 0.20 22)",
+          "oklch(70% 0.18 22)",
+          "oklch(80% 0.14 22)",
+          "oklch(89% 0.10 22)",
+          "oklch(96% 0.04 22)"
+        ]
+      },
+      "success-fg": {
+        "role": "secondary",
+        "displayName": "Success",
+        "canonical": "oklch(78% 0.18 152)",
+        "tonalRamp": [
+          "oklch(28% 0.08 152)",
+          "oklch(40% 0.12 152)",
+          "oklch(52% 0.16 152)",
+          "oklch(64% 0.18 152)",
+          "oklch(78% 0.18 152)",
+          "oklch(85% 0.14 152)",
+          "oklch(91% 0.10 152)",
+          "oklch(96% 0.05 152)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Page title only. Appears once per page (the H1 with tracker-root annotation)."
+      },
+      "title": {
+        "displayName": "Section Title",
+        "purpose": "Section labels (h2). Same size as body; hierarchy comes from the Firm Rule underline and 2rem top margin, not type scale."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default reading text and table cell contents."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Form labels and table column headers. Same metrics as body, color shifts to Muted."
+      },
+      "pill": {
+        "displayName": "Pill",
+        "purpose": "Status chip text. Smaller than body (0.85em ≈ 11.9px) so pills read as inline metadata, not content."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "Tabular numerics. Applied to any cell that holds a number so columns of digits line up."
+      },
+      "th": {
+        "displayName": "Table Header",
+        "purpose": "Column names. Body size, weight 500, color Muted. One weight step above body so columns name themselves."
+      }
+    },
+    "shadows": [],
+    "motion": [],
+    "breakpoints": [
+      { "name": "content-cap", "value": "1100px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button (Create issue)",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single primary verb on the page. Dispatches a new issue into the tracker. Dispatch Blue background, white label, 4px radius, no border, no shadow.",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">Create issue</button>",
+      "css": ".ds-btn-primary { background: #2a6df4; color: #ffffff; border: 0; border-radius: 4px; padding: 0.5rem 1rem; font: 14px ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 150ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-btn-primary:hover { background: oklch(48% 0.22 261); } .ds-btn-primary:focus-visible { outline: 2px solid oklch(78% 0.14 261); outline-offset: 2px; } .ds-btn-primary:active { background: oklch(40% 0.20 261); }"
+    },
+    {
+      "name": "Ghost Button (Refresh now)",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Secondary action: the 'Refresh now' control next to the Active sessions heading. Chip background, 1px Firm Rule border, smaller padding than the primary button.",
+      "html": "<button class=\"ds-btn-ghost\" type=\"button\">Refresh now</button>",
+      "css": ".ds-btn-ghost { background: #20242c; color: #dfe2e7; border: 1px solid #2a2e36; border-radius: 4px; padding: 0.3rem 0.7rem; font: 14px ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 150ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-btn-ghost:hover { background: #2a2e36; } .ds-btn-ghost:focus-visible { outline: 2px solid #2a6df4; outline-offset: 2px; }"
+    },
+    {
+      "name": "Input (text field)",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Default text input. Sunken into the form: Inset background (one step deeper than the form card), Firm Rule border, Strong text so what you're typing reads brighter than surrounding body text.",
+      "html": "<input class=\"ds-input\" type=\"text\" placeholder=\"ABC-42\" />",
+      "css": ".ds-input { background: #0c0f15; color: #e6ebf2; border: 1px solid #2a2e36; border-radius: 4px; padding: 0.4rem 0.6rem; font: 14px ui-sans-serif, system-ui, sans-serif; width: 100%; box-sizing: border-box; } .ds-input::placeholder { color: #6b7280; } .ds-input:focus-visible { outline: 1px solid #2a6df4; outline-offset: 0; border-color: #2a6df4; }"
+    },
+    {
+      "name": "Form Card",
+      "kind": "card",
+      "refersTo": "card-form",
+      "description": "The single card-shaped surface in the system: the create-issue form. Raised Panel background, 8px radius, 1rem padding, no border, no shadow. Grid layout aligns labels (max-content) with inputs (1fr).",
+      "html": "<form class=\"ds-card-form\"><label for=\"f-id\">Identifier</label><input id=\"f-id\" class=\"ds-input\" type=\"text\" placeholder=\"ABC-42\" /><label for=\"f-title\">Title</label><input id=\"f-title\" class=\"ds-input\" type=\"text\" /><button class=\"ds-btn-primary\" type=\"submit\">Create issue</button></form>",
+      "css": ".ds-card-form { display: grid; grid-template-columns: max-content 1fr; gap: 0.5rem 1rem; align-items: center; background: #161a22; padding: 1rem; border-radius: 8px; } .ds-card-form label { color: #9aa4b2; font: 14px ui-sans-serif, system-ui, sans-serif; } .ds-card-form .ds-btn-primary { grid-column: 2; justify-self: start; } .ds-input { background: #0c0f15; color: #e6ebf2; border: 1px solid #2a2e36; border-radius: 4px; padding: 0.4rem 0.6rem; font: 14px ui-sans-serif, system-ui, sans-serif; width: 100%; box-sizing: border-box; } .ds-btn-primary { background: #2a6df4; color: #ffffff; border: 0; border-radius: 4px; padding: 0.5rem 1rem; font: 14px ui-sans-serif, system-ui, sans-serif; cursor: pointer; }"
+    },
+    {
+      "name": "Pill: Running",
+      "kind": "chip",
+      "refersTo": "pill-running",
+      "description": "Active session status pill. Dark green background, light green text. Means: the orchestrator is currently spending tokens on this issue.",
+      "html": "<span class=\"ds-pill ds-pill-running\">running</span>",
+      "css": ".ds-pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font: 0.85em ui-sans-serif, system-ui, sans-serif; line-height: 1.4; } .ds-pill-running { background: #1f3a26; color: #58d68d; }"
+    },
+    {
+      "name": "Pill: Retrying",
+      "kind": "chip",
+      "refersTo": "pill-retrying",
+      "description": "Retry queue status pill. Dark amber background, light amber text. Means: the orchestrator hit a recoverable failure and will dispatch again on backoff.",
+      "html": "<span class=\"ds-pill ds-pill-retrying\">retry queued</span>",
+      "css": ".ds-pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font: 0.85em ui-sans-serif, system-ui, sans-serif; line-height: 1.4; } .ds-pill-retrying { background: #3a2f1f; color: #f0c060; }"
+    },
+    {
+      "name": "Pill: Idle",
+      "kind": "chip",
+      "refersTo": "pill-idle",
+      "description": "On disk, not running, not retrying. Shares the Chip neutral background and Muted text color because idle is the absence of status color.",
+      "html": "<span class=\"ds-pill ds-pill-idle\">idle</span>",
+      "css": ".ds-pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font: 0.85em ui-sans-serif, system-ui, sans-serif; line-height: 1.4; } .ds-pill-idle { background: #20242c; color: #9aa4b2; }"
+    },
+    {
+      "name": "Status Table",
+      "kind": "custom",
+      "refersTo": "td",
+      "description": "Dense data table with tabular numerics on every cell. Used for Active sessions, Retry queue, and All known issues. No striping; Soft Rule divider between rows is enough.",
+      "html": "<table class=\"ds-table\"><thead><tr><th>Issue</th><th>State</th><th>Turn</th><th>Started</th><th>Tokens</th></tr></thead><tbody><tr><td><strong>ABC-42</strong></td><td><span class=\"ds-pill ds-pill-running\">running</span></td><td>3</td><td><small class=\"ds-dim\">09:14:22</small></td><td>4128</td></tr><tr><td><strong>ABC-43</strong></td><td><span class=\"ds-pill ds-pill-retrying\">retry queued</span></td><td>1</td><td><small class=\"ds-dim\">09:11:08</small></td><td>912</td></tr></tbody></table>",
+      "css": ".ds-table { width: 100%; border-collapse: collapse; font: 14px ui-sans-serif, system-ui, sans-serif; color: #dfe2e7; } .ds-table th, .ds-table td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #1c2029; font-variant-numeric: tabular-nums; } .ds-table th { color: #9aa4b2; font-weight: 500; } .ds-dim { color: #6b7280; } .ds-pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.85em; line-height: 1.4; } .ds-pill-running { background: #1f3a26; color: #58d68d; } .ds-pill-retrying { background: #3a2f1f; color: #f0c060; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Workshop",
+    "overview": "A tidy workbench, not a control room. The orchestrator does the real work; this surface only shows what is on the bench right now, and gives one place to put new work on. Everything you can see is there because the orchestrator actually knows it, and nothing is there for atmosphere.\n\nThe system is dark because the user opens it next to a terminal, against an already-dark editor, in the middle of doing other things. It is flat because the workshop has no spotlights: depth is conveyed by stacking slightly lighter panels on a slightly darker bench, never by glow or lift. Numbers are tabular, labels are real field names, and pills mean exactly the three states the orchestrator tracks: running, retrying, idle.\n\nWhat this system rejects, drawn from PRODUCT.md: generic SaaS dashboard chrome (sidebar nav, gradient metric tiles, identical card grids), Jira-style ITSM heaviness (modal-on-modal flows, status pills whose colors don't encode distinct state), and AI-product chrome (violet gradients, glassmorphism, sparkle iconography). smol-symphony runs AI agents but is not an AI product; the agents are infrastructure, not the narrative.",
+    "keyCharacteristics": [
+      "Dark, cool-blue-leaning neutrals stacked into four tonal layers.",
+      "One saturated accent (Dispatch Blue) reserved for the single primary verb.",
+      "Three semantic pill states, each a paired bg + fg color. No fourth state, ever.",
+      "No shadows. Depth is tonal stacking only.",
+      "Single sans family. Tabular numerics for any cell that holds a number.",
+      "Density over whitespace luxury: tables are dense, the form is grid-packed."
+    ],
+    "rules": [
+      {
+        "name": "The One Verb Rule",
+        "body": "Dispatch Blue appears on exactly one element per page: the primary action. If a second saturated accent is needed, the design is wrong; reach for a status color (running/retrying/idle) or text weight first.",
+        "section": "colors"
+      },
+      {
+        "name": "The Three-Pill Rule",
+        "body": "Status pills encode running, retrying, idle. Nothing else. Never invent a fourth pill color for taste; if a fourth state emerges from the orchestrator, name it semantically and pair a new bg + fg before adding it here.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tinted Neutral Rule",
+        "body": "No pure greys. Every neutral leans on the cool blue brand axis (hue ≈260) at near-zero chroma (0.005–0.012). Pure #000 and pure #fff are prohibited.",
+        "section": "colors"
+      },
+      {
+        "name": "The System-Font Rule",
+        "body": "No web fonts are loaded, ever. The console must look like the user's OS. If a custom face is added later, it has to justify the latency cost in writing.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular-Numbers Rule",
+        "body": "Any cell that contains a number applies font-variant-numeric: tabular-nums. Token counts, attempt counts, timestamps, IDs with digits: all of them. Columns of numbers must line up.",
+        "section": "typography"
+      },
+      {
+        "name": "The Same-Size Section-Header Rule",
+        "body": "Section titles (h2) are the same size as body. Hierarchy comes from the divider rule beneath and the top margin above, not from type scale. This keeps page density high.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-By-Default Rule",
+        "body": "Surfaces are flat. Shadows are forbidden. Depth cues come from the four-step neutral stack and from the divider rules under section titles. If a future state needs visible elevation, introduce a fifth neutral step before reaching for box-shadow.",
+        "section": "elevation"
+      },
+      {
+        "name": "The No-Glow Rule",
+        "body": "Focus, hover, and active states change color or border, never glow. Glassmorphism, blur backdrops, and shimmer animations are prohibited.",
+        "section": "elevation"
+      },
+      {
+        "name": "The One-Card Rule",
+        "body": "The create-issue form is the only card-shaped surface. Other sections are unbordered blocks separated by section titles and divider rules. Resist adding cards to wrap tables or stats.",
+        "section": "components"
+      },
+      {
+        "name": "The Inline-Feedback Rule",
+        "body": "Success and error feedback land in the same inline .msg slot where the form sits. No toast notifications. No modal confirmations. The user already saw the issue land in the table below.",
+        "section": "components"
+      },
+      {
+        "name": "The Sunken-Input Rule",
+        "body": "Inputs are visually deeper than the surface they sit on (Inset against Raised Panel). They must not appear to float; if a new input style is introduced, it follows this depth rule.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Do stack neutrals in four steps (Inset → Bench → Raised Panel → Chip) to convey depth. No shadows.",
+      "Do keep Dispatch Blue (#2a6df4) on exactly one element per page: the primary verb. Everywhere else, status colors and text weight do the work.",
+      "Do apply font-variant-numeric: tabular-nums to every cell holding a number. Token counts and attempt numbers must align across rows.",
+      "Do name new colors semantically (surface-chip, retrying-fg), not by hue (grey-3, green-400). The token name is the contract.",
+      "Do put feedback inline in the .msg slot. Errors and successes never leave their grid cell.",
+      "Do keep the type scale tight: h1 1.3rem, h2 1rem (same as body), body 14px, pill 0.85em. Hierarchy through rules and weight, not scale.",
+      "Do keep section titles (h2) the same size as body, separated by a Firm Rule underline and 2rem of top margin."
+    ],
+    "donts": [
+      "Don't add a fourth saturated accent. There is one verb color. Status pills carry the only other saturation in the system, and they encode three named states. A fourth pill is a smell.",
+      "Don't ship a sidebar nav, breadcrumb trail, or a 'Welcome back' hero. PRODUCT.md flags this as generic-SaaS-dashboard chrome; the workshop has one room.",
+      "Don't use big-number-with-tiny-label metric tiles. The hero-metric template is explicitly prohibited.",
+      "Don't add violet gradients, glassmorphic blur, sparkle / star icons, or any 'AI inside' iconography. smol-symphony runs AI agents but is not an AI product.",
+      "Don't add Jira-style status pills whose colors do not map to distinct orchestrator state. Three pills, three states, three bg + fg pairs.",
+      "Don't introduce box-shadow. Depth is tonal. If you reach for a shadow, add a fifth neutral step instead.",
+      "Don't use border-left greater than 1px as a colored stripe on rows, cards, or alerts.",
+      "Don't use #000 or #fff as text or background. The single existing color: white on the primary button is a known soft spot to tint toward the brand hue on the next polish pass.",
+      "Don't introduce a web font. ui-sans-serif, system-ui, sans-serif is non-negotiable unless an intentional editorial change is being made.",
+      "Don't add modals. Inline-first, always.",
+      "Don't animate layout properties or add motion that doesn't encode state.",
+      "Don't wrap content in a generic container. The form is the one card. Tables and stat lines stand on the bench directly."
+    ]
+  }
+}

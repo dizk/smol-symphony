@@ -17,8 +17,10 @@ import type {
   AcpConfig,
   SmolvmConfig,
   ServerConfig,
+  McpConfig,
 } from './types.js';
 import { log } from './logging.js';
+import { isKnownAdapter } from './agent/adapters.js';
 
 export class WorkflowError extends Error {
   constructor(public code: string, message: string) {
@@ -220,14 +222,16 @@ export function buildServiceConfig(
     max_concurrent_agents_by_state: asMapStrPosInt(agentRaw['max_concurrent_agents_by_state']),
   };
 
-  // acp (Symphony extension; supersedes the §5.3.6 `codex` block). The adapter binary
-  // is whatever ACP-compatible agent the workflow targets — claude-agent-acp, codex-acp,
-  // opencode acp, etc. We still wrap it through a login shell so the agent inherits the
-  // VM's $PATH and locale.
+  // acp (Symphony extension; supersedes the §5.3.6 `codex` block). `adapter` selects
+  // one of symphony's known profiles (claude, codex). `command` is optional: when
+  // null/unset, symphony auto-derives the launch command from the adapter profile and
+  // stages the host credential file into the workspace. Override `command` only if
+  // you need a custom launch (testing a forked adapter, a non-default binary path,
+  // etc.) — overriding also opts out of credential staging.
   const acpRaw = getObject(raw, 'acp');
   const acp: AcpConfig = {
-    adapter: asString(acpRaw['adapter']) ?? 'unknown',
-    command: asString(acpRaw['command']) ?? 'claude-agent-acp',
+    adapter: asString(acpRaw['adapter']) ?? 'claude',
+    command: asString(acpRaw['command']),
     shell: asString(acpRaw['shell']) ?? 'bash',
     prompt_timeout_ms: asInt(acpRaw['prompt_timeout_ms'], 3_600_000),
     read_timeout_ms: asInt(acpRaw['read_timeout_ms'], 30_000),
@@ -292,6 +296,20 @@ export function buildServiceConfig(
     host: asString(serverRaw['host']) ?? '127.0.0.1',
   };
 
+  // mcp extension: per-issue MCP server (mark_done + request_human_steering tools) injected
+  // into each ACP session. `host` defaults to the QEMU slirp gateway; the port is the
+  // actually-bound HTTP server's port (resolved at runtime, not config-parse time, so
+  // `--port` and an unset server.port can never desync). `host_url` is an explicit full-URL
+  // override for cases where the VM can't reach the orchestrator via the host gateway.
+  const mcpRaw = getObject(raw, 'mcp');
+  const mcpEnabledRaw = mcpRaw['enabled'];
+  const mcpEnabled = mcpEnabledRaw === undefined ? true : mcpEnabledRaw !== false;
+  const mcp: McpConfig = {
+    enabled: mcpEnabled,
+    host: asString(mcpRaw['host']) ?? '10.0.2.2',
+    explicit_host_url: asString(mcpRaw['host_url']),
+  };
+
   return {
     workflow_path: workflowAbs,
     workflow_dir: workflowDir,
@@ -303,6 +321,7 @@ export function buildServiceConfig(
     acp,
     smolvm,
     server,
+    mcp,
   };
 }
 
@@ -322,7 +341,14 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
       return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
     }
   }
-  if (!cfg.acp.command || !cfg.acp.command.trim()) return 'acp.command must be non-empty';
+  // When acp.command is explicitly set, the operator owns the launch (and credential
+  // staging). Otherwise the adapter id must be one symphony has a profile for, so
+  // the runner can auto-derive the command and ship credentials.
+  if (cfg.acp.command !== null) {
+    if (!cfg.acp.command.trim()) return 'acp.command must be non-empty when set';
+  } else if (!isKnownAdapter(cfg.acp.adapter)) {
+    return `acp.adapter "${cfg.acp.adapter}" is not a known profile; set acp.command to override or use one of: claude, codex`;
+  }
   return null;
 }
 

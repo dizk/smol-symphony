@@ -43,6 +43,7 @@ import {
   type WaitForTerminalExitResponse,
   type WriteTextFileRequest,
   type WriteTextFileResponse,
+  type McpServer,
 } from '@agentclientprotocol/sdk';
 import type { RuntimeEvent } from '../types.js';
 import { log } from '../logging.js';
@@ -56,6 +57,8 @@ export interface AcpClientOptions {
   promptTimeoutMs: number;
   onEvent: (event: RuntimeEvent) => void;
   onTokenUsage: (usage: { input_tokens: number; output_tokens: number; total_tokens: number }) => void;
+  /** MCP servers to expose to the agent on session/new. Empty array = no MCP. */
+  mcpServers?: McpServer[];
 }
 
 export type PromptOutcome =
@@ -248,13 +251,55 @@ export class AcpClient {
       'initialize',
     );
     this.emit('session_init', `protocolVersion=${init.protocolVersion}`);
+
+    // MCP is required for symphony operations: if the agent doesn't advertise support
+    // for a requested transport, we refuse to start the session rather than silently
+    // dropping the entry and running a degraded agent that has no mark_done /
+    // request_human_steering tools. ACP's mcpCapabilities is optional and advertises
+    // `http`/`sse`/`acp` as booleans; missing/undefined means "not supported." Stdio is
+    // implicit (the spec treats it as the baseline) and has no `type` discriminator.
+    const requested = this.opts.mcpServers ?? [];
+    const caps = (init.agentCapabilities ?? {}) as {
+      mcpCapabilities?: { http?: boolean; sse?: boolean; acp?: boolean };
+    };
+    const mcpCaps = caps.mcpCapabilities ?? {};
+    const supportsKind = (kind: 'stdio' | 'http' | 'sse' | 'acp'): boolean => {
+      if (kind === 'stdio') return true;
+      if (kind === 'http') return mcpCaps.http === true;
+      if (kind === 'sse') return mcpCaps.sse === true;
+      if (kind === 'acp') return mcpCaps.acp === true;
+      return false;
+    };
+    const unsupported = requested.filter((s) => {
+      const kind = ((s as { type?: string }).type ?? 'stdio') as 'stdio' | 'http' | 'sse' | 'acp';
+      return !supportsKind(kind);
+    });
+    if (unsupported.length > 0) {
+      const kinds = unsupported
+        .map((s) => (s as { type?: string }).type ?? 'stdio')
+        .join(', ');
+      this.emit(
+        'mcp_capability_mismatch',
+        `unsupported=${kinds} adapter_caps=${JSON.stringify(mcpCaps)}`,
+      );
+      throw new AcpProtocolError(
+        'mcp_capability_mismatch',
+        `agent does not support required MCP transport(s): ${kinds}. Adapter caps: ${JSON.stringify(
+          mcpCaps,
+        )}`,
+      );
+    }
+
     const session = await withTimeout(
-      this.conn.newSession({ cwd: this.opts.cwd, mcpServers: [] }),
+      this.conn.newSession({ cwd: this.opts.cwd, mcpServers: requested }),
       this.opts.readTimeoutMs,
       'session/new',
     );
     this.sessionId = session.sessionId;
-    this.emit('session_started', `sessionId=${session.sessionId} cwd=${this.opts.cwd}`);
+    this.emit(
+      'session_started',
+      `sessionId=${session.sessionId} cwd=${this.opts.cwd} mcp_servers=${requested.length}`,
+    );
     return { sessionId: session.sessionId };
   }
 

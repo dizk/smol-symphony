@@ -37,10 +37,39 @@ describe('local tracker', () => {
         terminal_states: ['Done'],
         root,
       });
-      const issues = await t.fetchCandidateIssues();
+      const { issues } = await t.fetchCandidateIssues();
       assert.equal(issues.length, 2);
       const ids = issues.map((i) => i.identifier).sort();
       assert.deepEqual(ids, ['A-1', 'A-3']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('returns root and terminalStates alongside issues as an atomic snapshot', async () => {
+    // Regression: the orchestrator dispatch loop relies on fetchCandidateIssues
+    // returning the tracker config it actually used during the scan, so a
+    // workflow reload mid-tick can't make the fetched issues and the captured
+    // snapshot disagree.
+    const { root, cleanup } = await makeTree();
+    try {
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo'],
+        terminal_states: ['Done', 'Cancelled'],
+        root,
+      });
+      const result = await t.fetchCandidateIssues();
+      assert.equal(result.root, root);
+      assert.deepEqual(result.terminalStates, ['Done', 'Cancelled']);
+      // Snapshot is a copy, not a live reference: mutating it must not affect
+      // future calls.
+      result.terminalStates.push('Tampered');
+      const second = await t.fetchCandidateIssues();
+      assert.deepEqual(second.terminalStates, ['Done', 'Cancelled']);
     } finally {
       await cleanup();
     }
@@ -58,7 +87,7 @@ describe('local tracker', () => {
         terminal_states: ['Done'],
         root,
       });
-      const issues = await t.fetchCandidateIssues();
+      const { issues } = await t.fetchCandidateIssues();
       const a1 = issues.find((i) => i.identifier === 'A-1')!;
       assert.deepEqual(a1.labels, ['bug', 'foo']);
       assert.equal(a1.blocked_by[0]?.identifier, 'A-2');

@@ -14,6 +14,7 @@ import { SmolvmClient } from '../agent/smolvm.js';
 import { AgentRunner } from '../agent/runner.js';
 import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
+import { McpRegistry } from '../mcp.js';
 import { log } from '../logging.js';
 
 interface Cli {
@@ -88,6 +89,11 @@ async function main() {
   const tracker = new LocalMarkdownTracker(config.tracker);
   const workspaces = new WorkspaceManager(config);
   const smolvm = new SmolvmClient(config.smolvm);
+  // Always instantiate the registry so a workflow reload that flips mcp.enabled from
+  // false to true takes effect without a process restart. The runner and HTTP routes
+  // gate behavior on cfg.mcp.enabled at runtime; an inactive registry holds no entries
+  // and answers all routes with "not active."
+  const mcp = new McpRegistry(tracker, { terminalStates: config.tracker.terminal_states });
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
@@ -109,6 +115,7 @@ async function main() {
           pid: info.pid,
         }),
     },
+    mcp,
   );
   orch = new Orchestrator(config, definition, src, tracker, workspaces, runner);
 
@@ -120,10 +127,11 @@ async function main() {
     tracker.updateConfig(cfg.tracker);
     workspaces.updateConfig(cfg);
     runner.updateConfig(cfg, def);
+    mcp.updateTerminalStates(cfg.tracker.terminal_states);
     liveCfg = cfg;
   });
 
-  let http: { close: () => Promise<void> } | null = null;
+  let http: { close: () => Promise<void>; port: number } | null = null;
   const httpPort = cli.port ?? config.server.port;
   if (httpPort !== null && httpPort !== undefined) {
     try {
@@ -135,11 +143,54 @@ async function main() {
           activeStates: liveCfg.tracker.active_states,
           terminalStates: liveCfg.tracker.terminal_states,
         }),
+        mcp,
       });
+      // Tell the registry the actually-bound port (which differs from httpPort when
+      // --port 0 is used and the kernel picks an ephemeral port). MCP URLs injected into
+      // agents must point at the real listener, not the requested-port placeholder.
+      mcp.setEffectivePort(http.port);
     } catch (err) {
       process.stderr.write(
         `error: failed to bind HTTP server on ${config.server.host}:${httpPort}: ${(err as Error).message}\n`,
       );
+      await src.stop().catch(() => undefined);
+      process.exit(1);
+    }
+  }
+
+  // MCP precondition check: with mcp.enabled (the default), every dispatch will
+  // require a reachable MCP URL. Verify NOW that one can be constructed, rather
+  // than letting each per-issue dispatch fail with the same error after VM
+  // bring-up costs are sunk. This catches the "WORKFLOW.md has no server.port,
+  // and no --port was passed" misconfiguration at boot.
+  if (config.mcp.enabled) {
+    // The mcp.host_url override exists so an operator can point the in-VM agent
+    // at a reverse-proxy-visible URL even when symphony binds the listener at
+    // a different host/port. It does NOT replace the listener itself: symphony
+    // is the process that actually serves /api/v1/issues/<id>/mcp. If no HTTP
+    // listener was bound, the override would advertise a URL nothing answers,
+    // and mark_done calls from the agent would fail. Refuse to boot in that
+    // shape so the misconfiguration surfaces at startup instead of mid-dispatch.
+    if (http === null) {
+      process.stderr.write(
+        `error: mcp.enabled=true but no HTTP server is configured. Symphony itself\n` +
+          `must bind a listener (set --port or server.port) so it can serve the MCP\n` +
+          `endpoint, even when mcp.host_url points the in-VM agent at a reverse proxy.\n`,
+      );
+      await src.stop().catch(() => undefined);
+      process.exit(1);
+    }
+    const probeUrl = mcp.buildUrl('startup-check', {
+      host: config.mcp.host,
+      explicit_host_url: config.mcp.explicit_host_url,
+    });
+    if (probeUrl === null) {
+      process.stderr.write(
+        `error: mcp.enabled=true but no MCP URL can be constructed. ` +
+          `Set --port, server.port, or mcp.host_url so the in-VM agent can reach ` +
+          `the symphony MCP endpoint.\n`,
+      );
+      if (http) await http.close().catch(() => undefined);
       await src.stop().catch(() => undefined);
       process.exit(1);
     }

@@ -8,6 +8,7 @@ import path from 'node:path';
 import type { Orchestrator } from './orchestrator.js';
 import { sanitizeWorkspaceKey } from './workspace.js';
 import { log } from './logging.js';
+import type { McpRegistry } from './mcp.js';
 
 function jsonResponse(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -344,14 +345,18 @@ export interface HttpServerOptions {
   host: string;
   /** Returns the current tracker root and state lists. Wired to the orchestrator's live cfg. */
   getTrackerView: () => { trackerRoot: string | null; activeStates: string[]; terminalStates: string[] };
+  /** Optional MCP registry. When present, exposes /api/v1/issues/:id/mcp + steering-reply. */
+  mcp?: McpRegistry | null;
 }
 
 // Resolves once the server has either bound the requested port or rejected with the bind
 // error so CLI startup can surface EADDRINUSE / EACCES instead of an unhandled rejection.
+// Returns the *actually bound* port (relevant for --port 0, where the kernel picks an
+// ephemeral port) so callers can advertise the live address.
 export async function startHttpServer(
   orch: Orchestrator,
   opts: HttpServerOptions,
-): Promise<{ close: () => Promise<void> }> {
+): Promise<{ close: () => Promise<void>; port: number }> {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void handleRequest(req, res, orch, opts).catch((err) => {
       log.error('http handler error', { error: (err as Error).message });
@@ -373,6 +378,7 @@ export async function startHttpServer(
     }
   });
 
+  let boundPort = opts.port;
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error) => {
       server.removeListener('listening', onListening);
@@ -382,6 +388,7 @@ export async function startHttpServer(
       server.removeListener('error', onError);
       const addr = server.address();
       const port = typeof addr === 'object' && addr ? addr.port : opts.port;
+      boundPort = port;
       log.info('http server listening', { host: opts.host, port });
       resolve();
     };
@@ -397,6 +404,7 @@ export async function startHttpServer(
   });
 
   return {
+    port: boundPort,
     close: () =>
       new Promise<void>((resolve) => {
         server.close(() => resolve());
@@ -509,6 +517,78 @@ async function handleRequest(
     }
     return methodNotAllowed(res);
   }
+  // MCP JSON-RPC endpoint: agent (inside the smolvm) POSTs JSON-RPC envelopes here. The
+  // URL is per-issue (the agent only knows its own /<id>/mcp), backed by a bearer token
+  // generated at dispatch. Both layers are belt-and-braces against the no-auth 8787 socket.
+  const mcpMatch = /^\/api\/v1\/issues\/([^/]+)\/mcp$/.exec(pathname);
+  if (mcpMatch) {
+    if (method !== 'POST') return methodNotAllowed(res);
+    const mcp = opts.mcp;
+    if (!mcp) return notFound(res, 'mcp_disabled', 'mcp endpoint not enabled');
+    const identifier = decodeURIComponent(mcpMatch[1]!);
+    const auth = (req.headers['authorization'] ?? req.headers['Authorization']) as
+      | string
+      | undefined;
+    const token = auth && auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : '';
+    if (!token) {
+      res.statusCode = 401;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ error: { code: 'unauthorized', message: 'bearer token required' } }));
+      return;
+    }
+    if (!mcp.isActive(identifier, token)) {
+      res.statusCode = 404;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.end(
+        JSON.stringify({ error: { code: 'not_found', message: 'issue not active or token mismatch' } }),
+      );
+      return;
+    }
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return badRequest(res, (err as Error).message);
+    }
+    const reply = await mcp.handleJsonRpc(identifier, token, body);
+    if (reply === null) {
+      // JSON-RPC notification (no id) → 204 No Content
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+    return jsonResponse(res, 200, reply);
+  }
+
+  // Steering reply: the dashboard (or any operator with access) submits the human's
+  // response to a queued request_human_steering call. The orchestrator-side runner is
+  // awaiting on the registry; this POST unblocks it.
+  const steeringMatch = /^\/api\/v1\/issues\/([^/]+)\/steering-reply$/.exec(pathname);
+  if (steeringMatch) {
+    if (method !== 'POST') return methodNotAllowed(res);
+    const mcp = opts.mcp;
+    if (!mcp) return notFound(res, 'mcp_disabled', 'steering endpoint not enabled');
+    const identifier = decodeURIComponent(steeringMatch[1]!);
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return badRequest(res, (err as Error).message);
+    }
+    const text =
+      body && typeof body === 'object' && !Array.isArray(body) && typeof (body as Record<string, unknown>).text === 'string'
+        ? ((body as Record<string, unknown>).text as string).trim()
+        : '';
+    if (!text) return badRequest(res, 'text is required and must be a non-empty string');
+    const ok = mcp.submitSteeringReply(identifier, text);
+    if (!ok) {
+      return jsonResponse(res, 409, {
+        error: { code: 'no_pending_steering', message: 'no agent is awaiting steering for this issue' },
+      });
+    }
+    return jsonResponse(res, 202, { identifier, accepted_at: new Date().toISOString() });
+  }
+
   const m = /^\/api\/v1\/([^/]+)$/.exec(pathname);
   if (m) {
     if (method !== 'GET') return methodNotAllowed(res);

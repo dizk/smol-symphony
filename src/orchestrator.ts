@@ -14,6 +14,8 @@ import type { IssueTracker } from './trackers/types.js';
 import type { WorkflowSource } from './workflow.js';
 import { validateDispatch, WorkflowError } from './workflow.js';
 import type { AgentRunner } from './agent/runner.js';
+import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
+import { pickTerminalTarget } from './mcp.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
 // snapshot endpoint can attach whatever shape a future ACP `_meta` extension produces.
@@ -116,6 +118,18 @@ export class Orchestrator {
       log.error('startup validation failed', { error: validation });
       throw new WorkflowError('workflow_parse_error', validation);
     }
+    // Fail fast when symphony will auto-stage credentials but the host file the
+    // adapter needs is missing. Operators who set acp.command explicitly own their
+    // own credential plumbing, so skip the check in that branch.
+    if (this.cfg.acp.command === null && isKnownAdapter(this.cfg.acp.adapter)) {
+      const profile = ADAPTERS[this.cfg.acp.adapter as AcpAdapterId];
+      try {
+        await assertHostCredentialReadable(profile);
+      } catch (err) {
+        log.error('startup credential check failed', { error: (err as Error).message });
+        throw new WorkflowError('missing_host_credential', (err as Error).message);
+      }
+    }
     await this.startupTerminalCleanup();
     this.scheduleTick(0);
   }
@@ -167,8 +181,17 @@ export class Orchestrator {
     this.lastValidationError = null;
 
     let candidates: Issue[];
+    let snapshotTrackerRoot: string | null;
+    let snapshotTerminalTarget: string;
     try {
-      candidates = await this.tracker.fetchCandidateIssues();
+      // Atomic fetch: the tracker returns the issues AND the root/terminal_states
+      // it used during the scan. That's the snapshot we pin onto each RunningEntry,
+      // so a workflow reload that races the dispatch loop can't cause `mark_done`
+      // to operate against a different tracker config than where the issue lives.
+      const result = await this.tracker.fetchCandidateIssues();
+      candidates = result.issues;
+      snapshotTrackerRoot = result.root;
+      snapshotTerminalTarget = pickTerminalTarget(result.terminalStates);
     } catch (err) {
       log.warn('candidate fetch failed', { error: (err as Error).message });
       this.scheduleTick(this.cfg.polling.interval_ms);
@@ -178,7 +201,10 @@ export class Orchestrator {
     for (const issue of sorted) {
       if (this.availableGlobalSlots() <= 0) break;
       if (!this.isEligible(issue)) continue;
-      void this.dispatchIssue(issue, null);
+      void this.dispatchIssue(issue, null, {
+        trackerRoot: snapshotTrackerRoot,
+        terminalTarget: snapshotTerminalTarget,
+      });
     }
     this.scheduleTick(this.cfg.polling.interval_ms);
   }
@@ -189,6 +215,12 @@ export class Orchestrator {
     if (this.cfg.acp.stall_timeout_ms > 0) {
       const now = Date.now();
       for (const [issueId, entry] of this.running) {
+        // Skip stall detection for issues awaiting human steering: the agent is
+        // intentionally paused while the human composes a reply, and the wait can
+        // legitimately exceed stall_timeout_ms. The cancel signal still applies
+        // (the runner's awaitSteeringReply respects it) for non-stall reasons like
+        // terminal-state transitions or operator-initiated cancels.
+        if (entry.steering_requested) continue;
         const ref = entry.last_codex_timestamp ?? entry.started_at;
         const elapsed = now - Date.parse(ref);
         if (Number.isFinite(elapsed) && elapsed > this.cfg.acp.stall_timeout_ms) {
@@ -307,13 +339,28 @@ export class Orchestrator {
   }
 
   /** §16.4 dispatch_issue */
-  private async dispatchIssue(issue: Issue, attempt: number | null): Promise<void> {
+  private async dispatchIssue(
+    issue: Issue,
+    attempt: number | null,
+    snapshot?: { trackerRoot: string | null; terminalTarget: string },
+  ): Promise<void> {
     if (this.running.has(issue.id)) return;
     this.claimed.add(issue.id);
     this.retryAttempts.delete(issue.id);
     const cancel = { cancelled: false };
     const startedAt = new Date().toISOString();
     const workspacePath = this.workspaces.workspacePathFor(issue.identifier);
+    // Snapshot tracker.root and the terminal target BEFORE workspace setup,
+    // before_run, or smolvm bring-up. A WORKFLOW.md reload during that window
+    // (or even between fetchCandidateIssues returning and this iteration of
+    // the dispatch loop) can mutate the live tracker config; pinning here closes
+    // that window. When the caller supplies a snapshot (the tick/retry path
+    // does — it captured at the fetch atomically), prefer those values; the
+    // optional fallback reads the live config for completeness.
+    const trackerRootAtDispatch =
+      snapshot?.trackerRoot ?? (this.tracker.currentRoot ? this.tracker.currentRoot() : null);
+    const terminalTargetAtDispatch =
+      snapshot?.terminalTarget ?? pickTerminalTarget(this.cfg.tracker.terminal_states);
     const entry: RunningEntry = {
       issue_id: issue.id,
       identifier: issue.identifier,
@@ -341,6 +388,13 @@ export class Orchestrator {
       recent_events: [],
       last_error: null,
       cleanup_workspace_on_exit: false,
+      mcp_token: null,
+      tracker_root_at_dispatch: trackerRootAtDispatch,
+      terminal_target_at_dispatch: terminalTargetAtDispatch,
+      marked_done: false,
+      steering_requested: false,
+      steering_question: null,
+      steering_context: null,
     };
     this.running.set(issue.id, entry);
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
@@ -358,7 +412,7 @@ export class Orchestrator {
     let ok = false;
     let reason = 'unknown';
     try {
-      const result = await this.runner.runAttempt(issue, attempt, cancelSignal);
+      const result = await this.runner.runAttempt(issue, attempt, cancelSignal, entry);
       ok = result.ok;
       reason = result.reason;
       if (result.threadId) entry.thread_id = result.threadId;
@@ -450,8 +504,13 @@ export class Orchestrator {
     if (!entry) return;
     this.retryAttempts.delete(issueId);
     let candidates: Issue[];
+    let snapshotTrackerRoot: string | null;
+    let snapshotTerminalTarget: string;
     try {
-      candidates = await this.tracker.fetchCandidateIssues();
+      const result = await this.tracker.fetchCandidateIssues();
+      candidates = result.issues;
+      snapshotTrackerRoot = result.root;
+      snapshotTerminalTarget = pickTerminalTarget(result.terminalStates);
     } catch (err) {
       log.debug('retry poll failed', {
         issue_id: issueId,
@@ -505,7 +564,10 @@ export class Orchestrator {
       });
       return;
     }
-    void this.dispatchIssue(issue, entry.attempt);
+    void this.dispatchIssue(issue, entry.attempt, {
+      trackerRoot: snapshotTrackerRoot,
+      terminalTarget: snapshotTerminalTarget,
+    });
   }
 
   /** §8.6 startup terminal workspace cleanup. */

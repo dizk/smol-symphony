@@ -48,13 +48,13 @@ smolvm:
   cpus: 2
   mem_mib: 4096
   net: true
+  # NOTE: smolvm imposes a small per-VM mount limit. The runner already mounts the
+  # workspace, so keep extra volumes minimal. With MCP doing all issue-tracker writes
+  # server-side (via mark_done), the agent does not need filesystem access to the
+  # tracker root anymore — credentials for the chosen adapter are the only extra mount.
   volumes:
-    # Mount host CLI auth so codex / claude inside the VM can talk to their providers
-    # without re-running `codex login` / `claude login`. These directories also hold the
-    # CLIs' per-session sqlite state files, so they must be read-write.
-    - host: ~/.codex
-      guest: /root/.codex
-      readonly: false
+    # Mount the matching credentials dir for the adapter selected in `acp.command` above.
+    # For codex-acp, swap this to ~/.codex.
     - host: ~/.claude
       guest: /root/.claude
       readonly: false
@@ -64,7 +64,9 @@ smolvm:
 
 server:
   port: 8787
-  host: 127.0.0.1
+  # Bound to all interfaces because access is gated by tailscale, not by the HTTP server
+  # itself. The endpoint has no auth — only expose it inside a trusted network boundary.
+  host: 0.0.0.0
 ---
 You are picking up a single issue from a local Markdown tracker and shepherding it through
 the workflow.
@@ -86,10 +88,23 @@ Goals for this run:
 2. Make the smallest correct change that satisfies the issue.
 3. When you are done, write a short summary of what you did into `RESULT.md` in the
    workspace root.
-4. After your final commit (or final edit if there is no git repo), stop. The orchestrator
-   will re-poll the tracker and decide whether more turns are needed.
+4. **Signal completion through the `symphony` MCP server.** Two tools are available:
+   - `symphony.mark_done({ summary })` — call this once, at the end of a successful run,
+     after writing `RESULT.md`. The orchestrator atomically moves the issue file into the
+     terminal `Done/` state and stops dispatching new turns.
+   - `symphony.request_human_steering({ question, context? })` — call this when you
+     cannot proceed without a human decision. Your current turn ends immediately after
+     the tool returns; the human's response arrives as the prompt for your next turn.
+5. If you cannot finish (blocked on something only a human can resolve), call
+   `symphony.request_human_steering` rather than ending the turn silently. The
+   orchestrator will keep redispatching otherwise. Document blockers in `RESULT.md`
+   for context.
+6. After calling `symphony.mark_done`, stop. The orchestrator re-polls the tracker
+   every tick — if the file is still in an active state directory it will dispatch
+   another turn, which costs tokens.
 
 {% if attempt -%}
-This is continuation/retry attempt {{ attempt }}. Pick up where the previous turn left off.
-Avoid redoing work that is already reflected on disk.
+This is continuation/retry attempt {{ attempt }}. The previous run left the workspace in
+some state; inspect it before doing anything new. If `RESULT.md` already exists and the
+issue is satisfied, call `symphony.mark_done` and stop without further edits.
 {%- endif %}
