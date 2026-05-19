@@ -1,66 +1,65 @@
 # smol-symphony
 
-A TypeScript implementation of [Symphony](./SPEC.md) — a long-running orchestrator that
-reads work from an issue tracker, prepares per-issue workspaces, and runs the
-[Codex app-server](https://developers.openai.com/codex/app-server/) for each issue inside
-an isolated [smolvm](https://smolmachines.com/) microVM.
+A small TypeScript orchestrator that reads issues off a local Markdown tracker,
+prepares per-issue workspaces, and runs coding agents (Claude Code, Codex,
+OpenCode) inside isolated [smolvm](https://smolmachines.com/) microVMs over the
+[Agent Client Protocol](https://agentclientprotocol.com).
 
-## Architecture at a glance
+The agent signals completion through an injected MCP server (`mark_done`,
+`request_human_steering`); the orchestrator handles state, retry, concurrency,
+and produces either a pull request or a `git format-patch` bundle per issue.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ Symphony (Node.js host)                                                 │
-│                                                                         │
-│   ┌────────────┐    ┌────────────┐    ┌──────────────┐                  │
-│   │ WORKFLOW.md│───▶│ Workflow   │───▶│ Orchestrator │                  │
-│   │ (watched)  │    │ + Config   │    │ (single auth)│                  │
-│   └────────────┘    └────────────┘    └──────────────┘                  │
-│                                              │                          │
-│   ┌────────────┐                             ▼                          │
-│   │ issues/    │◀────── Local Markdown Tracker                          │
-│   │ <state>/   │                             │                          │
-│   │  *.md      │                             ▼                          │
-│   └────────────┘                       Agent Runner                     │
-│                                              │                          │
-│                                              ▼ stdio                    │
-│                                       ┌──────────────────────────────┐  │
-│                                       │ smolvm machine (per issue)   │  │
-│                                       │   workspace volume-mounted   │  │
-│                                       │   ┌────────────────────────┐ │  │
-│                                       │   │ codex app-server       │ │  │
-│                                       │   │   JSON-RPC over stdio  │ │  │
-│                                       │   └────────────────────────┘ │  │
-│                                       └──────────────────────────────┘  │
-│                                                                         │
-│   HTTP server (optional):  /  (UI),  /api/v1/state,  /api/v1/issues,    │
-│                            /api/v1/<identifier>,  /api/v1/refresh       │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  symphony (node host)                                                    │
+│                                                                          │
+│   issues/<state>/*.md  ─┐                                                │
+│      WORKFLOW.md       ─┼──▶  orchestrator  ──▶  agent runner            │
+│      WORKFLOW.template.md │   (poll → reconcile → dispatch)              │
+│                          │                          │                    │
+│                          │                          ▼  ACP (JSON-RPC)    │
+│                          │                  ┌──────────────────────────┐ │
+│                          │                  │ smolvm (per-issue VM)    │ │
+│                          │                  │   adapter binary         │ │
+│                          │                  │   workspace mount        │ │
+│                          │                  │   mcp client ←───────────┼─┼─▶ symphony MCP
+│                          │                  └──────────────────────────┘ │     mark_done
+│                          ▼                                               │     request_human_steering
+│   HTTP dashboard (HTMX):  /                                              │
+│     attention · sessions · on disk · new issue · totals                  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick start
 
 Prerequisites:
 
-- Node.js ≥ 20
-- A `smolvm` binary on `$PATH` and the `smolvm` server reachable on the configured endpoint
-  (`smolvm serve start --listen unix:///run/user/$UID/smolvm.sock` if not already running)
-- A Codex-compatible VM image with `codex` on the guest `$PATH` (see "Codex inside the VM"
-  below)
+- Node.js ≥ 20.
+- A `smolvm` binary on `$PATH` with the server reachable on the configured
+  endpoint (e.g. `smolvm serve start --listen unix:///run/user/$UID/smolvm.sock`).
+- A packed VM image (one-time): `bash scripts/build-vm.sh` produces
+  `.vm/symphony.smolmachine.smolmachine` (~1.1 GB; ships `claude-agent-acp`,
+  `codex-acp`, and `opencode` on the guest `$PATH`).
+- For the default `acp.adapter: claude`: a credentials file at
+  `~/.claude/.credentials.json` on the host (symphony reads and stages it; the
+  host directory is **not** bind-mounted into the VM).
+
+Run:
 
 ```bash
 npm install
 npm run build
 npx symphony WORKFLOW.md
-# or with the dev HTTP UI on http://127.0.0.1:8787
-npx symphony WORKFLOW.md --port 8787
 ```
 
-The CLI is a positional path argument, falling back to `./WORKFLOW.md`.
+Open the dashboard at `http://127.0.0.1:8787/`. Drop issues into
+`issues/Todo/` from the filesystem or the dashboard's `new issue` form;
+symphony dispatches them on the next poll.
 
 ## Local Markdown tracker
 
-This build ships only the `local` tracker. Issues live as `.md` files under
-`tracker.root`. The parent directory becomes the issue state.
+Issues live as `.md` files under `tracker.root`. The parent directory is the
+issue state.
 
 ```
 issues/
@@ -73,7 +72,7 @@ issues/
     └── ABC-4.md
 ```
 
-Each file uses YAML front matter:
+Each file has YAML front matter and an optional body:
 
 ```markdown
 ---
@@ -81,130 +80,153 @@ title: "Fix the login bug"
 priority: 2
 labels: [bug, auth]
 blocked_by: [ABC-5]
-created_at: "2026-05-18T09:00:00Z"
 ---
 Long-form description in the body.
 ```
 
-The state comparison is case-insensitive, so directory names like `todo`, `Todo`, or
-`TODO` are equivalent.
-
-To move an issue between states, move the file. The polling loop will pick the change up
-on the next tick. The agent inside the VM can do this itself (e.g.
-`mv ../Todo/ABC-1.md ../Done/`) since the parent `issues/` tree can be exposed via a hook
-or shared workspace if needed.
+State comparison is case-insensitive. Moving the file between state
+directories is the canonical state transition; the orchestrator does this
+itself in response to `mark_done`. The agent inside the VM does **not** have
+filesystem access to the tracker root: it signals completion through the
+MCP server and the orchestrator does the file move.
 
 ## WORKFLOW.md
 
-`WORKFLOW.md` is a Markdown file with YAML front matter for runtime config and a
-[Liquid](https://liquidjs.com/) template for the per-issue prompt. The spec details every
-field — see [SPEC.md §5–§6](./SPEC.md). The shipped example covers the common cases.
+`WORKFLOW.md` is a YAML front matter block (orchestrator config) plus a
+[Liquid](https://liquidjs.com/)-templated prompt body. The shipped file in
+this repo is the canonical project workflow; see
+[WORKFLOW.template.md](./WORKFLOW.template.md) for the annotated reference
+covering every supported option, its type, default, and example.
 
-The orchestrator watches the file and re-applies config (poll interval, concurrency,
-hooks, prompt template, smolvm settings) on change without restart. In-flight runs keep
-the settings they started with.
+Symphony watches the file and re-applies poll interval, concurrency, hooks,
+prompt body, smolvm settings, etc. on change without restart. In-flight runs
+keep the settings they started with.
 
-## HTTP UI
+## Dashboard
 
-When `--port` (or `server.port` in `WORKFLOW.md`) is set, a small dashboard is hosted at
-`/`:
+When `server.port` is set (or `--port <n>` is passed), a single-page HTMX
+dashboard is served at `/`. Five live regions poll their own partials every
+2s; idiomorph keeps unchanged DOM stable so polling doesn't twitch text.
 
-- A form to create new issues. POSTs to `/api/v1/issues`. The `state` field is restricted
-  to the configured active/terminal states.
-- A live status table (polls `/api/v1/state` every 2s) showing active sessions, the retry
-  queue, and aggregate token totals.
-- A list of all issues on disk so you can see ones that are idle.
+- **header strip** — workflow file + tracker root + status badge
+  (`working` / `attention` / `idle`).
+- **attention** — only present when something needs you. Steering requests
+  (question, original task, agent's context, reply textarea) and retry
+  queue ease open with a CSS `max-height` transition so the page doesn't
+  jump.
+- **sessions** — running issues. Two-line rows: identifier + pill + turn +
+  tokens, then a dim last-message line.
+- **on disk** — active-state issues not currently dispatched.
+- **new issue** — collapsed `<details>` form. Posts JSON to
+  `POST /api/v1/issues`.
+- **totals** — dim footer with token + runtime aggregate.
 
-`POST /api/v1/refresh` triggers an immediate poll + reconciliation cycle.
+The steering reply form posts form-encoded with `HX-Request: true` and a
+same-origin check. The endpoint also accepts `application/json` for direct
+API clients. CSRF-relevant content types (`text/plain`,
+`multipart/form-data`) are rejected with 415.
 
-## ACP — talking to Claude, Codex, and OpenCode
+## MCP — how the agent talks back
 
-Symphony speaks the [Agent Client Protocol](https://agentclientprotocol.com) (Zed's open
-JSON-RPC protocol for coding agents). One client, three (and counting) compatible adapters
-shipping inside the VM image:
+Symphony injects an MCP server into each ACP session at
+`http://<host>:<bound-port>/api/v1/issues/<id>/mcp`, gated by a per-dispatch
+bearer token. Two tools:
 
-| Adapter                   | Command inside VM         | Source                                          |
-| ------------------------- | ------------------------- | ----------------------------------------------- |
-| Claude Code               | `claude-agent-acp`        | `@agentclientprotocol/claude-agent-acp`         |
-| Codex                     | `codex-acp`               | `@zed-industries/codex-acp` (glibc prebuilt)    |
-| OpenCode                  | `opencode acp`            | `opencode-ai`                                   |
+- **`symphony.mark_done({ title, summary })`** — call once at end of a
+  successful run. `title` is a single-line imperative summary (≤72 chars);
+  `summary` is a one- to three-paragraph narrative. The orchestrator
+  atomically moves the issue file to the terminal state and stops
+  dispatching. The pair lands in
+  `<workspace>/.git/symphony-runtime/mark_done.md` (or
+  `<workspace>/.symphony-runtime/mark_done.md` when the workspace doesn't
+  have its own `.git/`) for the `after_run` hook to consume.
+- **`symphony.request_human_steering({ question, context? })`** — call
+  when blocked on something only a human can answer. The turn ends
+  immediately; the human's reply arrives as the prompt for the next turn.
+  Steering-reply turns don't count against `agent.max_turns`.
 
-Switching agents is a one-line change in `WORKFLOW.md`:
+In smolvm, the VM's `127.0.0.1` transparently reaches the host's
+`127.0.0.1` (verified empirically), so the agent reaches the orchestrator
+without any mount or special host alias.
+
+## ACP — adapter registry
+
+One ACP client (symphony's `agent/acp.ts`), two shipped adapter profiles.
+Each profile encodes the binary symphony launches and the host credential
+file it stages into the workspace before exec:
+
+| Adapter   | Binary             | Host credential file              |
+| --------- | ------------------ | --------------------------------- |
+| `claude`  | `claude-agent-acp` | `~/.claude/.credentials.json`     |
+| `codex`   | `codex-acp`        | `~/.codex/auth.json`              |
+
+`WORKFLOW.md`:
 
 ```yaml
 acp:
-  adapter: claude         # label only — appears in logs
-  command: claude-agent-acp
+  adapter: claude
   shell: bash
   prompt_timeout_ms: 1800000
   read_timeout_ms: 30000
   stall_timeout_ms: 300000
 ```
 
-For Codex, use `command: codex-acp`. For OpenCode, use `command: opencode acp`.
+Selecting an adapter is enough — symphony auto-derives the launch command
+that stages the credential into the workspace's runtime dir and copies it
+into the adapter's expected guest path before exec. Set `command:` only to
+override (testing a forked adapter, a non-standard binary path); doing so
+opts out of automatic credential staging.
 
-### Token accounting under ACP
+Credentials are **never bind-mounted from the host**. Symphony copies the
+single credential file into a per-workspace location (under `.git/` when
+the workspace has its own clone, else `.symphony-runtime/`) and refuses to
+operate on workspaces inside the credential file's ancestor repo.
 
-ACP's `usage_update` reports **context-window usage** (`used / size`), not cumulative
-input/output tokens. Symphony maps `used` into `total_tokens` and leaves `input_tokens` /
-`output_tokens` as zero. If you need true I/O token totals, an adapter-specific MCP server
-or `_meta` extension is the right place to surface it.
+## After-run handoff: PR or patch
 
-## The VM image
+`WORKFLOW.md`'s `after_run` hook ships in two modes:
 
-The shipped `scripts/build-vm.sh` builds a packed `.smolmachine` artifact that contains
-`node:20-bookworm-slim` + `git`, `ripgrep`, `curl`, `ca-certificates`, and the four
-agent-related npm packages above. Debian is used instead of Alpine because `codex-acp`'s
-prebuilt is glibc-linked.
+- **Pull request mode.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is
+  exported. The hook pushes the per-issue branch to GitHub and runs
+  `gh pr create --base $SYMPHONY_BASE_BRANCH ...`. Requires `gh auth status`
+  to be clean on the host. The token never enters the VM.
+- **Patch bundle mode** (default). Writes
+  `.symphony/patches/<branch>.patch` via `git format-patch` so you can
+  review and apply with `git am`. No remote required.
 
-```bash
-bash scripts/build-vm.sh
-# -> .vm/symphony.smolmachine.smolmachine  (~1.1 GB compressed)
-```
+The agent's `mark_done.md` provides the PR title/body or commit message; the
+hook reads it from the workspace's runtime dir.
 
-`WORKFLOW.md` then references it via `smolvm.from`:
-
-```yaml
-smolvm:
-  from: ./.vm/symphony.smolmachine.smolmachine
-  cpus: 2
-  mem_mib: 4096
-  net: true
-  volumes:
-    - host: ~/.claude          # claude-agent-acp credentials + per-session SQLite
-      guest: /root/.claude
-      readonly: false
-    - host: ~/.codex           # codex-acp credentials, if you use that adapter
-      guest: /root/.codex
-      readonly: false
-  forward_env: [OPENAI_API_KEY, ANTHROPIC_API_KEY]
-```
-
-The credential mounts are **read-write** because the adapters need to write per-session
-state into their respective home dirs. If you want stricter isolation, copy auth files
-into a per-workspace location and mount only that.
-
-Other ways to provide a VM image:
-- `smolvm.image: my-agent-image:latest` — pull from a registry.
-- `smolvm.image: null` + `smolvm.bin_path: /host/path/to/agent` — boot a bare VM and mount
-  the adapter binary in.
+See [AGENTS.md](./AGENTS.md) for the env-var contract and switch-over
+commands.
 
 ## Trust posture
 
-This implementation follows the SPEC §10.5 "high-trust" example posture:
+Sandbox isolation comes from running each agent inside a smolvm microVM.
+The VM has no network credentials (only the agent's API key is forwarded
+via `smolvm.forward_env`), no tracker filesystem access (the tracker is
+reached only through the MCP server), and stripped git remotes (set by
+`after_create`).
 
-- Command execution and file change approvals: **auto-approve** (accept-for-session).
-- User-input-required turns: **fail the run** (the orchestrator retries on backoff).
-- Unsupported dynamic tool calls: **return failure**, the session keeps running.
+Within the ACP session, the orchestrator follows SPEC §10.5's "high-trust"
+posture:
 
-Sandbox isolation comes from running each agent inside a smolvm microVM whose only
-external resource is the workspace volume.
+- Command execution and file change approvals: auto-approve.
+- User-input-required turns: end the turn (the orchestrator retries on
+  backoff).
+- Unsupported dynamic tool calls: return failure; the session keeps running.
 
-## Testing
+## Tests
 
 ```bash
-npm test         # unit tests for workflow / tracker / prompt / workspace
-npm run build    # tsc typecheck + emit dist/
+npm run typecheck    # tsc --noEmit
+npm test             # 67 tests across workflow, tracker, prompt, workspace,
+                     # adapters, http, and mcp surfaces
+npm run build        # tsc emit to dist/
 ```
 
-A real end-to-end smoke run requires a VM image with `codex` available.
+An end-to-end smoke run needs a real smolvm + VM image.
+
+## License
+
+MIT. See [LICENSE](./LICENSE).

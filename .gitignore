@@ -6,3 +6,22 @@ dist/
 .env
 .vm
 .symphony/
+
+# Local agent / tooling state. Do not commit per-developer overlays.
+.agents/
+.claude/
+.impeccable/
+skills-lock.json
+
+# Runtime tracker artifacts. Issue files under Done/, Cancelled/, and
+# In Progress/ are products of past dispatches, not source of truth.
+issues/Done/
+issues/Cancelled/
+issues/In Progress/
+
+# Keep the tracker directory tree so a fresh clone can dispatch immediately.
+!issues/
+!issues/Todo/
+!issues/Todo/.gitkeep
+!issues/In Progress/.gitkeep
+!issues/Done/.gitkeep

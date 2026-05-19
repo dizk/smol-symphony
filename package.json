@@ -1,18 +1,51 @@
 {
   "name": "smol-symphony",
   "version": "0.1.0",
-  "description": "Symphony orchestrator (per SPEC.md), running coding agents in isolated smolvm microVMs.",
+  "description": "Long-running orchestrator that dispatches coding agents (Claude, Codex, OpenCode) into per-issue smolvm microVMs over ACP, with MCP-driven completion and a live HTMX dashboard.",
+  "keywords": [
+    "orchestrator",
+    "agent",
+    "acp",
+    "mcp",
+    "smolvm",
+    "claude",
+    "codex",
+    "opencode",
+    "issue-tracker"
+  ],
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "author": "Didrik A. Rognstad <didrik.rognstad@gmail.com>",
+  "homepage": "https://github.com/dizk/smol-symphony#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dizk/smol-symphony.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dizk/smol-symphony/issues"
+  },
   "bin": {
     "symphony": "dist/bin/symphony.js"
   },
+  "files": [
+    "dist/",
+    "WORKFLOW.md",
+    "WORKFLOW.template.md",
+    "AGENTS.md",
+    "SPEC.md",
+    "PRODUCT.md",
+    "DESIGN.md",
+    "scripts/build-vm.sh",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "tsx src/bin/symphony.ts",
     "dev": "tsx watch src/bin/symphony.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx tests/*.test.ts"
+    "test": "node --test --import tsx tests/*.test.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.22.1",
@@ -27,5 +60,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }
