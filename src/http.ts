@@ -125,13 +125,61 @@ async function readTextBody(req: IncomingMessage, maxBytes = 1_000_000): Promise
   });
 }
 
+// Slugify a title into a filename-safe identifier. Lowercase ASCII with single-dash
+// separators; trims to a sensible length so the on-disk path stays readable. Falls back to
+// `issue` when the title is empty after stripping.
+function slugifyTitle(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+    .replace(/-+$/g, '');
+  return slug.length > 0 ? slug : 'issue';
+}
+
+// Walk every state directory under `trackerRoot` and return the set of issue identifiers
+// (filename stem) currently present. Used to pick a unique suffix when deriving an
+// identifier from a title — checking only the target state directory would let a `Done/foo.md`
+// silently shadow a freshly created `Todo/foo.md` once it moves out of Todo.
+async function collectExistingIdentifiers(trackerRoot: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  let entries: string[];
+  try {
+    entries = await readdir(trackerRoot);
+  } catch {
+    return out;
+  }
+  for (const stateDir of entries) {
+    const dirPath = path.join(trackerRoot, stateDir);
+    let st;
+    try {
+      st = await stat(dirPath);
+    } catch {
+      continue;
+    }
+    if (!st.isDirectory()) continue;
+    let files: string[];
+    try {
+      files = await readdir(dirPath);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (f.endsWith('.md')) out.add(f.slice(0, -3));
+    }
+  }
+  return out;
+}
+
 // Used by the dashboard form. The local tracker stores issues at:
 //   <tracker.root>/<state>/<identifier>.md
 // with YAML front matter. Identifier sanitization re-uses the workspace key rules so the
 // file name is always safe across the rest of the orchestrator.
 async function writeIssueFile(input: {
   trackerRoot: string;
-  identifier: string;
+  /** Explicit identifier from the caller; when omitted, derived from `title`. */
+  identifier?: string;
   state: string;
   title: string;
   description?: string;
@@ -139,16 +187,34 @@ async function writeIssueFile(input: {
   labels?: string[];
   blocked_by?: string[];
 }): Promise<{ path: string; identifier: string; state: string }> {
-  const ident = sanitizeWorkspaceKey(input.identifier);
-  if (!ident) throw new Error('identifier must contain at least one allowed character');
   const stateDir = path.join(input.trackerRoot, input.state);
   await mkdir(stateDir, { recursive: true });
-  const filePath = path.join(stateDir, `${ident}.md`);
-  try {
-    await stat(filePath);
-    throw new Error(`issue ${ident} already exists at ${filePath}`);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  let ident: string;
+  let filePath: string;
+  const explicit = (input.identifier ?? '').trim();
+  if (explicit.length > 0) {
+    ident = sanitizeWorkspaceKey(explicit);
+    if (!ident) throw new Error('identifier must contain at least one allowed character');
+    filePath = path.join(stateDir, `${ident}.md`);
+    try {
+      await stat(filePath);
+      throw new Error(`issue ${ident} already exists at ${filePath}`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  } else {
+    // No identifier supplied → derive a slug from the title and disambiguate against
+    // collisions across every state directory under the tracker root, so a `-2` suffix
+    // appears whenever the same titled issue already exists anywhere (Todo / Done / etc).
+    const base = slugifyTitle(input.title);
+    const existing = await collectExistingIdentifiers(input.trackerRoot);
+    ident = base;
+    let n = 2;
+    while (existing.has(ident)) {
+      ident = `${base}-${n}`;
+      n += 1;
+    }
+    filePath = path.join(stateDir, `${ident}.md`);
   }
   const now = new Date().toISOString();
   const fm: Record<string, unknown> = {
@@ -467,10 +533,7 @@ function renderTotalsPartial(p: PartialInputs): string {
 }
 
 function renderDashboardHtml(p: PartialInputs): string {
-  const allStates = Array.from(new Set([...p.activeStates, ...p.terminalStates]));
-  const stateOptions = allStates
-    .map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`)
-    .join('');
+  const defaultState = p.activeStates[0] ?? 'Todo';
   const diskCount = p.diskIssues.filter((i) => p.activeStates.includes(i.state)).length;
   const formOpen =
     diskCount === 0 && p.snapshot.running.length === 0 && p.snapshot.retrying.length === 0;
@@ -810,21 +873,13 @@ footer.totals:empty { display: none; }
 <details class="new-issue"${formOpen ? ' open' : ''}>
   <summary>new issue</summary>
   <form class="create" id="create-form">
-    <label for="identifier">identifier</label>
-    <input id="identifier" name="identifier" required placeholder="ABC-42" autocomplete="off" />
     <label for="title">title</label>
-    <input id="title" name="title" required autocomplete="off" />
-    <label for="state">state</label>
-    <select id="state" name="state">${stateOptions}</select>
-    <label for="priority">priority</label>
-    <input id="priority" name="priority" type="number" min="0" max="10" placeholder="2" />
-    <label for="labels">labels</label>
-    <input id="labels" name="labels" placeholder="bug, urgent" autocomplete="off" />
+    <input id="title" name="title" required autocomplete="off" placeholder="what needs doing?" />
     <label for="description">description</label>
-    <textarea id="description" name="description" placeholder="what needs to be done?"></textarea>
+    <textarea id="description" name="description" placeholder="optional — extra context for the agent"></textarea>
     <div class="submit-row">
       <button type="submit">create issue</button>
-      <span class="msg" id="create-msg" role="status" aria-live="polite"></span>
+      <span class="msg" id="create-msg" role="status" aria-live="polite">drops into <code>${escapeHtml(defaultState)}/</code> with a slug derived from the title.</span>
     </div>
   </form>
 </details>
@@ -849,21 +904,17 @@ document.addEventListener('keydown', (ev) => {
   }
 });
 
-// Create-issue form: stays on fetch+JSON (the create POST takes structured arrays). After
-// success we fire a custom event the polling regions listen to via hx-trigger.
+// Create-issue form: stays on fetch+JSON. The dashboard only collects title +
+// description; the server derives a slug identifier and defaults state to the first
+// active state. Advanced fields (priority, labels, explicit identifier, explicit state)
+// are still accepted by the API for direct callers — they just no longer clutter the form.
 $('create-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const msg = $('create-msg');
   msg.className = 'msg'; msg.textContent = 'creating…';
-  const labels = $('labels').value.split(',').map((s) => s.trim()).filter(Boolean);
-  const priorityRaw = $('priority').value.trim();
   const body = {
-    identifier: $('identifier').value.trim(),
     title: $('title').value.trim(),
-    state: $('state').value,
     description: $('description').value,
-    labels,
-    priority: priorityRaw === '' ? null : Number(priorityRaw),
   };
   try {
     const res = await fetch('/api/v1/issues', {
@@ -1066,10 +1117,16 @@ async function handleRequest(
       const b = body as Record<string, unknown>;
       const identifier = typeof b.identifier === 'string' ? b.identifier.trim() : '';
       const title = typeof b.title === 'string' ? b.title.trim() : '';
-      const state = typeof b.state === 'string' ? b.state.trim() : '';
-      if (!identifier) return badRequest(res, 'identifier is required');
+      const stateInput = typeof b.state === 'string' ? b.state.trim() : '';
       if (!title) return badRequest(res, 'title is required');
-      if (!state) return badRequest(res, 'state is required');
+      // `identifier` and `state` are optional: identifier is derived from the title when
+      // omitted, state defaults to the first active state (typically `Todo`). This keeps
+      // the dispatch surface to a single required field for callers that just want to
+      // hand the orchestrator a task.
+      const state = stateInput || view.activeStates[0] || '';
+      if (!state) {
+        return badRequest(res, 'state is required (no active_states configured to default to)');
+      }
       // Restrict `state` to one of the configured active/terminal states. Anything else
       // (or values containing path separators / `..`) is rejected so the request cannot
       // escape the tracker root via `path.join`.
