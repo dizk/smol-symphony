@@ -13,20 +13,23 @@ and produces either a pull request or a `git format-patch` bundle per issue.
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  symphony (node host)                                                    │
 │                                                                          │
-│   issues/<state>/*.md  ─┐                                                │
-│      WORKFLOW.md       ─┼──▶  orchestrator  ──▶  agent runner            │
-│      WORKFLOW.template.md │   (poll → reconcile → dispatch)              │
-│                          │                          │                    │
-│                          │                          ▼  ACP (JSON-RPC)    │
-│                          │                  ┌──────────────────────────┐ │
-│                          │                  │ smolvm (per-issue VM)    │ │
-│                          │                  │   adapter binary         │ │
-│                          │                  │   workspace mount        │ │
-│                          │                  │   mcp client ←───────────┼─┼─▶ symphony MCP
-│                          │                  └──────────────────────────┘ │     mark_done
-│                          ▼                                               │     request_human_steering
-│   HTTP dashboard (HTMX):  /                                              │
-│     attention · sessions · on disk · new issue · totals                  │
+│    ./issues/<state>/*.md  ──┐                                            │
+│    ./WORKFLOW.md            ├──▶  orchestrator  ──▶  agent runner        │
+│    ./WORKFLOW.template.md ──┘     poll · reconcile · dispatch            │
+│                                                          │               │
+│                                                          ▼  ACP/RPC      │
+│                                       ┌───────────────────────────────┐  │
+│                                       │ smolvm  (per-issue VM)        │  │
+│                                       │   adapter (claude / codex)    │  │
+│                                       │   workspace mount             │  │
+│                                       │   mcp client  ────────────────┼─┐│
+│                                       └───────────────────────────────┘ ││
+│                                                                         ││
+│              symphony MCP server  ◀─────────────────────────────────────┘│
+│              ( mark_done · request_human_steering )                      │
+│                                                                          │
+│    HTTP dashboard (HTMX):  /                                             │
+│      attention · sessions · on disk · new issue · totals                 │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
