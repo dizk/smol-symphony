@@ -44,17 +44,32 @@ Prerequisites:
   `~/.claude/.credentials.json` on the host (symphony reads and stages it; the
   host directory is **not** bind-mounted into the VM).
 
-Run:
+Run, against an existing workflow file in the current directory:
 
 ```bash
-npm install
-npm run build
-npx symphony WORKFLOW.md
+npx smol-symphony WORKFLOW.md
 ```
+
+(Or `npm i -g smol-symphony` and then `symphony WORKFLOW.md` to skip the
+fetch.) Both invoke the `symphony` bin shipped in this package.
 
 Open the dashboard at `http://127.0.0.1:8787/`. Drop issues into
 `issues/Todo/` from the filesystem or the dashboard's `new issue` form;
 symphony dispatches them on the next poll.
+
+### From a checkout
+
+If you're hacking on symphony itself:
+
+```bash
+git clone https://github.com/dizk/smol-symphony.git
+cd smol-symphony
+npm install
+npm run build
+npx symphony WORKFLOW.md     # the local bin
+```
+
+`npm run dev` (via `tsx watch`) reruns on source edits.
 
 ## Local Markdown tracker
 
