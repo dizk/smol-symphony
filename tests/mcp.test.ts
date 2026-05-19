@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { LocalMarkdownTracker } from '../src/trackers/local.js';
@@ -252,7 +252,7 @@ describe('McpRegistry JSON-RPC', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'tools/call',
-        params: { name: 'mark_done', arguments: { summary: 'all done' } },
+        params: { name: 'mark_done', arguments: { title: 'Demo', summary: 'all done' } },
       });
       assert.ok(res && 'result' in res);
       const result = res.result as { isError: boolean; content: Array<{ text: string }> };
@@ -288,7 +288,7 @@ describe('McpRegistry JSON-RPC', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'tools/call',
-        params: { name: 'mark_done', arguments: { summary: 'done' } },
+        params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
       });
       // File landed in the dispatch-time 'Done' target, NOT the post-reload first
       // entry 'Cancelled'.
@@ -334,7 +334,7 @@ describe('McpRegistry JSON-RPC', () => {
           jsonrpc: '2.0',
           id: 1,
           method: 'tools/call',
-          params: { name: 'mark_done', arguments: { summary: 'done' } },
+          params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
         });
         // Original root's ABC-1 moved into its own Done/.
         assert.deepEqual(await readdir(path.join(root, 'In Progress')), []);
@@ -409,7 +409,7 @@ describe('McpRegistry JSON-RPC', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'tools/call',
-        params: { name: 'mark_done', arguments: { summary: 'done' } },
+        params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
       });
       const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
       assert.equal(result.isError, true);
@@ -439,9 +439,53 @@ describe('McpRegistry JSON-RPC', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'tools/call',
-        params: { name: 'mark_done', arguments: { summary: 'done' } },
+        params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
       });
       assert.equal(entry.cleanup_workspace_on_exit, true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('mark_done rejects missing title', async () => {
+    const { root, cleanup } = await setupTree();
+    try {
+      const t = makeTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const entry = makeEntry('ABC-1', 'In Progress');
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'mark_done', arguments: { summary: 'ok' } },
+      });
+      const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /title is required/);
+      assert.equal(entry.marked_done, false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('mark_done rejects multi-line title', async () => {
+    const { root, cleanup } = await setupTree();
+    try {
+      const t = makeTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const entry = makeEntry('ABC-1', 'In Progress');
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'mark_done', arguments: { title: 'two\nlines', summary: 'ok' } },
+      });
+      const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /must be a single line/);
+      assert.equal(entry.marked_done, false);
     } finally {
       await cleanup();
     }
@@ -458,13 +502,53 @@ describe('McpRegistry JSON-RPC', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'tools/call',
-        params: { name: 'mark_done', arguments: { summary: '   ' } },
+        params: { name: 'mark_done', arguments: { title: 'Done', summary: '   ' } },
       });
       const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
       assert.equal(result.isError, true);
       assert.match(result.content[0]!.text, /summary is required/);
       assert.equal(entry.marked_done, false);
     } finally {
+      await cleanup();
+    }
+  });
+
+  it('mark_done persists title + summary as mark_done.md in the staging dir', async () => {
+    // Regression: the after_run hook reads the title/summary from mark_done.md.
+    // Confirm the structured artifact is written next to credentials (in .git/
+    // when a workspace has its own .git/, in .symphony-runtime/ otherwise) and
+    // that the markdown shape is "# <title>\n\n<summary>".
+    const { root, cleanup } = await setupTree();
+    const tmpWs = await mkdtemp(path.join(os.tmpdir(), 'symphony-mark-ws-'));
+    try {
+      // Workspace with its own .git/ dir so the staging-dir resolver picks the
+      // git path.
+      await mkdir(path.join(tmpWs, '.git'), { recursive: true });
+      const t = makeTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const entry = makeEntry('ABC-1', 'In Progress');
+      entry.workspace_path = tmpWs;
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'mark_done',
+          arguments: {
+            title: 'Add CHANGELOG.md',
+            summary: 'Wrote a 16-line changelog summarizing recent work.\n\nNo follow-ups.',
+          },
+        },
+      });
+      const result = (res as { result: { isError: boolean } }).result;
+      assert.equal(result.isError, false);
+      const body = await readFile(path.join(tmpWs, '.git', 'symphony-runtime', 'mark_done.md'), 'utf8');
+      assert.match(body, /^# Add CHANGELOG\.md\n\n/);
+      assert.match(body, /16-line changelog/);
+      assert.match(body, /No follow-ups\./);
+    } finally {
+      await rm(tmpWs, { recursive: true, force: true });
       await cleanup();
     }
   });

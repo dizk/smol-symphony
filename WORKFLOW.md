@@ -86,25 +86,25 @@ Goals for this run:
 
 1. Work in the current directory only; treat it as the issue workspace.
 2. Make the smallest correct change that satisfies the issue.
-3. When you are done, write a short summary of what you did into `RESULT.md` in the
-   workspace root.
-4. **Signal completion through the `symphony` MCP server.** Two tools are available:
-   - `symphony.mark_done({ summary })` — call this once, at the end of a successful run,
-     after writing `RESULT.md`. The orchestrator atomically moves the issue file into the
+3. **Signal completion through the `symphony` MCP server.** Two tools are available:
+   - `symphony.mark_done({ title, summary })` — call this once, at the end of a
+     successful run. `title` is a single-line imperative summary (≤72 chars; becomes
+     the PR/commit title). `summary` is a one- to three-paragraph narrative that
+     becomes the PR body. The orchestrator atomically moves the issue file into the
      terminal `Done/` state and stops dispatching new turns.
    - `symphony.request_human_steering({ question, context? })` — call this when you
      cannot proceed without a human decision. Your current turn ends immediately after
      the tool returns; the human's response arrives as the prompt for your next turn.
-5. If you cannot finish (blocked on something only a human can resolve), call
+4. If you cannot finish (blocked on something only a human can resolve), call
    `symphony.request_human_steering` rather than ending the turn silently. The
-   orchestrator will keep redispatching otherwise. Document blockers in `RESULT.md`
-   for context.
-6. After calling `symphony.mark_done`, stop. The orchestrator re-polls the tracker
+   orchestrator will keep redispatching otherwise.
+5. After calling `symphony.mark_done`, stop. The orchestrator re-polls the tracker
    every tick — if the file is still in an active state directory it will dispatch
    another turn, which costs tokens.
 
 {% if attempt -%}
 This is continuation/retry attempt {{ attempt }}. The previous run left the workspace in
-some state; inspect it before doing anything new. If `RESULT.md` already exists and the
-issue is satisfied, call `symphony.mark_done` and stop without further edits.
+some state; inspect it before doing anything new. If the work is already complete,
+call `symphony.mark_done` with an appropriate title and summary and stop without
+further edits.
 {%- endif %}

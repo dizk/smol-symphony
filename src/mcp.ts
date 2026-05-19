@@ -20,6 +20,8 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import { lstat, mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import type { IssueTracker } from './trackers/types.js';
 import type { RunningEntry } from './types.js';
 import { log } from './logging.js';
@@ -47,17 +49,22 @@ const TOOL_LIST = [
   {
     name: 'mark_done',
     description:
-      'Signal that this issue is fully complete. The orchestrator will move the issue file into the terminal Done state and stop dispatching new turns. Call this only once, at the very end of a successful run, after writing RESULT.md.',
+      'Signal that this issue is fully complete. The orchestrator will move the issue file into the terminal Done state, persist the title/summary you provide for downstream tooling (PR title, PR body, transcripts), and stop dispatching new turns. Call this once, at the very end of a successful run. There is no RESULT.md to write — the structured fields here are the canonical record.',
     inputSchema: {
       type: 'object',
       properties: {
+        title: {
+          type: 'string',
+          description:
+            'Short single-line title in imperative voice (≤72 chars recommended). Becomes the PR/commit title for the work. Example: "Add CHANGELOG.md with MCP entry".',
+        },
         summary: {
           type: 'string',
           description:
-            'One-paragraph summary of what was accomplished. Persisted to the issue transcript.',
+            'Multi-paragraph narrative describing what changed, why, and any follow-ups the agent noticed but did not do. Becomes the PR body / transcript record.',
         },
       },
-      required: ['summary'],
+      required: ['title', 'summary'],
     },
   },
   {
@@ -327,7 +334,14 @@ export class McpRegistry {
     id: string | number | null,
     args: Record<string, unknown>,
   ): Promise<McpJsonRpcResponse> {
+    const titleRaw = typeof args.title === 'string' ? args.title.trim() : '';
     const summary = typeof args.summary === 'string' ? args.summary : '';
+    if (!titleRaw) {
+      return makeToolError(id, 'title is required and must be a non-empty string');
+    }
+    if (titleRaw.includes('\n')) {
+      return makeToolError(id, 'title must be a single line (no embedded newlines)');
+    }
     if (!summary.trim()) {
       return makeToolError(id, 'summary is required and must be a non-empty string');
     }
@@ -357,10 +371,31 @@ export class McpRegistry {
       // before the next reconcile tick. Set it here so the workspace is cleaned up on
       // worker exit regardless of which path got there first.
       active.entry.cleanup_workspace_on_exit = true;
+      // Persist the structured title+summary into the workspace so the after_run
+      // hook (and any other consumers) can read them. Format is markdown so
+      // operators can `cat` it without parsing JSON:
+      //   # <title>
+      //
+      //   <summary>
+      try {
+        const stagingDir = await pickStagingDir(active.entry.workspace_path);
+        await mkdir(stagingDir, { recursive: true });
+        const body = `# ${titleRaw}\n\n${summary.trim()}\n`;
+        await writeFile(path.join(stagingDir, 'mark_done.md'), body, { mode: 0o644 });
+      } catch (err) {
+        // Persistence failure is non-fatal — the move already happened, the
+        // flag is set, and the title/summary are in the log line below. We
+        // surface it as a warning so the operator can investigate.
+        log.warn('mcp mark_done: failed to persist mark_done.md', {
+          issue_identifier: active.identifier,
+          error: (err as Error).message,
+        });
+      }
       log.info('mcp mark_done', {
         issue_identifier: active.identifier,
         from: result.fromState,
         to: result.toState,
+        title: titleRaw,
         summary_chars: summary.length,
       });
       return {
@@ -448,6 +483,25 @@ function constantTimeStringEqual(a: string, b: string): boolean {
   const bBuf = Buffer.from(b, 'utf8');
   if (aBuf.length !== bBuf.length) return false;
   return timingSafeEqual(aBuf, bBuf);
+}
+
+/**
+ * Pick the symphony-runtime staging directory for a workspace. Mirrors the
+ * adapter-staging policy in adapters.ts: when the workspace has its own
+ * `.git/` directory, the runtime files live inside it (outside the working
+ * tree, structurally untrackable); otherwise they sit at workspace root.
+ * `mark_done` writes its persisted artifact here so the after_run hook can
+ * find it via the same probe.
+ */
+async function pickStagingDir(workspacePath: string): Promise<string> {
+  const gitPath = path.join(workspacePath, '.git');
+  try {
+    const st = await lstat(gitPath);
+    if (st.isDirectory()) return path.join(workspacePath, '.git', 'symphony-runtime');
+  } catch {
+    // .git missing or unstat-able — fall through to the workspace-root path.
+  }
+  return path.join(workspacePath, '.symphony-runtime');
 }
 
 function getId(body: unknown): string | number | null {

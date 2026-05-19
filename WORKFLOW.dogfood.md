@@ -129,18 +129,35 @@ hooks:
       exit 0
     fi
 
+    # The mark_done MCP tool persists its title + summary into a structured
+    # markdown file at <staging>/mark_done.md. Resolve the staging dir (it's
+    # inside .git/ when the workspace has its own clone; .symphony-runtime/
+    # otherwise) and pull title/body from there.
+    MARKDONE=""
+    if [ -f .git/symphony-runtime/mark_done.md ]; then
+      MARKDONE=.git/symphony-runtime/mark_done.md
+    elif [ -f .symphony-runtime/mark_done.md ]; then
+      MARKDONE=.symphony-runtime/mark_done.md
+    fi
+    if [ -n "${MARKDONE}" ]; then
+      TITLE="$(sed -n '1 s/^# //p' "${MARKDONE}")"
+      BODY="$(tail -n +3 "${MARKDONE}")"
+    else
+      TITLE="${ISSUE_ID}"
+      BODY="Symphony dogfood run for ${ISSUE_ID}."
+    fi
+
     if [ -n "${SYMPHONY_REPO:-}" ]; then
       # Remote PR mode.
       git push -u origin "${BRANCH}"
       if gh pr view "${BRANCH}" >/dev/null 2>&1; then
         echo "PR already exists for ${BRANCH}; pushed updates"
       else
-        TITLE="$(head -n1 RESULT.md 2>/dev/null || echo "${ISSUE_ID}")"
         gh pr create \
           --base "${BASE}" \
           --head "${BRANCH}" \
           --title "${ISSUE_ID}: ${TITLE}" \
-          --body "Symphony dogfood run for ${ISSUE_ID}. See RESULT.md."
+          --body "${BODY}"
       fi
     else
       # Local-only mode: bundle the diff for human review.
@@ -231,11 +248,14 @@ Workflow:
 2. Make the smallest correct change. Add or update tests where the change is
    testable. Run `npm run typecheck` and `npm test`; both must pass.
 3. Commit your work to the per-issue branch with a short, conventional message.
-4. Write a one- to three-paragraph summary of what you did into `RESULT.md` in
-   the workspace root. Mention any follow-ups you noticed but didn't do.
-5. Call `symphony.mark_done({ summary })` with a one-line summary. This is the
-   only way to signal completion; nothing else will move the issue out of an
-   active state.
+4. Call `symphony.mark_done({ title, summary })`:
+   - `title`: a single line in imperative voice, ≤72 chars. This becomes the
+     PR/commit title. Example: `"Add CHANGELOG.md with MCP entry"`.
+   - `summary`: a one- to three-paragraph narrative of what you did and why,
+     plus any follow-ups you noticed but didn't do. This becomes the PR body.
+   This is the only way to signal completion; nothing else will move the issue
+   out of an active state. Do **not** write a separate `RESULT.md` — the
+   structured fields you pass here ARE the record.
 
 If you genuinely cannot proceed — ambiguous requirements, missing context that
 only a human can supply, a design decision that needs human input — call
@@ -245,7 +265,8 @@ next prompt.
 
 {% if attempt -%}
 This is continuation/retry attempt {{ attempt }}. Inspect the workspace before
-making new edits — your previous run may have left commits on the branch and
-a partial RESULT.md. If the work is already complete, call
-`symphony.mark_done` with a summary derived from RESULT.md and stop.
+making new edits — your previous run may have left commits on the branch.
+Check `git log agent/{{ issue.identifier }}` to see what's there. If the work
+is already complete, call `symphony.mark_done` with an appropriate title and
+summary and stop.
 {%- endif %}
