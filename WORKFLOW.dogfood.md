@@ -50,7 +50,7 @@ hooks:
   # All network remotes are stripped so any `git push`/`git fetch` from inside the
   # VM fails closed.
   after_create: |
-    set -euo pipefail
+    set -eu
     SOURCE_REPO="${SYMPHONY_SOURCE_REPO:-${PWD}/../../..}"
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
     ISSUE_ID="$(basename "$PWD")"
@@ -94,7 +94,7 @@ hooks:
   #   - Else (local-only mode): write the agent's work as a git format-patch bundle
   #     into ./.symphony/dogfood-patches/<branch>.patch for human review.
   after_run: |
-    set -euo pipefail
+    set -eu
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
     ISSUE_ID="$(basename "$PWD")"
     BRANCH="agent/${ISSUE_ID}"
@@ -145,7 +145,7 @@ hooks:
     else
       # Local-only mode: bundle the diff for human review.
       mkdir -p "${PATCHES_DIR}"
-      OUT="${PATCHES_DIR}/${BRANCH//\//_}.patch"
+      OUT="${PATCHES_DIR}/$(echo "${BRANCH}" | tr '/' '_').patch"
       git format-patch --stdout "${MERGE_BASE}..${BRANCH}" > "${OUT}"
       echo "wrote patch bundle: ${OUT}"
       echo "  apply with:  git -C <target-repo> am ${OUT}"
@@ -191,9 +191,12 @@ server:
   host: 0.0.0.0
 
 mcp:
-  # host_url is computed at runtime from `host` + the actually-bound port (8788).
-  # No need to override unless smolvm uses bridge networking instead of slirp.
-  host: 10.0.2.2
+  # In smolvm, the VM's loopback transparently reaches the host's loopback —
+  # confirmed empirically: `curl http://127.0.0.1:HOSTPORT/` from inside the VM
+  # hits the host's listener. The URL is built at runtime as
+  # `http://<host>:<bound-port>/api/v1/issues/<id>/mcp`. Default `host` is
+  # 127.0.0.1; override only if your VMM has a different host alias.
+  host: 127.0.0.1
 ---
 You are working on **smol-symphony**, a TypeScript orchestrator that dispatches
 coding agents into per-issue smolvm microVMs and talks to them over the Agent

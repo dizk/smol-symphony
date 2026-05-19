@@ -306,7 +306,11 @@ export function buildServiceConfig(
   const mcpEnabled = mcpEnabledRaw === undefined ? true : mcpEnabledRaw !== false;
   const mcp: McpConfig = {
     enabled: mcpEnabled,
-    host: asString(mcpRaw['host']) ?? '10.0.2.2',
+    // 127.0.0.1 works for smolvm because its VM network intercepts loopback
+    // traffic and forwards it to the host's loopback. (Empirically verified;
+    // 10.0.2.2 — the QEMU slirp gateway — is NOT reachable here.) Other VMMs
+    // can override via the `host` field in the WORKFLOW.md mcp block.
+    host: asString(mcpRaw['host']) ?? '127.0.0.1',
     explicit_host_url: asString(mcpRaw['host_url']),
   };
 
