@@ -39,6 +39,29 @@ operators can write; an out-of-date template is a bug, not paperwork.
 
 Run all three before calling `symphony.mark_done`.
 
+## Handoff: patch bundle vs. pull request
+
+`after_run` in `WORKFLOW.md` ships in two modes:
+
+- **Patch bundle (default).** Writes `git format-patch` to
+  `.symphony/patches/<branch>.patch` for human review. No remote needed.
+  This is what fires when no GitHub remote is wired up.
+- **Pull request.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is exported
+  before launch AND the working repo has an `origin` remote. The hook then
+  pushes the per-issue branch and runs `gh pr create`. `gh auth status` must
+  be clean on the host; the token never enters the VM.
+
+To switch this project to PR mode:
+
+```
+git remote add origin git@github.com:<owner>/smol-symphony.git
+git push -u origin main
+SYMPHONY_REPO=<owner>/smol-symphony npx symphony WORKFLOW.md
+```
+
+`SYMPHONY_BASE_BRANCH` (default `main`) overrides the base the agent branches
+from and the PR opens against.
+
 ## Don't write to generated state
 
 Skip these when staging commits unless the user asks:
