@@ -142,6 +142,7 @@ async function main() {
           trackerRoot: liveCfg.tracker.root,
           activeStates: liveCfg.tracker.active_states,
           terminalStates: liveCfg.tracker.terminal_states,
+          workflowPath,
         }),
         mcp,
       });

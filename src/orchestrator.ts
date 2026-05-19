@@ -29,6 +29,8 @@ export interface Snapshot {
   running: Array<{
     issue_id: string;
     issue_identifier: string;
+    issue_title: string;
+    issue_body: string;
     state: string;
     session_id: string | null;
     turn_count: number;
@@ -37,6 +39,10 @@ export interface Snapshot {
     started_at: string;
     last_event_at: string | null;
     tokens: { input_tokens: number; output_tokens: number; total_tokens: number };
+    steering_requested: boolean;
+    steering_question: string | null;
+    steering_context: string | null;
+    marked_done: boolean;
   }>;
   retrying: Array<{
     issue_id: string;
@@ -648,6 +654,8 @@ export class Orchestrator {
       running: [...this.running.values()].map((e) => ({
         issue_id: e.issue_id,
         issue_identifier: e.identifier,
+        issue_title: e.issue.title ?? '',
+        issue_body: e.issue.description ?? '',
         state: e.issue.state,
         session_id: e.session_id,
         turn_count: e.turn_count,
@@ -660,6 +668,10 @@ export class Orchestrator {
           output_tokens: e.codex_output_tokens,
           total_tokens: e.codex_total_tokens,
         },
+        steering_requested: e.steering_requested,
+        steering_question: e.steering_question,
+        steering_context: e.steering_context,
+        marked_done: e.marked_done,
       })),
       retrying: [...this.retryAttempts.values()].map((r) => ({
         issue_id: r.issue_id,
