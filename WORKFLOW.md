@@ -25,22 +25,39 @@ agent:
 
 codex:
   command: codex app-server
+  # The shipped VM image installs bash via apk, so the spec default `bash -lc` works.
+  # Override to `sh` if you bring an even more minimal image.
+  shell: bash
   approval_policy: never
   thread_sandbox: workspace-write
   turn_timeout_ms: 1800000
-  read_timeout_ms: 5000
+  # Bumped from the 5000 ms spec default because the VM cold-boot + codex app-server
+  # startup typically takes 8–12 s on first use; subsequent reuses are sub-second.
+  read_timeout_ms: 30000
   stall_timeout_ms: 300000
 
 smolvm:
-  # When `image` is null smolvm boots a bare Alpine VM. Provide an image that includes
-  # `codex` on $PATH (e.g. a custom image built from node:20-alpine plus `npm i -g @openai/codex`)
-  # for a real end-to-end run.
-  image: null
+  # Built once with: scripts/build-vm.sh
+  # The packed artifact ships `codex` + `claude` on /usr/local/bin inside the VM.
+  # The `.smolmachine.smolmachine` file is the data bundle; the bare `.smolmachine`
+  # next to it is a stub binary and not what `--from` accepts.
+  from: ./.vm/symphony.smolmachine.smolmachine
   cpus: 2
-  mem_mib: 2048
+  mem_mib: 4096
   net: true
+  volumes:
+    # Mount host CLI auth so codex / claude inside the VM can talk to their providers
+    # without re-running `codex login` / `claude login`. These directories also hold the
+    # CLIs' per-session sqlite state files, so they must be read-write.
+    - host: ~/.codex
+      guest: /root/.codex
+      readonly: false
+    - host: ~/.claude
+      guest: /root/.claude
+      readonly: false
   forward_env:
     - OPENAI_API_KEY
+    - ANTHROPIC_API_KEY
 
 server:
   port: 8787

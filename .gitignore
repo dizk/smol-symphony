@@ -4,3 +4,4 @@ dist/
 .tsx-cache/
 /tmp_workspaces/
 .env
+.vm

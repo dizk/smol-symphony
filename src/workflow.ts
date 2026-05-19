@@ -224,6 +224,9 @@ export function buildServiceConfig(
   const codexRaw = getObject(raw, 'codex');
   const codex: CodexConfig = {
     command: asString(codexRaw['command']) ?? 'codex app-server',
+    // SPEC §5.3.6/§10.1 names `bash -lc` as the canonical launch wrapper. Workflows that
+    // run on a minimal image without bash can opt into `sh` (or any other shell) explicitly.
+    shell: asString(codexRaw['shell']) ?? 'bash',
     approval_policy: asString(codexRaw['approval_policy']),
     thread_sandbox: asString(codexRaw['thread_sandbox']),
     turn_sandbox_policy: codexRaw['turn_sandbox_policy'] ?? null,
@@ -234,12 +237,43 @@ export function buildServiceConfig(
 
   // smolvm extension
   const smolvmRaw = getObject(raw, 'smolvm');
+  const fromRaw = asString(smolvmRaw['from']);
+  let from: string | null = null;
+  if (fromRaw) {
+    const expanded = expandVar(fromRaw);
+    if (expanded === '') {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `smolvm.from references an unset variable: ${fromRaw}`,
+      );
+    }
+    from = path.isAbsolute(expanded) ? expanded : path.resolve(workflowDir, expanded);
+  }
+  const volumesRaw = smolvmRaw['volumes'];
+  const volumes = Array.isArray(volumesRaw)
+    ? volumesRaw.flatMap((v) => {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) return [];
+        const m = v as Record<string, unknown>;
+        const hostRaw = asString(m['host']);
+        const guest = asString(m['guest']);
+        if (!hostRaw || !guest) return [];
+        const expandedHost = expandVar(hostRaw);
+        if (expandedHost === '') return [];
+        const host = path.isAbsolute(expandedHost)
+          ? expandedHost
+          : path.resolve(workflowDir, expandedHost);
+        const readonly = m['readonly'] === true;
+        return [{ host, guest, readonly }];
+      })
+    : [];
   const smolvm: SmolvmConfig = {
     image: asString(smolvmRaw['image']),
+    from,
     cpus: asInt(smolvmRaw['cpus'], 2),
     mem_mib: asInt(smolvmRaw['mem_mib'], 2048),
     net: smolvmRaw['net'] !== false,
     bin_path: asString(smolvmRaw['bin_path']),
+    volumes,
     forward_env: asStringList(smolvmRaw['forward_env'], ['OPENAI_API_KEY']),
     endpoint:
       asString(smolvmRaw['endpoint']) ??

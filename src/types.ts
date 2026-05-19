@@ -62,6 +62,10 @@ export interface AgentConfig {
 
 export interface CodexConfig {
   command: string;
+  // Shell binary used to invoke `command` inside the VM. SPEC §10.1 names `bash -lc` as a
+  // conforming default, but minimal Alpine images only ship POSIX `sh`. Override to `bash`
+  // when running on an image that has it.
+  shell: string;
   approval_policy: string | null;
   thread_sandbox: string | null;
   turn_sandbox_policy: unknown | null;
@@ -70,14 +74,25 @@ export interface CodexConfig {
   stall_timeout_ms: number;
 }
 
+export interface SmolvmVolume {
+  host: string;
+  guest: string;
+  readonly: boolean;
+}
+
 export interface SmolvmConfig {
-  // Persistent VM template / image (default: bare alpine; the codex binary is mounted in via volume.bin)
+  // Container image to pull. Mutually exclusive with `from`.
   image: string | null;
+  // Path to a packed .smolmachine artifact (smolvm pack create --from-vm). When set, takes
+  // precedence over `image`; the agent runner passes it to `smolvm machine create --from`.
+  from: string | null;
   cpus: number;
   mem_mib: number;
   net: boolean;
   // Path on host to a directory containing the codex binary; mounted read-only into the VM at /opt/codex.
   bin_path: string | null;
+  // Additional host:guest volume mounts (credentials, repo caches, ssh keys, …).
+  volumes: SmolvmVolume[];
   // Extra env vars forwarded into the VM exec (e.g. OPENAI_API_KEY).
   forward_env: string[];
   // Base URL or unix socket for the smolvm server. Format: "unix:///path/to/sock" or "http://host:port".

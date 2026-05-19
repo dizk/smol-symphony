@@ -123,19 +123,44 @@ When `--port` (or `server.port` in `WORKFLOW.md`) is set, a small dashboard is h
 directory is volume-mounted at the same absolute path so the agent's view of paths matches
 the host's.
 
-The cleanest setup is a custom OCI image with `codex` pre-installed. Point
-`smolvm.image` at it from `WORKFLOW.md`. If `image` is null, smolvm boots a bare Alpine VM
-and you can mount the host `codex` binary in via `smolvm.bin_path` (and set
-`codex.command` to use it — e.g. `codex.command: /opt/codex/bin/codex app-server`).
+The shipped `scripts/build-vm.sh` builds a packed `.smolmachine` artifact that contains
+`node:20-alpine` + `bash`, `git`, `ripgrep`, `curl`, and the `codex` and `claude` CLIs
+installed globally via npm. Run it once:
 
-For real runs you typically also forward `OPENAI_API_KEY`:
+```bash
+bash scripts/build-vm.sh
+# -> .vm/symphony.smolmachine.smolmachine  (~370 MiB compressed)
+```
+
+`WORKFLOW.md` then references it via `smolvm.from`:
 
 ```yaml
 smolvm:
-  image: my-codex-alpine:latest
+  from: ./.vm/symphony.smolmachine.smolmachine
+  cpus: 2
+  mem_mib: 4096
   net: true
-  forward_env: [OPENAI_API_KEY]
+  volumes:
+    - host: ~/.codex
+      guest: /root/.codex
+      readonly: false
+    - host: ~/.claude
+      guest: /root/.claude
+      readonly: false
+  forward_env: [OPENAI_API_KEY, ANTHROPIC_API_KEY]
 ```
+
+The credential mounts are **read-write** because both CLIs need to write per-session SQLite
+state into their respective home dirs. If you want stricter isolation, copy `auth.json` /
+`.credentials.json` into a per-workspace location and mount only that.
+
+Other ways to provide a VM image:
+- `smolvm.image: my-codex-alpine:latest` — pull from a registry.
+- `smolvm.image: null` + `smolvm.bin_path: /host/path/to/codex` — boot a bare Alpine VM and
+  mount the codex binary at `/opt/codex` (set `codex.command` accordingly).
+
+If the image only ships POSIX `sh` (no `bash`), set `codex.shell: sh` in `WORKFLOW.md` —
+the runner wraps your `codex.command` as `<shell> -lc <command>`.
 
 ## Trust posture
 

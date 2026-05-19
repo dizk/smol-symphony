@@ -103,6 +103,9 @@ export class AgentRunner {
     if (this.cfg.smolvm.bin_path) {
       mounts.push({ host: this.cfg.smolvm.bin_path, guest: '/opt/codex', readonly: true });
     }
+    for (const v of this.cfg.smolvm.volumes) {
+      mounts.push({ host: v.host, guest: v.guest, readonly: v.readonly });
+    }
     const env: Record<string, string> = {};
     for (const k of this.cfg.smolvm.forward_env) {
       const v = process.env[k];
@@ -112,6 +115,7 @@ export class AgentRunner {
     try {
       await this.smolvm.ensureRunning(vmName, {
         image: this.cfg.smolvm.image,
+        from: this.cfg.smolvm.from,
         cpus: this.cfg.smolvm.cpus,
         memMib: this.cfg.smolvm.mem_mib,
         net: this.cfg.smolvm.net,
@@ -127,9 +131,10 @@ export class AgentRunner {
     }
 
     // Launch `codex app-server` (or the configured command) inside the VM, wired to stdio.
-    // bash -lc preserves $PATH for cases where `codex` lives in /opt/codex/bin.
+    // `<shell> -lc` preserves $PATH for cases where `codex` lives in /opt/codex/bin. The
+    // shell is configurable because minimal Alpine images ship only POSIX `sh`.
     const execStream = this.smolvm.execInteractive(vmName, {
-      command: ['bash', '-lc', this.cfg.codex.command],
+      command: [this.cfg.codex.shell, '-lc', this.cfg.codex.command],
       workdir: workspace.path,
       env: {},
       timeoutMs: null,

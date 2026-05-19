@@ -22,7 +22,11 @@ export interface VmMount {
 }
 
 export interface CreateOptions {
+  // Either an OCI image reference (`--image`) or a path to a packed .smolmachine artifact
+  // (`--from`). When both are set, `from` wins because that's what smolvm itself would do
+  // — `--from` skips the registry pull and boots from pre-extracted layers (~250ms).
   image: string | null;
+  from: string | null;
   cpus: number;
   memMib: number;
   net: boolean;
@@ -64,7 +68,29 @@ export class SmolvmClient {
   // The smolvm binary is invoked directly. The endpoint config is reserved for a future HTTP
   // transport but is not threaded through the CLI today — the CLI talks to the local daemon
   // automatically.
+  // Redact secret-bearing argv values before logging. `--env KEY=value` carries forwarded
+  // tokens (OPENAI_API_KEY, ANTHROPIC_API_KEY, …) and must never reach stderr or log sinks.
+  private redactArgv(args: string[]): string {
+    const out: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i]!;
+      if (a === '--env' || a === '-e') {
+        out.push(a);
+        const next = args[i + 1];
+        if (next !== undefined) {
+          const eq = next.indexOf('=');
+          out.push(eq >= 0 ? `${next.slice(0, eq)}=<redacted>` : next);
+          i += 1;
+        }
+        continue;
+      }
+      out.push(a);
+    }
+    return out.join(' ');
+  }
+
   private async run(args: string[], opts: { timeoutMs?: number } = {}): Promise<{ stdout: string; stderr: string }> {
+    log.debug('smolvm cli', { argv: this.redactArgv(args) });
     try {
       const { stdout, stderr } = await execFile('smolvm', args, {
         maxBuffer: 32 * 1024 * 1024,
@@ -93,7 +119,11 @@ export class SmolvmClient {
 
   async create(name: string, opts: CreateOptions): Promise<void> {
     const args = ['machine', 'create', name];
-    if (opts.image) args.push('--image', opts.image);
+    if (opts.from) {
+      args.push('--from', opts.from);
+    } else if (opts.image) {
+      args.push('--image', opts.image);
+    }
     args.push('--cpus', String(opts.cpus));
     args.push('--mem', String(opts.memMib));
     if (opts.net) args.push('--net');
