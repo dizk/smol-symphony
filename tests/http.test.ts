@@ -301,6 +301,167 @@ describe('triage approve / discard', () => {
   });
 });
 
+describe('GET /issues/:identifier — issue detail page', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-detail-'));
+    await mkdir(path.join(root, 'Todo'), { recursive: true });
+    await mkdir(path.join(root, 'Done'), { recursive: true });
+    await mkdir(path.join(root, 'Triage'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Todo', 'ABC-7.md'),
+      [
+        '---',
+        'id: "ABC-7"',
+        'identifier: "ABC-7"',
+        'title: "Fix the login bug"',
+        'priority: 2',
+        'labels: ["bug", "auth"]',
+        'blocked_by: ["ABC-5"]',
+        'created_at: "2026-05-18T12:00:00Z"',
+        'updated_at: "2026-05-19T08:30:00Z"',
+        '---',
+        '## Background',
+        '',
+        "Users can't sign in after the **migration** because the token format changed.",
+        '',
+        '- check `auth/middleware.ts`',
+        '- check the prod log',
+      ].join('\n'),
+    );
+    await writeFile(
+      path.join(root, 'Done', 'ABC-1.md'),
+      `---\nid: "ABC-1"\nidentifier: "ABC-1"\ntitle: "Already done"\n---\nClosed.`,
+    );
+    await writeFile(
+      path.join(root, 'Triage', 'proposed-cleanup.md'),
+      [
+        '---',
+        'id: "proposed-cleanup"',
+        'identifier: "proposed-cleanup"',
+        'title: "Sweep stale workspaces"',
+        'proposed_by: "ABC-7"',
+        'proposed_at: "2026-05-20T10:00:00Z"',
+        '---',
+        'Body text for the proposal.',
+      ].join('\n'),
+    );
+    server = await bootServer(root, { withTracker: true });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('renders the active issue: title, state pill, labels, priority, blocker link, body markdown', async () => {
+    const res = await fetch(`${server.url}/issues/ABC-7`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /text\/html/);
+    const html = await res.text();
+    assert.match(html, /<h1>Fix the login bug<\/h1>/);
+    assert.match(html, /<span class="pill running">Todo<\/span>/);
+    assert.match(html, /<span class="label-chip">bug<\/span>/);
+    assert.match(html, /<span class="label-chip">auth<\/span>/);
+    assert.match(html, />priority<\/dt><dd><span class="num">2<\/span><\/dd>/);
+    assert.match(
+      html,
+      /<a class="blocker-link" href="\/issues\/ABC-5">ABC-5<\/a>/,
+    );
+    assert.match(html, /<h2>Background<\/h2>/);
+    assert.match(html, /<strong>migration<\/strong>/);
+    assert.match(html, /<code>auth\/middleware\.ts<\/code>/);
+    assert.match(html, /<p class="file-path"[^>]*>[^<]*Todo[/\\]ABC-7\.md<\/p>/);
+  });
+
+  it('renders a terminal-state issue with the done pill', async () => {
+    const res = await fetch(`${server.url}/issues/ABC-1`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<span class="pill done">Done<\/span>/);
+    assert.match(html, /<h1>Already done<\/h1>/);
+  });
+
+  it('surfaces proposal provenance for Triage-state issues', async () => {
+    const res = await fetch(`${server.url}/issues/proposed-cleanup`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<h1>Sweep stale workspaces<\/h1>/);
+    // Triage is neither active nor terminal so the page falls back to the idle pill.
+    assert.match(html, /<span class="pill idle">Triage<\/span>/);
+    // `proposed_by` is rendered as a clickable identifier link (the proposal's parent).
+    assert.match(html, /<a class="blocker-link" href="\/issues\/ABC-7">ABC-7<\/a>/);
+    assert.match(html, />proposed at<\/dt>/);
+  });
+
+  it('escapes raw HTML in the title and body so a malicious issue file cannot inject script', async () => {
+    await writeFile(
+      path.join(root, 'Todo', 'xss-attempt.md'),
+      `---\nid: "xss-attempt"\nidentifier: "xss-attempt"\ntitle: "<script>alert(1)</script>"\n---\nBody with <img onerror=alert(2)>.`,
+    );
+    const res = await fetch(`${server.url}/issues/xss-attempt`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // The page title rendering happens twice: in <title> and in <h1>. Neither should
+    // include the literal opening <script> tag.
+    assert.ok(!html.includes('<script>alert(1)</script>'), 'raw script tag leaked into page');
+    assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+    assert.match(html, /&lt;img onerror=alert\(2\)&gt;/);
+  });
+
+  it('returns 404 HTML when no .md file matches the identifier', async () => {
+    const res = await fetch(`${server.url}/issues/does-not-exist`);
+    assert.equal(res.status, 404);
+    assert.match(res.headers.get('content-type') ?? '', /text\/html/);
+    const html = await res.text();
+    assert.match(html, /issue not found/);
+    assert.match(html, /does-not-exist/);
+  });
+});
+
+describe('disk + triage rows link to the detail page', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-disk-links-'));
+    await mkdir(path.join(root, 'Todo'), { recursive: true });
+    await mkdir(path.join(root, 'Triage'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Todo', 'PILE-1.md'),
+      `---\nid: "PILE-1"\nidentifier: "PILE-1"\ntitle: "On disk task"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Triage', 'TRI-1.md'),
+      `---\nid: "TRI-1"\nidentifier: "TRI-1"\ntitle: "Proposed task"\n---\nbody.`,
+    );
+    server = await bootServer(root, { withTracker: true });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('on-disk row identifier is an anchor pointing at /issues/<id>', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<a class="ident" href="\/issues\/PILE-1"[^>]*>PILE-1<\/a>/);
+    assert.match(html, /<a class="title" href="\/issues\/PILE-1">On disk task<\/a>/);
+  });
+
+  it('triage row identifier is an anchor pointing at /issues/<id>', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/triage`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<a class="ident" href="\/issues\/TRI-1"[^>]*><strong>TRI-1<\/strong><\/a>/);
+    assert.match(html, /<a class="title" href="\/issues\/TRI-1">Proposed task<\/a>/);
+  });
+});
+
 describe('renderMarkdown — agent-flavoured Markdown', () => {
   it('wraps a plain question in a <p> and escapes raw HTML', () => {
     const out = renderMarkdown('Is the <script> tag here safe?');

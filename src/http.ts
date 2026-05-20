@@ -5,6 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import type { Orchestrator } from './orchestrator.js';
 import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
@@ -197,6 +198,87 @@ function matchFrontMatterString(text: string, key: string): string | null {
   const m = re.exec(text);
   if (!m) return null;
   return m[1]!.trim().replace(/^["'](.*)["']$/, '$1');
+}
+
+// Read a single issue file by basename identifier. Walks every state directory under the
+// tracker root because the on-disk listing and the dashboard refer to issues by their
+// filename stem; the state is implied by which directory the file is in. Returns null
+// when no .md file matches. Uses the real YAML parser (matches the local tracker) so a
+// detail page sees the same labels / priority / blockers the orchestrator does.
+interface DiskIssueDetail {
+  identifier: string;
+  state: string;
+  filePath: string;
+  frontMatter: Record<string, unknown>;
+  body: string;
+}
+
+async function readIssueFromDisk(
+  trackerRoot: string,
+  identifier: string,
+): Promise<DiskIssueDetail | null> {
+  let entries: string[];
+  try {
+    entries = await readdir(trackerRoot);
+  } catch {
+    return null;
+  }
+  const target = `${identifier}.md`;
+  for (const stateDir of entries) {
+    const dirPath = path.join(trackerRoot, stateDir);
+    let st;
+    try {
+      st = await stat(dirPath);
+    } catch {
+      continue;
+    }
+    if (!st.isDirectory()) continue;
+    const filePath = path.join(dirPath, target);
+    let text: string;
+    try {
+      text = await readFile(filePath, 'utf8');
+    } catch {
+      continue;
+    }
+    const { frontMatter, body } = splitMarkdownFrontMatter(text);
+    return { identifier, state: stateDir, filePath, frontMatter, body };
+  }
+  return null;
+}
+
+// Mirrors trackers/local.ts's splitFrontMatter — local copy keeps http.ts self-contained
+// for tests that don't construct a tracker. Failures fall through to an empty front matter
+// rather than throwing so the detail page still renders the body for files with malformed
+// YAML (the orchestrator would have skipped them anyway).
+function splitMarkdownFrontMatter(text: string): {
+  frontMatter: Record<string, unknown>;
+  body: string;
+} {
+  if (!text.startsWith('---')) return { frontMatter: {}, body: text.trim() };
+  const lines = text.split(/\r?\n/);
+  const isFence = (l: string | undefined) => /^---\s*$/.test(l ?? '');
+  if (!isFence(lines[0])) return { frontMatter: {}, body: text.trim() };
+  let endIdx = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (isFence(lines[i])) {
+      endIdx = i;
+      break;
+    }
+  }
+  if (endIdx < 0) return { frontMatter: {}, body: text.trim() };
+  const fmText = lines.slice(1, endIdx).join('\n').trim();
+  const body = lines.slice(endIdx + 1).join('\n').trim();
+  let parsed: unknown = {};
+  if (fmText.length > 0) {
+    try {
+      parsed = parseYaml(fmText);
+    } catch {
+      parsed = {};
+    }
+  }
+  if (parsed === null || parsed === undefined) parsed = {};
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) parsed = {};
+  return { frontMatter: parsed as Record<string, unknown>, body };
 }
 
 async function gatherPartialInputs(
@@ -447,10 +529,11 @@ function renderTriageRow(i: DiskIssue, approveTarget: string): string {
   // The buttons POST via HTMX and morph #triage so the row vanishes in place when the
   // file moves. We send hx-target=#triage rather than swapping the row inline because the
   // section header's count needs to update too.
+  const href = `/issues/${encodeURIComponent(i.identifier)}`;
   return `<li class="triage-row">
   <div class="triage-line-1">
-    <strong class="ident">${ident}</strong>
-    <span class="title">${escapeHtml(i.title)}</span>
+    <a class="ident" href="${href}" title="open ${ident}"><strong>${ident}</strong></a>
+    <a class="title" href="${href}">${escapeHtml(i.title)}</a>
   </div>
   <div class="triage-line-2">
     ${metaLine ? `<span class="meta dim">${metaLine}</span>` : '<span class="meta dim">proposed</span>'}
@@ -480,11 +563,14 @@ function renderDiskPartial(p: PartialInputs): string {
     return `<h2>on disk</h2>
 <p class="empty dim">tracker is clean. drop a markdown file into <code>${escapeHtml(p.activeStates[0] ?? 'Todo')}/</code> or open <em>new issue</em> below.</p>`;
   }
-  const items = filtered.map((i) => `<li>
-    <span class="ident">${escapeHtml(i.identifier)}</span>
+  const items = filtered.map((i) => {
+    const href = `/issues/${encodeURIComponent(i.identifier)}`;
+    return `<li>
+    <a class="ident" href="${href}" title="open ${escapeHtml(i.identifier)}">${escapeHtml(i.identifier)}</a>
     <span class="state dim">${escapeHtml(i.state)}</span>
-    <span class="title">${escapeHtml(i.title)}</span>
-  </li>`).join('');
+    <a class="title" href="${href}">${escapeHtml(i.title)}</a>
+  </li>`;
+  }).join('');
   return `<h2>on disk <span class="count dim">(${filtered.length})</span></h2>
 <ul class="disk">${items}</ul>`;
 }
@@ -532,6 +618,12 @@ main {
   padding: 1rem 1.5rem 2rem; flex: 1;
 }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; color: var(--strong); }
+/* List-row links (issue identifier / title in the disk + triage sections) inherit type
+   from their parent and drop the default underline; hover and focus surface affordance
+   through colour shift only — matches the no-glow rule. */
+.disk a, .triage a { color: inherit; text-decoration: none; }
+.disk a:hover, .disk a:focus-visible,
+.triage a:hover, .triage a:focus-visible { color: #9cc0ff; outline: none; }
 .dim { color: var(--dim); }
 .grow { flex: 1; }
 h2 {
@@ -1099,6 +1191,287 @@ function renderInlineMarkdown(input: string): string {
   return text;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue-detail page. Linked from the identifier on every "on disk" and triage
+// row. Shows what the on-disk Markdown file says: the front-matter metadata
+// (labels, priority, blocked_by, provenance, timestamps) and the body rendered
+// through the same minimal Markdown engine the steering panel uses. Read-only
+// — actions live on the dashboard, not here. Follows the design system's
+// quiet-workshop rules: flat panels, tabular numerics, no shadows, status pill
+// uses the existing palette.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function asStringList(v: unknown): string[] {
+  if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string');
+  return [];
+}
+
+function asString(v: unknown): string | null {
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+function asNumber(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  return null;
+}
+
+function formatTimestamp(v: unknown): string | null {
+  if (typeof v === 'string' && v.length > 0) return v;
+  if (v instanceof Date) return v.toISOString();
+  return null;
+}
+
+function renderIssueDetailPage(
+  issue: DiskIssueDetail,
+  view: { workflowPath: string; activeStates: string[]; terminalStates: string[] },
+): string {
+  const fm = issue.frontMatter;
+  const title = asString(fm['title']) ?? issue.identifier;
+  const labels = asStringList(fm['labels']);
+  const blockedBy = asStringList(fm['blocked_by']);
+  const priority = asNumber(fm['priority']);
+  const createdAt = formatTimestamp(fm['created_at']);
+  const updatedAt = formatTimestamp(fm['updated_at']);
+  const proposedBy = asString(fm['proposed_by']);
+  const proposedAt = formatTimestamp(fm['proposed_at']);
+  const branchName = asString(fm['branch_name']);
+  const url = asString(fm['url']);
+
+  const stateClass = view.activeStates.includes(issue.state)
+    ? 'running'
+    : view.terminalStates.includes(issue.state)
+      ? 'done'
+      : 'idle';
+
+  const metaRows: string[] = [];
+  const metaRow = (label: string, value: string): string =>
+    `<div class="meta-row"><dt>${escapeHtml(label)}</dt><dd>${value}</dd></div>`;
+
+  metaRows.push(metaRow('state', `<span class="pill ${stateClass}">${escapeHtml(issue.state)}</span>`));
+  if (labels.length > 0) {
+    const chips = labels
+      .map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`)
+      .join('');
+    metaRows.push(metaRow('labels', `<div class="label-chips">${chips}</div>`));
+  }
+  if (priority !== null) {
+    metaRows.push(metaRow('priority', `<span class="num">${escapeHtml(String(priority))}</span>`));
+  }
+  if (blockedBy.length > 0) {
+    const items = blockedBy
+      .map(
+        (b) =>
+          `<a class="blocker-link" href="/issues/${encodeURIComponent(b)}">${escapeHtml(b)}</a>`,
+      )
+      .join(', ');
+    metaRows.push(metaRow('blocked by', items));
+  }
+  if (branchName) metaRows.push(metaRow('branch', `<code>${escapeHtml(branchName)}</code>`));
+  if (url) {
+    const safe = /^https?:/i.test(url) ? url : '';
+    metaRows.push(
+      metaRow(
+        'url',
+        safe ? `<a href="${escapeHtml(safe)}" rel="noopener noreferrer">${escapeHtml(safe)}</a>` : escapeHtml(url),
+      ),
+    );
+  }
+  if (createdAt) metaRows.push(metaRow('created', `<span class="num">${escapeHtml(createdAt)}</span>`));
+  if (updatedAt && updatedAt !== createdAt)
+    metaRows.push(metaRow('updated', `<span class="num">${escapeHtml(updatedAt)}</span>`));
+  if (proposedBy)
+    metaRows.push(
+      metaRow(
+        'proposed by',
+        `<a class="blocker-link" href="/issues/${encodeURIComponent(proposedBy)}">${escapeHtml(proposedBy)}</a>`,
+      ),
+    );
+  if (proposedAt) metaRows.push(metaRow('proposed at', `<span class="num">${escapeHtml(proposedAt)}</span>`));
+
+  const bodyHtml = issue.body.length > 0
+    ? `<div class="issue-body">${renderMarkdown(issue.body)}</div>`
+    : `<p class="empty dim">no description</p>`;
+
+  const workflowName = path.basename(view.workflowPath || 'workflow.md');
+
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(issue.identifier)} · symphony</title>
+<style>
+:root {
+  color-scheme: dark;
+  --inset: #0c0f15; --bench: #0f1115; --raised: #161a22; --chip: #20242c;
+  --rule-soft: #1c2029; --rule-firm: #2a2e36;
+  --dim: #6b7280; --muted: #9aa4b2; --base: #dfe2e7; --strong: #e6ebf2;
+  --accent: #2a6df4;
+  --run-bg: #1f3a26; --run-fg: #58d68d;
+  --idle-bg: #20242c; --idle-fg: #9aa4b2;
+  --done-bg: #1c2a1f; --done-fg: #82c896;
+  --err: #ff7676;
+}
+* { box-sizing: border-box; }
+html, body { background: var(--bench); color: var(--base); }
+body {
+  font: 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+  margin: 0; padding: 0;
+  display: flex; flex-direction: column; min-height: 100vh;
+}
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; color: var(--strong); }
+a { color: var(--strong); text-decoration: none; }
+a:hover { color: #9cc0ff; }
+.dim { color: var(--dim); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* header strip mirrors the dashboard so navigation feels continuous */
+#header {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.65rem 1.5rem;
+  background: var(--bench); border-bottom: 1px solid var(--rule-firm);
+  font-size: 13px;
+  position: sticky; top: 0; z-index: 10;
+}
+#header .brand { font-weight: 600; color: var(--strong); letter-spacing: 0.01em; }
+#header .rule { color: var(--dim); }
+#header .crumb { color: var(--muted); }
+#header .crumb-current { color: var(--base); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+main {
+  width: 100%; max-width: 920px; margin: 0 auto;
+  padding: 1rem 1.5rem 2.5rem; flex: 1;
+}
+.back {
+  display: inline-block; padding: 0.2rem 0; margin: 0.2rem 0 0.6rem;
+  font-size: 0.88em; color: var(--muted);
+}
+.back:hover { color: var(--strong); }
+
+.issue-head {
+  display: grid; gap: 0.35rem;
+  padding-bottom: 0.6rem; margin-bottom: 1.1rem;
+  border-bottom: 1px solid var(--rule-firm);
+}
+.issue-head .ident {
+  font: 12.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--dim); letter-spacing: 0.02em;
+}
+.issue-head h1 {
+  margin: 0; font-size: 1.3rem; font-weight: 500; color: var(--strong);
+  line-height: 1.3;
+}
+
+/* pills carry status colour, sized to read as inline metadata not content */
+.pill {
+  display: inline-block; padding: 0.1rem 0.55rem; border-radius: 999px;
+  font-size: 0.82em; line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+.pill.running { background: var(--run-bg); color: var(--run-fg); }
+.pill.idle { background: var(--idle-bg); color: var(--idle-fg); }
+.pill.done { background: var(--done-bg); color: var(--done-fg); }
+
+/* metadata definition list: tight two-column grid, label left, value right */
+.issue-meta {
+  margin: 0 0 1.4rem;
+  display: grid; grid-template-columns: 8.5rem 1fr;
+  row-gap: 0.35rem; column-gap: 1rem;
+  font-variant-numeric: tabular-nums;
+}
+.issue-meta .meta-row { display: contents; }
+.issue-meta dt {
+  color: var(--dim); font-size: 0.85em;
+  letter-spacing: 0.05em; text-transform: uppercase;
+  align-self: baseline; padding-top: 0.15rem;
+}
+.issue-meta dd { margin: 0; color: var(--base); }
+.label-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.label-chip {
+  display: inline-block; padding: 0.05rem 0.5rem; border-radius: 4px;
+  background: var(--chip); color: var(--muted);
+  font-size: 0.85em; line-height: 1.5;
+}
+.blocker-link {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em; color: var(--muted);
+}
+.blocker-link:hover { color: var(--strong); }
+
+h2.section-title {
+  font-size: 1rem; font-weight: 500; margin: 0 0 0.5rem;
+  padding-bottom: 0.35rem; border-bottom: 1px solid var(--rule-firm);
+  letter-spacing: 0.01em;
+}
+
+.issue-body { color: var(--base); font-size: 0.95em; line-height: 1.55; }
+.issue-body > :first-child { margin-top: 0; }
+.issue-body > :last-child { margin-bottom: 0; }
+.issue-body p { margin: 0.6em 0; }
+.issue-body h1, .issue-body h2, .issue-body h3,
+.issue-body h4, .issue-body h5, .issue-body h6 {
+  margin: 1em 0 0.4em; font-weight: 500; color: var(--strong);
+  border: 0; padding: 0;
+}
+.issue-body h1 { font-size: 1.15em; }
+.issue-body h2 { font-size: 1.05em; }
+.issue-body h3 { font-size: 1em; }
+.issue-body ul, .issue-body ol { margin: 0.5em 0; padding-left: 1.5em; }
+.issue-body li { margin: 0.15em 0; }
+.issue-body code {
+  background: var(--inset); padding: 0.05em 0.35em; border-radius: 3px;
+  font-size: 0.92em;
+}
+.issue-body pre {
+  margin: 0.7em 0; padding: 0.6rem 0.75rem;
+  background: var(--inset); border: 1px solid var(--rule-firm); border-radius: 4px;
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted); overflow: auto;
+}
+.issue-body pre code { background: transparent; padding: 0; font-size: inherit; }
+.issue-body blockquote {
+  margin: 0.5em 0; padding: 0.1em 0.8em;
+  border-left: 2px solid var(--rule-firm); color: var(--muted);
+}
+.issue-body a { color: #9cc0ff; }
+
+.file-path {
+  margin-top: 1.4rem; padding-top: 0.7rem;
+  border-top: 1px solid var(--rule-soft);
+  color: var(--dim); font-size: 0.82em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all;
+}
+.empty { padding: 0.5rem 0; }
+</style>
+</head><body>
+
+<header id="header">
+  <span class="brand">symphony</span>
+  <span class="rule" aria-hidden="true">·</span>
+  <a class="crumb" href="/" title="back to ${escapeHtml(workflowName)}">${escapeHtml(workflowName)}</a>
+  <span class="rule" aria-hidden="true">/</span>
+  <span class="crumb-current">${escapeHtml(issue.identifier)}</span>
+</header>
+
+<main>
+  <a class="back" href="/">← back</a>
+
+  <section class="issue-head">
+    <span class="ident">${escapeHtml(issue.identifier)}</span>
+    <h1>${escapeHtml(title)}</h1>
+  </section>
+
+  <dl class="issue-meta">${metaRows.join('')}</dl>
+
+  <h2 class="section-title">description</h2>
+  ${bodyHtml}
+
+  <p class="file-path" title="path on disk">${escapeHtml(issue.filePath)}</p>
+</main>
+
+</body></html>`;
+}
+
 export interface HttpServerOptions {
   port: number;
   host: string;
@@ -1601,6 +1974,36 @@ async function handleRequest(
     }
   }
 
+  // Read-only HTML view of one issue. Linked from the identifier on every "on disk" and
+  // triage row; renders front-matter (labels, priority, blockers, provenance) plus the
+  // Markdown body so an operator can read the full task without leaving the browser. No
+  // editing surface — actions stay on the dashboard. Source of truth is the on-disk .md
+  // file, found by walking every state directory under tracker.root for a basename match.
+  const detailMatch = /^\/issues\/([^/]+)\/?$/.exec(pathname);
+  if (detailMatch) {
+    if (method !== 'GET') return methodNotAllowed(res);
+    const root = view.trackerRoot;
+    if (!root) {
+      res.statusCode = 404;
+      res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end(renderIssueNotFoundPage('(tracker root not configured)', view));
+      return;
+    }
+    const identifier = decodeURIComponent(detailMatch[1]!);
+    const issue = await readIssueFromDisk(root, identifier);
+    if (!issue) {
+      res.statusCode = 404;
+      res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end(renderIssueNotFoundPage(identifier, view));
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    res.setHeader('cache-control', 'no-store');
+    res.end(renderIssueDetailPage(issue, view));
+    return;
+  }
+
   const m = /^\/api\/v1\/([^/]+)$/.exec(pathname);
   if (m) {
     if (method !== 'GET') return methodNotAllowed(res);
@@ -1610,4 +2013,37 @@ async function handleRequest(
     return jsonResponse(res, 200, detail);
   }
   notFound(res);
+}
+
+function renderIssueNotFoundPage(
+  identifier: string,
+  view: { workflowPath: string },
+): string {
+  const workflowName = path.basename(view.workflowPath || 'workflow.md');
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>not found · symphony</title>
+<style>
+:root { color-scheme: dark; }
+html, body {
+  background: #0f1115; color: #dfe2e7;
+  font: 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+  margin: 0; padding: 0;
+}
+main { max-width: 640px; margin: 0 auto; padding: 2.5rem 1.5rem; }
+h1 { font-size: 1.2rem; font-weight: 500; color: #e6ebf2; margin: 0 0 0.6rem; }
+p { color: #9aa4b2; line-height: 1.5; }
+a { color: #9cc0ff; text-decoration: none; }
+a:hover { color: #e6ebf2; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #e6ebf2; }
+</style>
+</head><body>
+<main>
+  <h1>issue not found</h1>
+  <p>no issue file matches <code>${escapeHtml(identifier)}</code> under the tracker root.</p>
+  <p><a href="/">← back to ${escapeHtml(workflowName)}</a></p>
+</main>
+</body></html>`;
 }
