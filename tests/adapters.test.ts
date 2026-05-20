@@ -44,10 +44,18 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     acp: {
       adapter: 'claude',
       command: null,
+      model: null,
       shell: 'bash',
       prompt_timeout_ms: 1000,
       read_timeout_ms: 1000,
       stall_timeout_ms: 1000,
+      bridge: {
+        bind_host: '0.0.0.0',
+        bind_port: 8788,
+        reach_host: '127.0.0.1',
+        reach_url: null,
+        connect_timeout_ms: 30_000,
+      },
       ...over,
     },
     smolvm: {
@@ -149,6 +157,30 @@ describe('adapters registry', () => {
     // shQuote single-quotes anything outside [A-Za-z0-9_\-./], so the space-containing
     // path becomes one safe token in the cp argument.
     assert.match(cmd, /cp 'has spaces\/creds'/);
+  });
+
+  it('claude profile surfaces the selected model via ANTHROPIC_MODEL env', () => {
+    // claude-agent-acp reads ANTHROPIC_MODEL on startup and resolves it against the SDK
+    // model list. Env-based selection avoids per-attempt argv leaks (model isn't a
+    // secret, but ANTHROPIC_MODEL is the documented mechanism).
+    const inj = ADAPTERS.claude.modelInjection('claude-opus-4-7');
+    assert.deepEqual(inj, { env: { ANTHROPIC_MODEL: 'claude-opus-4-7' } });
+    assert.equal(inj.extraArgs, undefined);
+  });
+
+  it('codex profile surfaces the selected model via -c model="..." argv', () => {
+    // codex-acp takes `-c key=value` where value is parsed as TOML; we emit a JSON-
+    // quoted string so model names with dots/hyphens are unambiguously TOML strings.
+    const inj = ADAPTERS.codex.modelInjection('gpt-5-codex');
+    assert.deepEqual(inj, { extraArgs: ['-c', 'model="gpt-5-codex"'] });
+    assert.equal(inj.env, undefined);
+  });
+
+  it('codex modelInjection escapes embedded quotes so the TOML value stays well-formed', () => {
+    // A pathological model id with a double-quote would break a naive `model="..."`
+    // concatenation. JSON.stringify handles it; verify defensively.
+    const inj = ADAPTERS.codex.modelInjection('weird"name');
+    assert.deepEqual(inj, { extraArgs: ['-c', 'model="weird\\"name"'] });
   });
 });
 

@@ -255,9 +255,12 @@ export function buildServiceConfig(
   // src/acp-bridge.ts for rationale.
   const acpRaw = getObject(raw, 'acp');
   const bridgeRaw = getObject(acpRaw, 'bridge');
+  const modelRaw = asString(acpRaw['model']);
+  const modelTrimmed = modelRaw === null ? null : modelRaw.trim();
   const acp: AcpConfig = {
     adapter: asString(acpRaw['adapter']) ?? 'claude',
     command: asString(acpRaw['command']),
+    model: modelTrimmed && modelTrimmed.length > 0 ? modelTrimmed : null,
     shell: asString(acpRaw['shell']) ?? 'bash',
     prompt_timeout_ms: asInt(acpRaw['prompt_timeout_ms'], 3_600_000),
     read_timeout_ms: asInt(acpRaw['read_timeout_ms'], 30_000),
