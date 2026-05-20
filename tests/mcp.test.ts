@@ -539,13 +539,13 @@ describe('McpRegistry propose_issue', () => {
         structuredContent: { identifier: string; state: string; path: string };
       };
       assert.equal(result.isError, false);
-      assert.match(result.content[0]!.text, /^Proposed issue investigate-flaky-workspace-cleanup/);
+      assert.match(result.content[0]!.text, /^Proposed issue 1 /);
       assert.equal(result.structuredContent.state, 'Triage');
-      assert.equal(result.structuredContent.identifier, 'investigate-flaky-workspace-cleanup');
+      assert.equal(result.structuredContent.identifier, '1');
 
       const triageDir = path.join(root, 'Triage');
       const files = await readdir(triageDir);
-      assert.deepEqual(files, ['investigate-flaky-workspace-cleanup.md']);
+      assert.deepEqual(files, ['1.md']);
       const body = await readFile(path.join(triageDir, files[0]!), 'utf8');
       assert.match(body, /title: "Investigate flaky workspace cleanup"/);
       assert.match(body, /proposed_by: "ABC-1"/);
@@ -558,16 +558,16 @@ describe('McpRegistry propose_issue', () => {
     }
   });
 
-  it('disambiguates slug collisions across all state directories', async () => {
-    // Regression-flavor: agent proposes a title that already exists in Done/. The new
-    // proposal must land with a -2 suffix instead of overwriting the existing file,
-    // matching the dashboard form's behaviour.
+  it('picks the next free numeric identifier across all state directories', async () => {
+    // Regression-flavor: a prior cycle left `Done/1.md` behind. The new numeric proposal
+    // must skip 1 and land at 2 instead of overwriting the stale terminal file. Title-slug
+    // legacy files in other states are inert: only numeric basenames consume IDs.
     const { root, cleanup } = await setupTree();
     try {
-      // Plant a Done/ duplicate to force collision.
+      await writeFile(path.join(root, 'Done', '1.md'), `---\ntitle: Old\n---\nbody.`);
       await writeFile(
-        path.join(root, 'Done', 'fix-the-thing.md'),
-        `---\ntitle: Fix the thing\n---\nbody.`,
+        path.join(root, 'Done', 'legacy-slug.md'),
+        `---\ntitle: Legacy\n---\nbody.`,
       );
       const t = makeTracker(root);
       const reg = new McpRegistry(t, { states: trackerStates });
@@ -586,8 +586,8 @@ describe('McpRegistry propose_issue', () => {
         result: { isError: boolean; structuredContent: { identifier: string } };
       }).result;
       assert.equal(result.isError, false);
-      assert.equal(result.structuredContent.identifier, 'fix-the-thing-2');
-      assert.deepEqual(await readdir(path.join(root, 'Triage')), ['fix-the-thing-2.md']);
+      assert.equal(result.structuredContent.identifier, '2');
+      assert.deepEqual(await readdir(path.join(root, 'Triage')), ['2.md']);
     } finally {
       await cleanup();
     }
@@ -663,7 +663,7 @@ describe('McpRegistry propose_issue', () => {
           params: { name: 'propose_issue', arguments: { title: 'Snapshot test' } },
         });
         // Lands in the original root, NOT the decoy.
-        assert.deepEqual(await readdir(path.join(root, 'Triage')), ['snapshot-test.md']);
+        assert.deepEqual(await readdir(path.join(root, 'Triage')), ['1.md']);
         let decoyFiles: string[] = [];
         try {
           decoyFiles = await readdir(path.join(decoyRoot, 'Triage'));
@@ -925,7 +925,7 @@ describe('McpRegistry transition', () => {
       }).result;
       assert.equal(result.isError, false);
       assert.equal(result.structuredContent.state, 'Inbox');
-      assert.deepEqual(await readdir(path.join(root, 'Inbox')), ['new-idea.md']);
+      assert.deepEqual(await readdir(path.join(root, 'Inbox')), ['1.md']);
       // Triage directory got materialized only because we mkdir'd nothing in
       // setupStateTree; here we never created one and none was implicitly used.
       let triageFiles: string[] = [];

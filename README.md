@@ -83,13 +83,19 @@ issue state.
 ```
 issues/
 ├── Todo/
-│   ├── ABC-1.md
-│   └── ABC-2.md
+│   ├── 1.md
+│   └── 2.md
 ├── In Progress/
-│   └── ABC-3.md
+│   └── 3.md
 └── Done/
-    └── ABC-4.md
+    └── 4.md
 ```
+
+The basename is the issue identifier. When a caller (dashboard form, MCP
+`propose_issue`) omits an explicit identifier, the tracker picks the next free
+positive integer by scanning every state directory under `tracker.root`.
+Operator-supplied identifiers (e.g. `CACHE-7.md`) pass through unchanged and
+coexist with the numeric ones.
 
 Each file has YAML front matter and an optional body:
 
@@ -98,7 +104,7 @@ Each file has YAML front matter and an optional body:
 title: "Fix the login bug"
 priority: 2
 labels: [bug, auth]
-blocked_by: [ABC-5]
+blocked_by: [5]
 ---
 Long-form description in the body.
 ```
