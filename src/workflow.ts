@@ -161,9 +161,6 @@ export function buildServiceConfig(
     // Default local tracker root: <workflow-dir>/issues
     trackerRoot = path.resolve(workflowDir, 'issues');
   }
-  // `states:` is the canonical schema. Consumers that previously read derived
-  // lists (`tracker.active_states` / `tracker.terminal_states`) now filter the
-  // map by role via the helpers in src/issues.ts.
   const states = parseStatesBlock(raw['states']);
   const tracker: TrackerConfig = {
     kind: trackerKind,

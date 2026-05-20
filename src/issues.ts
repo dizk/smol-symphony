@@ -41,8 +41,7 @@ export function pickHoldingState(states: Record<string, StateConfig>): string {
 /**
  * Names of every `role: active` state in declaration order. Used by the
  * orchestrator's eligibility/reconciliation paths, the local tracker's
- * candidate filter, and the HTTP dashboard's default-state lookup. Replaces
- * the derived `tracker.active_states` list that was removed in Cleanup 4.
+ * candidate filter, and the HTTP dashboard's default-state lookup.
  */
 export function activeStateNames(states: Record<string, StateConfig>): string[] {
   const out: string[] = [];

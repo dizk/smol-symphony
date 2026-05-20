@@ -286,9 +286,8 @@ export class Orchestrator {
     const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
     const active = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
     // Look up canonical state config (declaration-cased) so the cleanup decision flows
-    // through `role` rather than a hardcoded "terminal => cleanup". Today the role-based
-    // branch lines up exactly with the legacy active/terminal classification (terminal
-    // cleans, anything else doesn't), but routing through `role` lets a future per-state
+    // through `role` rather than a hardcoded "terminal => cleanup". Today only terminal
+    // roles trigger cleanup, but routing through `role` lets a future per-state
     // `cleanup_workspace` flag override the policy without touching reconcile again.
     const stateMap = this.cfg.states;
     const stateLower = new Map<string, string>();
