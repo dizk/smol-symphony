@@ -4,7 +4,7 @@
 //
 //   transition(to_state, notes?)    ─ atomic file move into another declared state,
 //                                     optionally appending notes to the issue body
-//                                     first. Sets the marked_done flag so the runner
+//                                     first. Sets the `transitioned` flag so the runner
 //                                     exits cleanly on next post-turn check.
 //   request_human_steering(question, context?)
 //                                   ─ stashes the question on the RunningEntry, returns
@@ -188,7 +188,7 @@ export class McpRegistry {
   activate(entry: RunningEntry): string {
     const token = randomBytes(24).toString('base64url');
     entry.mcp_token = token;
-    entry.marked_done = false;
+    entry.transitioned = false;
     entry.steering_requested = false;
     entry.steering_question = null;
     entry.steering_context = null;
@@ -386,7 +386,7 @@ export class McpRegistry {
       notes: notes.length > 0 ? notes : undefined,
       actor,
     });
-    active.entry.marked_done = true;
+    active.entry.transitioned = true;
     // Look up the canonical declared name (preserving operator-supplied casing)
     // so the role lookup matches the workflow's `states:` map.
     const stateMap = this.states;
@@ -405,7 +405,7 @@ export class McpRegistry {
    * human-readable text block AND a structured JSON block describing the error
    * shape. This is NOT a JSON-RPC `error` envelope — the SDK delivers it as a
    * normal tool result and the agent reads the structured payload to pick a valid
-   * target on its next call. `marked_done` stays false; no file is touched.
+   * target on its next call. `transitioned` stays false; no file is touched.
    */
   private async callTransition(
     active: ActiveEntry,

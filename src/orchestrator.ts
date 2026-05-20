@@ -44,7 +44,7 @@ export interface Snapshot {
     steering_requested: boolean;
     steering_question: string | null;
     steering_context: string | null;
-    marked_done: boolean;
+    transitioned: boolean;
   }>;
   retrying: Array<{
     issue_id: string;
@@ -459,7 +459,7 @@ export class Orchestrator {
       mcp_token: null,
       tracker_root_at_dispatch: trackerRootAtDispatch,
       resolved_actor: resolvedActor,
-      marked_done: false,
+      transitioned: false,
       steering_requested: false,
       steering_question: null,
       steering_context: null,
@@ -815,7 +815,7 @@ export class Orchestrator {
         steering_requested: e.steering_requested,
         steering_question: e.steering_question,
         steering_context: e.steering_context,
-        marked_done: e.marked_done,
+        transitioned: e.transitioned,
       })),
       retrying: [...this.retryAttempts.values()].map((r) => ({
         issue_id: r.issue_id,

@@ -249,8 +249,11 @@ export interface RunningEntry {
   // into the notes header that `symphony.transition` writes onto the issue body so
   // the next agent (reading the issue in its new state) sees who handed off.
   resolved_actor: string;
-  // Tool-driven exit signals. The runner reads these between turns.
-  marked_done: boolean;
+  // Tool-driven exit signal. Set when the agent successfully called `symphony.transition`
+  // (the only way to mutate tracker state from inside the VM). The runner reads this
+  // between turns and unwinds cleanly; the field was named `marked_done` before the
+  // standalone `mark_done` MCP tool was removed in Cleanup 2.
+  transitioned: boolean;
   // The MCP request_human_steering tool sets steering_requested = true and stashes the
   // agent's question here. The runner pauses the autonomous loop and awaits a human reply
   // via POST /api/v1/issues/<id>/steering-reply; the reply lands in steering_reply and the

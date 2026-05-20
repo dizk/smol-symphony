@@ -503,7 +503,7 @@ function renderSessionRow(r: RunningRow): string {
   const awaiting = r.steering_requested;
   const pill = awaiting
     ? '<span class="pill awaiting">awaiting</span>'
-    : r.marked_done
+    : r.transitioned
       ? '<span class="pill done">done</span>'
       : '<span class="pill running">running</span>';
   const tokens = r.tokens.total_tokens || 0;

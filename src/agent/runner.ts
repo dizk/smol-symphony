@@ -660,11 +660,11 @@ export class AgentRunner {
       const outcome = await client.runPrompt(prompt);
 
       if (outcome.reason !== 'end_turn') {
-        // `marked_done` is authoritative: if the agent transitioned the issue
+        // `transitioned` is authoritative: if the agent called symphony.transition
         // mid-turn, reconcile may have tripped cancelSignal before the prompt
         // returned. The work is done regardless of how the prompt ended; honor that.
-        if (runningEntry?.marked_done) {
-          lastReason = 'agent_marked_done';
+        if (runningEntry?.transitioned) {
+          lastReason = 'agent_transitioned';
           break;
         }
         lastReason = outcome.reason;
@@ -682,8 +682,8 @@ export class AgentRunner {
       }
 
       // Tool-driven exits: the MCP handler has already done the work; we just read the flag.
-      if (runningEntry?.marked_done) {
-        lastReason = 'agent_marked_done';
+      if (runningEntry?.transitioned) {
+        lastReason = 'agent_transitioned';
         break;
       }
 

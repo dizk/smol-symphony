@@ -101,7 +101,7 @@ Important boundary:
 6. `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Launches the configured ACP adapter client.
    - Streams agent updates back to the orchestrator.
 
 7. `Status Surface` (OPTIONAL)
@@ -140,7 +140,8 @@ Symphony is easiest to port when kept in these layers:
 - Issue tracker (per `tracker.kind`; the local-filesystem tracker is the reference implementation).
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports the targeted Codex app-server mode.
+- Coding-agent executable that speaks the targeted adapter protocol (ACP in the reference
+  implementation; see §10 and §5.3.6).
 - Host environment authentication for the issue tracker and coding agent.
 
 ## 4. Core Domain Model
@@ -226,13 +227,18 @@ Fields (logical):
 
 State tracked while a coding-agent subprocess is running.
 
+The `codex_*` and `*_codex_*` field names below are historical — they pre-date the move to ACP
+with multiple adapter profiles and now refer to whichever adapter is configured. A field-rename
+to drop the codex prefix is a planned follow-up; the names below match the live `RunningEntry`
+shape in the reference implementation.
+
 Fields:
 
 - `session_id` (string, `<thread_id>-<turn_id>`)
 - `thread_id` (string)
 - `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
+- `codex_app_server_pid` (string or null) — pid of the adapter subprocess
+- `last_codex_event` (string/enum or null) — last ACP event seen from the adapter
 - `last_codex_timestamp` (timestamp or null)
 - `last_codex_message` (summarized payload)
 - `codex_input_tokens` (integer)
@@ -328,11 +334,12 @@ Returned workflow object:
 Top-level keys:
 
 - `tracker`
+- `states`
 - `polling`
 - `workspace`
 - `hooks`
 - `agent`
-- `codex`
+- `acp`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -350,10 +357,11 @@ Fields:
 - `kind` (string)
   - REQUIRED for dispatch.
   - Tracker-specific. Implementations document their supported values.
-- `active_states` (list of strings)
-  - Default: `Todo`, `In Progress`
-- `terminal_states` (list of strings)
-  - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+
+The set of recognised states and their roles is declared in the top-level `states:` block
+(see §5.3.7), not under `tracker`. The tracker reads role membership via the
+`activeStateNames(states)` / `terminalStateNames(states)` helpers (or by inspecting
+`states[*].role` directly).
 
 Tracker kinds MAY require additional fields under `tracker`. Implementations MUST document the
 required fields, defaults, and validation rules for each supported kind.
@@ -419,35 +427,66 @@ Fields:
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.6 `acp` (object)
 
-Fields:
+Coding-agent launch is mediated by the Agent Client Protocol. The runtime selects one of
+the known adapter profiles and runs it inside the per-issue sandbox; the host opens an
+authenticated TCP bridge that the in-sandbox proxy dials back over to carry ACP frames.
+See `WORKFLOW.template.md` (`acp:` section) for the full annotated field list.
 
-For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
-`turn_sandbox_policy`, supported values are defined by the targeted Codex app-server version.
-Implementors SHOULD treat them as pass-through Codex config values rather than relying on a
-hand-maintained enum in this spec. To inspect the installed Codex schema, run
-`codex app-server generate-json-schema --out <dir>` and inspect the relevant definitions referenced
-by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
-fields locally if they want stricter startup checks.
+Summary of fields read by the runtime:
 
-- `command` (string shell command)
-  - Default: `codex app-server`
-  - The runtime launches this command via `bash -lc` in the workspace directory.
-  - The launched process MUST speak a compatible app-server protocol over stdio.
-- `approval_policy` (Codex `AskForApproval` value)
-  - Default: implementation-defined.
-- `thread_sandbox` (Codex `SandboxMode` value)
-  - Default: implementation-defined.
-- `turn_sandbox_policy` (Codex `SandboxPolicy` value)
-  - Default: implementation-defined.
-- `turn_timeout_ms` (integer)
+- `adapter` (string)
+  - Default: `claude`
+  - Selects an adapter profile (`claude`, `codex`, …). Each profile encodes the binary the
+    runtime launches inside the sandbox and the host credential file it stages.
+- `model` (string or null)
+  - Default: `null` (use the adapter's own default).
+  - Forwarded to the adapter via its profile-specific mechanism (env var or argv).
+- `shell` (string)
+  - Default: `bash`
+- `prompt_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
-  - Default: `5000`
+  - Default: `30000`
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+- `bridge` (object)
+  - `bind_host`, `bind_port`, `reach_host`, `reach_url`, `connect_timeout_ms` — see
+    `WORKFLOW.template.md` for full field semantics.
+
+#### 5.3.7 `states` (map)
+
+REQUIRED. The top-level `states:` map declares every tracker state the workflow recognises
+and the per-state dispatch configuration. There is no implicit default set; a workflow
+that omits the block, or that omits any of the three roles (`active`, `terminal`,
+`holding`), is rejected at parse time.
+
+Each entry has the shape:
+
+- `role` (enum, REQUIRED)
+  - `active` — orchestrator dispatches issues in this state.
+  - `terminal` — orchestrator treats issues in this state as complete; the workspace is
+    removed after the run unwinds.
+  - `holding` — directory exists on disk but the orchestrator never dispatches it. The
+    landing state for `symphony.propose_issue` is the first declared `holding` state.
+- `adapter` (string, OPTIONAL)
+  - Overrides the workflow-level `acp.adapter` for agents dispatched in this state.
+- `model` (string or null, OPTIONAL)
+  - Overrides `acp.model` for this state.
+- `max_turns` (integer, OPTIONAL)
+  - Overrides `agent.max_turns` for this state.
+- `allowed_transitions` (list of strings or null, OPTIONAL)
+  - When non-null, restricts which states agents in this state may move to via the MCP
+    `symphony.transition` tool. Each entry must be a declared state name. `null` (or
+    omitted) means "any declared state is reachable"; `[]` means "no transitions allowed
+    out of this state" (the agent's `transition` calls are rejected with
+    `transition_not_allowed`).
+
+Declaration order is preserved: role-filtered listings (`activeStateNames(states)`,
+`terminalStateNames(states)`) follow it, and the dashboard renders columns in the same
+order.
 
 ### 5.4 Prompt Template Contract
 
@@ -556,7 +595,11 @@ Validation checks:
 - Workflow file can be loaded and parsed.
 - `tracker.kind` is present and supported.
 - Any tracker-kind-specific required fields are present after `$` resolution.
-- `codex.command` is present and non-empty.
+- `states:` is present, non-empty, and declares at least one `active`, one `terminal`, and
+  one `holding` state. Per-state overrides (`adapter`, `model`, `max_turns`,
+  `allowed_transitions`) MUST be self-consistent (e.g. each `allowed_transitions` entry
+  references a declared state, each `adapter` override is a known profile).
+- `acp.adapter` resolves to a known adapter profile (defaults to `claude` when omitted).
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -566,8 +609,10 @@ not require recognizing or validating extension fields unless that extension is 
 
 - `tracker.kind`: string, REQUIRED, tracker-specific (additional `tracker.*` fields are defined
   per tracker kind by the implementation)
-- `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
-- `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
+- `states`: map `state_name -> { role, adapter?, model?, max_turns?, allowed_transitions? }`,
+  REQUIRED. Must declare at least one `active`, one `terminal`, and one `holding` state.
+  Active/terminal membership is read from this map via the helpers `activeStateNames(states)`
+  / `terminalStateNames(states)` (or `states[name].role` directly).
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
@@ -579,13 +624,14 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `codex.command`: shell command string, default `codex app-server`
-- `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
-- `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
-- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
-- `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
-- `codex.stall_timeout_ms`: integer, default `300000`
+- `acp.adapter`: string, default `claude` (known profiles: `claude`, `codex`)
+- `acp.model`: string or null, default `null` (use adapter's own default)
+- `acp.shell`: string, default `bash`
+- `acp.prompt_timeout_ms`: integer, default `3600000`
+- `acp.read_timeout_ms`: integer, default `30000`
+- `acp.stall_timeout_ms`: integer, default `300000`
+- `acp.bridge.bind_host` / `bind_port` / `reach_host` / `reach_url` / `connect_timeout_ms`:
+  see `WORKFLOW.template.md` for the full annotated `bridge` object.
 
 ## 7. Orchestration State Machine
 
@@ -665,7 +711,7 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
-- `Codex Update Event`
+- `Adapter Update Event`
   - Update live session fields, token counters, and rate limits.
 
 - `Retry Timer Fired`
@@ -711,7 +757,8 @@ first.
 An issue is dispatch-eligible only if all are true:
 
 - It has `id`, `identifier`, `title`, and `state`.
-- Its state is in `active_states` and not in `terminal_states`.
+- Its state's declared `role` (from the `states:` map) is `active` — equivalently, the
+  state name is present in `activeStateNames(states)` and not in `terminalStateNames(states)`.
 - It is not already in `running`.
 - It is not already in `claimed`.
 - Global concurrency slots are available.
@@ -777,7 +824,7 @@ Part A: Stall detection
 - For each running issue, compute `elapsed_ms` since:
   - `last_codex_timestamp` if any event has been seen, else
   - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `elapsed_ms > acp.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -897,17 +944,21 @@ Invariant 3: Workspace key is sanitized.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
-This section defines Symphony's language-neutral responsibilities when integrating a Codex
-app-server. The Codex app-server protocol for the targeted Codex version is the source of truth for
-protocol schemas, message payloads, transport framing, and method names.
+This section defines Symphony's language-neutral responsibilities when integrating with a
+coding-agent adapter. The reference implementation speaks the Agent Client Protocol (ACP) to one
+of the known adapter profiles (`claude` via `claude-agent-acp`, `codex` via `codex-acp`), which in
+turn wraps the underlying coding agent (Anthropic Claude, Codex, …). ACP is the source of truth
+for protocol schemas, message payloads, transport framing, and method names; the spec below
+describes orchestration responsibilities on top of it.
 
 Protocol source of truth:
 
-- Implementations MUST send messages that are valid for the targeted Codex app-server version.
-- Implementations MUST consult the targeted Codex app-server documentation or generated schema
-  instead of treating this specification as a protocol schema.
-- If this specification appears to conflict with the targeted Codex app-server protocol, the Codex
-  protocol controls protocol shape and transport behavior.
+- Implementations MUST send messages that are valid for the ACP version the adapter advertises in
+  its initialize handshake.
+- Implementations MUST consult ACP documentation (https://agentclientprotocol.com) or its
+  generated schema rather than treating this specification as a protocol schema.
+- If this specification appears to conflict with ACP, the ACP protocol controls protocol shape
+  and transport behavior.
 - Symphony-specific requirements in this section still control orchestration behavior, workspace
   selection, prompt construction, continuation handling, and observability extraction.
 
@@ -915,78 +966,73 @@ Protocol source of truth:
 
 Subprocess launch parameters:
 
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
-- Working directory: workspace path
-- Transport/framing: the protocol transport required by the targeted Codex app-server version
-
-Notes:
-
-- The default command is `codex app-server`.
-- Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
-  using fields supported by the targeted Codex app-server version.
+- Command: derived from the selected `acp.adapter` profile (each profile encodes the adapter
+  binary the runtime invokes inside the sandbox and the host credential file it stages).
+- Invocation: the adapter binary is exec'd under `<acp.shell> -lc …` inside the per-issue
+  sandbox by the in-sandbox proxy, which dials back to the host's ACP bridge for protocol frames.
+- Working directory: workspace path.
+- Transport/framing: ACP (Agent Client Protocol) JSON-RPC over the host-side TCP bridge; the
+  adapter speaks the protocol version it advertises in its initialize handshake.
 
 RECOMMENDED additional process settings:
 
-- Max line size: 10 MB (for safe buffering)
+- Max line size: 10 MB (for safe buffering).
 
 ### 10.2 Session Startup Responsibilities
 
-Reference: https://developers.openai.com/codex/app-server/
+Reference: https://agentclientprotocol.com (ACP)
 
-Startup MUST follow the targeted Codex app-server contract. Symphony additionally requires the
-client to:
+Startup MUST follow the ACP contract. Symphony additionally requires the client to:
 
-- Start the app-server subprocess in the per-issue workspace.
-- Initialize the app-server session using the targeted Codex app-server protocol.
-- Create or resume a coding-agent thread according to the targeted protocol.
-- Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
-  targeted protocol accepts cwd.
-- Start the first turn with the rendered issue prompt.
-- Start later in-worker continuation turns on the same live thread with continuation guidance rather
-  than resending the original issue prompt.
-- Supply the implementation's documented approval and sandbox policy using fields supported by the
-  targeted protocol.
-- Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
-  protocol supports turn or session titles.
-- Advertise implemented client-side tools using the targeted protocol.
+- Launch the adapter subprocess inside the sandbox with the workspace mounted as cwd, via the
+  in-sandbox proxy that dials the host bridge.
+- Send `initialize` and complete the ACP handshake.
+- Start a session using `session/new`, supplying the absolute per-issue workspace path as the
+  session `cwd`.
+- Start the first turn with the rendered issue prompt via `session/prompt`.
+- Start later in-worker continuation turns on the same live session with continuation guidance
+  rather than re-sending the original issue prompt.
+- Advertise implemented client-side tools (e.g. the per-issue MCP endpoint that exposes
+  `symphony.transition`, `request_human_steering`, `propose_issue`).
 
 Session identifiers:
 
-- Extract `thread_id` from the thread identity returned by the targeted Codex app-server protocol.
-- Extract `turn_id` from each turn identity returned by the targeted Codex app-server protocol.
-- Emit `session_id = "<thread_id>-<turn_id>"`
-- Reuse the same `thread_id` for all continuation turns inside one worker run
+- Extract `session_id` from the response to `session/new`.
+- Symphony surfaces `turn_id` from per-prompt response identifiers when the adapter exposes them;
+  otherwise it stamps a monotonically-increasing turn counter.
+- Reuse the same ACP `session_id` for all continuation turns inside one worker run.
 
 ### 10.3 Streaming Turn Processing
 
-The client processes app-server updates according to the targeted Codex app-server protocol until
-the active turn terminates.
+The client processes ACP `session/update` notifications until the active `session/prompt`
+response settles.
 
 Completion conditions:
 
-- Targeted-protocol turn completion signal -> success
-- Targeted-protocol turn failure signal -> failure
-- Targeted-protocol turn cancellation signal -> failure
-- turn timeout (`turn_timeout_ms`) -> failure
-- subprocess exit -> failure
+- `session/prompt` resolves with `stopReason: 'end_turn'` -> success.
+- `session/prompt` resolves with any other `stopReason` (`max_tokens`, `refusal`, etc.) -> failure
+  with the reason surfaced upstream.
+- ACP transport error or adapter process exit -> failure.
+- Prompt timeout (`acp.prompt_timeout_ms`) -> failure.
+- Read-idle timeout (`acp.read_timeout_ms`) without any inbound bytes -> failure.
+- Stall timeout (`acp.stall_timeout_ms`) without any `session/update` event -> failure.
 
 Continuation processing:
 
-- If the worker decides to continue after a successful turn, it SHOULD start another turn on the same
-  live thread using the targeted protocol.
-- The app-server subprocess SHOULD remain alive across those continuation turns and be stopped only
+- If the worker decides to continue after a successful turn, it SHOULD send another
+  `session/prompt` on the same live session.
+- The adapter subprocess SHOULD remain alive across those continuation turns and be stopped only
   when the worker run is ending.
 
 Transport handling requirements:
 
-- Follow the transport and framing rules of the targeted Codex app-server version.
-- For stdio-based transports, keep protocol stream handling separate from diagnostic stderr
-  handling unless the targeted protocol specifies otherwise.
+- Frame ACP messages per the protocol (JSON-RPC 2.0; one frame per line on the bridge socket).
+- Keep protocol stream handling separate from diagnostic stderr handling — the bridge socket
+  carries JSON-RPC; the in-sandbox launcher's stderr surfaces adapter diagnostics independently.
 
 ### 10.4 Emitted Runtime Events (Upstream to Orchestrator)
 
-The app-server client emits structured events to the orchestrator callback. Each event SHOULD
+The ACP adapter client emits structured events to the orchestrator callback. Each event SHOULD
 include:
 
 - `event` (enum/string)
@@ -1038,10 +1084,10 @@ Unsupported dynamic tool calls:
 
 Optional client-side tool extension:
 
-- An implementation MAY expose a limited set of client-side tools to the app-server session.
-- If implemented, supported tools SHOULD be advertised to the app-server session during startup
-  using the protocol mechanism supported by the targeted Codex app-server version.
-- Unsupported tool names SHOULD still return a failure result using the targeted protocol and
+- An implementation MAY expose a limited set of client-side tools to the ACP session.
+- If implemented, supported tools SHOULD be advertised through the per-issue MCP endpoint
+  symphony stamps as a client capability during the ACP initialize handshake.
+- Unsupported tool names SHOULD still return a failure result via the ACP tool-call path and
   continue the session.
 
 User-input-required policy:
@@ -1056,9 +1102,9 @@ User-input-required policy:
 
 Timeouts:
 
-- `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: total turn stream timeout
-- `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- `acp.read_timeout_ms`: request/response timeout during startup and sync requests
+- `acp.prompt_timeout_ms`: total turn stream timeout
+- `acp.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):
 
@@ -1074,14 +1120,14 @@ Error mapping (RECOMMENDED normalized categories):
 
 ### 10.7 Agent Runner Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + ACP adapter client.
 
 Behavior:
 
 1. Create/reuse workspace for issue.
 2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
+3. Start ACP session via the configured adapter.
+4. Forward ACP events to orchestrator.
 5. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note:
@@ -1149,11 +1195,9 @@ layer validates `to_state` against the workflow's declared `states:` map and any
 `allowed_transitions`, then delegates the notes-append + atomic file move to `tracker.moveIssueToState`.
 The per-issue workspace and `agent/<id>` git branch persist across non-terminal transitions
 (active ↔ active, active → holding); cleanup is driven by the target state's role
-(`role: terminal` ⇒ remove workspace, otherwise keep). Workflow-defined `states:` are the canonical
-state list; legacy `tracker.active_states` / `tracker.terminal_states` lists are still accepted and
-synthesise into a `states` map (every active becomes `role: active`, every terminal becomes
-`role: terminal`, plus an implicit `Triage` holding state) so pre-`states:` workflows keep working
-unchanged.
+(`role: terminal` ⇒ remove workspace, otherwise keep). Workflow-defined `states:` is the only
+state source: there is no implicit/default active or terminal list, and a workflow without an
+explicit `states:` block is rejected at parse time.
 
 ## 12. Prompt Construction and Context Assembly
 
@@ -1605,10 +1649,10 @@ arguments are fully trustworthy just because they originate inside a normal work
 
 Possible hardening measures include:
 
-- Tightening Codex approval and sandbox settings described elsewhere in this specification instead
-  of running with a maximally permissive configuration.
+- Tightening the adapter's approval and sandbox settings rather than running with a maximally
+  permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
-  separate credentials beyond the built-in Codex policy controls.
+  separate credentials beyond the adapter's built-in policy controls.
 - Filtering which issues, projects, teams, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing any client-side tracker-access tools so they can only read or mutate data inside the
@@ -1699,11 +1743,12 @@ function reconcile_running_issues(state):
     return state
 
   for issue in refreshed:
-    if issue.state in terminal_states:
+    if role_of(state.states, issue.state) == "terminal":
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
-    else if issue.state in active_states:
+    else if role_of(state.states, issue.state) == "active":
       state.running[issue.id].issue = issue
     else:
+      // holding role, or a state no longer declared after a workflow reload.
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
 
   return state
@@ -1759,7 +1804,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
-  session = app_server.start_session(workspace=workspace.path)
+  session = acp_client.start_session(workspace=workspace.path)
   if session failed:
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
@@ -1770,25 +1815,25 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   while true:
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
-      app_server.stop_session(session)
+      acp_client.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
-    turn_result = app_server.run_turn(
+    turn_result = acp_client.run_turn(
       session=session,
       prompt=prompt,
       issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+      on_message=(msg) -> send(orchestrator_channel, {adapter_update, issue.id, msg})
     )
 
     if turn_result failed:
-      app_server.stop_session(session)
+      acp_client.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
     refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
     if refreshed_issue failed:
-      app_server.stop_session(session)
+      acp_client.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
@@ -1802,7 +1847,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     turn_number = turn_number + 1
 
-  app_server.stop_session(session)
+  acp_client.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()
@@ -1889,7 +1934,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `tracker.kind` validation enforces the implementation's supported kinds
 - `$VAR` resolution works for tracker-specific credential fields and path values
 - `~` path expansion works
-- `codex.command` is preserved as a shell command string
+- `acp.adapter` is resolved against the known adapter profiles; unknown profiles fail validation
+- A workflow missing `states:` or missing any of the `active`/`terminal`/`holding` roles is rejected
+- Per-state overrides (`adapter`, `model`, `max_turns`, `allowed_transitions`) validate against
+  the declared state set and known adapter profiles
 - Per-state concurrency override map normalizes state names and ignores invalid values
 - Prompt template renders `issue` and `attempt`
 - Prompt rendering fails on unknown variables (strict mode)
@@ -1938,29 +1986,30 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
-### 17.5 Coding-Agent App-Server Client
+### 17.5 ACP Adapter Client
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
-- Session startup follows the targeted Codex app-server protocol.
-- Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
-  them.
-- Policy-related startup payloads use the implementation's documented approval/sandbox settings
-- Thread and turn identities exposed by the targeted protocol are extracted and used to emit
-  `session_started`
-- Request/response read timeout is enforced
-- Turn timeout is enforced
-- Transport framing required by the targeted protocol is handled correctly
-- For stdio-based transports, diagnostic stderr handling is kept separate from the protocol stream
-- Command/file-change approvals are handled according to the implementation's documented policy
-- Unsupported dynamic tool calls are rejected without stalling the session
-- User input requests are handled according to the implementation's documented policy and do not
-  stall indefinitely
-- Usage and rate-limit telemetry exposed by the targeted protocol is extracted
-- Approval, user-input-required, usage, and rate-limit signals are interpreted according to the
-  targeted protocol
-- If client-side tools are implemented, session startup advertises the supported tool specs
-  using the targeted app-server protocol; unsupported tool names still fail without stalling
-  the session
+- Launch command uses workspace cwd and is dispatched through the configured `acp.adapter`
+  profile (the adapter binary runs inside the sandbox; the in-sandbox proxy bridges its stdio
+  onto the host ACP bridge socket).
+- Session startup follows the ACP protocol (initialize → session/new → session/prompt).
+- Client identity/capability payloads in the `initialize` request are valid.
+- Session `cwd` is the absolute per-issue workspace path.
+- ACP `session_id` is extracted from `session/new` and reused for every continuation turn within
+  the same worker run.
+- `acp.read_timeout_ms` (no bytes), `acp.stall_timeout_ms` (no `session/update`), and
+  `acp.prompt_timeout_ms` (wall-clock per turn) are each enforced.
+- ACP JSON-RPC framing is handled correctly on the bridge socket; one frame per line.
+- Diagnostic stderr from the adapter launcher (carried over the in-sandbox `exec` channel)
+  is kept separate from the bridge protocol stream.
+- Command/file-change approvals — when the adapter requests them via `session/request_permission`
+  — are handled according to the implementation's documented policy.
+- Unsupported tool calls from the adapter are rejected without stalling the session.
+- Human-input requests (via the `request_human_steering` MCP tool symphony exposes) pause the
+  autonomous loop without stalling the ACP session.
+- Usage and rate-limit telemetry from `session/update` events is extracted.
+- Client-side tools (`symphony.transition`, `request_human_steering`, `propose_issue`) are
+  advertised through the per-issue MCP endpoint and discoverable via the standard MCP
+  `tools/list` handshake.
 
 ### 17.6 Observability
 
@@ -2014,8 +2063,10 @@ Use the same validation profiles as Section 17:
 - Workspace manager with sanitized per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
-- Coding-agent app-server subprocess client with JSON line protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
+- Coding-agent adapter client speaking the Agent Client Protocol (ACP) over a host-side TCP
+  bridge to the in-sandbox proxy
+- Coding-agent adapter configured via `acp.adapter` (default `claude`, with `codex` also
+  supported)
 - Strict prompt rendering with `issue` and `attempt` variables
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
@@ -2062,8 +2113,9 @@ Extension config:
 - Each worker run is assigned to one host at a time, and that host becomes part of the run's
   effective execution identity along with the issue workspace.
 - `workspace.root` is interpreted on the remote host, not on the orchestrator host.
-- The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
-  orchestrator still owns the session lifecycle even though commands execute remotely.
+- The ACP adapter is launched on the remote host (e.g. over SSH stdio) instead of as a local
+  subprocess, so the orchestrator still owns the session lifecycle even though commands execute
+  remotely.
 - Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
 - A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
   shell, writable workspace root, coding-agent executable, and any required auth or repository

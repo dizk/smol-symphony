@@ -74,7 +74,7 @@ function makeEntry(
     mcp_token: null,
     tracker_root_at_dispatch: over.tracker_root_at_dispatch ?? null,
     resolved_actor: 'claude/default',
-    marked_done: false,
+    transitioned: false,
     steering_requested: false,
     steering_question: null,
     steering_context: null,
@@ -708,7 +708,7 @@ describe('McpRegistry transition', () => {
     });
   }
 
-  it('appends notes, moves the file, sets marked_done and preserves workspace for active→active', async () => {
+  it('appends notes, moves the file, sets transitioned and preserves workspace for active→active', async () => {
     const { root, cleanup } = await setupStateTree();
     try {
       await writeFile(
@@ -739,7 +739,7 @@ describe('McpRegistry transition', () => {
         structuredContent: { from_state: string; to_state: string; cleanup_workspace_on_exit: boolean };
       };
       assert.equal(result.isError, false);
-      assert.equal(entry.marked_done, true);
+      assert.equal(entry.transitioned, true);
       // Active→active: workspace NOT cleaned up so the same agent/<id> branch
       // survives into the next state.
       assert.equal(entry.cleanup_workspace_on_exit, false);
@@ -821,7 +821,7 @@ describe('McpRegistry transition', () => {
         'Triage',
       ]);
       // No file move, no flag flip.
-      assert.equal(entry.marked_done, false);
+      assert.equal(entry.transitioned, false);
       assert.equal(entry.cleanup_workspace_on_exit, false);
       assert.deepEqual(await readdir(path.join(root, 'Todo')), ['ABC-1.md']);
     } finally {
@@ -861,7 +861,7 @@ describe('McpRegistry transition', () => {
       assert.equal(result.structuredContent!['requested_to_state'], 'Cancelled');
       assert.deepEqual(result.structuredContent!['allowed_transitions'], ['Todo', 'Done']);
       // No-op on disk.
-      assert.equal(entry.marked_done, false);
+      assert.equal(entry.transitioned, false);
       assert.deepEqual(await readdir(path.join(root, 'Review')), ['ABC-1.md']);
     } finally {
       await cleanup();
@@ -1004,7 +1004,7 @@ describe('McpRegistry transition', () => {
         .result;
       assert.equal(result.isError, true);
       assert.match(result.content[0]!.text, /to_state is required/);
-      assert.equal(entry.marked_done, false);
+      assert.equal(entry.transitioned, false);
     } finally {
       await cleanup();
     }

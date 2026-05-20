@@ -574,7 +574,7 @@ describe('attention partial — Markdown rendering for steering questions', () =
       steering_requested: true,
       steering_question: question,
       steering_context: null,
-      marked_done: false,
+      transitioned: false,
     };
     const snap: Snapshot = {
       generated_at: new Date().toISOString(),
