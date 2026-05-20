@@ -55,6 +55,13 @@ async function bootServer(
       trackerRoot,
       activeStates: ['Todo', 'In Progress'],
       terminalStates: ['Done', 'Cancelled'],
+      states: [
+        { name: 'Todo', role: 'active' },
+        { name: 'In Progress', role: 'active' },
+        { name: 'Done', role: 'terminal' },
+        { name: 'Cancelled', role: 'terminal' },
+        { name: 'Triage', role: 'holding' },
+      ],
       workflowPath: '/tmp/WORKFLOW.md',
     }),
     mcp: null,
@@ -596,6 +603,13 @@ describe('attention partial — Markdown rendering for steering questions', () =
         trackerRoot: root,
         activeStates: ['Todo', 'In Progress'],
         terminalStates: ['Done', 'Cancelled'],
+        states: [
+          { name: 'Todo', role: 'active' },
+          { name: 'In Progress', role: 'active' },
+          { name: 'Done', role: 'terminal' },
+          { name: 'Cancelled', role: 'terminal' },
+          { name: 'Triage', role: 'holding' },
+        ],
         workflowPath: '/tmp/WORKFLOW.md',
       }),
       mcp: null,
@@ -613,5 +627,374 @@ describe('attention partial — Markdown rendering for steering questions', () =
       await handle.close();
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+// Phase 4 of the state-machine workflow refactor: the HTTP server reads role
+// from the declared `states:` map and uses that to colour the issue-detail pill,
+// to order the on-disk listing, to drive the triage approve/discard targets,
+// and to gate the dashboard's issue-creation form. These tests boot the server
+// against bespoke state shapes (alternative holding name, role permutations) to
+// confirm the dashboard tracks the declared config rather than the legacy
+// hardcoded "Triage" / "Cancelled" / "Done" strings.
+
+interface BespokeServerOpts {
+  states: Array<{ name: string; role: 'active' | 'terminal' | 'holding' }>;
+  trackerActiveStates?: string[];
+  trackerTerminalStates?: string[];
+}
+
+async function bootBespoke(
+  trackerRoot: string,
+  bespoke: BespokeServerOpts,
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const activeNames = bespoke.trackerActiveStates ?? bespoke.states.filter((s) => s.role === 'active').map((s) => s.name);
+  const terminalNames = bespoke.trackerTerminalStates ?? bespoke.states.filter((s) => s.role === 'terminal').map((s) => s.name);
+  const orch = makeStubOrchestrator();
+  const tracker = new LocalMarkdownTracker({
+    kind: 'local',
+    endpoint: null,
+    api_key: null,
+    project_slug: null,
+    active_states: activeNames,
+    terminal_states: terminalNames,
+    states: Object.fromEntries(bespoke.states.map((s) => [s.name, { role: s.role }])),
+    root: trackerRoot,
+  });
+  const handle = await startHttpServer(orch, {
+    port: 0,
+    host: '127.0.0.1',
+    getTrackerView: () => ({
+      trackerRoot,
+      activeStates: activeNames,
+      terminalStates: terminalNames,
+      states: bespoke.states,
+      workflowPath: '/tmp/WORKFLOW.md',
+    }),
+    mcp: null,
+    tracker,
+  });
+  return { url: `http://127.0.0.1:${handle.port}`, close: handle.close };
+}
+
+describe('role-based state pill on the issue-detail page', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-pill-'));
+    // Distinctive state names so the test asserts on role, not on a hardcoded
+    // "Todo"/"Done"/"Triage" string: any active state must read as "running",
+    // any terminal as "done", any holding as "idle".
+    await mkdir(path.join(root, 'Brewing'), { recursive: true });
+    await mkdir(path.join(root, 'Shipped'), { recursive: true });
+    await mkdir(path.join(root, 'Holding'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Brewing', 'A-1.md'),
+      `---\nid: "A-1"\nidentifier: "A-1"\ntitle: "active item"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Shipped', 'A-2.md'),
+      `---\nid: "A-2"\nidentifier: "A-2"\ntitle: "terminal item"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Holding', 'A-3.md'),
+      `---\nid: "A-3"\nidentifier: "A-3"\ntitle: "holding item"\n---\nbody.`,
+    );
+    server = await bootBespoke(root, {
+      states: [
+        { name: 'Brewing', role: 'active' },
+        { name: 'Shipped', role: 'terminal' },
+        { name: 'Holding', role: 'holding' },
+      ],
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('active role → running pill', async () => {
+    const res = await fetch(`${server.url}/issues/A-1`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<span class="pill running">Brewing<\/span>/);
+  });
+
+  it('terminal role → done pill', async () => {
+    const res = await fetch(`${server.url}/issues/A-2`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<span class="pill done">Shipped<\/span>/);
+  });
+
+  it('holding role → idle pill', async () => {
+    const res = await fetch(`${server.url}/issues/A-3`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<span class="pill idle">Holding<\/span>/);
+  });
+});
+
+describe('disk partial includes terminal-state issues but excludes holding', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-disk-terminal-'));
+    await mkdir(path.join(root, 'Todo'), { recursive: true });
+    await mkdir(path.join(root, 'Done'), { recursive: true });
+    await mkdir(path.join(root, 'Triage'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Todo', 'active-1.md'),
+      `---\nid: "active-1"\nidentifier: "active-1"\ntitle: "still working"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Done', 'finished-1.md'),
+      `---\nid: "finished-1"\nidentifier: "finished-1"\ntitle: "completed task"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Triage', 'pending-1.md'),
+      `---\nid: "pending-1"\nidentifier: "pending-1"\ntitle: "needs review"\n---\nbody.`,
+    );
+    server = await bootBespoke(root, {
+      states: [
+        { name: 'Todo', role: 'active' },
+        { name: 'Done', role: 'terminal' },
+        { name: 'Triage', role: 'holding' },
+      ],
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('includes active-state and terminal-state rows; excludes holding rows', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // Active state appears.
+    assert.ok(html.includes('active-1'), 'expected active-1 in the disk panel');
+    // Terminal state now appears (Phase 4 broadened the visibility rule from
+    // "active only" to "every declared non-holding state with issues").
+    assert.ok(html.includes('finished-1'), 'expected terminal finished-1 in the disk panel');
+    // Holding state is rendered in the separate triage panel; it must not
+    // double-list here.
+    assert.ok(!html.includes('pending-1'), 'holding-state pending-1 should not appear in the disk panel');
+  });
+});
+
+describe('disk partial renders states in declared order', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-disk-order-'));
+    // Three active states; issues seeded so the alphabetical-by-identifier sort
+    // would interleave them, letting the test prove the partial orders by the
+    // workflow's declared `states:` order rather than by identifier.
+    await mkdir(path.join(root, 'Backlog'), { recursive: true });
+    await mkdir(path.join(root, 'Doing'), { recursive: true });
+    await mkdir(path.join(root, 'Review'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Backlog', 'item-c.md'),
+      `---\nid: "item-c"\nidentifier: "item-c"\ntitle: "backlog c"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Doing', 'item-b.md'),
+      `---\nid: "item-b"\nidentifier: "item-b"\ntitle: "doing b"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Review', 'item-a.md'),
+      `---\nid: "item-a"\nidentifier: "item-a"\ntitle: "review a"\n---\nbody.`,
+    );
+    server = await bootBespoke(root, {
+      states: [
+        { name: 'Backlog', role: 'active' },
+        { name: 'Doing', role: 'active' },
+        { name: 'Review', role: 'active' },
+        { name: 'Done', role: 'terminal' },
+      ],
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('orders rows by declared state position (not identifier)', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    const cIdx = html.indexOf('item-c');
+    const bIdx = html.indexOf('item-b');
+    const aIdx = html.indexOf('item-a');
+    assert.ok(cIdx > -1 && bIdx > -1 && aIdx > -1, 'all three identifiers should render');
+    // Declared order is Backlog → Doing → Review, so item-c (Backlog) should
+    // render before item-b (Doing) which should render before item-a (Review).
+    assert.ok(cIdx < bIdx, `expected item-c (Backlog) before item-b (Doing); got positions ${cIdx} vs ${bIdx}`);
+    assert.ok(bIdx < aIdx, `expected item-b (Doing) before item-a (Review); got positions ${bIdx} vs ${aIdx}`);
+  });
+});
+
+describe('triage approve/discard with alternative holding/cancelled names', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-triage-roles-'));
+    await mkdir(path.join(root, 'Holding'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Holding', 'h-1.md'),
+      `---\nid: "h-1"\nidentifier: "h-1"\ntitle: "approve me"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Holding', 'h-2.md'),
+      `---\nid: "h-2"\nidentifier: "h-2"\ntitle: "discard me"\n---\nbody.`,
+    );
+    server = await bootBespoke(root, {
+      // First active state is "Working" (not "Todo"); the discard preference
+      // for a case-insensitive "Cancelled" must still fire even when the
+      // declared name uses different casing ("cancelled" → "cancelled").
+      states: [
+        { name: 'Working', role: 'active' },
+        { name: 'Shipped', role: 'terminal' },
+        { name: 'cancelled', role: 'terminal' },
+        { name: 'Holding', role: 'holding' },
+      ],
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('approve moves into the first declared active state (not the literal "Todo")', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/h-1/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { from_state: string; to_state: string };
+    assert.equal(data.from_state, 'Holding');
+    assert.equal(data.to_state, 'Working');
+    const workingFiles = await readdir(path.join(root, 'Working'));
+    assert.ok(workingFiles.includes('h-1.md'));
+  });
+
+  it('discard prefers the case-insensitive "cancelled" terminal over the first declared terminal', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/h-2/discard`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { from_state: string; to_state: string };
+    assert.equal(data.from_state, 'Holding');
+    assert.equal(data.to_state, 'cancelled');
+    const cancelledFiles = await readdir(path.join(root, 'cancelled'));
+    assert.ok(cancelledFiles.includes('h-2.md'));
+  });
+});
+
+describe('triage discard falls back to first terminal when no "cancelled" is declared', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-triage-fallback-'));
+    await mkdir(path.join(root, 'Triage'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Triage', 'orphan.md'),
+      `---\nid: "orphan"\nidentifier: "orphan"\ntitle: "orphan"\n---\nbody.`,
+    );
+    server = await bootBespoke(root, {
+      // Only one terminal, and it's not called "Cancelled". The discard handler
+      // must fall back to it rather than failing.
+      states: [
+        { name: 'Todo', role: 'active' },
+        { name: 'Archived', role: 'terminal' },
+        { name: 'Triage', role: 'holding' },
+      ],
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('falls back to the first declared terminal state', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/orphan/discard`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { to_state: string };
+    assert.equal(data.to_state, 'Archived');
+  });
+});
+
+describe('POST /api/v1/issues accepts declared active+terminal states and rejects holding/undeclared', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-issue-roles-'));
+    server = await bootBespoke(root, {
+      states: [
+        { name: 'Working', role: 'active' },
+        { name: 'Shipped', role: 'terminal' },
+        { name: 'Holding', role: 'holding' },
+      ],
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('accepts an active state', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'item one', state: 'Working' }),
+    });
+    assert.equal(res.status, 201);
+  });
+
+  it('accepts a terminal state', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'item two', state: 'Shipped' }),
+    });
+    assert.equal(res.status, 201);
+  });
+
+  it('rejects a holding state name', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'item three', state: 'Holding' }),
+    });
+    assert.equal(res.status, 400);
+    const data = (await res.json()) as { error: { message: string } };
+    assert.match(data.error.message, /state must be one of/);
+    assert.ok(!data.error.message.includes('Holding'), 'holding state should not appear in the allow-list message');
+  });
+
+  it('rejects an undeclared state name', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'item four', state: 'NotDeclared' }),
+    });
+    assert.equal(res.status, 400);
   });
 });

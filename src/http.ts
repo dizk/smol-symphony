@@ -11,6 +11,17 @@ import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
 import { writeIssueFile, TRIAGE_STATE } from './issues.js';
 import type { IssueTracker } from './trackers/types.js';
+import type { StateConfig } from './types.js';
+
+// Compact view of the declared per-state config used by the dashboard. The view-builder
+// in src/bin/symphony.ts derives this from `cfg.states` on every request so a workflow
+// reload (which mutates the live config in place) is reflected without rebinding the
+// server. Order is the workflow declaration order — operators get state columns and
+// approve/discard targets in the sequence they wrote them in `states:`.
+export interface StateView {
+  name: string;
+  role: 'active' | 'terminal' | 'holding';
+}
 
 function jsonResponse(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -287,6 +298,7 @@ async function gatherPartialInputs(
     trackerRoot: string | null;
     activeStates: string[];
     terminalStates: string[];
+    states: StateView[];
     workflowPath: string;
   },
 ): Promise<PartialInputs> {
@@ -305,6 +317,7 @@ async function gatherPartialInputs(
     trackerRoot,
     activeStates: view.activeStates,
     terminalStates: view.terminalStates,
+    states: view.states,
     snapshot: orch.snapshot(),
     diskIssues,
   };
@@ -333,8 +346,36 @@ interface PartialInputs {
   trackerRoot: string;
   activeStates: string[];
   terminalStates: string[];
+  // Declared per-state config in workflow declaration order. Drives the role-based
+  // pill class (active → running, terminal → done, holding → idle) and the column
+  // ordering in the on-disk listing. `activeStates` / `terminalStates` are derived
+  // snapshots kept around so the form-default and existing filter call sites don't
+  // need to switch in this pass — the role-based lookup is the new source of truth
+  // for everything where the role itself matters.
+  states: StateView[];
   snapshot: Snapshot;
   diskIssues: DiskIssue[];
+}
+
+/**
+ * Map a declared state name to its pill colour class. Active states pulse green
+ * (`running`), terminals settle into the muted "done" palette, holdings (Triage)
+ * use the same idle palette they always have. Unknown names — issues sitting in a
+ * directory that's no longer declared in `states:` — fall back to idle so the
+ * dashboard still renders something legible.
+ */
+function pillClassForState(states: StateView[], stateName: string): string {
+  const lower = stateName.toLowerCase();
+  const match = states.find((s) => s.name.toLowerCase() === lower);
+  if (!match) return 'idle';
+  switch (match.role) {
+    case 'active':
+      return 'running';
+    case 'terminal':
+      return 'done';
+    case 'holding':
+      return 'idle';
+  }
 }
 
 function trackerStatus(snap: Snapshot): 'attention' | 'working' | 'idle' {
@@ -505,13 +546,23 @@ function renderSessionRow(r: RunningRow): string {
 // minus the "from <parent>" bit — meaning operators can also pre-stage human proposals
 // in that directory.
 function renderTriagePartial(p: PartialInputs): string {
-  const triage = p.diskIssues.filter((i) => i.state === TRIAGE_STATE);
+  // Surface every issue whose on-disk state has role `holding`. The legacy
+  // synthesis path stamps an implicit "Triage" state onto un-migrated workflows
+  // so the panel keeps working there; workflows that declare alternative holding
+  // names (e.g. "Backlog") get them surfaced through the same panel without
+  // touching this code again.
+  const holdingNames = new Set(
+    p.states.filter((s) => s.role === 'holding').map((s) => s.name.toLowerCase()),
+  );
+  if (holdingNames.size === 0) holdingNames.add(TRIAGE_STATE.toLowerCase());
+  const triage = p.diskIssues.filter((i) => holdingNames.has(i.state.toLowerCase()));
   if (triage.length === 0) {
     // Empty state is silent rather than narrated — operators see "triage" only when
     // there is something to triage. This matches PRODUCT.md "show real state".
     return '';
   }
-  const approveTarget = p.activeStates[0] ?? 'Todo';
+  const firstActive = p.states.find((s) => s.role === 'active');
+  const approveTarget = firstActive?.name ?? p.activeStates[0] ?? 'Todo';
   const items = triage.map((i) => renderTriageRow(i, approveTarget)).join('');
   return `<h2 class="triage-title">triage <span class="count dim">(${triage.length})</span></h2>
 <ul class="triage">${items}</ul>`;
@@ -555,10 +606,41 @@ function renderTriageRow(i: DiskIssue, approveTarget: string): string {
 function renderDiskPartial(p: PartialInputs): string {
   const runIds = new Set(p.snapshot.running.map((r) => r.issue_identifier));
   const retryIds = new Set(p.snapshot.retrying.map((r) => r.issue_identifier));
-  const active = new Set(p.activeStates);
-  const filtered = p.diskIssues.filter(
-    (i) => active.has(i.state) && !runIds.has(i.identifier) && !retryIds.has(i.identifier),
-  );
+  // Visibility rule (Phase 4 brief): "include every state that has at least one
+  // issue OR is declared active". Concretely:
+  //   • Declared `active` states appear in the panel's ordering even when they
+  //     have no rows (their heading is implicit since the flat list uses a
+  //     per-row state label rather than per-state subheaders, so this only
+  //     matters for the "tracker is clean" empty-state hint).
+  //   • Declared `terminal` states surface their rows here when they hold files
+  //     — operators get one place to see finished work without leaving the
+  //     dashboard. Today's design hid these; the role-based config now decides.
+  //   • Declared `holding` states are surfaced through the separate triage
+  //     panel above; we exclude them here to avoid double-listing.
+  //   • Undeclared on-disk states (a directory whose name isn't in `states:`)
+  //     surface too, so a workflow rename leaves a paper trail rather than
+  //     silently dropping the rows. They sort to the end of the list.
+  const declaredLower = new Map(p.states.map((s) => [s.name.toLowerCase(), s]));
+  const candidates = p.diskIssues.filter((i) => {
+    if (runIds.has(i.identifier) || retryIds.has(i.identifier)) return false;
+    const declared = declaredLower.get(i.state.toLowerCase());
+    if (!declared) return true;
+    return declared.role !== 'holding';
+  });
+  // Order: declared-state position first (so Todo before In Progress before any
+  // ad-hoc state), then identifier within a state. Undeclared states sort to the
+  // end alphabetically by state name so stray rows still cluster together.
+  const declaredOrder = p.states.map((s) => s.name);
+  const orderIndex = new Map(declaredOrder.map((name, idx) => [name.toLowerCase(), idx]));
+  const filtered = candidates.slice().sort((a, b) => {
+    const ai = orderIndex.get(a.state.toLowerCase());
+    const bi = orderIndex.get(b.state.toLowerCase());
+    if (ai !== undefined && bi !== undefined && ai !== bi) return ai - bi;
+    if (ai !== undefined && bi === undefined) return -1;
+    if (ai === undefined && bi !== undefined) return 1;
+    if (a.state !== b.state) return a.state.localeCompare(b.state);
+    return a.identifier.localeCompare(b.identifier);
+  });
   if (filtered.length === 0) {
     return `<h2>on disk</h2>
 <p class="empty dim">tracker is clean. drop a markdown file into <code>${escapeHtml(p.activeStates[0] ?? 'Todo')}/</code> or open <em>new issue</em> below.</p>`;
@@ -1223,7 +1305,7 @@ function formatTimestamp(v: unknown): string | null {
 
 function renderIssueDetailPage(
   issue: DiskIssueDetail,
-  view: { workflowPath: string; activeStates: string[]; terminalStates: string[] },
+  view: { workflowPath: string; activeStates: string[]; terminalStates: string[]; states: StateView[] },
 ): string {
   const fm = issue.frontMatter;
   const title = asString(fm['title']) ?? issue.identifier;
@@ -1237,11 +1319,11 @@ function renderIssueDetailPage(
   const branchName = asString(fm['branch_name']);
   const url = asString(fm['url']);
 
-  const stateClass = view.activeStates.includes(issue.state)
-    ? 'running'
-    : view.terminalStates.includes(issue.state)
-      ? 'done'
-      : 'idle';
+  // Pill colour follows the declared role: active → running, terminal → done,
+  // holding → idle. An undeclared state (stale directory, file dropped by hand
+  // into a name not in `states:`) falls back to idle so the detail page still
+  // renders legibly.
+  const stateClass = pillClassForState(view.states, issue.state);
 
   const metaRows: string[] = [];
   const metaRow = (label: string, value: string): string =>
@@ -1475,11 +1557,21 @@ h2.section-title {
 export interface HttpServerOptions {
   port: number;
   host: string;
-  /** Returns the current tracker root and state lists. Wired to the orchestrator's live cfg. */
+  /**
+   * Returns the current tracker root, state lists, and the declared per-state
+   * config in workflow order. Wired to the orchestrator's live cfg so a workflow
+   * reload (which mutates the live config object in place) is reflected on the
+   * next request without rebinding the server. `activeStates` / `terminalStates`
+   * are kept as derived snapshots so existing call sites that just want a flat
+   * list of names — the form-default, the issue-creation validation — don't have
+   * to filter `states` themselves; `states` is the canonical role-bearing source
+   * for everything that cares about role.
+   */
   getTrackerView: () => {
     trackerRoot: string | null;
     activeStates: string[];
     terminalStates: string[];
+    states: StateView[];
     workflowPath: string;
   };
   /** Optional MCP registry. When present, exposes /api/v1/issues/:id/mcp + steering-reply. */
@@ -1665,12 +1757,21 @@ async function handleRequest(
       if (!state) {
         return badRequest(res, 'state is required (no active_states configured to default to)');
       }
-      // Restrict `state` to one of the configured active/terminal states. Anything else
-      // (or values containing path separators / `..`) is rejected so the request cannot
-      // escape the tracker root via `path.join`.
-      const allowedStates = new Set([...view.activeStates, ...view.terminalStates]);
+      // Restrict `state` to one of the declared states with role in {active, terminal}.
+      // Holding states (Triage) are reachable through `propose_issue` and the on-disk
+      // file drop, not this dashboard form — keeping the form to dispatchable targets
+      // matches today's behaviour and stops a caller from bypassing the operator-
+      // approval queue. Values containing path separators / `..` are rejected by the
+      // set lookup so the request cannot escape the tracker root via `path.join`.
+      const allowedNames = view.states
+        .filter((s) => s.role === 'active' || s.role === 'terminal')
+        .map((s) => s.name);
+      const allowedStates = new Set(allowedNames);
       if (!allowedStates.has(state)) {
-        return badRequest(res, `state must be one of: ${[...allowedStates].join(', ') || '<none configured>'}`);
+        return badRequest(
+          res,
+          `state must be one of: ${allowedNames.join(', ') || '<none configured>'}`,
+        );
       }
       const description = typeof b.description === 'string' ? b.description : undefined;
       const priority =
@@ -1910,28 +2011,42 @@ async function handleRequest(
     }
     let toState: string;
     if (action === 'approve') {
-      toState = view.activeStates[0] ?? 'Todo';
+      // First declared `active` state, falling back to the snapshot list (which
+      // Phase 1 derives from `states:` in declaration order) and ultimately to
+      // the literal "Todo" so a workflow without any active states still produces
+      // a defined error path rather than crashing the handler.
+      const firstActive = view.states.find((s) => s.role === 'active');
+      toState = firstActive?.name ?? view.activeStates[0] ?? 'Todo';
     } else {
-      // Prefer a state literally named "Cancelled" (case-insensitive); fall back to the
-      // first terminal state. If neither is configured, refuse the action rather than
-      // deleting silently.
-      const cancelled = view.terminalStates.find((s) => s.toLowerCase() === 'cancelled');
-      const fallback = view.terminalStates[0];
+      // Discard prefers a state literally named "Cancelled" (case-insensitive)
+      // and falls back to the first declared `terminal` state. If neither is
+      // declared we refuse the action rather than silently deleting.
+      const terminals = view.states.filter((s) => s.role === 'terminal');
+      const cancelled = terminals.find((s) => s.name.toLowerCase() === 'cancelled');
+      const fallback = terminals[0];
       const target = cancelled ?? fallback;
       if (!target) {
         return jsonResponse(res, 409, {
           error: {
             code: 'no_discard_target',
-            message: 'no terminal_states configured to discard the proposal into',
+            message: 'no terminal state configured to discard the proposal into',
           },
         });
       }
-      toState = target;
+      toState = target.name;
     }
+    // From-state for the move: the first declared `holding` state in declaration
+    // order, with the literal "Triage" as a final fallback. Phase 1's legacy
+    // synthesis stamps Triage onto every un-migrated workflow, so this is the
+    // same string the dashboard's renderTriagePartial filter and the MCP
+    // propose_issue tool both target. Kept in sync with `pickHoldingState` in
+    // src/issues.ts.
+    const holdingFromState =
+      view.states.find((s) => s.role === 'holding')?.name ?? TRIAGE_STATE;
     try {
       const result = await tracker.moveIssueToState(identifier, toState, {
         fromRoot: root,
-        fromState: TRIAGE_STATE,
+        fromState: holdingFromState,
       });
       log.info('triage action', { identifier, action, from: result.fromState, to: result.toState });
       // Nudge the orchestrator to pick the freshly approved issue up immediately instead

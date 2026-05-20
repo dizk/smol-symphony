@@ -9,12 +9,31 @@
 import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sanitizeWorkspaceKey } from './workspace.js';
+import type { StateConfig } from './types.js';
 
 // Where agent-proposed issues land. The state directory is not in `tracker.active_states`
 // (so the orchestrator never dispatches it) and not in `terminal_states` (so the tracker
 // doesn't treat it as completed). The operator approves a proposal from the dashboard,
 // which moves it into the first active state (typically Todo).
 export const TRIAGE_STATE = 'Triage';
+
+/**
+ * First declared `holding` state in declaration order, or the literal
+ * "Triage" when no holding state is declared. Shared between the MCP
+ * `propose_issue` tool (where new agent-proposed issues land) and the HTTP
+ * triage approve/discard handler (where the from-state is implied). Keeps
+ * both callers behaviour-equivalent under the role-based state model and the
+ * legacy-fallback synthesis that Phase 1 added an implicit Triage holding
+ * state to every un-migrated workflow.
+ */
+export function pickHoldingState(states: Record<string, StateConfig> | null | undefined): string {
+  if (states) {
+    for (const [name, cfg] of Object.entries(states)) {
+      if (cfg.role === 'holding') return name;
+    }
+  }
+  return TRIAGE_STATE;
+}
 
 // Slugify a title into a filename-safe identifier. Lowercase ASCII with single-dash
 // separators; trims to a sensible length so the on-disk path stays readable. Falls back to

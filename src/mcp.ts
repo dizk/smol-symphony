@@ -25,7 +25,7 @@ import path from 'node:path';
 import type { IssueTracker } from './trackers/types.js';
 import type { RunningEntry, StateConfig } from './types.js';
 import { log } from './logging.js';
-import { writeIssueFile, TRIAGE_STATE } from './issues.js';
+import { writeIssueFile, pickHoldingState } from './issues.js';
 
 const TERMINAL_STATE_FOR_DONE_DEFAULT = 'Done';
 
@@ -681,18 +681,6 @@ export class McpRegistry {
   }
 
   /**
-   * First declared `holding` state in declaration order, or the literal
-   * "Triage" when no holding state is declared. Used by `propose_issue` to
-   * decide where new agent-proposed issues land.
-   */
-  private pickProposeLandingState(): string {
-    for (const [name, cfg] of Object.entries(this.states)) {
-      if (cfg.role === 'holding') return name;
-    }
-    return TRIAGE_STATE;
-  }
-
-  /**
    * Drop a new issue file into the tracker's Triage/ directory. The orchestrator
    * never dispatches Triage entries because the state isn't in active_states; the
    * operator approves or discards from the dashboard. Parent issue (the active
@@ -739,7 +727,7 @@ export class McpRegistry {
     // 1's legacy-fallback synthesis adds an implicit Triage holding state to every
     // workflow that didn't migrate to the `states:` block, so this path keeps
     // existing operators' Triage directories working unchanged.
-    const landingState = this.pickProposeLandingState();
+    const landingState = pickHoldingState(this.states);
     try {
       const result = await writeIssueFile({
         trackerRoot: root,
