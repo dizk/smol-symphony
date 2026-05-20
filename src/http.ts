@@ -335,7 +335,7 @@ function renderSteeringBlock(r: RunningRow): string {
     <span class="pill awaiting">awaiting</span>
     <span class="turn"><span class="dim">turn</span> ${r.turn_count}</span>
   </header>
-  <p class="question-primary">${escapeHtml(question)}</p>
+  <div class="question-primary">${renderMarkdown(question)}</div>
   ${hasAnyExtra ? `<details class="steering-task">
     <summary>${escapeHtml(summaryLabel)}</summary>
     <div class="steering-task-body">
@@ -631,6 +631,41 @@ h2:first-child { margin-top: 0.4rem; }
   font-size: calc(14px * 1.1);
   line-height: 1.4; color: var(--strong); font-weight: 400;
 }
+/* Inner Markdown rendered from the steering question. Reset margins so the
+   first/last block hug the panel edge, but keep spacing between blocks. */
+.steering .question-primary > :first-child { margin-top: 0; }
+.steering .question-primary > :last-child { margin-bottom: 0; }
+.steering .question-primary p { margin: 0.4em 0; }
+.steering .question-primary h1,
+.steering .question-primary h2,
+.steering .question-primary h3,
+.steering .question-primary h4,
+.steering .question-primary h5,
+.steering .question-primary h6 {
+  margin: 0.6em 0 0.3em;
+  font-weight: 500;
+  border: 0; padding: 0;
+  font-size: 1em;
+}
+.steering .question-primary ul,
+.steering .question-primary ol { margin: 0.4em 0; padding-left: 1.4em; }
+.steering .question-primary li { margin: 0.15em 0; }
+.steering .question-primary code {
+  background: var(--inset); padding: 0.05em 0.35em; border-radius: 3px;
+  font-size: 0.92em;
+}
+.steering .question-primary pre {
+  margin: 0.5em 0; padding: 0.5rem 0.65rem;
+  background: var(--inset); border: 1px solid var(--rule-firm); border-radius: 4px;
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted); overflow: auto;
+}
+.steering .question-primary pre code { background: transparent; padding: 0; font-size: inherit; }
+.steering .question-primary blockquote {
+  margin: 0.4em 0; padding: 0.1em 0.7em;
+  border-left: 2px solid var(--rule-firm); color: var(--muted);
+}
+.steering .question-primary a { color: var(--await-fg); }
 .steering details.steering-task { font-size: 0.92em; }
 .steering details.steering-task > summary {
   cursor: pointer; list-style: none;
@@ -955,6 +990,113 @@ $('create-form').addEventListener('submit', async (ev) => {
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+}
+
+// Minimal Markdown → HTML renderer used to make the steering panel's question
+// (which agents tend to write in Markdown) actually readable. Intentionally
+// dependency-free and small; covers the subset agents reach for in chat-style
+// prompts: headers, paragraphs, lists, blockquotes, fenced + inline code,
+// bold/italic, and links. Input is treated as untrusted: everything outside the
+// transforms below is HTML-escaped, and link hrefs are restricted to
+// http/https/mailto schemes so a `javascript:` URL can't slip through.
+export function renderMarkdown(input: string): string {
+  const text = input.replace(/\r\n?/g, '\n');
+  const lines = text.split('\n');
+  const blocks: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const fence = /^```([\w-]*)\s*$/.exec(line);
+    if (fence) {
+      const lang = fence[1] ?? '';
+      const body: string[] = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i]!)) {
+        body.push(lines[i]!);
+        i++;
+      }
+      if (i < lines.length) i++; // consume closing fence
+      const langAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+      blocks.push(`<pre><code${langAttr}>${escapeHtml(body.join('\n'))}</code></pre>`);
+      continue;
+    }
+    const header = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (header) {
+      const level = header[1]!.length;
+      blocks.push(`<h${level}>${renderInlineMarkdown(header[2]!)}</h${level}>`);
+      i++;
+      continue;
+    }
+    if (line.trim() === '') {
+      i++;
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i]!)) {
+        const m = /^\s*[-*+]\s+(.*)$/.exec(lines[i]!)!;
+        items.push(`<li>${renderInlineMarkdown(m[1]!)}</li>`);
+        i++;
+      }
+      blocks.push(`<ul>${items.join('')}</ul>`);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i]!)) {
+        const m = /^\s*\d+\.\s+(.*)$/.exec(lines[i]!)!;
+        items.push(`<li>${renderInlineMarkdown(m[1]!)}</li>`);
+        i++;
+      }
+      blocks.push(`<ol>${items.join('')}</ol>`);
+      continue;
+    }
+    if (/^\s*>\s?/.test(line)) {
+      const buf: string[] = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i]!)) {
+        buf.push(lines[i]!.replace(/^\s*>\s?/, ''));
+        i++;
+      }
+      blocks.push(`<blockquote>${renderMarkdown(buf.join('\n'))}</blockquote>`);
+      continue;
+    }
+    const para: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i]!.trim() !== '' &&
+      !/^```/.test(lines[i]!) &&
+      !/^#{1,6}\s+/.test(lines[i]!) &&
+      !/^\s*[-*+]\s+/.test(lines[i]!) &&
+      !/^\s*\d+\.\s+/.test(lines[i]!) &&
+      !/^\s*>\s?/.test(lines[i]!)
+    ) {
+      para.push(lines[i]!);
+      i++;
+    }
+    blocks.push(`<p>${renderInlineMarkdown(para.join('\n'))}</p>`);
+  }
+  return blocks.join('\n');
+}
+
+function renderInlineMarkdown(input: string): string {
+  const codes: string[] = [];
+  let text = input.replace(/`([^`\n]+)`/g, (_m, code: string) => {
+    const idx = codes.length;
+    codes.push(`<code>${escapeHtml(code)}</code>`);
+    return ` C${idx} `;
+  });
+  text = escapeHtml(text);
+  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, label: string, url: string) => {
+    if (!/^(https?:|mailto:)/i.test(url)) return m;
+    return `<a href="${url}" rel="noopener noreferrer">${label}</a>`;
+  });
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+  text = text.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>');
+  text = text.replace(/(^|[^_\w])_([^_\n]+)_(?!\w)/g, '$1<em>$2</em>');
+  text = text.replace(/\n/g, '<br>');
+  text = text.replace(/ C(\d+) /g, (_m, idx: string) => codes[Number(idx)]!);
+  return text;
 }
 
 export interface HttpServerOptions {
