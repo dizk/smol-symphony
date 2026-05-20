@@ -1521,12 +1521,16 @@ async function handleRequest(
         },
       });
     }
-    if (isFormBody) {
+    // Both form-encoded and empty Content-Type are "simple" CORS requests that bypass
+    // preflight, so a cross-origin page can POST them without the browser blocking.
+    // Gate both on HX-Request + same-origin; only application/json (which triggers a
+    // preflight on cross-origin fetches) is exempt.
+    if (isFormBody || isEmptyCtype) {
       if (!isHtmx || !isSameOriginRequest(req)) {
         return jsonResponse(res, 403, {
           error: {
             code: 'forbidden',
-            message: 'form-encoded triage actions require an HTMX same-origin request',
+            message: 'triage actions require an HTMX same-origin request or application/json',
           },
         });
       }

@@ -271,6 +271,27 @@ describe('triage approve / discard', () => {
     assert.ok(triageFiles.includes('csrf-target.md'));
   });
 
+  it('rejects empty Content-Type without HX-Request (CSRF protection)', async () => {
+    // Browsers send no Content-Type on a no-cors `fetch(..., { method: 'POST' })`
+    // with no body; that "simple" request bypasses preflight, so an empty
+    // Content-Type cross-origin POST must be rejected the same way a form-encoded
+    // one is — otherwise any page can drive the triage endpoint.
+    await writeFile(
+      path.join(root, 'Triage', 'csrf-empty-ctype.md'),
+      `---\nid: "csrf-empty-ctype"\nidentifier: "csrf-empty-ctype"\ntitle: "CSRF empty ctype"\n---\nbody.`,
+    );
+    const res = await fetch(`${server.url}/api/v1/issues/csrf-empty-ctype/approve`, {
+      method: 'POST',
+      // Undici sets a default content-type on fetch() POSTs; clear it explicitly
+      // so the server sees the no-Content-Type case a browser no-cors POST sends.
+      headers: { 'content-type': '' },
+    });
+    assert.equal(res.status, 403);
+    // File was not moved.
+    const triageFiles = await readdir(path.join(root, 'Triage'));
+    assert.ok(triageFiles.includes('csrf-empty-ctype.md'));
+  });
+
   it('returns 404 when the issue does not exist in Triage/', async () => {
     const res = await fetch(`${server.url}/api/v1/issues/does-not-exist/approve`, {
       method: 'POST',
