@@ -73,6 +73,33 @@ workspace:
   root: ./.symphony/workspaces
 
 # ─────────────────────────────────────────────────────────────────────────────
+# logs — per-issue JSONL run logs (everything to/from the VM, plus hooks).
+#
+# One file per issue at `<root>/<sanitized-identifier>.jsonl`, appended across
+# attempts AND across symphony process restarts. Each line is a self-describing
+# JSON object with `ts`, `issue_id`, `attempt`, and a `channel` discriminator:
+#
+#   channel: "acp"     — JSON-RPC frame between host and the in-VM adapter.
+#                        `direction` ("host_to_vm" | "vm_to_host") and `frame`
+#                        (parsed JSON) — or `kind: "unparseable"` + `raw`.
+#   channel: "stderr"  — raw byte chunk from the adapter / VM stderr.
+#   channel: "hook"    — stdout/stderr chunk from a host-side hook, plus a final
+#                        `kind: "result"` line (exit_code, signal, timed_out).
+#                        `hook` field names which hook: after_create | before_run
+#                        | after_run | before_remove.
+#   channel: "system"  — orchestrator lifecycle events (attempt_started,
+#                        attempt_ended, reconciliation_terminating, etc.).
+#
+# Intended for later evaluation — typically by another agent running inside a VM
+# — so the schema is verbose on purpose. Writes are best-effort: a failure to
+# write a log line never crashes the orchestrator.
+# ─────────────────────────────────────────────────────────────────────────────
+logs:
+  # root (path): directory holding per-issue JSONL files.
+  # Default: ./.symphony/logs
+  root: ./.symphony/logs
+
+# ─────────────────────────────────────────────────────────────────────────────
 # hooks — shell scripts the orchestrator runs at workspace lifecycle points.
 #
 # All hooks run on the HOST (not inside the VM), with cwd set to the per-issue
@@ -151,11 +178,13 @@ acp:
   #   codex    — codex-acp;        stages ~/.codex/auth.json
   adapter: claude
 
-  # command (string | null): optional shell override. When set, replaces the
-  # auto-generated launch command and OPTS OUT of credential staging — you
-  # become responsible for placing whatever credentials the adapter needs.
-  # Leave null for the supported zero-config flow. Default: null.
-  command: null
+  # NOTE: `acp.command` is intentionally not part of the TCP bridge contract. Under the
+  # bridge transport every launch must exec the in-VM proxy (`/opt/symphony/vm-agent.mjs`)
+  # so it can dial the host's bridge listener with the per-dispatch bearer token. A raw
+  # `command` that execs the adapter directly never authenticates, so the bridge waits
+  # the full `connect_timeout_ms` and the attempt fails. For custom behavior fork
+  # `scripts/vm-agent.js` and rebuild the image via `scripts/build-vm.sh`. Setting
+  # acp.command in WORKFLOW.md is rejected by validateDispatch at startup.
 
   # shell (string): shell used to run the ACP launch command. Default: 'bash'.
   shell: bash
@@ -172,6 +201,38 @@ acp:
   # stall_timeout_ms (int): max time the adapter can be idle (no events) before
   # the turn is killed and retried. Default: 300000
   stall_timeout_ms: 300000
+
+  # bridge — host-side TCP listener the in-VM proxy dials back to for ACP traffic.
+  #
+  # This replaced the old smolvm-exec stdio path. Symphony writes ACP JSON-RPC frames
+  # onto an authenticated TCP socket; the in-VM proxy (`/opt/symphony/vm-agent.mjs`)
+  # spawns the adapter via `child_process.spawn` with kernel pipes and bridges the
+  # socket to the adapter's stdio. This decouples symphony from any particular
+  # sandbox's stdio quirks — any sandbox that can launch a process with env vars and
+  # reach the host loopback works unchanged.
+  bridge:
+    # bind_host (string): host symphony binds the listener on. 0.0.0.0 allows any
+    # in-VM interface to reach the host loopback (smolvm remaps guest loopback to
+    # host loopback transparently). Default: 0.0.0.0
+    bind_host: 0.0.0.0
+
+    # bind_port (int): port symphony binds the listener on. 0 picks an ephemeral
+    # port (used port surfaces via the in-VM SYMPHONY_ACP_URL env var). Default: 8788
+    bind_port: 8788
+
+    # reach_host (string): host the in-VM proxy dials back to. For smolvm this is
+    # 127.0.0.1 because the guest loopback hits the host loopback. Other sandboxes
+    # may need a different alias. Default: 127.0.0.1
+    reach_host: 127.0.0.1
+
+    # reach_url (string|null): full URL override for the in-VM proxy's dial
+    # destination, e.g. through a reverse proxy or different scheme. When null,
+    # symphony constructs `tcp://<reach_host>:<bind_port>`. Default: null
+    # reach_url: null
+
+    # connect_timeout_ms (int): how long to wait for the in-VM proxy to connect after
+    # the sandbox is launched, before failing the attempt. Default: 30000
+    connect_timeout_ms: 30000
 
 # ─────────────────────────────────────────────────────────────────────────────
 # smolvm — microVM execution environment.

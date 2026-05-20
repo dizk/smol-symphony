@@ -15,6 +15,7 @@ import { AgentRunner } from '../agent/runner.js';
 import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
+import { AcpBridge } from '../acp-bridge.js';
 import { log } from '../logging.js';
 
 interface Cli {
@@ -94,6 +95,10 @@ async function main() {
   // gate behavior on cfg.mcp.enabled at runtime; an inactive registry holds no entries
   // and answers all routes with "not active."
   const mcp = new McpRegistry(tracker, { terminalStates: config.tracker.terminal_states });
+  // ACP transport. The bridge listens on a TCP port for the in-VM agent's dial-back,
+  // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
+  // bind failure surfaces before we accept any dispatches.
+  const acpBridge = new AcpBridge();
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
@@ -116,6 +121,7 @@ async function main() {
         }),
     },
     mcp,
+    acpBridge,
   );
   orch = new Orchestrator(config, definition, src, tracker, workspaces, runner);
 
@@ -130,6 +136,18 @@ async function main() {
     mcp.updateTerminalStates(cfg.tracker.terminal_states);
     liveCfg = cfg;
   });
+
+  // Start the ACP TCP bridge BEFORE accepting any dispatches. A bind failure here is
+  // fatal — we cannot run agents without their transport.
+  try {
+    await acpBridge.start(config.acp.bridge.bind_host, config.acp.bridge.bind_port);
+  } catch (err) {
+    process.stderr.write(
+      `error: failed to bind ACP bridge on ${config.acp.bridge.bind_host}:${config.acp.bridge.bind_port}: ${(err as Error).message}\n`,
+    );
+    await src.stop().catch(() => undefined);
+    process.exit(1);
+  }
 
   let http: { close: () => Promise<void>; port: number } | null = null;
   const httpPort = cli.port ?? config.server.port;
@@ -216,6 +234,7 @@ async function main() {
   const shutdown = async (signal: string) => {
     log.info('shutdown requested', { signal });
     await orch.stop();
+    await acpBridge.stop().catch(() => undefined);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
     process.exit(0);

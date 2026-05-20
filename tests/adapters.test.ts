@@ -55,7 +55,9 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
       from: null,
       cpus: 1,
       mem_mib: 256,
-      net: false,
+      // The TCP bridge needs the VM to reach the host listener; validateDispatch refuses
+      // `net: false` under the bridge transport.
+      net: true,
       bin_path: null,
       volumes: [],
       forward_env: [],
@@ -84,18 +86,28 @@ describe('adapters registry', () => {
     assert.equal(isKnownAdapter(''), false);
   });
 
-  it('deriveAcpCommand emits a copy-then-exec pipeline using the supplied staged path', () => {
+  it('deriveAcpCommand emits a scrub-copy-proxy pipeline using the supplied staged path', () => {
     const cmd = deriveAcpCommand(ADAPTERS.claude, '.git/symphony-runtime/credentials/claude');
-    assert.match(cmd, /mkdir -p \/root\/\.claude/);
+    // Scrub MUST come before mkdir+cp so any state baked into the VM image (e.g. from
+    // `claude --version` running during the build's verification step) is gone before we
+    // re-stage.
+    assert.match(cmd, /^rm -rf \/root\/\.claude && mkdir -p \/root\/\.claude/);
     assert.match(cmd, /cp \.git\/symphony-runtime\/credentials\/claude \/root\/\.claude\/\.credentials\.json/);
     assert.match(cmd, /chmod 600 \/root\/\.claude\/\.credentials\.json/);
-    assert.match(cmd, /exec claude-agent-acp$/);
+    // The adapter is launched indirectly via the in-VM proxy. The proxy reads its config
+    // (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from the environment symphony
+    // sets on the `smolvm exec` invocation — NOT inline in the bash command — so the
+    // command itself is identical across adapters and avoids leaking the per-dispatch
+    // token into `ps`-visible argv.
+    assert.match(cmd, /exec node \/opt\/symphony\/vm-agent\.mjs$/);
+    assert.doesNotMatch(cmd, /SYMPHONY_/);
   });
 
-  it('deriveAcpCommand for codex points at codex paths', () => {
+  it('deriveAcpCommand for codex scrubs codex state dir then execs the same proxy', () => {
     const cmd = deriveAcpCommand(ADAPTERS.codex, '.git/symphony-runtime/credentials/codex');
+    assert.match(cmd, /^rm -rf \/root\/\.codex && mkdir -p \/root\/\.codex/);
     assert.match(cmd, /cp \.git\/symphony-runtime\/credentials\/codex \/root\/\.codex\/auth\.json/);
-    assert.match(cmd, /exec codex-acp$/);
+    assert.match(cmd, /exec node \/opt\/symphony\/vm-agent\.mjs$/);
   });
 
   it('deriveAcpCommand quotes every binary token (no shell injection via profile)', () => {
@@ -107,9 +119,13 @@ describe('adapters registry', () => {
       binary: ['opencode', 'acp', '; rm -rf /'] as const,
     };
     const cmd = deriveAcpCommand(evil, '.git/symphony-runtime/credentials/claude');
-    // Each token shows up single-quoted; the destructive payload cannot escape.
-    assert.match(cmd, /exec opencode acp '; rm -rf \/'$/);
-    assert.ok(!/exec.*&&.*rm -rf/.test(cmd));
+    // The adapter binary + args don't appear in the bash command at all under the TCP
+    // architecture — they're passed via env on the smolvm-exec call, where the values
+    // are argv to `smolvm` rather than substituted into a shell. The command must end
+    // exactly at the proxy exec; nothing the profile contributes lands in the shell.
+    assert.match(cmd, /exec node \/opt\/symphony\/vm-agent\.mjs$/);
+    assert.doesNotMatch(cmd, /opencode/);
+    assert.doesNotMatch(cmd, /rm -rf \/'/);
   });
 
   it('deriveAcpCommand throws on an empty binary vector', () => {
@@ -418,7 +434,7 @@ describe('validateDispatch + acp.command', () => {
     });
   });
 
-  it('rejects when acp.command is null and adapter is unknown', async () => {
+  it('rejects when adapter is unknown', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
       const cfg = bareCfg({ adapter: 'opencode', command: null });
@@ -426,30 +442,39 @@ describe('validateDispatch + acp.command', () => {
       const err = validateDispatch(cfg);
       assert.ok(err, 'expected validation error');
       assert.match(err!, /opencode/);
-      assert.match(err!, /set acp\.command to override/);
+      assert.match(err!, /known profile/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('passes when acp.command is set for an unknown adapter (override path)', async () => {
+  it('rejects smolvm.net=false (in-VM proxy must reach the bridge)', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
-      const cfg = bareCfg({ adapter: 'opencode', command: 'opencode acp' });
+      const cfg = bareCfg({ adapter: 'claude', command: null });
       cfg.tracker.root = root;
-      assert.equal(validateDispatch(cfg), null);
+      cfg.smolvm.net = false;
+      const err = validateDispatch(cfg);
+      assert.ok(err, 'expected validation error');
+      assert.match(err!, /smolvm\.net=false is incompatible/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('rejects empty acp.command when explicitly set', async () => {
+  it('rejects any acp.command override (incompatible with TCP bridge)', async () => {
+    // acp.command was a pre-bridge escape hatch. Under the bridge architecture the launch
+    // shape is fixed (the in-VM proxy must dial back), so a raw command that execs the
+    // adapter directly would wedge attempts forever. validateDispatch now refuses outright
+    // with a message pointing operators at the in-VM proxy script for customization.
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
-      const cfg = bareCfg({ adapter: 'claude', command: '   ' });
+      const cfg = bareCfg({ adapter: 'claude', command: 'claude-agent-acp' });
       cfg.tracker.root = root;
       const err = validateDispatch(cfg);
-      assert.match(err ?? '', /acp\.command must be non-empty when set/);
+      assert.ok(err, 'expected validation error');
+      assert.match(err!, /acp\.command is not supported/);
+      assert.match(err!, /vm-agent\.js/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

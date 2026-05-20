@@ -20,8 +20,9 @@ import { pickTerminalTarget } from './mcp.js';
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
 // snapshot endpoint can attach whatever shape a future ACP `_meta` extension produces.
 type JsonValue = unknown;
-import type { WorkspaceManager } from './workspace.js';
+import type { WorkspaceManager, HookCapture, HookResult } from './workspace.js';
 import { withIssue, log } from './logging.js';
+import { openRunLog, type RunLog } from './runlog.js';
 
 export interface Snapshot {
   generated_at: string;
@@ -70,6 +71,16 @@ export class Orchestrator {
   private claimed = new Set<string>();
   private retryAttempts = new Map<string, RetryEntry>();
   private completed = new Set<string>();
+  // Per-issue JSONL run log. Opened lazily on first dispatch for an issue, kept open across
+  // retries so the file is one chronological stream per issue, and closed only when the
+  // issue finally unwinds (terminal cleanup, claim release without redispatch, or stop()).
+  private runLogs = new Map<string, RunLog>();
+  // Set of issue ids whose terminal cleanup (workspaces.remove + before_remove hook) is
+  // still in flight. Used by closeRunLog to defer the close until the cleanup hook
+  // capture has stopped writing; otherwise the retry-timer's "claim released" close fires
+  // ~1s after worker exit (before the hook finishes) and we'd lose the cleanup hook lines
+  // in the JSONL log.
+  private cleanupInFlight = new Set<string>();
   private codexTotals: CodexTotals = {
     input_tokens: 0,
     output_tokens: 0,
@@ -152,6 +163,14 @@ export class Orchestrator {
     for (const e of this.running.values()) e.cancel();
     this.running.clear();
     this.claimed.clear();
+    // Drain every open run log so the JSONL files are flushed before exit.
+    const closures: Promise<void>[] = [];
+    for (const [issueId, rl] of this.runLogs) {
+      rl.system('runlog_closed', { reason: 'orchestrator_stopped' });
+      closures.push(rl.close());
+      this.runLogs.delete(issueId);
+    }
+    await Promise.all(closures);
   }
 
   /** Operator trigger for an immediate poll cycle (§13.7 /refresh). */
@@ -276,6 +295,10 @@ export class Orchestrator {
     if (!entry) return;
     if (cleanupWorkspace) entry.cleanup_workspace_on_exit = true;
     entry.cancel();
+    this.runLogs.get(issueId)?.system('reconciliation_terminating', {
+      reason,
+      cleanup_workspace: cleanupWorkspace,
+    });
     log.info('reconciliation terminating run', {
       issue_id: issueId,
       issue_identifier: entry.identifier,
@@ -404,8 +427,62 @@ export class Orchestrator {
     };
     this.running.set(issue.id, entry);
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
+    const runLog = this.ensureRunLog(issue.id, issue.identifier);
+    if (runLog) {
+      runLog.setAttempt(attempt ?? 0);
+      runLog.system('attempt_started', {
+        attempt: attempt ?? 0,
+        issue_state: issue.state,
+        issue_title: issue.title,
+        workspace_path: workspacePath,
+        tracker_root: trackerRootAtDispatch,
+        terminal_target: terminalTargetAtDispatch,
+      });
+    }
     logger.info('agent attempt started', { attempt });
-    void this.runWorker(issue, attempt, entry, cancel);
+    void this.runWorker(issue, attempt, entry, cancel, runLog);
+  }
+
+  /**
+   * Open (or return the existing) per-issue run log. Returns `undefined` only when log file
+   * opening throws — symphony should keep running even if logs can't be persisted, so the
+   * runner sees `undefined` and behaves exactly as before.
+   *
+   * `issueId` (tracker primary key) is stamped on every line and is the map key so the
+   * lifecycle survives identifier collisions or renames; `identifier` derives the filename.
+   */
+  private ensureRunLog(issueId: string, identifier: string): RunLog | undefined {
+    const existing = this.runLogs.get(issueId);
+    if (existing) return existing;
+    try {
+      const rl = openRunLog(this.cfg.logs.root, issueId, identifier);
+      this.runLogs.set(issueId, rl);
+      return rl;
+    } catch (err) {
+      log.warn('runlog open failed; continuing without run log', {
+        issue_id: issueId,
+        issue_identifier: identifier,
+        error: (err as Error).message,
+      });
+      return undefined;
+    }
+  }
+
+  private closeRunLog(
+    issueId: string,
+    fields?: Record<string, unknown>,
+    opts: { viaCleanup?: boolean } = {},
+  ): void {
+    // If a terminal cleanup (`workspaces.remove`) is mid-flight for this issue, the
+    // before_remove hook capture is still writing to the run log. Closing the log here
+    // would truncate those lines on disk. Defer until the cleanup's .finally fires the
+    // close with `viaCleanup: true`.
+    if (!opts.viaCleanup && this.cleanupInFlight.has(issueId)) return;
+    const rl = this.runLogs.get(issueId);
+    if (!rl) return;
+    if (fields) rl.system('runlog_closed', fields);
+    this.runLogs.delete(issueId);
+    void rl.close();
   }
 
   private async runWorker(
@@ -413,14 +490,17 @@ export class Orchestrator {
     attempt: number | null,
     entry: RunningEntry,
     cancelSignal: { cancelled: boolean },
+    runLog: RunLog | undefined,
   ): Promise<void> {
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
     let ok = false;
     let reason = 'unknown';
+    let turnsCompleted = 0;
     try {
-      const result = await this.runner.runAttempt(issue, attempt, cancelSignal, entry);
+      const result = await this.runner.runAttempt(issue, attempt, cancelSignal, entry, runLog);
       ok = result.ok;
       reason = result.reason;
+      turnsCompleted = result.turnsCompleted;
       if (result.threadId) entry.thread_id = result.threadId;
       entry.turn_count = result.turnsCompleted;
     } catch (err) {
@@ -428,6 +508,7 @@ export class Orchestrator {
       reason = (err as Error).message;
       logger.error('worker threw', { error: reason });
     }
+    runLog?.system('attempt_ended', { ok, reason, turns_completed: turnsCompleted });
     this.onWorkerExit(issue.id, ok, reason, entry);
   }
 
@@ -444,18 +525,44 @@ export class Orchestrator {
     if (entry.cleanup_workspace_on_exit) {
       // Workspace removal is deferred until the worker has fully unwound (including
       // after_run hook execution) so we never delete the dir while the agent is still
-      // inside it.
+      // inside it. The before_remove hook runs inside `workspaces.remove` and is mirrored
+      // into the per-issue run log via the same HookCapture pattern as the in-attempt hooks.
+      const runLog = this.runLogs.get(issueId);
+      const capture: HookCapture | undefined = runLog
+        ? {
+            onChunk: (stream, text) =>
+              runLog.record({ channel: 'hook', hook: 'before_remove', stream, text }),
+            onResult: (r: HookResult) =>
+              runLog.record({
+                channel: 'hook',
+                hook: 'before_remove',
+                kind: 'result',
+                exit_code: r.exit_code,
+                signal: r.signal,
+                timed_out: r.timed_out,
+              }),
+          }
+        : undefined;
+      this.cleanupInFlight.add(issueId);
       this.workspaces
-        .remove(entry.identifier, this.cfg.hooks)
+        .remove(entry.identifier, this.cfg.hooks, capture)
         .catch((err) =>
           logger.warn('workspace removal failed', { error: (err as Error).message }),
-        );
+        )
+        .finally(() => {
+          // Issue is in a terminal state; close the log so the file handle is released.
+          // Pass `viaCleanup: true` so the close goes through even though
+          // `cleanupInFlight` is still set for this issueId — we clear it right after.
+          this.cleanupInFlight.delete(issueId);
+          this.closeRunLog(issueId, { reason: 'cleanup_on_exit' }, { viaCleanup: true });
+        });
     }
 
     // §14.2: if the service was stopped while this worker was unwinding, do not schedule
     // a new retry — that would leave a live timer behind even though stop() was called.
     if (this.stopped) {
       this.claimed.delete(issueId);
+      // stop() also closes any open run logs; do nothing more here.
       return;
     }
 
@@ -541,6 +648,7 @@ export class Orchestrator {
         issue_id: issueId,
         issue_identifier: entry.identifier,
       });
+      this.closeRunLog(issueId, { reason: 'claim_released_not_in_candidates' });
       return;
     }
     // Re-apply full candidate eligibility, ignoring this issue's own claim. This catches
@@ -568,6 +676,7 @@ export class Orchestrator {
         issue_identifier: entry.identifier,
         reason,
       });
+      this.closeRunLog(issueId, { reason: `claim_released_ineligible:${reason}` });
       return;
     }
     void this.dispatchIssue(issue, entry.attempt, {

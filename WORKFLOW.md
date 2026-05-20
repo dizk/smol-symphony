@@ -37,6 +37,14 @@ polling:
 workspace:
   root: ./.symphony/workspaces
 
+# Per-issue JSONL run logs. One file per issue, appended across attempts and
+# process restarts. Captures every ACP JSON-RPC frame to/from the VM, raw
+# adapter stderr, host-side hook output, and orchestrator lifecycle events —
+# intended for later evaluation by another agent. See WORKFLOW.template.md
+# for the full schema.
+logs:
+  root: ./.symphony/logs
+
 hooks:
   timeout_ms: 120000
 
@@ -171,12 +179,26 @@ acp:
   # Selecting "claude" is enough: symphony reads ~/.claude/.credentials.json on
   # the host, stages a copy into the workspace's runtime dir, and auto-generates
   # a launch command that places the file at the adapter's expected path inside
-  # the VM before exec'ing claude-agent-acp. Set `command` only to override.
+  # the VM before exec'ing the in-VM proxy. There is no `command` escape hatch
+  # under the TCP bridge transport — the launch shape is fixed; fork
+  # scripts/vm-agent.js if you need to customize what the proxy spawns.
   adapter: claude
   shell: bash
   prompt_timeout_ms: 1800000
   read_timeout_ms: 30000
-  stall_timeout_ms: 300000
+  # ACP TCP bridge. Symphony binds a listener on `bridge.bind_host:bind_port`; the in-VM
+  # proxy (`/opt/symphony/vm-agent.mjs`) dials `bridge.reach_host:bind_port` on startup
+  # and authenticates with a per-dispatch bearer token. This replaced the smolvm-exec
+  # stdio path so symphony is not coupled to any particular sandbox's stdio quirks.
+  bridge:
+    bind_host: 0.0.0.0
+    bind_port: 8788
+    reach_host: 127.0.0.1
+  # Time between any ACP event from the adapter before symphony kills the attempt as stalled.
+  # Raised from the 5-minute default because Opus 4.7 at effort=xhigh can take many minutes to
+  # produce its first thought chunk on a heavy prompt. If a real wedge happens, attempts will
+  # die at this longer threshold; if the agent is just thinking, we let it finish.
+  stall_timeout_ms: 1800000
 
 smolvm:
   from: ./.vm/symphony.smolmachine.smolmachine

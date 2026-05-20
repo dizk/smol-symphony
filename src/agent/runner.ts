@@ -26,6 +26,10 @@ import {
 import type { McpRegistry } from '../mcp.js';
 import { withIssue } from '../logging.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
+import type { RunLog } from '../runlog.js';
+import type { HookCapture, HookResult } from '../workspace.js';
+import type { AcpBridge } from '../acp-bridge.js';
+import type { Socket } from 'node:net';
 
 export interface AgentRunnerEvents {
   onSessionStarted?: (info: {
@@ -87,7 +91,16 @@ export class AgentRunner {
     private smolvm: SmolvmClient,
     private events: AgentRunnerEvents,
     private mcp: McpRegistry | null = null,
+    /**
+     * Host-side TCP bridge the in-VM agent dials back to for ACP traffic. Replaced the
+     * smolvm-exec stdio path; required at runtime — runAttempt fails fast if absent.
+     */
+    private acpBridge: AcpBridge | null = null,
   ) {}
+
+  setAcpBridge(bridge: AcpBridge | null): void {
+    this.acpBridge = bridge;
+  }
 
   updateConfig(cfg: ServiceConfig, workflow: WorkflowDefinition): void {
     this.cfg = cfg;
@@ -107,53 +120,79 @@ export class AgentRunner {
     attempt: number | null,
     cancelSignal: { cancelled: boolean },
     runningEntry?: RunningEntry,
+    runLog?: RunLog,
   ): Promise<RunAttemptResult> {
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
+    const hookCapture = (hook: string): HookCapture | undefined =>
+      runLog
+        ? {
+            onChunk: (stream, text) => runLog.record({ channel: 'hook', hook, stream, text }),
+            onResult: (r: HookResult) =>
+              runLog.record({
+                channel: 'hook',
+                hook,
+                kind: 'result',
+                exit_code: r.exit_code,
+                signal: r.signal,
+                timed_out: r.timed_out,
+              }),
+          }
+        : undefined;
     let workspace: Awaited<ReturnType<WorkspaceManager['ensureFor']>>;
     try {
-      workspace = await this.workspaces.ensureFor(issue.identifier);
+      workspace = await this.workspaces.ensureFor(issue.identifier, hookCapture('after_create'));
     } catch (err) {
       logger.error('workspace error', { error: (err as Error).message });
       return { ok: false, reason: 'workspace error', threadId: null, turnsCompleted: 0 };
     }
 
     try {
-      await this.workspaces.runBeforeRun(workspace.path, this.cfg.hooks);
+      await this.workspaces.runBeforeRun(workspace.path, this.cfg.hooks, hookCapture('before_run'));
     } catch (err) {
       logger.error('before_run hook failed', { error: (err as Error).message });
       return { ok: false, reason: 'before_run hook error', threadId: null, turnsCompleted: 0 };
     }
 
-    // Resolve which adapter binary to launch and how to feed it credentials. Two
-    // paths:
-    //   1. acp.command is set in WORKFLOW.md → use it verbatim (operator owns
-    //      credential handling; symphony stays out of the way).
-    //   2. acp.command is null → look up the adapter profile, stage the host
-    //      credential into the workspace, and synthesize a launch command that
-    //      copies the cred into the adapter's expected location and exec's the
-    //      adapter binary.
-    let effectiveAcpCommand: string;
-    if (this.cfg.acp.command !== null) {
-      effectiveAcpCommand = this.cfg.acp.command;
-    } else if (isKnownAdapter(this.cfg.acp.adapter)) {
-      const profile = ADAPTERS[this.cfg.acp.adapter as AcpAdapterId];
-      let staged;
-      try {
-        staged = await stageCredential(workspace.path, profile);
-      } catch (err) {
-        logger.error('credential staging failed', {
-          adapter: profile.id,
-          error: (err as Error).message,
-        });
-        await this.workspaces.runAfterRunBestEffort(workspace.path, this.cfg.hooks);
-        return { ok: false, reason: 'credential staging error', threadId: null, turnsCompleted: 0 };
-      }
-      effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath);
-    } else {
-      // validateDispatch should have caught this, but defend in depth.
-      logger.error('no acp launch path', { adapter: this.cfg.acp.adapter });
-      return { ok: false, reason: 'no acp launch path configured', threadId: null, turnsCompleted: 0 };
+    // Resolve adapter launch. Under the TCP bridge architecture there is exactly one
+    // launch shape: scrub the in-VM credential dir, stage the host credential into the
+    // workspace, exec the in-VM proxy at /opt/symphony/vm-agent.mjs. The proxy reads its
+    // config (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from env, dials the
+    // host's bridge, and spawns the adapter. validateDispatch already rejected unknown
+    // adapters and any `acp.command` override; the branches below are pure data binding.
+    if (!isKnownAdapter(this.cfg.acp.adapter)) {
+      // Should be unreachable after validateDispatch; defend in depth.
+      logger.error('unknown acp adapter', { adapter: this.cfg.acp.adapter });
+      return { ok: false, reason: 'unknown acp adapter', threadId: null, turnsCompleted: 0 };
     }
+    const profile = ADAPTERS[this.cfg.acp.adapter as AcpAdapterId];
+    let staged;
+    try {
+      staged = await stageCredential(workspace.path, profile);
+    } catch (err) {
+      logger.error('credential staging failed', {
+        adapter: profile.id,
+        error: (err as Error).message,
+      });
+      await this.workspaces.runAfterRunBestEffort(
+        workspace.path,
+        this.cfg.hooks,
+        hookCapture('after_run'),
+      );
+      return { ok: false, reason: 'credential staging error', threadId: null, turnsCompleted: 0 };
+    }
+    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath);
+    const adapterBin = profile.binary[0]!;
+    const adapterArgs = profile.binary.slice(1);
+
+    // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
+    // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
+    if (!this.acpBridge) {
+      logger.error('acp bridge is not configured', {});
+      return { ok: false, reason: 'acp bridge unavailable', threadId: null, turnsCompleted: 0 };
+    }
+    const acpReachUrl =
+      this.cfg.acp.bridge.reach_url ??
+      `tcp://${this.cfg.acp.bridge.reach_host}:${this.acpBridge.port() ?? this.cfg.acp.bridge.bind_port}`;
 
     const vmName = this.vmNameFor(issue);
     const mounts = [
@@ -171,6 +210,13 @@ export class AgentRunner {
       if (v && v.length > 0) env[k] = v;
     }
 
+    // Bring up the VM BEFORE registering with the ACP bridge. If we registered first and
+    // ensureRunning then threw, the catch path would call `bridgeReg.cancel(...)` which
+    // synchronously rejects the registration's `accepted` promise — and at that point no
+    // .catch handler is attached yet (the awaiter is wired further below). The resulting
+    // unhandled-rejection crashes the orchestrator (Node ≥ 15 default). Registering after
+    // a successful bring-up makes the cancel path moot for that early failure.
+    let vmReady = false;
     try {
       await this.smolvm.ensureRunning(vmName, {
         image: this.cfg.smolvm.image,
@@ -183,20 +229,109 @@ export class AgentRunner {
         workdir: workspace.path,
         sshAgent: false,
       });
+      vmReady = true;
     } catch (err) {
       logger.error('smolvm bring-up failed', { error: (err as Error).message });
-      await this.workspaces.runAfterRunBestEffort(workspace.path, this.cfg.hooks);
+      // ensureRunning can fail after `machine create` succeeded but before `machine start`
+      // — leaving a halted VM behind. Attempt a destroy so we don't leak it. No bridge
+      // registration exists yet (intentional ordering); nothing else to cancel.
+      runLog?.system('vm_destroy', { vm: vmName, reason: 'bring_up_failed' });
+      await this.smolvm.destroy(vmName);
+      await this.workspaces.runAfterRunBestEffort(
+        workspace.path,
+        this.cfg.hooks,
+        hookCapture('after_run'),
+      );
       return { ok: false, reason: 'smolvm bring-up error', threadId: null, turnsCompleted: 0 };
+    }
+
+    // VM is up — now register with the bridge. The .accepted promise will get its
+    // rejection handler attached when we Promise.race against it below; that
+    // continuation is created within the same synchronous block so no failure path
+    // between here and there can crash on an unhandled rejection.
+    //
+    // register() throws synchronously if the bridge has already been stopped (e.g. a
+    // SIGTERM landed between ensureRunning resolving and this line). The VM is up at
+    // that point, so we must tear it down here — the cleanup closure that handles
+    // post-handshake failures isn't built yet.
+    let bridgeReg: ReturnType<AcpBridge['register']>;
+    try {
+      bridgeReg = this.acpBridge.register(issue.id, issue.identifier);
+    } catch (err) {
+      logger.error('acp bridge register failed', { error: (err as Error).message });
+      runLog?.system('vm_destroy', { vm: vmName, reason: 'bridge_register_failed' });
+      await this.smolvm.destroy(vmName);
+      await this.workspaces.runAfterRunBestEffort(
+        workspace.path,
+        this.cfg.hooks,
+        hookCapture('after_run'),
+      );
+      return {
+        ok: false,
+        reason: 'acp bridge register failed',
+        threadId: null,
+        turnsCompleted: 0,
+      };
     }
 
     const execStream = this.smolvm.execInteractive(vmName, {
       command: [this.cfg.acp.shell, '-lc', effectiveAcpCommand],
       workdir: workspace.path,
-      env: {},
+      // The in-VM proxy (`vm-agent.mjs`) reads these to know where to dial back and what
+      // adapter to spawn. The bearer token is a per-dispatch secret so it cannot survive
+      // the attempt; visible via `ps` on the host but the host is trusted.
+      env: {
+        SYMPHONY_ACP_URL: acpReachUrl,
+        SYMPHONY_ACP_TOKEN: bridgeReg.token,
+        SYMPHONY_ADAPTER_BIN: adapterBin,
+        SYMPHONY_ADAPTER_ARGS: JSON.stringify(adapterArgs),
+      },
       timeoutMs: null,
     });
 
+    // We do NOT use execStream.stdin/.stdout for ACP frames anymore — those flow over the
+    // bridge socket once the in-VM agent dials back. The exec channel just carries
+    // diagnostic stderr (vm-agent's own logs + the inherited adapter stderr) and acts as
+    // a process tether so we can kill the in-VM agent by closing the exec.
+    execStream.stdin.end();
+
+    // Attach the stderr tap NOW — before we await the bridge handshake — so any
+    // pre-connect crash (vm-agent missing, malformed env, adapter that exits during
+    // startup) lands in the per-issue run log and the orchestrator's event ring. AcpClient
+    // no longer reads stderr; this is the single, always-on source. The same listener
+    // stays attached for the duration of the attempt and continues capturing post-connect
+    // stderr (e.g. claude-agent-acp warnings).
+    execStream.stderr.setEncoding('utf8');
+    execStream.stderr.on('data', (chunk: string) => {
+      // Always mirror the raw chunk into the run log so the evaluator sees adapter output
+      // byte-for-byte, even if it is only whitespace.
+      runLog?.record({ channel: 'stderr', text: chunk });
+      const text = chunk.trim();
+      if (text.length === 0) return;
+      // Push into the orchestrator's per-issue ring + symphony log. Truncate the symphony
+      // log line so a chatty adapter (claude-agent-acp's "No onPostToolUseHook found …"
+      // warnings, for example) doesn't dominate the host stderr stream.
+      this.events.onRuntimeEvent(issue.id, {
+        at: new Date().toISOString(),
+        event: 'agent_stderr',
+        message: text.length > 240 ? text.slice(0, 240) + '…' : text,
+      });
+      logger.info('agent stderr', { text: text.slice(0, 500) });
+    });
+
+    // The socket the bridge accepts becomes AcpClient's stdin AND stdout. We keep a
+    // reference so cleanup can close it even on partial failure.
+    let acpSocket: Socket | null = null;
+
     const cleanup = async (reason: string) => {
+      // Cancel the bridge registration if the in-VM agent never connected. Idempotent on
+      // success (already-resolved registrations ignore cancel).
+      bridgeReg.cancel(reason);
+      try {
+        if (acpSocket && !acpSocket.destroyed) acpSocket.destroy();
+      } catch {
+        /* ignore */
+      }
       try {
         execStream.kill();
       } catch {
@@ -211,8 +346,42 @@ export class AgentRunner {
         this.mcp.deactivate(runningEntry.identifier);
       }
       logger.debug('agent runner cleanup', { reason });
-      await this.workspaces.runAfterRunBestEffort(workspace.path, this.cfg.hooks);
+      await this.workspaces.runAfterRunBestEffort(
+        workspace.path,
+        this.cfg.hooks,
+        hookCapture('after_run'),
+      );
+      // Per the agreed lifecycle, every attempt gets a fresh VM. Destroy is best-effort:
+      // smolvm.destroy already swallows errors and logs at warn, so a stuck/lost VM here
+      // never aborts the attempt's return path. The next attempt's ensureRunning will
+      // notice the VM is absent and create a new one.
+      if (vmReady) {
+        runLog?.system('vm_destroy', { vm: vmName, reason });
+        await this.smolvm.destroy(vmName);
+      }
     };
+
+    // Wait for the in-VM agent to dial back and authenticate. We bound this with a config
+    // timeout because a stuck VM or misconfigured `reach_host` would otherwise hang the
+    // attempt until the orchestrator's stall timer fires much later. The exec process's
+    // stderr is captured separately so failures surface there for debugging.
+    try {
+      acpSocket = await Promise.race([
+        bridgeReg.accepted,
+        new Promise<Socket>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('acp bridge: in-VM agent did not connect in time')),
+            this.cfg.acp.bridge.connect_timeout_ms,
+          ),
+        ),
+      ]);
+      runLog?.system('acp_bridge_connected', { reach_url: acpReachUrl });
+    } catch (err) {
+      logger.error('acp bridge connect timeout', { error: (err as Error).message });
+      runLog?.system('acp_bridge_failed', { error: (err as Error).message });
+      await cleanup('acp_bridge_connect_failed');
+      return { ok: false, reason: 'acp bridge connect failed', threadId: null, turnsCompleted: 0 };
+    }
 
     const onCancel = () => {
       if (cancelSignal.cancelled) {
@@ -268,9 +437,14 @@ export class AgentRunner {
       logger.debug('mcp registered', { url });
     }
 
+    // ACP transport: bridge socket for stdin AND stdout (writes go through the same
+    // socket the in-VM agent reads from; reads come from the socket the agent writes to).
+    // Adapter stderr still flows via the smolvm-exec stderr channel (vm-agent inherits
+    // stderr from its parent, which is the smolvm exec), so symphony's LineTap on
+    // execStream.stderr keeps the per-issue JSONL log full-fidelity for stderr.
     const client = new AcpClient({
-      stdin: execStream.stdin,
-      stdout: execStream.stdout,
+      stdin: acpSocket,
+      stdout: acpSocket,
       stderr: execStream.stderr,
       cwd: workspace.path,
       readTimeoutMs: this.cfg.acp.read_timeout_ms,
@@ -278,6 +452,7 @@ export class AgentRunner {
       onEvent: (event) => this.events.onRuntimeEvent(issue.id, event),
       onTokenUsage: (u) => this.events.onTokenUsage(issue.id, u),
       mcpServers,
+      runLog,
     });
 
     let sessionId: string;

@@ -240,12 +240,17 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
     // lives outside the workspace mount, so symphony cannot place the credential
     // there and still have the in-VM agent reach it. Any worktree-internal path
     // is inside the working tree, where `.gitignore` negation or a tracked file
-    // could still expose the secret to `git add -A`. Refuse loudly; operators
-    // who need a worktree workspace must set acp.command and manage credentials
-    // themselves.
+    // could still expose the secret to `git add -A`.
+    //
+    // The previous error pointed operators at `acp.command` as the workaround, but
+    // the TCP bridge transport no longer accepts that override. Linked worktrees
+    // are currently unsupported under the bridge — use a non-linked workspace
+    // clone (e.g. `git clone --local`) or fork scripts/vm-agent.js to stage
+    // credentials in whatever shape your worktree layout needs.
     throw new Error(
       `cannot auto-stage credentials in a linked worktree (.git at ${gitPath} is a file). ` +
-        `Set acp.command explicitly and manage credentials in that command.`,
+        `Linked worktrees are unsupported under the ACP TCP bridge transport; use a ` +
+        `non-linked workspace clone or fork scripts/vm-agent.js.`,
     );
   }
   throw new Error(
@@ -316,14 +321,30 @@ async function ensureRealDir(p: string): Promise<void> {
 }
 
 /**
- * Build the bash command symphony will exec inside the VM. Copies the staged credential
- * (located at `stagedRelPath`, a POSIX path relative to the in-VM cwd which equals the
- * workspace mount) to the adapter's expected location, chmods it, and exec's the
- * adapter binary.
+ * Build the bash command symphony will exec inside the VM. Wipes the adapter's state
+ * directory, re-creates it, copies the staged credential (`stagedRelPath`, a POSIX path
+ * relative to the in-VM cwd which equals the workspace mount) into place, chmods it, and
+ * execs the in-VM proxy at `/opt/symphony/vm-agent.mjs`. The proxy reads its config —
+ * SYMPHONY_ACP_URL, SYMPHONY_ACP_TOKEN, SYMPHONY_ADAPTER_BIN, SYMPHONY_ADAPTER_ARGS —
+ * from the environment that symphony sets on the `smolvm exec` invocation, dials the
+ * host's TCP ACP bridge, and spawns the adapter with kernel pipes.
  *
- * Every interpolated value (binary tokens, paths) is run through shQuote so future
- * profiles with spaces or metacharacters compose safely. `stagedRelPath` comes from
- * `stageCredential`, which picks a path outside the working tree when git is present.
+ * Why TCP through a proxy: smolvm-exec's stdin pump does not reliably wake the in-VM
+ * reader for kernel events unless host stdin keeps writing. Piping ACP frames through
+ * smolvm-exec stdio caused the adapter to hang after the first session/update. The TCP
+ * bridge (see src/acp-bridge.ts) bypasses that pump entirely and decouples symphony from
+ * any specific sandbox tech — any sandbox that can launch a process with env vars and
+ * reach the host loopback can run this stack unchanged.
+ *
+ * Wiping `guestDir` (e.g. `/root/.claude` or `/root/.codex`) on every exec is defense in
+ * depth: the per-issue VM is destroyed after each attempt already, but a freshly-baked
+ * image may carry state from build verification steps (e.g. `claude --version` writes
+ * settings to /root/.claude). The scrub guarantees a clean slate. The VM's workspace
+ * mount is separate from `guestDir`, so this scrub never touches operator data.
+ *
+ * Every interpolated path is run through shQuote so future profiles with spaces or
+ * metacharacters compose safely. `stagedRelPath` comes from `stageCredential`, which
+ * picks a path outside the working tree when git is present.
  */
 export function deriveAcpCommand(profile: AdapterProfile, stagedRelPath: string): string {
   if (profile.binary.length === 0) {
@@ -331,12 +352,12 @@ export function deriveAcpCommand(profile: AdapterProfile, stagedRelPath: string)
   }
   const guestDir = path.posix.dirname(profile.guestCredentialPath);
   const guestPath = profile.guestCredentialPath;
-  const execCmd = profile.binary.map(shQuote).join(' ');
   return [
+    `rm -rf ${shQuote(guestDir)}`,
     `mkdir -p ${shQuote(guestDir)}`,
     `cp ${shQuote(stagedRelPath)} ${shQuote(guestPath)}`,
     `chmod 600 ${shQuote(guestPath)}`,
-    `exec ${execCmd}`,
+    `exec node /opt/symphony/vm-agent.mjs`,
   ].join(' && ');
 }
 

@@ -36,12 +36,14 @@
     "PRODUCT.md",
     "DESIGN.md",
     "scripts/build-vm.sh",
+    "scripts/vm-agent.js",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
     "start": "tsx src/bin/symphony.ts",
+    "symphony": "SYMPHONY_REPO=dizk/smol-symphony SYMPHONY_BASE_BRANCH=main tsx src/bin/symphony.ts WORKFLOW.md",
     "dev": "tsx watch src/bin/symphony.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test --import tsx tests/*.test.ts",

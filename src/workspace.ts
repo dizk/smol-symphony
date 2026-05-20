@@ -62,6 +62,15 @@ export interface HookResult {
   stderr: string;
 }
 
+// Optional streaming capture for hook execution. `onChunk` fires for every stdout/stderr
+// burst the hook produces; `onResult` fires once with the final outcome. The orchestrator
+// uses this to mirror hook output into the per-issue JSONL run log in real time. The
+// existing buffered stdout/stderr in HookResult is preserved for callers that don't care.
+export interface HookCapture {
+  onChunk?: (stream: 'stdout' | 'stderr', text: string) => void;
+  onResult?: (result: HookResult) => void;
+}
+
 // A hook failed when it timed out, exited with a non-zero status, or was terminated by a
 // signal. The signal-termination case is important — otherwise a fatal `before_run` script
 // that calls `kill -TERM $$` would look successful (exit_code=null, timed_out=false).
@@ -76,11 +85,13 @@ function hookFailureReason(res: HookResult): string {
 }
 
 // Execute a hook script (POSIX `sh -lc`). Returns result so callers can decide on failure
-// semantics (§9.4).
+// semantics (§9.4). Optional `capture` streams output in real time (used by per-issue JSONL
+// run logs) and reports the final result to the same callback.
 export async function runHookScript(
   script: string,
   cwd: string,
   timeoutMs: number,
+  capture?: HookCapture,
 ): Promise<HookResult> {
   return new Promise((resolve) => {
     const child = spawn('sh', ['-lc', script], {
@@ -92,24 +103,32 @@ export async function runHookScript(
     let stderr = '';
     let timedOut = false;
     child.stdout?.on('data', (b) => {
-      stdout += b.toString('utf8');
+      const text = b.toString('utf8');
+      stdout += text;
       if (stdout.length > 65_536) stdout = stdout.slice(0, 65_536);
+      capture?.onChunk?.('stdout', text);
     });
     child.stderr?.on('data', (b) => {
-      stderr += b.toString('utf8');
+      const text = b.toString('utf8');
+      stderr += text;
       if (stderr.length > 65_536) stderr = stderr.slice(0, 65_536);
+      capture?.onChunk?.('stderr', text);
     });
+    const finish = (result: HookResult) => {
+      capture?.onResult?.(result);
+      resolve(result);
+    };
     const t = setTimeout(() => {
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
     child.on('error', () => {
       clearTimeout(t);
-      resolve({ ran: true, exit_code: null, signal: null, timed_out: timedOut, stdout, stderr });
+      finish({ ran: true, exit_code: null, signal: null, timed_out: timedOut, stdout, stderr });
     });
     child.on('close', (code, signal) => {
       clearTimeout(t);
-      resolve({
+      finish({
         ran: true,
         exit_code: code,
         signal: signal ?? null,
@@ -137,7 +156,7 @@ export class WorkspaceManager {
   }
 
   // Ensure the per-issue workspace directory exists. Runs after_create when created_now.
-  async ensureFor(identifier: string): Promise<Workspace> {
+  async ensureFor(identifier: string, captureAfterCreate?: HookCapture): Promise<Workspace> {
     const workspaceRoot = this.cfg.workspace.root;
     await mkdir(workspaceRoot, { recursive: true });
     const wsPath = this.workspacePathFor(identifier);
@@ -175,6 +194,7 @@ export class WorkspaceManager {
         this.cfg.hooks.after_create,
         wsPath,
         this.cfg.hooks.timeout_ms,
+        captureAfterCreate,
       );
       if (hookFailed(res)) {
         // §9.4: after_create failure is fatal — also unwind the partially prepared directory.
@@ -198,22 +218,30 @@ export class WorkspaceManager {
   }
 
   // Run before_run; throw on failure/timeout (§9.4).
-  async runBeforeRun(workspacePath: string, hooks: HooksConfig): Promise<void> {
+  async runBeforeRun(workspacePath: string, hooks: HooksConfig, capture?: HookCapture): Promise<void> {
     if (!hooks.before_run) return;
-    const res = await runHookScript(hooks.before_run, workspacePath, hooks.timeout_ms);
+    const res = await runHookScript(hooks.before_run, workspacePath, hooks.timeout_ms, capture);
     if (hookFailed(res)) {
       throw new WorkspaceError('before_run_failed', `before_run hook ${hookFailureReason(res)}`);
     }
   }
 
   // Best-effort after_run hook (§9.4: failure logged and ignored — caller logs).
-  async runAfterRunBestEffort(workspacePath: string, hooks: HooksConfig): Promise<HookResult | null> {
+  async runAfterRunBestEffort(
+    workspacePath: string,
+    hooks: HooksConfig,
+    capture?: HookCapture,
+  ): Promise<HookResult | null> {
     if (!hooks.after_run) return null;
-    return runHookScript(hooks.after_run, workspacePath, hooks.timeout_ms);
+    return runHookScript(hooks.after_run, workspacePath, hooks.timeout_ms, capture);
   }
 
   // Best-effort before_remove + filesystem removal (§9.4).
-  async remove(identifier: string, hooks: HooksConfig): Promise<HookResult | null> {
+  async remove(
+    identifier: string,
+    hooks: HooksConfig,
+    capture?: HookCapture,
+  ): Promise<HookResult | null> {
     const wsPath = this.workspacePathFor(identifier);
     assertContained(this.cfg.workspace.root, wsPath);
     let hookResult: HookResult | null = null;
@@ -224,7 +252,7 @@ export class WorkspaceManager {
       return null;
     }
     if (hooks.before_remove) {
-      hookResult = await runHookScript(hooks.before_remove, wsPath, hooks.timeout_ms);
+      hookResult = await runHookScript(hooks.before_remove, wsPath, hooks.timeout_ms, capture);
     }
     await rm(wsPath, { recursive: true, force: true });
     return hookResult;

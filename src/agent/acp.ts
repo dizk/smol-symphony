@@ -14,7 +14,8 @@
 //   * exposes high-level methods `initSession()` and `runPrompt()` that the agent runner
 //     uses to drive one turn of work.
 
-import { Readable, Writable } from 'node:stream';
+import { Readable, Transform, type TransformCallback, Writable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import {
   ClientSideConnection,
   ndJsonStream,
@@ -47,6 +48,7 @@ import {
 } from '@agentclientprotocol/sdk';
 import type { RuntimeEvent } from '../types.js';
 import { log } from '../logging.js';
+import type { RunLog } from '../runlog.js';
 
 export interface AcpClientOptions {
   stdin: Writable;
@@ -59,6 +61,12 @@ export interface AcpClientOptions {
   onTokenUsage: (usage: { input_tokens: number; output_tokens: number; total_tokens: number }) => void;
   /** MCP servers to expose to the agent on session/new. Empty array = no MCP. */
   mcpServers?: McpServer[];
+  /**
+   * Per-issue JSONL run log. When set, every ACP frame in either direction (parsed as JSON
+   * where possible, raw otherwise), every byte of adapter stderr, and lifecycle system
+   * events are recorded for later evaluation. Optional so unit tests can omit it.
+   */
+  runLog?: RunLog;
 }
 
 export type PromptOutcome =
@@ -97,6 +105,115 @@ function extractTextContent(content: unknown): string {
   return '';
 }
 
+// Transform that hands each newline-delimited frame to `onLine` while passing the raw bytes
+// through to downstream consumers unchanged. Used to tap the ACP JSON-RPC transport in both
+// directions for the per-issue JSONL run log. Buffering lives in `_transform`; a final flush
+// surfaces any unterminated tail so a clean shutdown does not drop the last frame.
+//
+// We decode with a `StringDecoder` rather than `chunk.toString('utf8')` because TCP/stdout
+// chunk boundaries can fall inside a multibyte UTF-8 sequence: an unaccompanied byte split
+// would otherwise be silently converted to a U+FFFD replacement character, corrupting the
+// JSON we record. The decoder buffers the trailing incomplete sequence and returns it
+// prepended to the next chunk's decode.
+class LineTap extends Transform {
+  private buf = '';
+  private decoder = new StringDecoder('utf8');
+  constructor(private readonly onLine: (line: string) => void) {
+    super();
+  }
+  _transform(chunk: Buffer | string, _enc: BufferEncoding, cb: TransformCallback): void {
+    this.buf +=
+      typeof chunk === 'string' ? chunk : this.decoder.write(chunk as Buffer);
+    let idx: number;
+    while ((idx = this.buf.indexOf('\n')) !== -1) {
+      const line = this.buf.slice(0, idx);
+      this.buf = this.buf.slice(idx + 1);
+      if (line.length > 0) {
+        try {
+          this.onLine(line);
+        } catch {
+          // Tap failures must not interrupt the stream.
+        }
+      }
+    }
+    cb(null, chunk);
+  }
+  _flush(cb: TransformCallback): void {
+    // Drain any incomplete multibyte sequence the decoder is still holding, then surface
+    // an unterminated tail so a clean shutdown does not drop the last frame.
+    const tail = this.decoder.end();
+    if (tail.length > 0) this.buf += tail;
+    if (this.buf.length > 0) {
+      try {
+        this.onLine(this.buf);
+      } catch {
+        /* see _transform */
+      }
+      this.buf = '';
+    }
+    cb();
+  }
+}
+
+// Record one ACP frame to the run log. Lines that parse as JSON are stored as parsed values
+// so the evaluator agent doesn't double-decode; anything else lands as `kind: "unparseable"`
+// with the raw bytes preserved for forensic value.
+//
+// Before recording, capability tokens in the frame are redacted in place. The most common
+// one is the symphony MCP bearer that we inject into `session/new` as
+// `mcpServers[].headers[].value = "Bearer <token>"`; that token is the agent's per-issue
+// capability to call `mark_done` and `request_human_steering`, and the JSONL log is a
+// long-lived append-only file an evaluator may share. Replace any string starting with
+// `Bearer ` with `Bearer <redacted>` anywhere in the tree.
+function recordAcpFrame(
+  runLog: RunLog | undefined,
+  direction: 'host_to_vm' | 'vm_to_host',
+  line: string,
+): void {
+  if (!runLog) return;
+  let frame: unknown;
+  try {
+    frame = JSON.parse(line);
+  } catch {
+    runLog.record({ channel: 'acp', direction, kind: 'unparseable', raw: line });
+    return;
+  }
+  redactBearerTokens(frame);
+  runLog.record({ channel: 'acp', direction, frame });
+}
+
+// Walk `value` and replace any string of the form `Bearer <token>` with `Bearer <redacted>`.
+// Mutates in place; callers must pass the parsed JSON (which is single-use per call). We
+// walk arrays and plain objects only; primitives other than strings are skipped, and we
+// guard against cycles even though ACP frames shouldn't contain them.
+function redactBearerTokens(value: unknown, seen = new WeakSet<object>()): void {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return;
+    seen.add(value);
+    for (let i = 0; i < value.length; i++) {
+      const v = value[i];
+      if (typeof v === 'string') {
+        if (v.startsWith('Bearer ')) value[i] = 'Bearer <redacted>';
+      } else if (v && typeof v === 'object') {
+        redactBearerTokens(v, seen);
+      }
+    }
+    return;
+  }
+  if (value && typeof value === 'object') {
+    if (seen.has(value as object)) return;
+    seen.add(value as object);
+    for (const k of Object.keys(value as Record<string, unknown>)) {
+      const v = (value as Record<string, unknown>)[k];
+      if (typeof v === 'string') {
+        if (v.startsWith('Bearer ')) (value as Record<string, unknown>)[k] = 'Bearer <redacted>';
+      } else if (v && typeof v === 'object') {
+        redactBearerTokens(v, seen);
+      }
+    }
+  }
+}
+
 // One open ACP session bound to a single child process. The adapter is expected to be
 // already running; `initSession()` performs `initialize` + `session/new`, and `runPrompt()`
 // drives one prompt-to-stop_reason cycle.
@@ -110,24 +227,24 @@ export class AcpClient {
 
   constructor(private opts: AcpClientOptions) {
     // Bridge child stdio to the WHATWG streams the SDK speaks. `ndJsonStream` expects raw
-    // bytes; we use Readable.toWeb / Writable.toWeb for the conversion.
-    const input = Readable.toWeb(opts.stdout) as ReadableStream<Uint8Array>;
-    const output = Writable.toWeb(opts.stdin) as WritableStream<Uint8Array>;
+    // bytes; we use Readable.toWeb / Writable.toWeb for the conversion. Both directions
+    // pass through a LineTap so the per-issue JSONL run log captures every JSON-RPC frame
+    // verbatim (parsed JSON when possible, raw bytes when not).
+    const inboundTap = new LineTap((line) => recordAcpFrame(opts.runLog, 'vm_to_host', line));
+    const outboundTap = new LineTap((line) => recordAcpFrame(opts.runLog, 'host_to_vm', line));
+    opts.stdout.pipe(inboundTap);
+    outboundTap.pipe(opts.stdin);
+    const input = Readable.toWeb(inboundTap) as ReadableStream<Uint8Array>;
+    const output = Writable.toWeb(outboundTap) as WritableStream<Uint8Array>;
     const stream = ndJsonStream(output, input);
     this.conn = new ClientSideConnection((_agent) => this.makeClient(), stream);
 
-    opts.stderr.setEncoding('utf8');
-    opts.stderr.on('data', (chunk: string) => {
-      const text = chunk.trim();
-      if (text.length > 0) {
-        this.emit('agent_stderr', summarize(text));
-        // Adapters shouldn't normally write to stderr; when they do it's a real
-        // condition (a failed in-VM cp, a missing binary, an SDK warning). Log
-        // at info so it lands in the symphony log alongside other lifecycle
-        // events instead of disappearing into the per-issue event ring buffer.
-        log.info('agent stderr', { text: text.slice(0, 500) });
-      }
-    });
+    // Stderr handling lives in the AgentRunner now — it attaches a tap immediately after
+    // launching the sandbox process so pre-bridge startup failures (vm-agent missing,
+    // bad env, adapter crash before connect) are captured in the JSONL run log and the
+    // per-issue event ring. AcpClient no longer consumes opts.stderr; the field is kept
+    // on the options type for backward compatibility and so callers retain a single
+    // place to think about where the stderr stream goes.
     opts.stdout.on('close', () => this.handleTransportClose('stdout_closed'));
     opts.stdin.on('error', () => {
       /* surface through transport close */

@@ -12,6 +12,7 @@ import type {
   TrackerConfig,
   PollingConfig,
   WorkspaceConfig,
+  LogsConfig,
   HooksConfig,
   AgentConfig,
   AcpConfig,
@@ -196,6 +197,26 @@ export function buildServiceConfig(
   }
   const workspace: WorkspaceConfig = { root: path.resolve(workspaceRoot) };
 
+  // logs (symphony extension): per-issue JSONL run logs. Default sits next to the workspace
+  // root under `.symphony/logs/` so all symphony-managed state for a project lives in one
+  // tree. Same expansion rules as workspace.root.
+  const logsRaw = getObject(raw, 'logs');
+  const logsRootInput = asString(logsRaw['root']);
+  let logsRoot: string;
+  if (logsRootInput) {
+    const expanded = expandVar(logsRootInput);
+    if (expanded === '') {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `logs.root references an unset variable: ${logsRootInput}`,
+      );
+    }
+    logsRoot = path.isAbsolute(expanded) ? expanded : path.resolve(workflowDir, expanded);
+  } else {
+    logsRoot = path.resolve(workflowDir, '.symphony', 'logs');
+  }
+  const logs: LogsConfig = { root: path.resolve(logsRoot) };
+
   // hooks (§5.3.4)
   const hooksRaw = getObject(raw, 'hooks');
   const hooks: HooksConfig = {
@@ -223,12 +244,17 @@ export function buildServiceConfig(
   };
 
   // acp (Symphony extension; supersedes the §5.3.6 `codex` block). `adapter` selects
-  // one of symphony's known profiles (claude, codex). `command` is optional: when
-  // null/unset, symphony auto-derives the launch command from the adapter profile and
-  // stages the host credential file into the workspace. Override `command` only if
-  // you need a custom launch (testing a forked adapter, a non-default binary path,
-  // etc.) — overriding also opts out of credential staging.
+  // one of symphony's known profiles (claude, codex); symphony auto-derives the launch
+  // command from the adapter profile and stages the host credential file into the
+  // workspace. The legacy `acp.command` shell override is still parsed for backward
+  // compatibility but rejected by validateDispatch (the TCP bridge needs the in-VM proxy
+  // to dial back, so a raw adapter command would wedge every attempt).
+  //
+  // `acp.bridge` configures the host-side TCP listener that the in-VM agent dials back
+  // to for ACP traffic. The bridge replaced the smolvm-exec stdio path; see
+  // src/acp-bridge.ts for rationale.
   const acpRaw = getObject(raw, 'acp');
+  const bridgeRaw = getObject(acpRaw, 'bridge');
   const acp: AcpConfig = {
     adapter: asString(acpRaw['adapter']) ?? 'claude',
     command: asString(acpRaw['command']),
@@ -236,6 +262,13 @@ export function buildServiceConfig(
     prompt_timeout_ms: asInt(acpRaw['prompt_timeout_ms'], 3_600_000),
     read_timeout_ms: asInt(acpRaw['read_timeout_ms'], 30_000),
     stall_timeout_ms: asInt(acpRaw['stall_timeout_ms'], 300_000),
+    bridge: {
+      bind_host: asString(bridgeRaw['bind_host']) ?? '0.0.0.0',
+      bind_port: asInt(bridgeRaw['bind_port'], 8788),
+      reach_host: asString(bridgeRaw['reach_host']) ?? '127.0.0.1',
+      reach_url: asString(bridgeRaw['reach_url']),
+      connect_timeout_ms: asInt(bridgeRaw['connect_timeout_ms'], 30_000),
+    },
   };
 
   // smolvm extension
@@ -320,6 +353,7 @@ export function buildServiceConfig(
     tracker,
     polling,
     workspace,
+    logs,
     hooks,
     agent,
     acp,
@@ -345,13 +379,34 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
       return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
     }
   }
-  // When acp.command is explicitly set, the operator owns the launch (and credential
-  // staging). Otherwise the adapter id must be one symphony has a profile for, so
-  // the runner can auto-derive the command and ship credentials.
+  // `acp.command` was a pre-bridge escape hatch: operators could substitute their own
+  // adapter launch string. With the TCP bridge architecture in place, every launch must
+  // end up running `node /opt/symphony/vm-agent.mjs` so the in-VM proxy can dial back and
+  // bridge the adapter's stdio onto an authenticated socket. A raw `acp.command` that
+  // execs the adapter directly never sends the bearer line, so the bridge waits the full
+  // `connect_timeout_ms` and the attempt fails. Fail loudly at startup instead — clear
+  // signal for operators with a stale config, no silent wedges. Anyone who genuinely needs
+  // a custom launch can fork the in-VM proxy (`scripts/vm-agent.js`) and rebuild the image.
   if (cfg.acp.command !== null) {
-    if (!cfg.acp.command.trim()) return 'acp.command must be non-empty when set';
-  } else if (!isKnownAdapter(cfg.acp.adapter)) {
-    return `acp.adapter "${cfg.acp.adapter}" is not a known profile; set acp.command to override or use one of: claude, codex`;
+    return (
+      'acp.command is not supported under the TCP bridge transport. Remove it from ' +
+      'WORKFLOW.md; symphony auto-derives the launch (scrub guest cred dir + stage ' +
+      'credential + exec the in-VM proxy). For custom behavior, edit scripts/vm-agent.js ' +
+      'and rebuild via scripts/build-vm.sh.'
+    );
+  }
+  if (!isKnownAdapter(cfg.acp.adapter)) {
+    return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex`;
+  }
+  // The bridge transport requires the VM to dial the host. Without networking the proxy
+  // can never reach `SYMPHONY_ACP_URL`, every attempt fails after connect_timeout_ms,
+  // and the operator gets a slow opaque error instead of a fast clear one.
+  if (cfg.smolvm.net === false) {
+    return (
+      'smolvm.net=false is incompatible with the ACP TCP bridge. The in-VM proxy must ' +
+      'reach the host listener; set smolvm.net: true (the default) or override the ' +
+      'reachability of the bridge via acp.bridge.reach_url.'
+    );
   }
   return null;
 }

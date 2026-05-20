@@ -45,6 +45,12 @@ export interface WorkspaceConfig {
   root: string;
 }
 
+export interface LogsConfig {
+  // Directory where per-issue JSONL run logs live. One file per issue
+  // (`<root>/<sanitized-identifier>.jsonl`), appended across attempts and process restarts.
+  root: string;
+}
+
 export interface HooksConfig {
   after_create: string | null;
   before_run: string | null;
@@ -73,6 +79,33 @@ export interface AcpConfig {
   prompt_timeout_ms: number;
   read_timeout_ms: number;
   stall_timeout_ms: number;
+  /**
+   * Host-side TCP bridge that the in-VM agent dials back to for ACP traffic. The bridge
+   * replaces the previous smolvm-exec stdio path (which had a stdin-pump bug) and decouples
+   * symphony from any specific sandbox tech.
+   */
+  bridge: AcpBridgeConfig;
+}
+
+export interface AcpBridgeConfig {
+  /** Host/IP symphony binds the bridge listener on. 0.0.0.0 by default for VM access. */
+  bind_host: string;
+  /** Port symphony binds. 0 picks an ephemeral port (recorded after start). */
+  bind_port: number;
+  /**
+   * Host the in-VM agent uses to reach the bridge. Defaults to 127.0.0.1 because smolvm
+   * remaps guest loopback to host loopback. Other sandboxes that need a different host
+   * alias (or a reverse proxy) can override.
+   */
+  reach_host: string;
+  /** Optional override for the full URL (e.g. through a reverse proxy). */
+  reach_url: string | null;
+  /**
+   * How long to wait for the in-VM agent to connect after the VM is launched, before
+   * failing the attempt. The agent normally connects within a second; this catches
+   * misconfigured `reach_host` or sandbox-network issues.
+   */
+  connect_timeout_ms: number;
 }
 
 export interface SmolvmVolume {
@@ -128,6 +161,7 @@ export interface ServiceConfig {
   tracker: TrackerConfig;
   polling: PollingConfig;
   workspace: WorkspaceConfig;
+  logs: LogsConfig;
   hooks: HooksConfig;
   agent: AgentConfig;
   acp: AcpConfig;
