@@ -12,7 +12,7 @@ import type {
 } from './types.js';
 import type { IssueTracker } from './trackers/types.js';
 import type { WorkflowSource } from './workflow.js';
-import { validateDispatch, WorkflowError } from './workflow.js';
+import { resolveHooksForState, validateDispatch, WorkflowError } from './workflow.js';
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
 import { resolveDispatchConfig } from './agent/runner.js';
@@ -581,8 +581,13 @@ export class Orchestrator {
           }
         : undefined;
       this.cleanupInFlight.add(issueId);
+      // Resolve before_remove against the issue's terminal state — that's the state the
+      // file landed in when `symphony.transition` flipped cleanup_workspace_on_exit, so a
+      // terminal-state-specific before_remove (e.g. "merge the PR, then drop the
+      // workspace") fires instead of the workflow-level fallback.
+      const removalHooks = resolveHooksForState(this.cfg, entry.issue.state);
       this.workspaces
-        .remove(entry.identifier, this.cfg.hooks, capture)
+        .remove(entry.identifier, removalHooks, capture)
         .catch((err) =>
           logger.warn('workspace removal failed', { error: (err as Error).message }),
         )
@@ -725,7 +730,10 @@ export class Orchestrator {
       const terminals = await this.tracker.fetchIssuesByStates(terminalStateNames(this.cfg.states));
       for (const issue of terminals) {
         try {
-          await this.workspaces.remove(issue.identifier, this.cfg.hooks);
+          // Each terminal state can declare its own before_remove (e.g. push a PR vs.
+          // write a patch). Resolve per issue.state so the right one fires.
+          const removalHooks = resolveHooksForState(this.cfg, issue.state);
+          await this.workspaces.remove(issue.identifier, removalHooks);
         } catch (err) {
           log.warn('terminal cleanup failed for issue', {
             issue_identifier: issue.identifier,

@@ -60,6 +60,17 @@ tracker:
 #             allowed out of this state" — the agent's `transition` calls will
 #             always be rejected with `transition_not_allowed`. Useful for
 #             review-style states that should pause until a human re-routes.
+#   hooks     (map, optional): per-state overrides for the workflow-level `hooks:`
+#             block. Each of `after_create`, `before_run`, `after_run`, and
+#             `before_remove` is optional; an omitted key inherits the
+#             workflow-level hook, an explicit `null` suppresses it for this
+#             state, and a string replaces it. Resolution is by the issue's
+#             state at hook-fire time — when the agent calls
+#             `symphony.transition`, after_run and before_remove are resolved
+#             against the POST-transition state, so a terminal-state's hook can
+#             drive a state-specific handoff (e.g. Done opens a PR; Merge runs
+#             an auto-merge; Cancelled writes only a patch). The shared
+#             `timeout_ms` is not overridable per state.
 #
 # Declaration order matters: role-filtered listings (active states, terminal
 # states) follow it, and the dashboard renders state columns in the same order.
@@ -78,6 +89,12 @@ states:
     allowed_transitions: [Todo, Done]
   Done:
     role: terminal
+    # Per-state hooks let each terminal state drive its own handoff. Done could
+    # push the branch and open a PR; a sibling Merge state could push, open the
+    # PR, then auto-merge; Cancelled could opt out entirely with `after_run: null`.
+    # hooks:
+    #   after_run: |
+    #     # state-specific PR-create logic here
   Cancelled:
     role: terminal
   Triage:
@@ -141,6 +158,12 @@ logs:
 # Plus any env var the operator exports before launching `symphony`. The
 # common pattern is to plumb tracker root / repo / base via env so the same
 # workflow file works against multiple repos. See WORKFLOW.md for an example.
+#
+# Per-state overrides: any state can declare its own `hooks:` block under
+# `states.<name>.hooks` that overrides individual fields here for issues in
+# that state. Useful when terminal states should branch behavior — e.g. Done
+# opens a PR while a sibling Merge state opens it and auto-merges. See the
+# `states:` block above for details.
 # ─────────────────────────────────────────────────────────────────────────────
 hooks:
   # timeout_ms (int): max wall time for a single hook invocation.

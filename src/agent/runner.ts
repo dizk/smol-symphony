@@ -26,6 +26,7 @@ import {
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
+import { resolveHooksForState } from '../workflow.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { RunLog } from '../runlog.js';
 import type { HookCapture, HookResult } from '../workspace.js';
@@ -229,16 +230,25 @@ export class AgentRunner {
               }),
           }
         : undefined;
+    // Resolve hooks against the dispatch-time state. after_create only fires when the
+    // workspace is created (i.e. the first attempt against an issue), so this state is
+    // also the one whose after_create runs. before_run uses the same state — runAttempt
+    // runs once per attempt and the issue hasn't moved between dispatchIssue and here.
+    const initialHooks = resolveHooksForState(this.cfg, issue.state);
     let workspace: Awaited<ReturnType<WorkspaceManager['ensureFor']>>;
     try {
-      workspace = await this.workspaces.ensureFor(issue.identifier, hookCapture('after_create'));
+      workspace = await this.workspaces.ensureFor(
+        issue.identifier,
+        initialHooks,
+        hookCapture('after_create'),
+      );
     } catch (err) {
       logger.error('workspace error', { error: (err as Error).message });
       return { ok: false, reason: 'workspace error', threadId: null, turnsCompleted: 0 };
     }
 
     try {
-      await this.workspaces.runBeforeRun(workspace.path, this.cfg.hooks, hookCapture('before_run'));
+      await this.workspaces.runBeforeRun(workspace.path, initialHooks, hookCapture('before_run'));
     } catch (err) {
       logger.error('before_run hook failed', { error: (err as Error).message });
       return { ok: false, reason: 'before_run hook error', threadId: null, turnsCompleted: 0 };
@@ -262,7 +272,7 @@ export class AgentRunner {
       });
       await this.workspaces.runAfterRunBestEffort(
         workspace.path,
-        this.cfg.hooks,
+        initialHooks,
         hookCapture('after_run'),
       );
       return { ok: false, reason: 'credential staging error', threadId: null, turnsCompleted: 0 };
@@ -338,7 +348,7 @@ export class AgentRunner {
       await this.smolvm.destroy(vmName);
       await this.workspaces.runAfterRunBestEffort(
         workspace.path,
-        this.cfg.hooks,
+        initialHooks,
         hookCapture('after_run'),
       );
       return { ok: false, reason: 'smolvm bring-up error', threadId: null, turnsCompleted: 0 };
@@ -362,7 +372,7 @@ export class AgentRunner {
       await this.smolvm.destroy(vmName);
       await this.workspaces.runAfterRunBestEffort(
         workspace.path,
-        this.cfg.hooks,
+        initialHooks,
         hookCapture('after_run'),
       );
       return {
@@ -446,9 +456,16 @@ export class AgentRunner {
         this.mcp.deactivate(runningEntry.identifier);
       }
       logger.debug('agent runner cleanup', { reason });
+      // Resolve after_run against the issue's CURRENT state. If the agent called
+      // symphony.transition during the attempt, the MCP handler updated
+      // runningEntry.issue.state to the new state, so terminal-state hooks (e.g. Done's
+      // PR-create hook) fire instead of the initial state's. Falls back to the initial
+      // state when no entry is wired or the transition never happened.
+      const cleanupState = runningEntry?.issue.state ?? issue.state;
+      const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
       await this.workspaces.runAfterRunBestEffort(
         workspace.path,
-        this.cfg.hooks,
+        cleanupHooks,
         hookCapture('after_run'),
       );
       // Per the agreed lifecycle, every attempt gets a fresh VM. Destroy is best-effort:

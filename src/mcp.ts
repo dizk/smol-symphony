@@ -393,6 +393,12 @@ export class McpRegistry {
     const canonicalName = canonicalStateName(stateMap, result.toState);
     active.entry.cleanup_workspace_on_exit =
       canonicalName !== null && stateMap[canonicalName]!.role === 'terminal';
+    // Mutate the entry's view of the issue's state so downstream code (runner's
+    // cleanup, orchestrator's terminal-state workspace removal) resolves the right
+    // state's hooks. Without this, after_run / before_remove would resolve against
+    // the pre-transition state and a terminal-state hook (e.g. Done's PR-create)
+    // would never fire.
+    active.entry.issue.state = canonicalName ?? result.toState;
     return result;
   }
 
