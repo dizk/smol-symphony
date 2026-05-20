@@ -106,6 +106,24 @@ function asString(v: unknown): string | null {
   return null;
 }
 
+// Per-state override parser for fields that cascade off a workflow-level
+// default (currently model and effort). Three-way result: undefined when the
+// key is absent (inherit), null when explicitly null or blank-string (clear),
+// trimmed string when a value is provided.
+function parseStateOverride(
+  m: Record<string, unknown>,
+  key: string,
+): string | null | undefined {
+  if (!Object.prototype.hasOwnProperty.call(m, key)) return undefined;
+  const v = m[key];
+  if (v === null) return null;
+  if (typeof v === 'string') {
+    const trimmed = v.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  return null;
+}
+
 function asInt(v: unknown, fallback: number): number {
   if (typeof v === 'number' && Number.isFinite(v)) return Math.trunc(v);
   if (typeof v === 'string' && /^-?\d+$/.test(v)) return parseInt(v, 10);
@@ -401,16 +419,13 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
       );
     }
     const adapter = asString(m['adapter']);
-    const modelRaw = asString(m['model']);
-    const modelTrimmed = modelRaw === null ? undefined : modelRaw.trim();
-    const model =
-      modelTrimmed === undefined ? undefined : modelTrimmed.length > 0 ? modelTrimmed : null;
-    // Effort uses the same undefined/null shape as model: undefined means
-    // "inherit acp.effort", explicit blank-or-null means "no effort override".
-    const effortRaw = asString(m['effort']);
-    const effortTrimmed = effortRaw === null ? undefined : effortRaw.trim();
-    const effort =
-      effortTrimmed === undefined ? undefined : effortTrimmed.length > 0 ? effortTrimmed : null;
+    // Distinguish key absence (`undefined` → inherit acp default) from explicit
+    // null or blank string (`null` → clear the workflow default for this state).
+    // `resolveDispatchConfig` keys off this distinction; collapsing both branches
+    // to undefined would silently re-inherit acp.model / acp.effort on a state
+    // the operator deliberately cleared.
+    const model = parseStateOverride(m, 'model');
+    const effort = parseStateOverride(m, 'effort');
     let maxTurns: number | undefined;
     if (m['max_turns'] !== undefined) {
       const n = asInt(m['max_turns'], -1);

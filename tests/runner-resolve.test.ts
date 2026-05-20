@@ -132,16 +132,20 @@ describe('resolveDispatchConfig', () => {
         tracker: { kind: 'local', root: '/tmp/issues' },
         acp: { adapter: 'claude', model: 'claude-opus-4-7' },
         states: {
-          Todo: { role: 'active', model: '   ' },
+          // Blank trims to null; YAML literal null also clears.
+          Blank: { role: 'active', model: '   ' },
+          ExplicitNull: { role: 'active', model: null },
           Done: { role: 'terminal' },
           Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
     );
-    // Parser normalizes a blank model string to null; resolveDispatchConfig
-    // must keep that null instead of replacing it with the workflow fallback.
-    assert.equal(resolveDispatchConfig(cfg, 'Todo').model, null);
+    // Parser normalizes both blank strings and an explicit YAML null to null;
+    // resolveDispatchConfig must keep that null instead of replacing it with
+    // the workflow fallback.
+    assert.equal(resolveDispatchConfig(cfg, 'Blank').model, null);
+    assert.equal(resolveDispatchConfig(cfg, 'ExplicitNull').model, null);
   });
 
   it('resolves effort with per-state precedence and workflow fallback', () => {
@@ -156,6 +160,10 @@ describe('resolveDispatchConfig', () => {
           Todo: { role: 'active', effort: 'xhigh' },
           Review: { role: 'active' },
           NoEffort: { role: 'active', effort: '   ' },
+          // Regression: an explicit YAML `effort: null` (or `effort: ~`) must
+          // also clear the workflow-level default. Previously this collapsed
+          // to "omitted" in the parser and silently re-inherited `acp.effort`.
+          ExplicitNull: { role: 'active', effort: null },
           Done: { role: 'terminal' },
           Triage: { role: 'holding' },
         },
@@ -165,6 +173,7 @@ describe('resolveDispatchConfig', () => {
     assert.equal(resolveDispatchConfig(cfg, 'Todo').effort, 'xhigh');
     assert.equal(resolveDispatchConfig(cfg, 'Review').effort, 'high');
     assert.equal(resolveDispatchConfig(cfg, 'NoEffort').effort, null);
+    assert.equal(resolveDispatchConfig(cfg, 'ExplicitNull').effort, null);
   });
 
   it('defaults effort to null when neither workflow nor state declares it', () => {

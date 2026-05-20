@@ -184,6 +184,8 @@ describe('workflow states block', () => {
         states: {
           Todo: { role: 'active', model: '  claude-opus-4-7  ' },
           Review: { role: 'active', model: '   ' },
+          ExplicitNull: { role: 'active', model: null },
+          NoOverride: { role: 'active' },
           Done: { role: 'terminal' },
           Triage: { role: 'holding' },
         },
@@ -193,6 +195,11 @@ describe('workflow states block', () => {
     assert.equal(cfg.states.Todo!.model, 'claude-opus-4-7');
     // Blank model trims to null — same normalization as the workflow-level acp.model.
     assert.equal(cfg.states.Review!.model, null);
+    // Explicit YAML `model: null` must also normalize to null, distinct from
+    // omitting the key entirely (which stays undefined so resolveDispatchConfig
+    // inherits the workflow default).
+    assert.equal(cfg.states.ExplicitNull!.model, null);
+    assert.equal(cfg.states.NoOverride!.model, undefined);
   });
 
   it('trims and normalizes per-state effort overrides; preserves undefined when absent', () => {
@@ -203,6 +210,7 @@ describe('workflow states block', () => {
           Todo: { role: 'active' },
           Review: { role: 'active', effort: '  xhigh  ' },
           Blank: { role: 'active', effort: '   ' },
+          ExplicitNull: { role: 'active', effort: null },
           Done: { role: 'terminal' },
           Triage: { role: 'holding' },
         },
@@ -215,6 +223,9 @@ describe('workflow states block', () => {
     assert.equal(cfg.states.Review!.effort, 'xhigh');
     // Explicit blank string clears the workflow default (same shape as model).
     assert.equal(cfg.states.Blank!.effort, null);
+    // Explicit YAML null also clears — must NOT collapse to undefined the way an
+    // omitted key does, or resolveDispatchConfig would silently re-inherit acp.effort.
+    assert.equal(cfg.states.ExplicitNull!.effort, null);
   });
 });
 
