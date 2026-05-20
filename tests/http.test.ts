@@ -7,9 +7,11 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { startHttpServer, type HttpServerOptions } from '../src/http.js';
+import { renderMarkdown, startHttpServer, type HttpServerOptions } from '../src/http.js';
 import type { Orchestrator, Snapshot } from '../src/orchestrator.js';
 import { LocalMarkdownTracker } from '../src/trackers/local.js';
+
+type RunningRow = Snapshot['running'][number];
 
 function makeStubOrchestrator(): Orchestrator {
   const emptySnapshot: Snapshot = {
@@ -295,6 +297,139 @@ describe('triage approve / discard', () => {
     } finally {
       await noTracker.close();
       await rm(otherRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('renderMarkdown — agent-flavoured Markdown', () => {
+  it('wraps a plain question in a <p> and escapes raw HTML', () => {
+    const out = renderMarkdown('Is the <script> tag here safe?');
+    assert.equal(out, '<p>Is the &lt;script&gt; tag here safe?</p>');
+  });
+
+  it('renders bold, italic, and inline code', () => {
+    const out = renderMarkdown('Use **bold** and *italic* with `code` inline.');
+    assert.match(out, /<strong>bold<\/strong>/);
+    assert.match(out, /<em>italic<\/em>/);
+    assert.match(out, /<code>code<\/code>/);
+  });
+
+  it('does not turn snake_case_identifiers into italics', () => {
+    const out = renderMarkdown('Call set_user_id with the id.');
+    assert.ok(!out.includes('<em>'), `unexpected <em> in: ${out}`);
+  });
+
+  it('renders headers, paragraphs, and unordered lists', () => {
+    const out = renderMarkdown(['# Question', '', 'Should I:', '', '- option A', '- option B'].join('\n'));
+    assert.match(out, /<h1>Question<\/h1>/);
+    assert.match(out, /<p>Should I:<\/p>/);
+    assert.match(out, /<ul><li>option A<\/li><li>option B<\/li><\/ul>/);
+  });
+
+  it('renders ordered lists', () => {
+    const out = renderMarkdown(['1. first', '2. second'].join('\n'));
+    assert.match(out, /<ol><li>first<\/li><li>second<\/li><\/ol>/);
+  });
+
+  it('renders fenced code blocks with escaped contents and language class', () => {
+    const out = renderMarkdown(['```ts', 'const x = `<i>` + 1;', '```'].join('\n'));
+    assert.match(out, /<pre><code class="language-ts">const x = `&lt;i&gt;` \+ 1;<\/code><\/pre>/);
+  });
+
+  it('does not process markdown inside a code fence', () => {
+    const out = renderMarkdown(['```', '**not bold**', '```'].join('\n'));
+    assert.match(out, /<pre><code>\*\*not bold\*\*<\/code><\/pre>/);
+    assert.ok(!out.includes('<strong>'), `unexpected <strong> in: ${out}`);
+  });
+
+  it('renders safe http(s) and mailto links and rejects javascript: URLs', () => {
+    const safe = renderMarkdown('See [docs](https://example.com/path?a=1&b=2).');
+    assert.match(safe, /<a href="https:\/\/example.com\/path\?a=1&amp;b=2" rel="noopener noreferrer">docs<\/a>/);
+
+    const mailto = renderMarkdown('Email [me](mailto:me@example.com).');
+    assert.match(mailto, /href="mailto:me@example.com"/);
+
+    const unsafe = renderMarkdown('Click [here](javascript:alert(1)).');
+    assert.ok(!unsafe.includes('<a '), `javascript: should not produce a link tag: ${unsafe}`);
+    assert.ok(unsafe.includes('[here]'), `unsafe link text should be preserved literally: ${unsafe}`);
+  });
+
+  it('renders blockquotes', () => {
+    const out = renderMarkdown(['> agent says hi', '> on two lines'].join('\n'));
+    assert.match(out, /<blockquote>/);
+    assert.match(out, /agent says hi/);
+  });
+
+  it('escapes HTML inside inline code', () => {
+    const out = renderMarkdown('See `<script>alert(1)</script>` literally.');
+    assert.match(out, /<code>&lt;script&gt;alert\(1\)&lt;\/script&gt;<\/code>/);
+    assert.ok(!out.includes('<script>'), `raw <script> leaked: ${out}`);
+  });
+});
+
+describe('attention partial — Markdown rendering for steering questions', () => {
+  function makeOrchestratorWithSteering(question: string): Orchestrator {
+    const row: RunningRow = {
+      issue_id: 'q1',
+      issue_identifier: 'q1',
+      issue_title: 'Sample issue',
+      issue_body: '',
+      state: 'In Progress',
+      session_id: 'abcd1234',
+      turn_count: 2,
+      last_event: null,
+      last_message: null,
+      started_at: new Date().toISOString(),
+      last_event_at: null,
+      tokens: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      steering_requested: true,
+      steering_question: question,
+      steering_context: null,
+      marked_done: false,
+    };
+    const snap: Snapshot = {
+      generated_at: new Date().toISOString(),
+      counts: { running: 1, retrying: 0 },
+      running: [row],
+      retrying: [],
+      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      rate_limits: null,
+    };
+    return {
+      snapshot: () => snap,
+      triggerRefresh: () => ({ status: 'ok' as const }),
+      detailByIdentifier: () => null,
+    } as unknown as Orchestrator;
+  }
+
+  it('renders Markdown inside the question-primary container instead of a raw <p>', async () => {
+    const orch = makeOrchestratorWithSteering(
+      ['Should I:', '', '- **delete** the file', '- or rename it to `foo.bak`?'].join('\n'),
+    );
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-md-'));
+    const handle = await startHttpServer(orch, {
+      port: 0,
+      host: '127.0.0.1',
+      getTrackerView: () => ({
+        trackerRoot: root,
+        activeStates: ['Todo', 'In Progress'],
+        terminalStates: ['Done', 'Cancelled'],
+        workflowPath: '/tmp/WORKFLOW.md',
+      }),
+      mcp: null,
+      tracker: null,
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/v1/partials/attention`);
+      assert.equal(res.status, 200);
+      const html = await res.text();
+      assert.match(html, /<div class="question-primary">/);
+      assert.match(html, /<strong>delete<\/strong>/);
+      assert.match(html, /<code>foo\.bak<\/code>/);
+      assert.match(html, /<ul><li>/);
+    } finally {
+      await handle.close();
+      await rm(root, { recursive: true, force: true });
     }
   });
 });
