@@ -161,6 +161,7 @@ async function main() {
           activeStates: liveCfg.tracker.active_states,
           terminalStates: liveCfg.tracker.terminal_states,
           workflowPath,
+          logsRoot: liveCfg.logs.root,
         }),
         mcp,
         tracker,

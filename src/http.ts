@@ -10,6 +10,14 @@ import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
 import { writeIssueFile, TRIAGE_STATE } from './issues.js';
 import type { IssueTracker } from './trackers/types.js';
+import {
+  isSafeIdentifier,
+  listSessions,
+  loadSession,
+  renderHistoryListPage,
+  renderSessionDetailPage,
+  summarize as summarizeSession,
+} from './history.js';
 
 function jsonResponse(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -567,6 +575,16 @@ h2:first-child { margin-top: 0.4rem; }
 #header .badge-working { background: var(--run-bg); color: var(--run-fg); }
 #header .badge-attention { background: var(--await-bg); color: var(--await-fg); }
 #header .badge-idle { background: var(--idle-bg); color: var(--idle-fg); }
+#header .history-link {
+  color: var(--muted); text-decoration: none;
+  font-size: 12px; letter-spacing: 0.02em;
+  padding: 0.1rem 0.4rem; border-radius: 3px;
+  border: 1px solid transparent;
+  transition: color 180ms cubic-bezier(.22,1,.36,1),
+              border-color 180ms cubic-bezier(.22,1,.36,1);
+}
+#header .history-link:hover { color: var(--strong); border-color: var(--rule-firm); }
+#header .history-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 #header .refresh {
   background: var(--chip); color: var(--base);
   border: 1px solid var(--rule-firm); border-radius: 4px;
@@ -893,6 +911,7 @@ footer.totals:empty { display: none; }
   <span class="rule" aria-hidden="true">·</span>
   <span class="workflow" title="${escapeHtml(p.workflowPath)}">${escapeHtml(p.workflowName)}</span>
   <span class="tracker-root" title="${escapeHtml(p.trackerRoot)}">${escapeHtml(p.trackerRoot)}</span>
+  <a class="history-link" href="/history" title="historical sessions">history</a>
   <span id="tracker-state"
         hx-get="/api/v1/partials/header" hx-trigger="every 2s, refreshed from:body"
         hx-swap="morph:innerHTML">${renderHeaderPartial(p)}</span>
@@ -1108,6 +1127,11 @@ export interface HttpServerOptions {
     activeStates: string[];
     terminalStates: string[];
     workflowPath: string;
+    /**
+     * Per-issue JSONL run logs root. When null the /history pages render an empty state.
+     * Optional so existing tests that don't care about history can omit it.
+     */
+    logsRoot?: string | null;
   };
   /** Optional MCP registry. When present, exposes /api/v1/issues/:id/mcp + steering-reply. */
   mcp?: McpRegistry | null;
@@ -1208,6 +1232,77 @@ async function handleRequest(
     res.statusCode = 200;
     res.setHeader('content-type', 'text/html; charset=utf-8');
     res.end(html);
+    return;
+  }
+  // Historical sessions browser. Reads the per-issue JSONL run logs written by runlog.ts
+  // — these are append-only and persist across symphony restarts, so they're the canonical
+  // record an operator audits when judging whether an agent did the right thing.
+  //
+  //   GET /history                  — listing of all run logs, most-recent first
+  //   GET /history/<identifier>     — per-session timeline (system, ACP, hook, stderr)
+  //   GET /api/v1/history/<id>.jsonl — raw file download, for offline / scripted analysis
+  if (pathname === '/history' || pathname === '/history/') {
+    if (method !== 'GET') return methodNotAllowed(res);
+    const logsRoot = view.logsRoot ?? null;
+    const sessions = await listSessions(logsRoot);
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    res.setHeader('cache-control', 'no-store');
+    res.end(renderHistoryListPage({ logsRoot, sessions }));
+    return;
+  }
+  const historyMatch = /^\/history\/([^/]+)$/.exec(pathname);
+  if (historyMatch) {
+    if (method !== 'GET') return methodNotAllowed(res);
+    const identifier = decodeURIComponent(historyMatch[1]!);
+    const logsRoot = view.logsRoot ?? null;
+    if (!logsRoot) return notFound(res, 'logs_not_configured', 'logs.root is not configured');
+    if (!isSafeIdentifier(identifier)) {
+      return notFound(res, 'invalid_identifier', 'invalid session identifier');
+    }
+    const session = await loadSession(logsRoot, identifier);
+    if (!session) return notFound(res, 'session_not_found', `no log for ${identifier}`);
+    const summary = summarizeSession(
+      session.identifier,
+      path.join(logsRoot, `${session.identifier}.jsonl`),
+      session.mtimeMs,
+      session.size,
+      session.entries,
+    );
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    res.setHeader('cache-control', 'no-store');
+    res.end(
+      renderSessionDetailPage({
+        identifier: session.identifier,
+        entries: session.entries,
+        mtimeMs: session.mtimeMs,
+        size: session.size,
+        summary,
+      }),
+    );
+    return;
+  }
+  const rawHistoryMatch = /^\/api\/v1\/history\/([^/]+)\.jsonl$/.exec(pathname);
+  if (rawHistoryMatch) {
+    if (method !== 'GET') return methodNotAllowed(res);
+    const identifier = decodeURIComponent(rawHistoryMatch[1]!);
+    const logsRoot = view.logsRoot ?? null;
+    if (!logsRoot) return notFound(res, 'logs_not_configured', 'logs.root is not configured');
+    if (!isSafeIdentifier(identifier)) {
+      return notFound(res, 'invalid_identifier', 'invalid session identifier');
+    }
+    const filePath = path.join(logsRoot, `${identifier}.jsonl`);
+    let text: string;
+    try {
+      text = await readFile(filePath, 'utf8');
+    } catch {
+      return notFound(res, 'session_not_found', `no log for ${identifier}`);
+    }
+    res.statusCode = 200;
+    res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('cache-control', 'no-store');
+    res.end(text);
     return;
   }
   // Static preview for impeccable live mode. The file under .impeccable/preview/ is a
