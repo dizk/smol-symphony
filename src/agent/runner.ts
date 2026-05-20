@@ -383,10 +383,35 @@ export class AgentRunner {
       return { ok: false, reason: 'acp bridge connect failed', threadId: null, turnsCompleted: 0 };
     }
 
+    // Cancellation tear-down. Three things have to happen for the runner to actually
+    // unwind a stuck `client.runPrompt()`:
+    //   1. `client.cancel()` — sends `session/cancel` over ACP. The polite path; the
+    //      adapter SHOULD respond to the in-flight `session/prompt` with
+    //      `stop_reason: cancelled`. In practice the adapter often goes silent (e.g.
+    //      after the model has emitted its final text and called `mark_done`).
+    //   2. `client.forceClose()` — explicitly ends the LineTap streams the SDK is reading
+    //      from. This makes the SDK's `receive()` reader loop observe `done` and call its
+    //      internal `close()`, which rejects every pending request including the in-flight
+    //      `session/prompt`. Without this, the runner stays parked in `runPrompt()` for
+    //      the full `prompt_timeout_ms` (30 min) even after the transport is gone.
+    //   3. `execStream.kill()` + `acpSocket.destroy()` — terminate the host-side
+    //      `smolvm machine exec` and the TCP bridge connection. The kill does NOT
+    //      propagate into the VM (the in-VM adapter keeps running until VM destroy in
+    //      cleanup()), but breaking the socket lets the bridge entry be reclaimed and
+    //      surfaces the close as `'close'` on the socket (a belt-and-braces second
+    //      trigger for `handleTransportClose` if `forceClose` somehow didn't fire).
     const onCancel = () => {
       if (cancelSignal.cancelled) {
         client.cancel().catch(() => undefined);
+        client.forceClose('cancel_requested');
         execStream.kill();
+        if (acpSocket && !acpSocket.destroyed) {
+          try {
+            acpSocket.destroy();
+          } catch {
+            /* idempotent on already-destroyed socket */
+          }
+        }
       }
     };
     const cancelCheckTimer = setInterval(onCancel, 500);

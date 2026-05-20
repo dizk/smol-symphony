@@ -224,18 +224,26 @@ export class AcpClient {
   private cancelled = false;
   // Tracked here so the runner snapshot picks up the most recent assistant text per turn.
   private lastAssistantText = '';
+  // Held so `handleTransportClose` can forcibly end the SDK's reader/writer streams.
+  // Without this, destroying the underlying socket emits `'close'` on `opts.stdout` but
+  // the LineTap Transform in between may not propagate end-of-stream synchronously to
+  // `Readable.toWeb`'s output. The SDK's `receive()` reader loop then stays parked in
+  // `reader.read()`, so the in-flight `session/prompt` promise never rejects and the
+  // runner hangs in `runPrompt()` despite the socket being gone.
+  private inboundTap: LineTap;
+  private outboundTap: LineTap;
 
   constructor(private opts: AcpClientOptions) {
     // Bridge child stdio to the WHATWG streams the SDK speaks. `ndJsonStream` expects raw
     // bytes; we use Readable.toWeb / Writable.toWeb for the conversion. Both directions
     // pass through a LineTap so the per-issue JSONL run log captures every JSON-RPC frame
     // verbatim (parsed JSON when possible, raw bytes when not).
-    const inboundTap = new LineTap((line) => recordAcpFrame(opts.runLog, 'vm_to_host', line));
-    const outboundTap = new LineTap((line) => recordAcpFrame(opts.runLog, 'host_to_vm', line));
-    opts.stdout.pipe(inboundTap);
-    outboundTap.pipe(opts.stdin);
-    const input = Readable.toWeb(inboundTap) as ReadableStream<Uint8Array>;
-    const output = Writable.toWeb(outboundTap) as WritableStream<Uint8Array>;
+    this.inboundTap = new LineTap((line) => recordAcpFrame(opts.runLog, 'vm_to_host', line));
+    this.outboundTap = new LineTap((line) => recordAcpFrame(opts.runLog, 'host_to_vm', line));
+    opts.stdout.pipe(this.inboundTap);
+    this.outboundTap.pipe(opts.stdin);
+    const input = Readable.toWeb(this.inboundTap) as ReadableStream<Uint8Array>;
+    const output = Writable.toWeb(this.outboundTap) as WritableStream<Uint8Array>;
     const stream = ndJsonStream(output, input);
     this.conn = new ClientSideConnection((_agent) => this.makeClient(), stream);
 
@@ -356,6 +364,34 @@ export class AcpClient {
     if (this.closed) return;
     this.closed = true;
     this.emit('subprocess_exit', reason);
+    // Force-end the LineTap streams so the SDK's `receive()` reader loop observes
+    // `done: true` from `reader.read()`. That makes the SDK call its internal `close()`,
+    // which rejects every entry in `pendingResponses` (including the in-flight
+    // `session/prompt`). Without this, the runner hangs in `runPrompt()` for the full
+    // `prompt_timeout_ms` (30 min) even though the socket is gone, because `socket.destroy()`
+    // emits `'close'` on the socket but Node's pipe machinery does not always propagate an
+    // end-of-stream through the Transform synchronously. `Transform.end()` is idempotent
+    // and safe to call here even if the natural pipe-EOF would have eventually arrived.
+    try {
+      this.inboundTap.end();
+    } catch {
+      /* idempotent — already ended */
+    }
+    try {
+      this.outboundTap.end();
+    } catch {
+      /* idempotent — already ended */
+    }
+  }
+
+  /**
+   * Explicit force-close for cancel paths. Idempotent. Triggers `handleTransportClose`
+   * (and thus the SDK's internal close + pendingResponses rejection) without waiting for
+   * the underlying socket to surface its own `'close'` event. Safe to call from cancel
+   * timers that fire repeatedly.
+   */
+  forceClose(reason: string): void {
+    this.handleTransportClose(reason);
   }
 
   // Negotiate protocol + open a session. Throws on either failure.
