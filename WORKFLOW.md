@@ -60,7 +60,10 @@ states:
 
 tracker:
   kind: local
-  root: ./issues
+  # Operator-scoped tracker root (outside the repo). State transitions and
+  # propose_issue writes don't dirty the codebase's git status. Symphony
+  # auto-mkdirs every declared state directory under this root on startup.
+  root: ~/.symphony/trackers/smol-symphony
 
 polling:
   interval_ms: 5000
@@ -138,7 +141,7 @@ hooks:
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
     ISSUE_ID="$(basename "$PWD")"
     BRANCH="agent/${ISSUE_ID}"
-    TRACKER_ROOT="${SYMPHONY_TRACKER_ROOT:-$PWD/../../../issues}"
+    TRACKER_ROOT="${SYMPHONY_TRACKER_ROOT:-$HOME/.symphony/trackers/smol-symphony}"
     PATCHES_DIR="${SYMPHONY_PATCHES_DIR:-$PWD/../../../.symphony/patches}"
     # Terminal-state set. The orchestrator does not currently expose declared
     # terminal states to the hook environment; until it does, hardcode the
