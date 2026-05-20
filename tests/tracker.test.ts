@@ -115,3 +115,110 @@ describe('local tracker', () => {
     }
   });
 });
+
+describe('local tracker state-machine integration', () => {
+  it('auto-mkdirs every declared state directory on start()', async () => {
+    const { mkdtemp, readdir, rm } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-tracker-start-'));
+    try {
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo', 'Review'],
+        terminal_states: ['Done', 'Cancelled'],
+        states: {
+          Todo: { role: 'active' },
+          Review: { role: 'active' },
+          Done: { role: 'terminal' },
+          Cancelled: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+        root,
+      });
+      await t.start();
+      const entries = (await readdir(root)).sort();
+      assert.deepEqual(entries, ['Cancelled', 'Done', 'Review', 'Todo', 'Triage']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads issues across every declared state, attaching state from the directory name', async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-tracker-multi-'));
+    try {
+      for (const dir of ['Todo', 'Review', 'Done', 'Triage']) {
+        await mkdir(path.join(root, dir), { recursive: true });
+      }
+      await writeFile(path.join(root, 'Todo', 'A-1.md'), `---\ntitle: One\n---\nbody`);
+      await writeFile(path.join(root, 'Review', 'A-2.md'), `---\ntitle: Two\n---\nbody`);
+      await writeFile(path.join(root, 'Done', 'A-3.md'), `---\ntitle: Three\n---\nbody`);
+      await writeFile(path.join(root, 'Triage', 'A-4.md'), `---\ntitle: Four\n---\nbody`);
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo', 'Review'],
+        terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Review: { role: 'active' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+        root,
+      });
+      const all = await t.fetchIssuesByStates(['Todo', 'Review', 'Done', 'Triage']);
+      const map = new Map(all.map((i) => [i.identifier, i.state]));
+      assert.equal(map.get('A-1'), 'Todo');
+      assert.equal(map.get('A-2'), 'Review');
+      assert.equal(map.get('A-3'), 'Done');
+      assert.equal(map.get('A-4'), 'Triage');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips directories not declared in the state map (warning only, no crash)', async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-tracker-unknown-'));
+    try {
+      await mkdir(path.join(root, 'Todo'), { recursive: true });
+      await mkdir(path.join(root, 'OldRetiredState'), { recursive: true });
+      await writeFile(path.join(root, 'Todo', 'A-1.md'), `---\ntitle: One\n---\nbody`);
+      await writeFile(path.join(root, 'OldRetiredState', 'A-99.md'), `---\ntitle: Ghost\n---\nbody`);
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo'],
+        terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+        },
+        root,
+      });
+      // Existing API: the scan ignores undeclared dirs without raising.
+      const { issues } = await t.fetchCandidateIssues();
+      const ids = issues.map((i) => i.identifier).sort();
+      assert.deepEqual(ids, ['A-1']);
+      // And the orphan file is not returned even when explicitly queried.
+      const all = await t.fetchIssuesByStates(['Todo', 'OldRetiredState']);
+      const idsAll = all.map((i) => i.identifier).sort();
+      assert.deepEqual(idsAll, ['A-1']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

@@ -99,6 +99,27 @@ export class LocalMarkdownTracker implements IssueTracker {
     this.cfg = cfg;
   }
 
+  /**
+   * Eagerly create the directory for every declared state under `tracker.root`.
+   * Called from the orchestrator boot path so the operator-facing tree (and the
+   * dashboard) sees every column the workflow declared, even before any issue
+   * file lands in it. Lazy creation in writeIssueFile / moveIssueToState is left
+   * in place as a belt-and-suspenders fallback for code paths that target a
+   * state directory directly.
+   */
+  async start(): Promise<void> {
+    if (!this.cfg.root) throw new TrackerError('local_no_root', 'tracker.root is required');
+    const names = Object.keys(this.cfg.states ?? {});
+    // When no `states` map is set (e.g. an older test harness building
+    // TrackerConfig directly), fall back to the union of active + terminal so
+    // boot still produces a usable tree.
+    const decl =
+      names.length > 0 ? names : [...this.cfg.active_states, ...this.cfg.terminal_states];
+    for (const name of decl) {
+      await mkdir(path.join(this.cfg.root, name), { recursive: true });
+    }
+  }
+
   private get root(): string {
     return this.cfg.root!;
   }
@@ -253,6 +274,22 @@ export class LocalMarkdownTracker implements IssueTracker {
         `cannot read tracker.root ${root}: ${(err as Error).message}`,
       );
     }
+    // Match directories against the declared state map case-insensitively, the
+    // same comparison the orchestrator uses for active/terminal classification.
+    // Unknown directories (operator-left scratch, a legacy state that was removed
+    // from `states:`) are ignored with a warning so a stale tree doesn't crash
+    // the dispatch loop. When the caller didn't provide a states map (e.g. a
+    // test constructs TrackerConfig directly), fall back to active + terminal +
+    // the implicit `Triage` holding state so legacy callers keep working.
+    const declared = new Map<string, string>();
+    const stateNames = Object.keys(this.cfg.states ?? {});
+    if (stateNames.length > 0) {
+      for (const name of stateNames) declared.set(name.toLowerCase(), name);
+    } else {
+      for (const name of [...this.cfg.active_states, ...this.cfg.terminal_states, 'Triage']) {
+        declared.set(name.toLowerCase(), name);
+      }
+    }
     const out: RawIssueFile[] = [];
     for (const dirEntry of entries) {
       const dirPath = path.join(root, dirEntry);
@@ -263,6 +300,10 @@ export class LocalMarkdownTracker implements IssueTracker {
         continue;
       }
       if (!stats.isDirectory()) continue;
+      if (!declared.has(dirEntry.toLowerCase())) {
+        log.warn('skipping undeclared state directory', { dir: dirPath });
+        continue;
+      }
       const state = dirEntry;
       let files: string[];
       try {

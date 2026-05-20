@@ -52,9 +52,64 @@ tracker:
   # terminal_states (string[]): states the orchestrator treats as complete;
   # mark_done moves issues to the first listed state.
   # Default: [Done]
+  #
+  # NOTE: when a top-level `states:` block (below) is present, both
+  # `active_states` and `terminal_states` are derived from it (every entry with
+  # `role: active` becomes an active state in declaration order; every
+  # `role: terminal` becomes a terminal state). Operators with a `states:`
+  # block should NOT also set these lists.
   terminal_states:
     - Done
     - Cancelled
+
+# ─────────────────────────────────────────────────────────────────────────────
+# states — per-state configuration map. Optional; when absent, symphony
+# synthesizes a map from `tracker.active_states` / `tracker.terminal_states`
+# (every active becomes `role: active`, every terminal becomes `role: terminal`)
+# plus an implicit `Triage: { role: holding }` so propose_issue keeps working.
+#
+# Keys are state names; values are config objects with these fields:
+#   role (required, enum):
+#     active   — orchestrator dispatches issues in this state.
+#     terminal — orchestrator treats issues in this state as complete; the
+#                workspace is removed after the run unwinds.
+#     holding  — directory exists on disk, but the orchestrator never
+#                dispatches issues from it. Triage is the canonical example.
+#   adapter   (string, optional): override the workflow-level `acp.adapter` for
+#             agents dispatched in this state. Must be a known profile (claude,
+#             codex) and its host credential must be readable at startup.
+#   model     (string, optional): override `acp.model` for this state.
+#             Blank or whitespace-only values normalize to "use the adapter
+#             default" (same as the workflow-level acp.model semantics).
+#   max_turns (int, optional): override `agent.max_turns` for this state.
+#   allowed_transitions (string[]|null, optional): when set, restricts which
+#             states agents in this state may transition to via the MCP
+#             `transition` tool. Each entry must be a declared state. Omit (or
+#             explicitly set to null) for "any declared state is reachable".
+#
+# Declaration order matters: derived active/terminal lists track it, and the
+# dashboard renders state columns in the same order.
+#
+# Default: derived from active_states + terminal_states + implicit Triage.
+# ─────────────────────────────────────────────────────────────────────────────
+states:
+  Todo:
+    role: active
+    adapter: claude
+    model: claude-opus-4-7
+    max_turns: 10
+  Review:
+    role: active
+    adapter: codex
+    model: gpt-5-codex
+    max_turns: 4
+    allowed_transitions: [Todo, Done]
+  Done:
+    role: terminal
+  Cancelled:
+    role: terminal
+  Triage:
+    role: holding
 
 # ─────────────────────────────────────────────────────────────────────────────
 # polling — how often to poll the tracker.

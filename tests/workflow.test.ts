@@ -1,6 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitFrontMatter, buildServiceConfig, expandVar } from '../src/workflow.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  splitFrontMatter,
+  buildServiceConfig,
+  expandVar,
+  validateDispatch,
+} from '../src/workflow.js';
 
 describe('workflow', () => {
   it('parses front matter + body', () => {
@@ -75,4 +83,225 @@ describe('workflow', () => {
     );
     assert.equal(cfg.acp.model, null);
   });
+});
+
+describe('workflow states block', () => {
+  it('parses an explicit states block with role + per-state overrides', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active', adapter: 'claude', model: 'claude-opus-4-7', max_turns: 10 },
+          Review: { role: 'active', adapter: 'codex', allowed_transitions: ['Todo', 'Done'] },
+          Done: { role: 'terminal' },
+          Cancelled: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.deepEqual(Object.keys(cfg.states), ['Todo', 'Review', 'Done', 'Cancelled', 'Triage']);
+    assert.equal(cfg.states.Todo!.role, 'active');
+    assert.equal(cfg.states.Todo!.adapter, 'claude');
+    assert.equal(cfg.states.Todo!.model, 'claude-opus-4-7');
+    assert.equal(cfg.states.Todo!.max_turns, 10);
+    assert.deepEqual(cfg.states.Review!.allowed_transitions, ['Todo', 'Done']);
+    // Derived active/terminal lists track declaration order so the dashboard's
+    // grouping stays deterministic.
+    assert.deepEqual(cfg.tracker.active_states, ['Todo', 'Review']);
+    assert.deepEqual(cfg.tracker.terminal_states, ['Done', 'Cancelled']);
+  });
+
+  it('synthesizes a states map from legacy active/terminal lists when absent', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: {
+          kind: 'local',
+          root: '/tmp/issues',
+          active_states: ['Todo', 'In Progress'],
+          terminal_states: ['Done', 'Cancelled'],
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.states['Todo']!.role, 'active');
+    assert.equal(cfg.states['In Progress']!.role, 'active');
+    assert.equal(cfg.states['Done']!.role, 'terminal');
+    assert.equal(cfg.states['Cancelled']!.role, 'terminal');
+    // Triage falls in implicitly as a holding state so workflows using the
+    // propose_issue tool keep functioning without re-declaring it.
+    assert.equal(cfg.states['Triage']!.role, 'holding');
+    // No per-state overrides come from the legacy synthesis.
+    assert.equal(cfg.states['Todo']!.adapter, undefined);
+    assert.equal(cfg.states['Todo']!.model, undefined);
+  });
+
+  it('trims and normalizes per-state model overrides', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active', model: '  claude-opus-4-7  ' },
+          Review: { role: 'active', model: '   ' },
+          Done: { role: 'terminal' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.states.Todo!.model, 'claude-opus-4-7');
+    // Blank model trims to null — same normalization as the workflow-level acp.model.
+    assert.equal(cfg.states.Review!.model, null);
+  });
+});
+
+describe('workflow states validation', () => {
+  // Use a fresh tracker root so the tracker existence check inside validateDispatch
+  // succeeds and we exercise the state-map branch.
+  async function withTrackerRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-states-validate-'));
+    try {
+      return await fn(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it('rejects a workflow with no active state', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: { Done: { role: 'terminal' }, Triage: { role: 'holding' } },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /at least one state must have role: active/);
+    });
+  });
+
+  it('rejects a workflow with no terminal state', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: { Todo: { role: 'active' } },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /at least one state must have role: terminal/);
+    });
+  });
+
+  it('rejects duplicate state names (case-insensitive)', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active' },
+            todo: { role: 'active' },
+            Done: { role: 'terminal' },
+          },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /duplicate state name/);
+    });
+  });
+
+  it('rejects allowed_transitions targeting an undeclared state', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active', allowed_transitions: ['Mystery'] },
+            Done: { role: 'terminal' },
+          },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /allowed_transitions references undeclared state "Mystery"/);
+    });
+  });
+
+  it('rejects unknown adapter in a per-state override', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active', adapter: 'opencode' },
+            Done: { role: 'terminal' },
+          },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /adapter "opencode" is not a known profile/);
+    });
+  });
+
+  it('rejects per-state adapter whose host credential is missing', async () => {
+    // Point HOME at an empty tmp dir so the cred file the validator probes for
+    // does not exist. assertHostCredentialReadable uses os.homedir() which reads
+    // $HOME at call time.
+    await withTrackerRoot(async (root) => {
+      const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-'));
+      const prevHome = process.env.HOME;
+      process.env.HOME = fakeHome;
+      try {
+        const cfg = buildServiceConfig(
+          {
+            tracker: { kind: 'local', root },
+            states: {
+              Todo: { role: 'active', adapter: 'claude' },
+              Done: { role: 'terminal' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        );
+        const err = validateDispatch(cfg);
+        assert.match(err ?? '', /requires a host credential at/);
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        await rm(fakeHome, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('accepts a workflow with no per-state adapter overrides even when host cred is missing', async () => {
+    // The acp-level adapter check still runs (via the existing orchestrator
+    // startup probe), but validateStates only walks per-state adapters; a state
+    // without `adapter` must not trigger a credential check.
+    await withTrackerRoot(async (root) => {
+      const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-'));
+      const prevHome = process.env.HOME;
+      process.env.HOME = fakeHome;
+      try {
+        const cfg = buildServiceConfig(
+          {
+            tracker: { kind: 'local', root },
+            states: {
+              Todo: { role: 'active' },
+              Done: { role: 'terminal' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        );
+        const err = validateDispatch(cfg);
+        assert.equal(err, null);
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        await rm(fakeHome, { recursive: true, force: true });
+      }
+    });
+  });
+
 });

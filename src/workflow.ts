@@ -8,6 +8,7 @@ import chokidar from 'chokidar';
 import { parse as parseYaml } from 'yaml';
 import type {
   ServiceConfig,
+  StateConfig,
   WorkflowDefinition,
   TrackerConfig,
   PollingConfig,
@@ -21,7 +22,13 @@ import type {
   McpConfig,
 } from './types.js';
 import { log } from './logging.js';
-import { isKnownAdapter } from './agent/adapters.js';
+import {
+  isKnownAdapter,
+  ADAPTERS,
+  hostCredentialAbsPath,
+  type AcpAdapterId,
+} from './agent/adapters.js';
+import { accessSync, constants as fsConstants } from 'node:fs';
 
 export class WorkflowError extends Error {
   constructor(public code: string, message: string) {
@@ -157,19 +164,27 @@ export function buildServiceConfig(
     // Default local tracker root: <workflow-dir>/issues
     trackerRoot = path.resolve(workflowDir, 'issues');
   }
+  // Legacy active/terminal lists are still parsed so they can drive the fallback
+  // state-map synthesis below when no `states:` block is declared. Once `states`
+  // is canonical, these get replaced by the derived view computed from the map.
+  const legacyActive = asStringList(trackerRaw['active_states'], ['Todo', 'In Progress']);
+  const legacyTerminal = asStringList(trackerRaw['terminal_states'], [
+    'Closed',
+    'Cancelled',
+    'Canceled',
+    'Duplicate',
+    'Done',
+  ]);
+  const states = parseStatesBlock(raw['states'], legacyActive, legacyTerminal);
+  const { activeStates, terminalStates } = deriveStateLists(states);
   const tracker: TrackerConfig = {
     kind: trackerKind,
     endpoint: asString(trackerRaw['endpoint']) ?? trackerEndpointDefault,
     api_key: apiKeyResolved && apiKeyResolved.length > 0 ? apiKeyResolved : null,
     project_slug: asString(trackerRaw['project_slug']),
-    active_states: asStringList(trackerRaw['active_states'], ['Todo', 'In Progress']),
-    terminal_states: asStringList(trackerRaw['terminal_states'], [
-      'Closed',
-      'Cancelled',
-      'Canceled',
-      'Duplicate',
-      'Done',
-    ]),
+    active_states: activeStates,
+    terminal_states: terminalStates,
+    states,
     root: trackerRoot,
   };
 
@@ -363,7 +378,98 @@ export function buildServiceConfig(
     smolvm,
     server,
     mcp,
+    states,
   };
+}
+
+// Parse the top-level `states:` block. When absent, synthesize a map from the
+// legacy `tracker.active_states` / `tracker.terminal_states` lists so workflows
+// written before the state-machine refactor keep working unchanged. Insertion
+// order matters — downstream consumers (dashboard, derived active/terminal
+// lists) follow declaration order — so we build a plain object incrementally
+// rather than reconstructing via `Object.fromEntries`.
+function parseStatesBlock(
+  raw: unknown,
+  legacyActive: string[],
+  legacyTerminal: string[],
+): Record<string, StateConfig> {
+  if (raw === undefined || raw === null) {
+    return synthesizeLegacyStates(legacyActive, legacyTerminal);
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new WorkflowError('workflow_parse_error', 'states: must be a map of name → config');
+  }
+  const out: Record<string, StateConfig> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${name}": value must be a map`,
+      );
+    }
+    const m = value as Record<string, unknown>;
+    const roleRaw = asString(m['role']);
+    if (roleRaw !== 'active' && roleRaw !== 'terminal' && roleRaw !== 'holding') {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${name}": role must be one of active|terminal|holding (got: ${String(m['role'])})`,
+      );
+    }
+    const adapter = asString(m['adapter']);
+    const modelRaw = asString(m['model']);
+    const modelTrimmed = modelRaw === null ? undefined : modelRaw.trim();
+    const model =
+      modelTrimmed === undefined ? undefined : modelTrimmed.length > 0 ? modelTrimmed : null;
+    let maxTurns: number | undefined;
+    if (m['max_turns'] !== undefined) {
+      const n = asInt(m['max_turns'], -1);
+      if (n <= 0) {
+        throw new WorkflowError(
+          'workflow_parse_error',
+          `state "${name}": max_turns must be a positive integer`,
+        );
+      }
+      maxTurns = n;
+    }
+    let allowed: string[] | null | undefined;
+    if (m['allowed_transitions'] === undefined) {
+      allowed = undefined;
+    } else if (m['allowed_transitions'] === null) {
+      allowed = null;
+    } else if (Array.isArray(m['allowed_transitions'])) {
+      allowed = (m['allowed_transitions'] as unknown[]).filter(
+        (x): x is string => typeof x === 'string',
+      );
+    } else {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${name}": allowed_transitions must be a list of state names (or null/omitted)`,
+      );
+    }
+    const sc: StateConfig = { role: roleRaw };
+    if (adapter !== null) sc.adapter = adapter;
+    if (model !== undefined) sc.model = model;
+    if (maxTurns !== undefined) sc.max_turns = maxTurns;
+    if (allowed !== undefined) sc.allowed_transitions = allowed;
+    out[name] = sc;
+  }
+  return out;
+}
+
+// Project the canonical state map onto the legacy active/terminal-state lists so
+// downstream consumers (tracker queries, dashboard grouping) see consistent
+// values regardless of how the operator declared the workflow.
+function deriveStateLists(states: Record<string, StateConfig>): {
+  activeStates: string[];
+  terminalStates: string[];
+} {
+  const activeStates: string[] = [];
+  const terminalStates: string[] = [];
+  for (const [name, cfg] of Object.entries(states)) {
+    if (cfg.role === 'active') activeStates.push(name);
+    else if (cfg.role === 'terminal') terminalStates.push(name);
+  }
+  return { activeStates, terminalStates };
 }
 
 // §6.3 dispatch preflight validation.
@@ -382,6 +488,13 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
       return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
     }
   }
+  // `cfg.states` is set by buildServiceConfig in every real run; test harnesses
+  // that synthesize a ServiceConfig literal sometimes omit it, so fall back to
+  // the legacy active/terminal lists rather than refusing to validate.
+  const stateMap: Record<string, StateConfig> =
+    cfg.states ?? synthesizeLegacyStates(cfg.tracker.active_states, cfg.tracker.terminal_states);
+  const statesError = validateStates(stateMap);
+  if (statesError) return statesError;
   // `acp.command` was a pre-bridge escape hatch: operators could substitute their own
   // adapter launch string. With the TCP bridge architecture in place, every launch must
   // end up running `node /opt/symphony/vm-agent.mjs` so the in-VM proxy can dial back and
@@ -410,6 +523,72 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
       'reach the host listener; set smolvm.net: true (the default) or override the ' +
       'reachability of the bridge via acp.bridge.reach_url.'
     );
+  }
+  return null;
+}
+
+// Synthesize a state map from the legacy `tracker.active_states` /
+// `tracker.terminal_states` lists. Includes `Triage` as an implicit holding
+// state so workflows that pre-date the `states:` block — and rely on the
+// propose_issue tool dropping files into a `Triage/` directory — keep working
+// unchanged: the dashboard's approve/discard surface and the local-tracker
+// directory scan both treat it as declared.
+function synthesizeLegacyStates(
+  active: string[],
+  terminal: string[],
+): Record<string, StateConfig> {
+  const out: Record<string, StateConfig> = {};
+  for (const name of active) out[name] = { role: 'active' };
+  for (const name of terminal) out[name] = { role: 'terminal' };
+  const seen = new Set(Object.keys(out).map((n) => n.toLowerCase()));
+  if (!seen.has('triage')) out['Triage'] = { role: 'holding' };
+  return out;
+}
+
+// State-map validation, exposed as a string|null so it composes with the rest of
+// `validateDispatch`. Checks declared in the same order the operator would hit
+// them while iterating on a malformed workflow: structural (roles, uniqueness),
+// then cross-references (allowed_transitions targets), then host-resource
+// dependencies (adapter known + credential readable).
+function validateStates(states: Record<string, StateConfig>): string | null {
+  const names = Object.keys(states);
+  if (names.length === 0) return 'states: at least one state must be declared';
+  let hasActive = false;
+  let hasTerminal = false;
+  for (const cfg of Object.values(states)) {
+    if (cfg.role === 'active') hasActive = true;
+    else if (cfg.role === 'terminal') hasTerminal = true;
+  }
+  if (!hasActive) return 'states: at least one state must have role: active';
+  if (!hasTerminal) return 'states: at least one state must have role: terminal';
+  const seen = new Map<string, string>();
+  for (const name of names) {
+    const key = name.toLowerCase();
+    const prior = seen.get(key);
+    if (prior !== undefined) {
+      return `states: duplicate state name (case-insensitive): "${prior}" and "${name}"`;
+    }
+    seen.set(key, name);
+  }
+  for (const [name, cfg] of Object.entries(states)) {
+    if (cfg.allowed_transitions) {
+      for (const target of cfg.allowed_transitions) {
+        if (!seen.has(target.toLowerCase())) {
+          return `state "${name}": allowed_transitions references undeclared state "${target}"`;
+        }
+      }
+    }
+    if (cfg.adapter !== undefined) {
+      if (!isKnownAdapter(cfg.adapter)) {
+        return `state "${name}": adapter "${cfg.adapter}" is not a known profile; use one of: claude, codex`;
+      }
+      const credPath = hostCredentialAbsPath(ADAPTERS[cfg.adapter as AcpAdapterId]);
+      try {
+        accessSync(credPath, fsConstants.R_OK);
+      } catch (err) {
+        return `state "${name}": adapter "${cfg.adapter}" requires a host credential at ${credPath}, but it is missing or unreadable: ${(err as Error).message}`;
+      }
+    }
   }
   return null;
 }

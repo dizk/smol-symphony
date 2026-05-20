@@ -88,6 +88,16 @@ async function main() {
   }
 
   const tracker = new LocalMarkdownTracker(config.tracker);
+  // Materialize every declared state directory under tracker.root up front so
+  // the dashboard sees the full set of columns (including `holding` states like
+  // Triage) before any issue lands in them.
+  try {
+    await tracker.start();
+  } catch (err) {
+    process.stderr.write(`error: tracker init failed: ${(err as Error).message}\n`);
+    await src.stop().catch(() => undefined);
+    process.exit(1);
+  }
   const workspaces = new WorkspaceManager(config);
   const smolvm = new SmolvmClient(config.smolvm);
   // Always instantiate the registry so a workflow reload that flips mcp.enabled from
@@ -135,6 +145,12 @@ async function main() {
     runner.updateConfig(cfg, def);
     mcp.updateTerminalStates(cfg.tracker.terminal_states);
     liveCfg = cfg;
+    // Materialize any state directory the reload introduced. Best-effort: a
+    // mkdir failure here would normally come from a tracker.root rotation that
+    // also failed at validateDispatch, so logging is enough.
+    void tracker.start().catch((err) => {
+      log.warn('tracker reinit after reload failed', { error: (err as Error).message });
+    });
   });
 
   // Start the ACP TCP bridge BEFORE accepting any dispatches. A bind failure here is

@@ -26,13 +26,34 @@ export interface WorkflowDefinition {
   prompt_template: string;
 }
 
+// Per-state configuration declared in the `states:` block of a workflow file. The
+// orchestrator dispatches against `active`; `terminal` ends a run and triggers
+// workspace cleanup; `holding` keeps a file in the tracker tree without ever
+// dispatching it (Triage is the canonical example). `adapter` / `model` /
+// `max_turns` override the workflow-level defaults when set; null/undefined means
+// "use the workflow default at dispatch time". `allowed_transitions`, when non-null,
+// restricts which states the agent may move to via the MCP `transition` tool; null
+// means "any declared state is reachable".
+export interface StateConfig {
+  role: 'active' | 'terminal' | 'holding';
+  adapter?: string;
+  model?: string | null;
+  max_turns?: number;
+  allowed_transitions?: string[] | null;
+}
+
 export interface TrackerConfig {
   kind: string;
   endpoint: string | null;
   api_key: string | null;
   project_slug: string | null;
+  // Derived from `states` after workflow parse so existing consumers keep working
+  // unchanged. `active_states` lists every state with role `active`, in declaration
+  // order; `terminal_states` lists every state with role `terminal`, in declaration
+  // order. `states` is the canonical map.
   active_states: string[];
   terminal_states: string[];
+  states: Record<string, StateConfig>;
   // local-tracker only:
   root: string | null;
 }
@@ -174,6 +195,10 @@ export interface ServiceConfig {
   smolvm: SmolvmConfig;
   server: ServerConfig;
   mcp: McpConfig;
+  // Canonical per-state configuration map. `tracker.active_states` /
+  // `tracker.terminal_states` / `tracker.states` are derived from this at parse
+  // time so the tracker (which only sees its slice of config) keeps working.
+  states: Record<string, StateConfig>;
 }
 
 export interface Workspace {
