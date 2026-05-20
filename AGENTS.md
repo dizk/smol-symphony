@@ -62,6 +62,28 @@ SYMPHONY_REPO=<owner>/smol-symphony npx symphony WORKFLOW.md
 `SYMPHONY_BASE_BRANCH` (default `main`) overrides the base the agent branches
 from and the PR opens against.
 
+### File-based auto-merge
+
+In PR mode, `after_run` can arm `gh pr merge --auto` on the freshly opened PR so
+GitHub merges it as soon as required checks pass. Three env vars gate this:
+
+- `SYMPHONY_AUTO_MERGE` — set to a truthy value (`1`, `true`, …) to enable.
+  Unset / `0` / `false` leaves the existing manual-review behavior in place.
+- `SYMPHONY_CRITICAL_FILES` — newline-separated git pathspec entries. If any
+  commit on the per-issue branch touches a matching path, auto-merge is
+  suppressed and the PR is left open for a human to review and merge. Empty
+  lines are ignored. Example:
+  ```
+  SYMPHONY_CRITICAL_FILES="package.json
+  src/types.ts
+  :(glob)src/**/*.sql"
+  ```
+- `SYMPHONY_MERGE_METHOD` — `squash` (default), `merge`, or `rebase`. Picks
+  the strategy `gh pr merge --auto` requires.
+
+Auto-merge requires the repo to have "Allow auto-merge" enabled in its GitHub
+settings and the usual branch-protection prerequisites for the chosen method.
+
 ## Don't write to generated state
 
 Skip these when staging commits unless the user asks:

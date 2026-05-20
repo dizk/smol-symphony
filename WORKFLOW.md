@@ -267,18 +267,74 @@ hooks:
       fi
       # Push + PR. On failure we leave the patch bundle (above) in place as the canonical
       # record; operators can `gh pr create` from it manually.
+      PR_AVAILABLE=0
       if git push -u origin "${BRANCH}"; then
         if gh pr view "${BRANCH}" >/dev/null 2>&1; then
           echo "PR already exists for ${BRANCH}; pushed updates"
-        elif ! gh pr create \
+          PR_AVAILABLE=1
+        elif gh pr create \
           --base "${BASE}" \
           --head "${BRANCH}" \
           --title "${ISSUE_ID}${TITLE:+: ${TITLE}}" \
           --body "${BODY}"; then
+          PR_AVAILABLE=1
+        else
           echo "gh pr create failed; patch bundle preserved at ${PATCH_OUT}" >&2
         fi
       else
         echo "git push failed; patch bundle preserved at ${PATCH_OUT}" >&2
+      fi
+
+      # File-based auto-merge. When SYMPHONY_AUTO_MERGE is set to a truthy value
+      # (anything but unset / "0" / "false"), ask GitHub to auto-merge the PR as
+      # soon as required checks pass — unless one of the commits in this branch
+      # touches a path matching SYMPHONY_CRITICAL_FILES, in which case the PR is
+      # left open for a human to review and merge by hand.
+      #
+      # SYMPHONY_CRITICAL_FILES is a newline-separated list of git pathspec
+      # entries (e.g. "package.json", "src/types.ts", ":(glob)src/**/*.sql").
+      # Empty / blank lines are skipped. If the env var is unset, no file is
+      # treated as critical and every successful PR is eligible for auto-merge.
+      #
+      # SYMPHONY_MERGE_METHOD picks the merge strategy `gh pr merge --auto`
+      # requires; defaults to `squash`. Accepted values: squash | merge | rebase.
+      if [ "${PR_AVAILABLE}" = "1" ] \
+         && [ -n "${SYMPHONY_AUTO_MERGE:-}" ] \
+         && [ "${SYMPHONY_AUTO_MERGE}" != "0" ] \
+         && [ "${SYMPHONY_AUTO_MERGE}" != "false" ]; then
+        TOUCHED_CRITICAL=""
+        if [ -n "${SYMPHONY_CRITICAL_FILES:-}" ]; then
+          # Drop blank lines so an accidental empty entry doesn't become an
+          # empty pathspec (which would match every file).
+          NORMALIZED_PATTERNS="$(printf '%s\n' "${SYMPHONY_CRITICAL_FILES}" | awk 'NF')"
+          if [ -n "${NORMALIZED_PATTERNS}" ]; then
+            OLD_IFS="$IFS"
+            IFS='
+'
+            # shellcheck disable=SC2086  # intentional newline word-splitting
+            set -- ${NORMALIZED_PATTERNS}
+            IFS="$OLD_IFS"
+            TOUCHED_CRITICAL="$(git diff --name-only "${MERGE_BASE}..${BRANCH}" -- "$@" 2>/dev/null || true)"
+          fi
+        fi
+        if [ -n "${TOUCHED_CRITICAL}" ]; then
+          echo "critical files touched on ${BRANCH}; leaving PR for human review:"
+          printf '%s\n' "${TOUCHED_CRITICAL}" | sed 's/^/  /'
+        else
+          MERGE_METHOD="${SYMPHONY_MERGE_METHOD:-squash}"
+          case "${MERGE_METHOD}" in
+            squash|merge|rebase) ;;
+            *)
+              echo "SYMPHONY_MERGE_METHOD=${MERGE_METHOD} not in {squash,merge,rebase}; falling back to squash" >&2
+              MERGE_METHOD="squash"
+              ;;
+          esac
+          if gh pr merge "${BRANCH}" --auto "--${MERGE_METHOD}"; then
+            echo "auto-merge armed on PR ${BRANCH} (method: ${MERGE_METHOD})"
+          else
+            echo "gh pr merge --auto failed; PR left for human review" >&2
+          fi
+        fi
       fi
     else
       # Local-only mode: the patch bundle above is the canonical output.
