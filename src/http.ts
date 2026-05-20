@@ -3,12 +3,13 @@
 // needed.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdir, readdir, readFile, writeFile, stat } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { Orchestrator } from './orchestrator.js';
-import { sanitizeWorkspaceKey } from './workspace.js';
 import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
+import { writeIssueFile, TRIAGE_STATE } from './issues.js';
+import type { IssueTracker } from './trackers/types.js';
 
 function jsonResponse(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -125,134 +126,24 @@ async function readTextBody(req: IncomingMessage, maxBytes = 1_000_000): Promise
   });
 }
 
-// Slugify a title into a filename-safe identifier. Lowercase ASCII with single-dash
-// separators; trims to a sensible length so the on-disk path stays readable. Falls back to
-// `issue` when the title is empty after stripping.
-function slugifyTitle(title: string): string {
-  const slug = title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60)
-    .replace(/-+$/g, '');
-  return slug.length > 0 ? slug : 'issue';
-}
-
-// Walk every state directory under `trackerRoot` and return the set of issue identifiers
-// (filename stem) currently present. Used to pick a unique suffix when deriving an
-// identifier from a title — checking only the target state directory would let a `Done/foo.md`
-// silently shadow a freshly created `Todo/foo.md` once it moves out of Todo.
-async function collectExistingIdentifiers(trackerRoot: string): Promise<Set<string>> {
-  const out = new Set<string>();
-  let entries: string[];
-  try {
-    entries = await readdir(trackerRoot);
-  } catch {
-    return out;
-  }
-  for (const stateDir of entries) {
-    const dirPath = path.join(trackerRoot, stateDir);
-    let st;
-    try {
-      st = await stat(dirPath);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    let files: string[];
-    try {
-      files = await readdir(dirPath);
-    } catch {
-      continue;
-    }
-    for (const f of files) {
-      if (f.endsWith('.md')) out.add(f.slice(0, -3));
-    }
-  }
-  return out;
-}
-
-// Used by the dashboard form. The local tracker stores issues at:
-//   <tracker.root>/<state>/<identifier>.md
-// with YAML front matter. Identifier sanitization re-uses the workspace key rules so the
-// file name is always safe across the rest of the orchestrator.
-async function writeIssueFile(input: {
-  trackerRoot: string;
-  /** Explicit identifier from the caller; when omitted, derived from `title`. */
-  identifier?: string;
-  state: string;
-  title: string;
-  description?: string;
-  priority?: number | null;
-  labels?: string[];
-  blocked_by?: string[];
-}): Promise<{ path: string; identifier: string; state: string }> {
-  const stateDir = path.join(input.trackerRoot, input.state);
-  await mkdir(stateDir, { recursive: true });
-  let ident: string;
-  let filePath: string;
-  const explicit = (input.identifier ?? '').trim();
-  if (explicit.length > 0) {
-    ident = sanitizeWorkspaceKey(explicit);
-    if (!ident) throw new Error('identifier must contain at least one allowed character');
-    filePath = path.join(stateDir, `${ident}.md`);
-    try {
-      await stat(filePath);
-      throw new Error(`issue ${ident} already exists at ${filePath}`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    }
-  } else {
-    // No identifier supplied → derive a slug from the title and disambiguate against
-    // collisions across every state directory under the tracker root, so a `-2` suffix
-    // appears whenever the same titled issue already exists anywhere (Todo / Done / etc).
-    const base = slugifyTitle(input.title);
-    const existing = await collectExistingIdentifiers(input.trackerRoot);
-    ident = base;
-    let n = 2;
-    while (existing.has(ident)) {
-      ident = `${base}-${n}`;
-      n += 1;
-    }
-    filePath = path.join(stateDir, `${ident}.md`);
-  }
-  const now = new Date().toISOString();
-  const fm: Record<string, unknown> = {
-    id: ident,
-    identifier: ident,
-    title: input.title,
-    created_at: now,
-    updated_at: now,
-  };
-  if (typeof input.priority === 'number') fm.priority = input.priority;
-  if (input.labels && input.labels.length > 0) fm.labels = input.labels;
-  if (input.blocked_by && input.blocked_by.length > 0) fm.blocked_by = input.blocked_by;
-
-  const yamlLines = ['---'];
-  for (const [k, v] of Object.entries(fm)) {
-    if (Array.isArray(v)) {
-      yamlLines.push(`${k}: [${v.map((x) => JSON.stringify(x)).join(', ')}]`);
-    } else if (typeof v === 'string') {
-      yamlLines.push(`${k}: ${JSON.stringify(v)}`);
-    } else {
-      yamlLines.push(`${k}: ${String(v)}`);
-    }
-  }
-  yamlLines.push('---', '');
-  const body = (input.description ?? '').trim();
-  const content = yamlLines.join('\n') + (body.length > 0 ? body + '\n' : '');
-  await writeFile(filePath, content, 'utf8');
-  return { path: filePath, identifier: ident, state: input.state };
-}
-
 // Browse current issues directly from disk so the UI can show items that are neither
-// currently running nor in the retry queue.
+// currently running nor in the retry queue. Triage entries additionally surface the
+// `proposed_by` / `proposed_at` front-matter so the dashboard can show provenance for
+// agent-authored proposals — fields are optional and null for hand-written issues.
 async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
   identifier: string;
   state: string;
   title: string;
+  proposed_by: string | null;
+  proposed_at: string | null;
 }>> {
-  const out: Array<{ identifier: string; state: string; title: string }> = [];
+  const out: Array<{
+    identifier: string;
+    state: string;
+    title: string;
+    proposed_by: string | null;
+    proposed_at: string | null;
+  }> = [];
   let entries: string[];
   try {
     entries = await readdir(trackerRoot);
@@ -288,11 +179,24 @@ async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
       if (titleMatch) {
         title = titleMatch[1]!.trim().replace(/^["'](.*)["']$/, '$1');
       }
-      out.push({ identifier: f.slice(0, -3), state: stateDir, title });
+      const proposed_by = matchFrontMatterString(text, 'proposed_by');
+      const proposed_at = matchFrontMatterString(text, 'proposed_at');
+      out.push({ identifier: f.slice(0, -3), state: stateDir, title, proposed_by, proposed_at });
     }
   }
   out.sort((a, b) => a.identifier.localeCompare(b.identifier));
   return out;
+}
+
+// Read a single string-valued key from the YAML front-matter block at the top of the file.
+// Mirrors the cheap regex approach used for `title` rather than a full YAML parse — the
+// dashboard only needs the value for display, and the local tracker's reader (which uses
+// the real YAML parser) is still authoritative for dispatch.
+function matchFrontMatterString(text: string, key: string): string | null {
+  const re = new RegExp(`^---[\\s\\S]*?\\n${key}:\\s*(.+)\\n[\\s\\S]*?---`, 'm');
+  const m = re.exec(text);
+  if (!m) return null;
+  return m[1]!.trim().replace(/^["'](.*)["']$/, '$1');
 }
 
 async function gatherPartialInputs(
@@ -333,7 +237,13 @@ async function gatherPartialInputs(
 type Snapshot = ReturnType<Orchestrator['snapshot']>;
 type RunningRow = Snapshot['running'][number];
 type RetryRow = Snapshot['retrying'][number];
-type DiskIssue = { identifier: string; state: string; title: string };
+type DiskIssue = {
+  identifier: string;
+  state: string;
+  title: string;
+  proposed_by: string | null;
+  proposed_at: string | null;
+};
 
 interface PartialInputs {
   workflowName: string;
@@ -503,6 +413,59 @@ function renderSessionRow(r: RunningRow): string {
     <span class="tokens dim">${formatTokens(tokens)} tok</span>
   </div>
   ${lastMsg ? `<div class="session-msg dim">${escapeHtml(lastMsg)}</div>` : ''}
+</li>`;
+}
+
+// Pending agent proposals. Empty when no issues sit in the Triage/ directory; otherwise a
+// two-line row per item with an approve (→ first active state) and discard (→ first
+// terminal state, prefers Cancelled) action. Provenance (`proposed_by`, `proposed_at`) is
+// surfaced as a dim meta line. Hand-written files dropped into Triage/ render the same way
+// minus the "from <parent>" bit — meaning operators can also pre-stage human proposals
+// in that directory.
+function renderTriagePartial(p: PartialInputs): string {
+  const triage = p.diskIssues.filter((i) => i.state === TRIAGE_STATE);
+  if (triage.length === 0) {
+    // Empty state is silent rather than narrated — operators see "triage" only when
+    // there is something to triage. This matches PRODUCT.md "show real state".
+    return '';
+  }
+  const approveTarget = p.activeStates[0] ?? 'Todo';
+  const items = triage.map((i) => renderTriageRow(i, approveTarget)).join('');
+  return `<h2 class="triage-title">triage <span class="count dim">(${triage.length})</span></h2>
+<ul class="triage">${items}</ul>`;
+}
+
+function renderTriageRow(i: DiskIssue, approveTarget: string): string {
+  const meta: string[] = [];
+  if (i.proposed_by) meta.push(`from ${escapeHtml(i.proposed_by)}`);
+  if (i.proposed_at) {
+    const when = formatTimeShort(i.proposed_at);
+    if (when) meta.push(when);
+  }
+  const metaLine = meta.length > 0 ? meta.join(' · ') : '';
+  const ident = escapeHtml(i.identifier);
+  // The buttons POST via HTMX and morph #triage so the row vanishes in place when the
+  // file moves. We send hx-target=#triage rather than swapping the row inline because the
+  // section header's count needs to update too.
+  return `<li class="triage-row">
+  <div class="triage-line-1">
+    <strong class="ident">${ident}</strong>
+    <span class="title">${escapeHtml(i.title)}</span>
+  </div>
+  <div class="triage-line-2">
+    ${metaLine ? `<span class="meta dim">${metaLine}</span>` : '<span class="meta dim">proposed</span>'}
+    <span class="grow"></span>
+    <form class="triage-actions"
+          hx-post="/api/v1/issues/${encodeURIComponent(i.identifier)}/approve"
+          hx-target="#triage" hx-swap="morph:innerHTML">
+      <button type="submit" class="ghost-sm" title="move to ${escapeHtml(approveTarget)}/">approve</button>
+    </form>
+    <form class="triage-actions"
+          hx-post="/api/v1/issues/${encodeURIComponent(i.identifier)}/discard"
+          hx-target="#triage" hx-swap="morph:innerHTML">
+      <button type="submit" class="ghost-sm danger" title="discard proposal">discard</button>
+    </form>
+  </div>
 </li>`;
 }
 
@@ -775,6 +738,53 @@ h2:first-child { margin-top: 0.4rem; }
 .disk .title { color: var(--base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .count { font-weight: 400; font-size: 0.88em; margin-left: 0.4rem; }
 
+/* ── triage ──────────────────────────────────────────────────────────────
+   Agent-proposed issues awaiting operator approval. Visually adjacent to the
+   "disk" listing (a flat, dense list) — not to the "attention" zone, because
+   triage is not blocking the orchestrator; it's a queue the operator drains at
+   their own pace. The amber-ish "retry" palette is reused for the section
+   header to mark it as "needs your eyes" without escalating to the urgent
+   blue/attention treatment reserved for steering and retry failures. */
+#triage:empty { display: none; }
+.triage-title { color: var(--retry-fg); border-bottom-color: var(--retry-bg); }
+.triage { list-style: none; padding: 0; margin: 0; }
+.triage li.triage-row {
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--rule-soft);
+  display: grid; gap: 0.1rem;
+}
+.triage li.triage-row:last-child { border-bottom: 0; }
+.triage .triage-line-1 {
+  display: flex; align-items: baseline; gap: 0.65rem;
+  font-variant-numeric: tabular-nums;
+}
+.triage .triage-line-1 .ident {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--strong);
+}
+.triage .triage-line-1 .title {
+  color: var(--base);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.triage .triage-line-2 {
+  display: flex; align-items: center; gap: 0.5rem;
+  font-size: 0.88em;
+  padding-left: 0.05rem;
+}
+.triage .meta { font-variant-numeric: tabular-nums; }
+.triage form.triage-actions { display: inline; margin: 0; padding: 0; }
+.ghost-sm {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--rule-firm); border-radius: 3px;
+  padding: 0.15rem 0.55rem; font: inherit; font-size: 0.82em; cursor: pointer;
+  transition: color 180ms cubic-bezier(.22,1,.36,1),
+              border-color 180ms cubic-bezier(.22,1,.36,1);
+}
+.ghost-sm:hover { color: var(--strong); border-color: var(--muted); }
+.ghost-sm.danger:hover { color: var(--err); border-color: var(--err); }
+.ghost-sm:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* ── new issue (collapsed) ────────────────────────────────────────────── */
 details.new-issue {
   margin-top: 1.4rem;
@@ -866,6 +876,10 @@ footer.totals:empty { display: none; }
          hx-get="/api/v1/partials/sessions" hx-trigger="every 2s, refreshed from:body"
          hx-swap="morph:innerHTML">${renderSessionsPartial(p)}</section>
 
+<section id="triage"
+         hx-get="/api/v1/partials/triage" hx-trigger="every 2s, refreshed from:body"
+         hx-swap="morph:innerHTML">${renderTriagePartial(p)}</section>
+
 <section id="disk"
          hx-get="/api/v1/partials/disk" hx-trigger="every 2s, refreshed from:body"
          hx-swap="morph:innerHTML">${renderDiskPartial(p)}</section>
@@ -955,6 +969,14 @@ export interface HttpServerOptions {
   };
   /** Optional MCP registry. When present, exposes /api/v1/issues/:id/mcp + steering-reply. */
   mcp?: McpRegistry | null;
+  /**
+   * Optional tracker reference. When present and the tracker supports
+   * `moveIssueToState`, the triage approve/discard endpoints are enabled so
+   * proposed issues can be promoted to the active queue or cancelled from the
+   * dashboard. When null, the triage section still renders (it's just disk
+   * listing) but the action buttons return 404.
+   */
+  tracker?: IssueTracker | null;
 }
 
 // Resolves once the server has either bound the requested port or rejected with the bind
@@ -1073,6 +1095,7 @@ async function handleRequest(
     if (slug === 'header') body = renderHeaderPartial(p);
     else if (slug === 'attention') body = renderAttentionPartial(p);
     else if (slug === 'sessions') body = renderSessionsPartial(p);
+    else if (slug === 'triage') body = renderTriagePartial(p);
     else if (slug === 'disk') body = renderDiskPartial(p);
     else if (slug === 'totals') body = renderTotalsPartial(p);
     if (body === null) return notFound(res, 'partial_not_found', `partial ${slug} does not exist`);
@@ -1311,6 +1334,129 @@ async function handleRequest(
       return;
     }
     return jsonResponse(res, 202, { identifier, accepted_at: new Date().toISOString() });
+  }
+
+  // Triage approve / discard. The dashboard renders these as buttons inside the triage
+  // section; an operator clicks one and we move the issue file out of Triage/. Approve
+  // sends it to the first active state (typically Todo) where the orchestrator will pick
+  // it up on the next poll; discard sends it to the first terminal state that looks like a
+  // cancellation (case-insensitive "Cancelled" match preferred) so the proposal is
+  // archived rather than deleted — operators can still grep for what was proposed and
+  // turned down.
+  //
+  // CSRF posture mirrors the steering-reply endpoint: form-encoded requires HX-Request
+  // + same-origin; JSON requires application/json (preflight-triggering). HTMX errors
+  // come back as 200 with a partial so the section doesn't go stale.
+  const triageMatch = /^\/api\/v1\/issues\/([^/]+)\/(approve|discard)$/.exec(pathname);
+  if (triageMatch) {
+    if (method !== 'POST') return methodNotAllowed(res);
+    const tracker = opts.tracker;
+    if (!tracker || !tracker.moveIssueToState) {
+      return notFound(
+        res,
+        'tracker_no_state_transitions',
+        'tracker does not support state transitions',
+      );
+    }
+    const root = view.trackerRoot;
+    if (!root) return badRequest(res, 'tracker.root not configured');
+    const identifier = decodeURIComponent(triageMatch[1]!);
+    const action = triageMatch[2]!;
+    const isHtmx = req.headers['hx-request'] === 'true';
+    const ctype = (req.headers['content-type'] ?? '').toLowerCase();
+    const baseCtype = ctype.split(';', 1)[0]!.trim();
+    const isFormBody = baseCtype === 'application/x-www-form-urlencoded';
+    const isJsonBody = baseCtype === 'application/json';
+    // HTMX form submits arrive with an empty body and the standard form content-type;
+    // direct API callers send application/json. An empty Content-Type from curl is
+    // treated as a JSON call (consistent with how /issues handles bodyless POSTs).
+    const isEmptyCtype = baseCtype === '';
+    if (!isFormBody && !isJsonBody && !isEmptyCtype) {
+      return jsonResponse(res, 415, {
+        error: {
+          code: 'unsupported_media_type',
+          message: 'content-type must be application/json or application/x-www-form-urlencoded',
+        },
+      });
+    }
+    if (isFormBody) {
+      if (!isHtmx || !isSameOriginRequest(req)) {
+        return jsonResponse(res, 403, {
+          error: {
+            code: 'forbidden',
+            message: 'form-encoded triage actions require an HTMX same-origin request',
+          },
+        });
+      }
+    }
+    let toState: string;
+    if (action === 'approve') {
+      toState = view.activeStates[0] ?? 'Todo';
+    } else {
+      // Prefer a state literally named "Cancelled" (case-insensitive); fall back to the
+      // first terminal state. If neither is configured, refuse the action rather than
+      // deleting silently.
+      const cancelled = view.terminalStates.find((s) => s.toLowerCase() === 'cancelled');
+      const fallback = view.terminalStates[0];
+      const target = cancelled ?? fallback;
+      if (!target) {
+        return jsonResponse(res, 409, {
+          error: {
+            code: 'no_discard_target',
+            message: 'no terminal_states configured to discard the proposal into',
+          },
+        });
+      }
+      toState = target;
+    }
+    try {
+      const result = await tracker.moveIssueToState(identifier, toState, {
+        fromRoot: root,
+        fromState: TRIAGE_STATE,
+      });
+      log.info('triage action', { identifier, action, from: result.fromState, to: result.toState });
+      // Nudge the orchestrator to pick the freshly approved issue up immediately instead
+      // of waiting for the next poll tick. Best-effort: triggerRefresh is idempotent.
+      if (action === 'approve') {
+        try {
+          orch.triggerRefresh();
+        } catch {
+          /* refresh request is fire-and-forget */
+        }
+      }
+      if (isHtmx) {
+        const p = await gatherPartialInputs(orch, view);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end(renderTriagePartial(p));
+        return;
+      }
+      return jsonResponse(res, 200, {
+        identifier,
+        action,
+        from_state: result.fromState,
+        to_state: result.toState,
+      });
+    } catch (err) {
+      const code = (err as Error & { code?: string }).code ?? 'triage_failed';
+      const status = code === 'local_issue_not_found' ? 404 : 409;
+      if (isHtmx) {
+        // Re-render the section so the row that "failed" stays visible; the operator can
+        // retry or investigate. We don't have a banner widget for this section yet, so
+        // surface the failure via the log line + the section staying populated. A more
+        // verbose UI is a follow-up if operators report needing it.
+        const p = await gatherPartialInputs(orch, view);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end(renderTriagePartial(p));
+        return;
+      }
+      return jsonResponse(res, status, {
+        error: { code, message: (err as Error).message },
+      });
+    }
   }
 
   const m = /^\/api\/v1\/([^/]+)$/.exec(pathname);

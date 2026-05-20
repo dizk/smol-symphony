@@ -216,7 +216,7 @@ describe('McpRegistry JSON-RPC', () => {
       assert.ok(res && 'result' in res);
       const result = res.result as { tools: Array<{ name: string }> };
       const names = result.tools.map((t) => t.name).sort();
-      assert.deepEqual(names, ['mark_done', 'request_human_steering']);
+      assert.deepEqual(names, ['mark_done', 'propose_issue', 'request_human_steering']);
     } finally {
       await cleanup();
     }
@@ -773,6 +773,175 @@ describe('McpRegistry.buildUrl', () => {
       reg.setEffectivePort(8787);
       const url = reg.buildUrl('ABC-1 hi', { host: '10.0.2.2', explicit_host_url: null });
       assert.equal(url, 'http://10.0.2.2:8787/api/v1/issues/ABC-1%20hi/mcp');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe('McpRegistry propose_issue', () => {
+  it('writes a Triage/<slug>.md file with proposed_by stamped from the calling issue', async () => {
+    const { root, cleanup } = await setupTree();
+    try {
+      const t = makeTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'propose_issue',
+          arguments: {
+            title: 'Investigate flaky workspace cleanup',
+            description: 'Saw two consecutive runs leave dangling .symphony-runtime dirs.',
+            labels: ['bug', 'flaky'],
+            priority: 3,
+          },
+        },
+      });
+      assert.ok(res && 'result' in res);
+      const result = res.result as {
+        isError: boolean;
+        content: Array<{ text: string }>;
+        structuredContent: { identifier: string; state: string; path: string };
+      };
+      assert.equal(result.isError, false);
+      assert.match(result.content[0]!.text, /^Proposed issue investigate-flaky-workspace-cleanup/);
+      assert.equal(result.structuredContent.state, 'Triage');
+      assert.equal(result.structuredContent.identifier, 'investigate-flaky-workspace-cleanup');
+
+      const triageDir = path.join(root, 'Triage');
+      const files = await readdir(triageDir);
+      assert.deepEqual(files, ['investigate-flaky-workspace-cleanup.md']);
+      const body = await readFile(path.join(triageDir, files[0]!), 'utf8');
+      assert.match(body, /title: "Investigate flaky workspace cleanup"/);
+      assert.match(body, /proposed_by: "ABC-1"/);
+      assert.match(body, /proposed_at: "/);
+      assert.match(body, /labels: \["bug", "flaky"\]/);
+      assert.match(body, /priority: 3/);
+      assert.match(body, /Saw two consecutive runs/);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('disambiguates slug collisions across all state directories', async () => {
+    // Regression-flavor: agent proposes a title that already exists in Done/. The new
+    // proposal must land with a -2 suffix instead of overwriting the existing file,
+    // matching the dashboard form's behaviour.
+    const { root, cleanup } = await setupTree();
+    try {
+      // Plant a Done/ duplicate to force collision.
+      await writeFile(
+        path.join(root, 'Done', 'fix-the-thing.md'),
+        `---\ntitle: Fix the thing\n---\nbody.`,
+      );
+      const t = makeTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'propose_issue',
+          arguments: { title: 'Fix the thing' },
+        },
+      });
+      const result = (res as {
+        result: { isError: boolean; structuredContent: { identifier: string } };
+      }).result;
+      assert.equal(result.isError, false);
+      assert.equal(result.structuredContent.identifier, 'fix-the-thing-2');
+      assert.deepEqual(await readdir(path.join(root, 'Triage')), ['fix-the-thing-2.md']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('rejects missing or multi-line title', async () => {
+    const { root, cleanup } = await setupTree();
+    try {
+      const t = makeTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const noTitle = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'propose_issue', arguments: {} },
+      });
+      const noTitleResult = (noTitle as { result: { isError: boolean; content: Array<{ text: string }> } })
+        .result;
+      assert.equal(noTitleResult.isError, true);
+      assert.match(noTitleResult.content[0]!.text, /title is required/);
+
+      const multiLine = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'propose_issue', arguments: { title: 'two\nlines' } },
+      });
+      const multiLineResult = (multiLine as { result: { isError: boolean; content: Array<{ text: string }> } })
+        .result;
+      assert.equal(multiLineResult.isError, true);
+      assert.match(multiLineResult.content[0]!.text, /must be a single line/);
+
+      // No triage file was written for either failure.
+      let triageFiles: string[] = [];
+      try {
+        triageFiles = await readdir(path.join(root, 'Triage'));
+      } catch {
+        triageFiles = [];
+      }
+      assert.deepEqual(triageFiles, []);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('uses the tracker root snapshotted at dispatch time, not a post-reload root', async () => {
+    // Same rationale as mark_done: a workflow reload that mutates tracker.root mid-flight
+    // must not redirect an in-flight proposal to a different filesystem location.
+    const { root, cleanup } = await setupTree();
+    try {
+      const t = makeTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
+      const decoyRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-decoy-propose-'));
+      try {
+        t.updateConfig({
+          kind: 'local',
+          endpoint: null,
+          api_key: null,
+          project_slug: null,
+          active_states: ['Todo', 'In Progress'],
+          terminal_states: ['Done'],
+          root: decoyRoot,
+        });
+        const token = reg.activate(entry);
+        await reg.handleJsonRpc('ABC-1', token, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name: 'propose_issue', arguments: { title: 'Snapshot test' } },
+        });
+        // Lands in the original root, NOT the decoy.
+        assert.deepEqual(await readdir(path.join(root, 'Triage')), ['snapshot-test.md']);
+        let decoyFiles: string[] = [];
+        try {
+          decoyFiles = await readdir(path.join(decoyRoot, 'Triage'));
+        } catch {
+          decoyFiles = [];
+        }
+        assert.deepEqual(decoyFiles, []);
+      } finally {
+        await rm(decoyRoot, { recursive: true, force: true });
+      }
     } finally {
       await cleanup();
     }

@@ -148,7 +148,7 @@ API clients. CSRF-relevant content types (`text/plain`,
 
 Symphony injects an MCP server into each ACP session at
 `http://<host>:<bound-port>/api/v1/issues/<id>/mcp`, gated by a per-dispatch
-bearer token. Two tools:
+bearer token. Three tools:
 
 - **`symphony.mark_done({ title, summary })`** — call once at end of a
   successful run. `title` is a single-line imperative summary (≤72 chars);
@@ -162,6 +162,14 @@ bearer token. Two tools:
   when blocked on something only a human can answer. The turn ends
   immediately; the human's reply arrives as the prompt for the next turn.
   Steering-reply turns don't count against `agent.max_turns`.
+- **`symphony.propose_issue({ title, description?, labels?, priority? })`** —
+  call when the agent notices work that is out of scope for its current
+  task. The proposal lands in the `Triage/` state directory, which the
+  orchestrator does **not** dispatch; the operator approves (→ first active
+  state) or discards (→ first terminal state, prefers `Cancelled`) from the
+  dashboard. The calling issue's identifier and a timestamp are stamped into
+  the proposal's front-matter as `proposed_by` / `proposed_at` so provenance
+  is visible.
 
 In smolvm, the VM's `127.0.0.1` transparently reaches the host's
 `127.0.0.1` (verified empirically), so the agent reaches the orchestrator
