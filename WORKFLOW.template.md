@@ -170,7 +170,15 @@ acp:
   read_timeout_ms: 30000
 
   # stall_timeout_ms (int): max time the adapter can be idle (no events) before
-  # the turn is killed and retried. Default: 300000
+  # the turn is killed and retried. Default: 300000.
+  #
+  # Note: during a prompt symphony writes a bare `\n` to the adapter's stdin
+  # every 1.5s as a keepalive — without it the smolvm-exec stdio pump can wedge
+  # silently after `available_commands_update` on long-running prompts. The
+  # timeout therefore measures wall time since the last *any* event from the
+  # adapter, and should comfortably exceed expected first-token latency on the
+  # configured model. The default is fine for most setups; raise it only if you
+  # observe genuine wedges or need very-long thinking budgets.
   stall_timeout_ms: 300000
 
 # ─────────────────────────────────────────────────────────────────────────────
