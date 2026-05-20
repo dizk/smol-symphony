@@ -48,7 +48,7 @@ describe('prompt', () => {
 
   it('falls back to a default prompt when template is empty', async () => {
     const out = await renderPrompt({ template: '   \n   ', issue, attempt: null });
-    assert.match(out, /Linear/);
+    assert.match(out, /working on an issue/);
   });
 
   it('blocks prototype property lookups', async () => {

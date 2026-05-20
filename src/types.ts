@@ -44,9 +44,6 @@ export interface StateConfig {
 
 export interface TrackerConfig {
   kind: string;
-  endpoint: string | null;
-  api_key: string | null;
-  project_slug: string | null;
   // Derived from `states` after workflow parse so existing consumers keep working
   // unchanged. `active_states` lists every state with role `active`, in declaration
   // order; `terminal_states` lists every state with role `terminal`, in declaration
@@ -89,13 +86,11 @@ export interface AgentConfig {
 
 // ACP adapter configuration. `adapter` selects one of symphony's known adapter profiles
 // (currently `claude` and `codex`); the profile encodes the binary symphony launches
-// inside the VM and the credential file it copies in from the host. `command` is an
-// optional override — if set, it replaces the auto-generated `mkdir + cp + exec`
-// dance and the operator becomes responsible for staging credentials. Leave it null
-// for the supported zero-config experience.
+// inside the VM and the credential file it copies in from the host. Symphony always
+// auto-derives the launch command (scrub guest cred dir + stage credential + exec the
+// in-VM proxy); operators who need a custom shape fork scripts/vm-agent.js.
 export interface AcpConfig {
   adapter: string;
-  command: string | null;
   /**
    * Optional model selector forwarded to the adapter. Each adapter profile decides how
    * to surface it (env var for claude-agent-acp's ANTHROPIC_MODEL; `-c model="..."` argv
@@ -150,8 +145,6 @@ export interface SmolvmConfig {
   cpus: number;
   mem_mib: number;
   net: boolean;
-  // Path on host to a directory containing the codex binary; mounted read-only into the VM at /opt/codex.
-  bin_path: string | null;
   // Additional host:guest volume mounts (credentials, repo caches, ssh keys, …).
   volumes: SmolvmVolume[];
   // Extra env vars forwarded into the VM exec (e.g. OPENAI_API_KEY).

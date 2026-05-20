@@ -40,9 +40,6 @@ async function bootServer(
   const tracker = opts?.withTracker
     ? new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo', 'In Progress'],
         terminal_states: ['Done', 'Cancelled'],
         root: trackerRoot,
@@ -653,9 +650,6 @@ async function bootBespoke(
   const orch = makeStubOrchestrator();
   const tracker = new LocalMarkdownTracker({
     kind: 'local',
-    endpoint: null,
-    api_key: null,
-    project_slug: null,
     active_states: activeNames,
     terminal_states: terminalNames,
     states: Object.fromEntries(bespoke.states.map((s) => [s.name, { role: s.role }])),

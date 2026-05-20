@@ -291,8 +291,8 @@ smolvm:
   net: true
   # No volume mounts. Workspace is auto-mounted by the runner. Credentials are
   # staged into the workspace by symphony and copied into ~/.claude by the
-  # auto-derived acp.command. The tracker is reached only through the symphony
-  # MCP server.
+  # auto-derived ACP launch command. The tracker is reached only through the
+  # symphony MCP server.
   volumes: []
   forward_env:
     - OPENAI_API_KEY

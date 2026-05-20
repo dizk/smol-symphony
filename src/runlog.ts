@@ -34,11 +34,11 @@ export class RunLog {
   private broken = false;
 
   /**
-   * `issueId` is the tracker's primary key (e.g. a Linear UUID or the local tracker's
-   * front-matter `id`) and is what each JSONL line is stamped with. `identifier` is the
-   * filename-safe display id (e.g. `ABC-123`) and is only used to derive the file path.
-   * The two coincide for local trackers today but MUST be kept separate so downstream
-   * evaluators can correlate by tracker id even on trackers where the values diverge.
+   * `issueId` is the tracker's primary key (e.g. the local tracker's front-matter `id`)
+   * and is what each JSONL line is stamped with. `identifier` is the filename-safe display
+   * id (e.g. `ABC-123`) and is only used to derive the file path. The two coincide for
+   * local trackers today but MUST be kept separate so downstream evaluators can correlate
+   * by tracker id even on trackers where the values diverge.
    */
   constructor(
     private readonly filePath: string,
@@ -121,8 +121,8 @@ export class RunLog {
  *
  * `issueId` is the tracker's primary key and is stamped on every line as `issue_id`.
  * `issueIdentifier` is the filename-safe display id and is used to derive the path AND
- * is stamped as `issue_identifier`. Pass both — they diverge on trackers like Linear
- * where ids are opaque UUIDs distinct from human-readable identifiers.
+ * is stamped as `issue_identifier`. Pass both — they may diverge on trackers where ids
+ * are opaque distinct from human-readable identifiers.
  */
 export function openRunLog(
   logsRoot: string,

@@ -248,9 +248,8 @@ export class AgentRunner {
     // workspace, exec the in-VM proxy at /opt/symphony/vm-agent.mjs. The proxy reads its
     // config (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from env, dials the
     // host's bridge, and spawns the adapter. The adapter id was already validated up
-    // top via `resolved` (which folds in any per-state override), and `acp.command`
-    // overrides are rejected by validateDispatch; the branches below are pure data
-    // binding off the resolved profile.
+    // top via `resolved` (which folds in any per-state override); the branches below are
+    // pure data binding off the resolved profile.
     const profile = ADAPTERS[resolved.adapter];
     let staged;
     try {
@@ -300,9 +299,6 @@ export class AgentRunner {
     const mounts = [
       { host: workspace.path, guest: workspace.path, readonly: false },
     ];
-    if (this.cfg.smolvm.bin_path) {
-      mounts.push({ host: this.cfg.smolvm.bin_path, guest: '/opt/codex', readonly: true });
-    }
     for (const v of this.cfg.smolvm.volumes) {
       mounts.push({ host: v.host, guest: v.guest, readonly: v.readonly });
     }

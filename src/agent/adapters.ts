@@ -12,9 +12,8 @@
 //   - binary             : the executable inside the VM that speaks ACP.
 //
 // To add a new adapter (e.g. opencode), populate the profile and add it to ADAPTERS.
-// Until an adapter has a verified profile, workflows can still target it by setting
-// `acp.command` explicitly — that opts out of symphony's auto-staging and the operator
-// becomes responsible for getting credentials to the adapter themselves.
+// Unprofiled adapters are not supported at runtime — symphony always auto-stages the
+// host credential and execs the in-VM proxy.
 //
 // IMPORTANT: every host path here is treated as private. Symphony reads the file,
 // stages a copy into the workspace, and chmods the copy to 0600. The original host
@@ -111,8 +110,9 @@ export function hostCredentialAbsPath(profile: AdapterProfile): string {
  *   - `.git` is a file (linked worktree) → refused at stage time. The
  *     per-worktree gitdir lives outside the workspace mount, so symphony
  *     cannot place the credential where the in-VM agent can see it without
- *     re-introducing the working-tree-leak risk. Operators who need a worktree
- *     workspace must set `acp.command` explicitly and own credential staging.
+ *     re-introducing the working-tree-leak risk. Linked worktrees are
+ *     unsupported under the TCP bridge transport; use a non-linked workspace
+ *     clone or fork scripts/vm-agent.js.
  *
  * Returned path is relative to `workspacePath` and slash-joined (POSIX) so it
  * works as-is in the in-VM acp launch command, regardless of host OS path
@@ -147,7 +147,7 @@ export async function assertHostCredentialReadable(profile: AdapterProfile): Pro
  *   1. `resolveStagingLocation` picks a path OUTSIDE the working tree when git is
  *      present (`.git/symphony-runtime/...`) so `git add -A`, a tracked file at
  *      `.symphony-runtime/`, or a `.gitignore` negation cannot expose the secret.
- *      Linked worktrees are refused (operator must override acp.command).
+ *      Linked worktrees are refused (see resolveStagingLocation comment).
  *   2. `ensureRealDir` walks each parent we materialize and refuses if any exists
  *      as a symlink or non-directory.
  *   3. `rm + copyFile(COPYFILE_EXCL)` closes the local race on the leaf path:
@@ -234,15 +234,15 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
         throw new Error(
           `cannot auto-stage credentials: workspace ${workspacePath} could not be resolved ` +
             `(realpath failed: ${(resolveErr as Error).message}). Refusing to stage without a ` +
-            `canonical path; fix the workspace or set acp.command explicitly.`,
+            `canonical path; fix the workspace.`,
         );
       }
       const ancestor = await findAncestorGit(resolvedWorkspace);
       if (ancestor !== null) {
         throw new Error(
           `cannot auto-stage credentials: workspace ${workspacePath} has no .git of its own ` +
-            `but is inside an ancestor git repo at ${ancestor}. Either create a nested clone ` +
-            `(e.g. via hooks.after_create) or set acp.command explicitly.`,
+            `but is inside an ancestor git repo at ${ancestor}. Create a nested clone ` +
+            `(e.g. via hooks.after_create).`,
         );
       }
       return {
@@ -268,13 +268,10 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
     // lives outside the workspace mount, so symphony cannot place the credential
     // there and still have the in-VM agent reach it. Any worktree-internal path
     // is inside the working tree, where `.gitignore` negation or a tracked file
-    // could still expose the secret to `git add -A`.
-    //
-    // The previous error pointed operators at `acp.command` as the workaround, but
-    // the TCP bridge transport no longer accepts that override. Linked worktrees
-    // are currently unsupported under the bridge — use a non-linked workspace
-    // clone (e.g. `git clone --local`) or fork scripts/vm-agent.js to stage
-    // credentials in whatever shape your worktree layout needs.
+    // could still expose the secret to `git add -A`. Linked worktrees are
+    // currently unsupported — use a non-linked workspace clone (e.g.
+    // `git clone --local`) or fork scripts/vm-agent.js to stage credentials in
+    // whatever shape your worktree layout needs.
     throw new Error(
       `cannot auto-stage credentials in a linked worktree (.git at ${gitPath} is a file). ` +
         `Linked worktrees are unsupported under the ACP TCP bridge transport; use a ` +

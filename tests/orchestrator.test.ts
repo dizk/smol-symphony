@@ -141,42 +141,4 @@ describe('Orchestrator startup credential check', () => {
     }
   });
 
-  it('skips per-state credential checks when acp.command is set (operator-managed)', async () => {
-    // acp.command is rejected by validateDispatch under the TCP bridge, so we
-    // can't actually start with one set today. But the credential-check
-    // pathway must still be conditional on `cfg.acp.command === null`: this
-    // test guards the conditional so a future relaxation of validateDispatch
-    // doesn't accidentally start probing host paths the operator owns.
-    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-cmd-'));
-    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-cmd-'));
-    const prevHome = process.env.HOME;
-    process.env.HOME = fakeHome;
-    try {
-      // No credentials staged at all; if the gate is honored, start() will
-      // still fail (validateDispatch rejects acp.command under the TCP
-      // bridge) but the failure must NOT be about a missing credential —
-      // it has to be the acp.command rejection.
-      const { cfg, def } = await buildCfgAndDef(
-        {
-          acp: { adapter: 'claude', command: 'echo not-supported' },
-          states: {
-            Todo: { role: 'active' },
-            Done: { role: 'terminal' },
-          },
-        },
-        trackerRoot,
-      );
-      const { workflowSrc, tracker, workspaces, runner } = makeStubs();
-      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, workspaces, runner);
-      await assert.rejects(
-        () => orch.start(),
-        (err: unknown) => err instanceof Error && /acp\.command is not supported/.test(err.message),
-      );
-    } finally {
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
-      await rm(fakeHome, { recursive: true, force: true });
-      await rm(trackerRoot, { recursive: true, force: true });
-    }
-  });
 });

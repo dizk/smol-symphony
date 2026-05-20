@@ -44,8 +44,8 @@ describe('runlog', () => {
     assert.equal(b.attempt, 2);
   });
 
-  it('stamps issue_id and issue_identifier separately so Linear-style UUIDs survive', async () => {
-    // Linear-style: id is an opaque UUID, identifier is the human-readable key.
+  it('stamps issue_id and issue_identifier separately so opaque-UUID ids survive', async () => {
+    // Some trackers use an opaque UUID as `id` and a human-readable key as `identifier`.
     const rl = openRunLog(tmpDir, 'a1b2c3d4-uuid', 'ENG-42');
     rl.record({ channel: 'system', event: 'attempt_started' });
     const file = path.join(tmpDir, 'ENG-42.jsonl');

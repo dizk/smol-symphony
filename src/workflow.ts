@@ -145,9 +145,6 @@ export function buildServiceConfig(
   // tracker (§5.3.1)
   const trackerRaw = getObject(raw, 'tracker');
   const trackerKind = (asString(trackerRaw['kind']) ?? '').trim();
-  const apiKeyRaw = asString(trackerRaw['api_key']);
-  const apiKeyResolved = apiKeyRaw ? expandVar(apiKeyRaw) : null;
-  const trackerEndpointDefault = trackerKind === 'linear' ? 'https://api.linear.app/graphql' : null;
   // local-tracker extension: optional `tracker.root` path.
   const trackerRootRaw = asString(trackerRaw['root']);
   let trackerRoot: string | null = null;
@@ -179,9 +176,6 @@ export function buildServiceConfig(
   const { activeStates, terminalStates } = deriveStateLists(states);
   const tracker: TrackerConfig = {
     kind: trackerKind,
-    endpoint: asString(trackerRaw['endpoint']) ?? trackerEndpointDefault,
-    api_key: apiKeyResolved && apiKeyResolved.length > 0 ? apiKeyResolved : null,
-    project_slug: asString(trackerRaw['project_slug']),
     active_states: activeStates,
     terminal_states: terminalStates,
     states,
@@ -261,9 +255,7 @@ export function buildServiceConfig(
   // acp (Symphony extension; supersedes the §5.3.6 `codex` block). `adapter` selects
   // one of symphony's known profiles (claude, codex); symphony auto-derives the launch
   // command from the adapter profile and stages the host credential file into the
-  // workspace. The legacy `acp.command` shell override is still parsed for backward
-  // compatibility but rejected by validateDispatch (the TCP bridge needs the in-VM proxy
-  // to dial back, so a raw adapter command would wedge every attempt).
+  // workspace.
   //
   // `acp.bridge` configures the host-side TCP listener that the in-VM agent dials back
   // to for ACP traffic. The bridge replaced the smolvm-exec stdio path; see
@@ -274,7 +266,6 @@ export function buildServiceConfig(
   const modelTrimmed = modelRaw === null ? null : modelRaw.trim();
   const acp: AcpConfig = {
     adapter: asString(acpRaw['adapter']) ?? 'claude',
-    command: asString(acpRaw['command']),
     model: modelTrimmed && modelTrimmed.length > 0 ? modelTrimmed : null,
     shell: asString(acpRaw['shell']) ?? 'bash',
     prompt_timeout_ms: asInt(acpRaw['prompt_timeout_ms'], 3_600_000),
@@ -326,7 +317,6 @@ export function buildServiceConfig(
     cpus: asInt(smolvmRaw['cpus'], 2),
     mem_mib: asInt(smolvmRaw['mem_mib'], 2048),
     net: smolvmRaw['net'] !== false,
-    bin_path: asString(smolvmRaw['bin_path']),
     volumes,
     // Default forwarded credentials cover all three shipped ACP adapters so workflows that
     // do not override `smolvm.forward_env` still authenticate after the default-adapter
@@ -474,19 +464,12 @@ function deriveStateLists(states: Record<string, StateConfig>): {
 
 // §6.3 dispatch preflight validation.
 export function validateDispatch(cfg: ServiceConfig): string | null {
-  if (!cfg.tracker.kind) return 'tracker.kind is required';
-  if (cfg.tracker.kind !== 'linear' && cfg.tracker.kind !== 'local') {
-    return `unsupported_tracker_kind: ${cfg.tracker.kind}`;
+  if (cfg.tracker.kind !== 'local') {
+    return `unsupported_tracker_kind: ${cfg.tracker.kind || '<missing>'}`;
   }
-  if (cfg.tracker.kind === 'linear') {
-    if (!cfg.tracker.api_key) return 'missing_tracker_api_key';
-    if (!cfg.tracker.project_slug) return 'missing_tracker_project_slug';
-  }
-  if (cfg.tracker.kind === 'local') {
-    if (!cfg.tracker.root) return 'tracker.root must be set for local tracker';
-    if (!existsSync(cfg.tracker.root) || !statSync(cfg.tracker.root).isDirectory()) {
-      return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
-    }
+  if (!cfg.tracker.root) return 'tracker.root must be set for local tracker';
+  if (!existsSync(cfg.tracker.root) || !statSync(cfg.tracker.root).isDirectory()) {
+    return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
   }
   // `cfg.states` is set by buildServiceConfig in every real run; test harnesses
   // that synthesize a ServiceConfig literal sometimes omit it, so fall back to
@@ -495,22 +478,6 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
     cfg.states ?? synthesizeLegacyStates(cfg.tracker.active_states, cfg.tracker.terminal_states);
   const statesError = validateStates(stateMap);
   if (statesError) return statesError;
-  // `acp.command` was a pre-bridge escape hatch: operators could substitute their own
-  // adapter launch string. With the TCP bridge architecture in place, every launch must
-  // end up running `node /opt/symphony/vm-agent.mjs` so the in-VM proxy can dial back and
-  // bridge the adapter's stdio onto an authenticated socket. A raw `acp.command` that
-  // execs the adapter directly never sends the bearer line, so the bridge waits the full
-  // `connect_timeout_ms` and the attempt fails. Fail loudly at startup instead — clear
-  // signal for operators with a stale config, no silent wedges. Anyone who genuinely needs
-  // a custom launch can fork the in-VM proxy (`scripts/vm-agent.js`) and rebuild the image.
-  if (cfg.acp.command !== null) {
-    return (
-      'acp.command is not supported under the TCP bridge transport. Remove it from ' +
-      'WORKFLOW.md; symphony auto-derives the launch (scrub guest cred dir + stage ' +
-      'credential + exec the in-VM proxy). For custom behavior, edit scripts/vm-agent.js ' +
-      'and rebuild via scripts/build-vm.sh.'
-    );
-  }
   if (!isKnownAdapter(cfg.acp.adapter)) {
     return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex`;
   }

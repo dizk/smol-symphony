@@ -30,9 +30,6 @@ describe('local tracker', () => {
     try {
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done'],
         root,
@@ -55,9 +52,6 @@ describe('local tracker', () => {
     try {
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done', 'Cancelled'],
         root,
@@ -80,9 +74,6 @@ describe('local tracker', () => {
     try {
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done'],
         root,
@@ -102,9 +93,6 @@ describe('local tracker', () => {
     try {
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done'],
         root,
@@ -125,9 +113,6 @@ describe('local tracker state-machine integration', () => {
     try {
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo', 'Review'],
         terminal_states: ['Done', 'Cancelled'],
         states: {
@@ -162,9 +147,6 @@ describe('local tracker state-machine integration', () => {
       await writeFile(path.join(root, 'Triage', 'A-4.md'), `---\ntitle: Four\n---\nbody`);
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo', 'Review'],
         terminal_states: ['Done'],
         states: {
@@ -198,9 +180,6 @@ describe('local tracker state-machine integration', () => {
       await writeFile(path.join(root, 'OldRetiredState', 'A-99.md'), `---\ntitle: Ghost\n---\nbody`);
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done'],
         states: {
@@ -244,9 +223,6 @@ describe('local tracker moveIssueToState with notes', () => {
       );
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo', 'Review'],
         terminal_states: ['Done'],
         states: {
@@ -296,9 +272,6 @@ describe('local tracker moveIssueToState with notes', () => {
       await writeFile(path.join(root, 'Todo', 'A-1.md'), `---\ntitle: First\n---\nBody.`);
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo', 'Review'],
         terminal_states: ['Done'],
         states: {
@@ -330,9 +303,6 @@ describe('local tracker moveIssueToState with notes', () => {
       );
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done'],
         states: {

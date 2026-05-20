@@ -10,9 +10,6 @@ import type { RunningEntry, Issue } from '../src/types.js';
 function makeTracker(root: string): LocalMarkdownTracker {
   return new LocalMarkdownTracker({
     kind: 'local',
-    endpoint: null,
-    api_key: null,
-    project_slug: null,
     active_states: ['Todo', 'In Progress'],
     terminal_states: ['Done', 'Cancelled'],
     root,
@@ -328,9 +325,6 @@ describe('McpRegistry JSON-RPC', () => {
         // simulating a workflow reload during workspace setup / before_run.
         t.updateConfig({
           kind: 'local',
-          endpoint: null,
-          api_key: null,
-          project_slug: null,
           active_states: ['Todo', 'In Progress'],
           terminal_states: ['Done', 'Cancelled'],
           root: decoyRoot,
@@ -922,9 +916,6 @@ describe('McpRegistry propose_issue', () => {
       try {
         t.updateConfig({
           kind: 'local',
-          endpoint: null,
-          api_key: null,
-          project_slug: null,
           active_states: ['Todo', 'In Progress'],
           terminal_states: ['Done'],
           root: decoyRoot,
@@ -977,9 +968,6 @@ describe('McpRegistry transition', () => {
   function makeStateTracker(root: string): LocalMarkdownTracker {
     return new LocalMarkdownTracker({
       kind: 'local',
-      endpoint: null,
-      api_key: null,
-      project_slug: null,
       active_states: ['Todo', 'Review'],
       terminal_states: ['Done', 'Cancelled'],
       states,
@@ -1228,9 +1216,6 @@ describe('McpRegistry transition', () => {
       }
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done'],
         states: customStates,
@@ -1277,9 +1262,6 @@ describe('McpRegistry transition', () => {
       }
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        endpoint: null,
-        api_key: null,
-        project_slug: null,
         active_states: ['Todo'],
         terminal_states: ['Done'],
         states: noHoldingStates,

@@ -22,26 +22,13 @@ Notation:
 # tracker — where issues come from.
 # ─────────────────────────────────────────────────────────────────────────────
 tracker:
-  # kind (required): 'local' or 'linear'.
-  #   local  — markdown files under `root`, one per issue, organized by state.
-  #   linear — Linear API (workspace + project_slug).
+  # kind (required): currently the only supported value is 'local' (markdown
+  # files under `root`, one per issue, organized by state subdirectory).
   kind: local
 
-  # root (path): local-tracker only. Directory containing `<state>/<id>.md`
-  # files. Required when kind=local. Resolved relative to the workflow file
-  # if not absolute.
+  # root (path): directory containing `<state>/<id>.md` files. Required.
+  # Resolved relative to the workflow file if not absolute.
   root: ./issues
-
-  # endpoint (string): linear-tracker only. API endpoint.
-  # Default: Linear's public GraphQL endpoint.
-  endpoint: https://api.linear.app/graphql
-
-  # api_key (string): linear-tracker only. Personal API key. Required for
-  # kind=linear. Pulled from $LINEAR_API_KEY if you use `$LINEAR_API_KEY`.
-  api_key: $LINEAR_API_KEY
-
-  # project_slug (string): linear-tracker only. Required for kind=linear.
-  project_slug: my-team/my-project
 
   # active_states (string[]): states the orchestrator dispatches against.
   # Default: [Todo, In Progress]
@@ -246,13 +233,8 @@ acp:
   # Leave unset / null to use the adapter's own default model. Default: null.
   # model: claude-opus-4-7
 
-  # NOTE: `acp.command` is intentionally not part of the TCP bridge contract. Under the
-  # bridge transport every launch must exec the in-VM proxy (`/opt/symphony/vm-agent.mjs`)
-  # so it can dial the host's bridge listener with the per-dispatch bearer token. A raw
-  # `command` that execs the adapter directly never authenticates, so the bridge waits
-  # the full `connect_timeout_ms` and the attempt fails. For custom behavior fork
-  # `scripts/vm-agent.js` and rebuild the image via `scripts/build-vm.sh`. Setting
-  # acp.command in WORKFLOW.md is rejected by validateDispatch at startup.
+  # NOTE: the launch shape is fixed (in-VM proxy dialing back over the bridge);
+  # fork `scripts/vm-agent.js` if you need to customize what the proxy spawns.
 
   # shell (string): shell used to run the ACP launch command. Default: 'bash'.
   shell: bash
@@ -325,10 +307,6 @@ smolvm:
   # Setting false isolates the VM at the cost of breaking adapters that fetch
   # tokens, models, or dependencies at run time.
   net: true
-
-  # bin_path (path | null): legacy mount; host directory containing the codex
-  # binary, mounted read-only at /opt/codex. Default: null.
-  bin_path: null
 
   # volumes (list): additional host:guest bind mounts. smolvm has a small
   # per-VM mount cap (the workspace itself already consumes one slot), so keep

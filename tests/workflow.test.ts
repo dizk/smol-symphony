@@ -51,8 +51,6 @@ describe('workflow', () => {
     assert.equal(cfg.polling.interval_ms, 30000);
     assert.equal(cfg.agent.max_concurrent_agents, 10);
     assert.equal(cfg.agent.max_turns, 20);
-    // acp.command defaults to null so symphony auto-derives it from acp.adapter.
-    assert.equal(cfg.acp.command, null);
     assert.equal(cfg.acp.adapter, 'claude');
     assert.equal(cfg.acp.shell, 'bash');
     // acp.model defaults to null: the adapter falls back to its own default model.

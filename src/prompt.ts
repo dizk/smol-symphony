@@ -49,7 +49,7 @@ export interface RenderInput {
   attempt: number | null;
 }
 
-const FALLBACK_PROMPT = 'You are working on an issue from Linear.';
+const FALLBACK_PROMPT = 'You are working on an issue.';
 
 export async function renderPrompt(input: RenderInput): Promise<string> {
   const tpl = input.template.trim();

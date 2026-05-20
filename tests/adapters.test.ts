@@ -19,9 +19,6 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     workflow_dir: '/tmp',
     tracker: {
       kind: 'local',
-      endpoint: null,
-      api_key: null,
-      project_slug: null,
       active_states: ['Todo'],
       terminal_states: ['Done'],
       root: '/tmp/issues',
@@ -43,7 +40,6 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     },
     acp: {
       adapter: 'claude',
-      command: null,
       model: null,
       shell: 'bash',
       prompt_timeout_ms: 1000,
@@ -66,7 +62,6 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
       // The TCP bridge needs the VM to reach the host listener; validateDispatch refuses
       // `net: false` under the bridge transport.
       net: true,
-      bin_path: null,
       volumes: [],
       forward_env: [],
       endpoint: 'unix:///tmp/sock',
@@ -341,8 +336,8 @@ describe('stageCredential', () => {
   it('refuses to auto-stage in a linked worktree (.git is a file)', async () => {
     // Regression: worktrees don't have a .git/ dir to stage under, and any
     // worktree-internal path is inside the working tree where gitignore-
-    // negation can still expose the secret. Refuse loudly; operators using
-    // worktrees must override acp.command.
+    // negation can still expose the secret. Refuse loudly; linked worktrees
+    // are unsupported under the TCP bridge transport.
     const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-'));
     const fakeHome = path.join(tmp, 'home');
     const ws = path.join(tmp, 'ws');
@@ -455,9 +450,9 @@ describe('stageCredential', () => {
   });
 });
 
-describe('validateDispatch + acp.command', () => {
-  it('passes when acp.command is null and adapter is known', () => {
-    const cfg = bareCfg({ adapter: 'claude', command: null });
+describe('validateDispatch', () => {
+  it('passes when adapter is known and local tracker root exists', () => {
+    const cfg = bareCfg({ adapter: 'claude' });
     // tracker.root must exist to pass; create a temp dir.
     return mkdtemp(path.join(os.tmpdir(), 'symphony-vd-')).then(async (root) => {
       cfg.tracker.root = root;
@@ -469,7 +464,7 @@ describe('validateDispatch + acp.command', () => {
   it('rejects when adapter is unknown', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
-      const cfg = bareCfg({ adapter: 'opencode', command: null });
+      const cfg = bareCfg({ adapter: 'opencode' });
       cfg.tracker.root = root;
       const err = validateDispatch(cfg);
       assert.ok(err, 'expected validation error');
@@ -483,30 +478,12 @@ describe('validateDispatch + acp.command', () => {
   it('rejects smolvm.net=false (in-VM proxy must reach the bridge)', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
-      const cfg = bareCfg({ adapter: 'claude', command: null });
+      const cfg = bareCfg({ adapter: 'claude' });
       cfg.tracker.root = root;
       cfg.smolvm.net = false;
       const err = validateDispatch(cfg);
       assert.ok(err, 'expected validation error');
       assert.match(err!, /smolvm\.net=false is incompatible/);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('rejects any acp.command override (incompatible with TCP bridge)', async () => {
-    // acp.command was a pre-bridge escape hatch. Under the bridge architecture the launch
-    // shape is fixed (the in-VM proxy must dial back), so a raw command that execs the
-    // adapter directly would wedge attempts forever. validateDispatch now refuses outright
-    // with a message pointing operators at the in-VM proxy script for customization.
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
-    try {
-      const cfg = bareCfg({ adapter: 'claude', command: 'claude-agent-acp' });
-      cfg.tracker.root = root;
-      const err = validateDispatch(cfg);
-      assert.ok(err, 'expected validation error');
-      assert.match(err!, /acp\.command is not supported/);
-      assert.match(err!, /vm-agent\.js/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
