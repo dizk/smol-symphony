@@ -37,7 +37,9 @@ tracker:
     - In Progress
 
   # terminal_states (string[]): states the orchestrator treats as complete;
-  # mark_done moves issues to the first listed state.
+  # `symphony.transition` into one of these states ends the run and triggers
+  # workspace cleanup. The first entry is treated as the canonical "Done" by
+  # operators / dashboards.
   # Default: [Done]
   #
   # NOTE: when a top-level `states:` block (below) is present, both
@@ -343,22 +345,17 @@ server:
 # mcp — Model Context Protocol server exposed to in-VM agents.
 #
 # The orchestrator runs a JSON-RPC endpoint scoped to each active issue at
-# /api/v1/issues/<id>/mcp, gated by a per-dispatch bearer token. Four tools
+# /api/v1/issues/<id>/mcp, gated by a per-dispatch bearer token. Three tools
 # live there:
 #
 #   • symphony.transition({ to_state, notes? })
-#     — canonical exit verb. Moves the issue into another declared state,
-#       optionally appending `notes` (markdown) to the issue body before the
-#       move so the next agent (in `to_state`) reads them as part of
+#     — canonical (and only) exit verb. Moves the issue into another declared
+#       state, optionally appending `notes` (markdown) to the issue body before
+#       the move so the next agent (in `to_state`) reads them as part of
 #       `issue.description`. Terminal targets clean the workspace; active and
 #       holding targets preserve it so the same `agent/<id>` git branch
 #       survives the handoff. Rejected transitions return MCP tool-result
 #       errors (isError:true) the agent can read and retry.
-#   • symphony.mark_done({ title, summary })
-#     — thin shim that targets the first declared `role: terminal` state with
-#       a synthesised "# <title>\n\n<summary>" notes block. Kept for
-#       single-agent flows that don't have a review state. Prefer `transition`
-#       in multi-state workflows.
 #   • symphony.request_human_steering({ question, context? })
 #   • symphony.propose_issue({ title, description?, labels?, priority? })
 #     — drops a new issue into the first declared `role: holding` state
@@ -390,10 +387,10 @@ Liquid-templated prompt body. Rendered once per dispatched issue. Context:
   issue.identifier   — the issue's external id (e.g. "DEMO-42").
   issue.title        — issue title (string).
   issue.state        — current state (string, matches a key in `states:`).
-  issue.description  — body text (string or empty). `symphony.transition` and
-                       `symphony.mark_done` append their `notes` block here
-                       before the file moves, so the next state's agent reads
-                       the previous state's handoff message verbatim.
+  issue.description  — body text (string or empty). `symphony.transition`
+                       appends its `notes` block here before the file moves,
+                       so the next state's agent reads the previous state's
+                       handoff message verbatim.
   issue.priority     — number or null.
   issue.labels       — list of strings (lowercased).
   attempt            — int, 1-based attempt counter; absent on first attempt.
@@ -408,9 +405,8 @@ only its own instructions plus whatever common preamble / postamble lives
 outside the case. See WORKFLOW.md in this repo for a worked example.
 
 The body below is the literal prompt sent to the agent. Keep it specific to
-this workflow; orchestrator behavior (transition, mark_done,
-request_human_steering, propose_issue) is the same no matter what you write
-here.
+this workflow; orchestrator behavior (transition, request_human_steering,
+propose_issue) is the same no matter what you write here.
 -->
 
 You are picking up a single issue and shepherding it through the workflow.
@@ -431,10 +427,10 @@ Goals:
 1. Work in the current directory only; treat it as the issue workspace.
 2. Make the smallest correct change that satisfies the issue.
 3. Hand off when done. `symphony.transition({ to_state, notes? })` is the
-   canonical exit verb: pass a declared state name and optional markdown
-   notes that get appended to the issue body for the next agent. For
-   single-agent workflows, `symphony.mark_done({ title, summary })` is a
-   thin shim that targets the first declared `role: terminal` state.
+   canonical (and only) exit verb: pass a declared state name and optional
+   markdown notes that get appended to the issue body for the next agent.
+   For single-agent workflows, transition straight into the first declared
+   `role: terminal` state to end the run.
 4. If you cannot proceed without human input, call
    `symphony.request_human_steering({ question, context? })`. Your turn ends
    immediately; the human's reply arrives as your next prompt.

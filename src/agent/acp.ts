@@ -163,7 +163,7 @@ class LineTap extends Transform {
 // Before recording, capability tokens in the frame are redacted in place. The most common
 // one is the symphony MCP bearer that we inject into `session/new` as
 // `mcpServers[].headers[].value = "Bearer <token>"`; that token is the agent's per-issue
-// capability to call `mark_done` and `request_human_steering`, and the JSONL log is a
+// capability to call `transition` and `request_human_steering`, and the JSONL log is a
 // long-lived append-only file an evaluator may share. Replace any string starting with
 // `Bearer ` with `Bearer <redacted>` anywhere in the tree.
 function recordAcpFrame(
@@ -414,7 +414,7 @@ export class AcpClient {
 
     // MCP is required for symphony operations: if the agent doesn't advertise support
     // for a requested transport, we refuse to start the session rather than silently
-    // dropping the entry and running a degraded agent that has no mark_done /
+    // dropping the entry and running a degraded agent that has no transition /
     // request_human_steering tools. ACP's mcpCapabilities is optional and advertises
     // `http`/`sse`/`acp` as booleans; missing/undefined means "not supported." Stdio is
     // implicit (the spec treats it as the baseline) and has no `type` discriminator.

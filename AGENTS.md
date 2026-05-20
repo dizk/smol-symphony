@@ -37,7 +37,7 @@ operators can write; an out-of-date template is a bug, not paperwork.
 - `npm test` — must pass.
 - `npm run build` — must pass.
 
-Run all three before calling `symphony.mark_done`.
+Run all three before calling `symphony.transition` into a terminal state.
 
 ## Handoff: patch bundle vs. pull request
 

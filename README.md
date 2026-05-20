@@ -5,9 +5,10 @@ prepares per-issue workspaces, and runs coding agents (Claude Code, Codex,
 OpenCode) inside isolated [smolvm](https://smolmachines.com/) microVMs over the
 [Agent Client Protocol](https://agentclientprotocol.com).
 
-The agent signals completion through an injected MCP server (`mark_done`,
-`request_human_steering`); the orchestrator handles state, retry, concurrency,
-and produces either a pull request or a `git format-patch` bundle per issue.
+The agent signals progress through an injected MCP server (`transition`,
+`request_human_steering`, `propose_issue`); the orchestrator handles state,
+retry, concurrency, and produces either a pull request or a `git format-patch`
+bundle per issue.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -26,7 +27,7 @@ and produces either a pull request or a `git format-patch` bundle per issue.
 │                                       └───────────────────────────────┘ ││
 │                                                                         ││
 │              symphony MCP server  ◀─────────────────────────────────────┘│
-│              ( mark_done · request_human_steering )                      │
+│              ( transition · request_human_steering )                     │
 │                                                                          │
 │    HTTP dashboard (HTMX):  /                                             │
 │      attention · sessions · on disk · new issue · totals                 │
@@ -104,9 +105,9 @@ Long-form description in the body.
 
 State comparison is case-insensitive. Moving the file between state
 directories is the canonical state transition; the orchestrator does this
-itself in response to `mark_done`. The agent inside the VM does **not** have
-filesystem access to the tracker root: it signals completion through the
-MCP server and the orchestrator does the file move.
+itself in response to `symphony.transition`. The agent inside the VM does
+**not** have filesystem access to the tracker root: it signals progress
+through the MCP server and the orchestrator does the file move.
 
 ## WORKFLOW.md
 
@@ -150,14 +151,16 @@ Symphony injects an MCP server into each ACP session at
 `http://<host>:<bound-port>/api/v1/issues/<id>/mcp`, gated by a per-dispatch
 bearer token. Three tools:
 
-- **`symphony.mark_done({ title, summary })`** — call once at end of a
-  successful run. `title` is a single-line imperative summary (≤72 chars);
-  `summary` is a one- to three-paragraph narrative. The orchestrator
-  atomically moves the issue file to the terminal state and stops
-  dispatching. The pair lands in
-  `<workspace>/.git/symphony-runtime/mark_done.md` (or
-  `<workspace>/.symphony-runtime/mark_done.md` when the workspace doesn't
-  have its own `.git/`) for the `after_run` hook to consume.
+- **`symphony.transition({ to_state, notes? })`** — canonical (and only)
+  exit verb. Moves the issue into another declared state, optionally
+  appending markdown `notes` to the issue body before the move so the next
+  agent (in `to_state`) reads them as part of `issue.description`. A
+  transition into a `role: terminal` state ends the run and triggers
+  workspace cleanup; transitions between active/holding states preserve the
+  workspace so the same `agent/<id>` git branch survives the handoff.
+  Rejected transitions (unknown target, disallowed by
+  `allowed_transitions`) return MCP tool-result errors the agent can read
+  and retry.
 - **`symphony.request_human_steering({ question, context? })`** — call
   when blocked on something only a human can answer. The turn ends
   immediately; the human's reply arrives as the prompt for the next turn.
@@ -220,8 +223,10 @@ operate on workspaces inside the credential file's ancestor repo.
   `.symphony/patches/<branch>.patch` via `git format-patch` so you can
   review and apply with `git am`. No remote required.
 
-The agent's `mark_done.md` provides the PR title/body or commit message; the
-hook reads it from the workspace's runtime dir.
+The PR title and body come from the issue file itself: title from the
+front-matter `title:` (prefixed with the issue id), body from everything
+after the front-matter — which includes every `symphony.transition` notes
+block accumulated across the run, giving reviewers the full handoff thread.
 
 See [AGENTS.md](./AGENTS.md) for the env-var contract and switch-over
 commands.

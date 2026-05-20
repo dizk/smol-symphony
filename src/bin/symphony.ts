@@ -105,7 +105,6 @@ async function main() {
   // gate behavior on cfg.mcp.enabled at runtime; an inactive registry holds no entries
   // and answers all routes with "not active."
   const mcp = new McpRegistry(tracker, {
-    terminalStates: config.tracker.terminal_states,
     states: config.states,
   });
   // ACP transport. The bridge listens on a TCP port for the in-VM agent's dial-back,
@@ -146,7 +145,6 @@ async function main() {
     tracker.updateConfig(cfg.tracker);
     workspaces.updateConfig(cfg);
     runner.updateConfig(cfg, def);
-    mcp.updateTerminalStates(cfg.tracker.terminal_states);
     mcp.updateStates(cfg.states);
     liveCfg = cfg;
     // Materialize any state directory the reload introduced. Best-effort: a
@@ -221,7 +219,7 @@ async function main() {
     // a different host/port. It does NOT replace the listener itself: symphony
     // is the process that actually serves /api/v1/issues/<id>/mcp. If no HTTP
     // listener was bound, the override would advertise a URL nothing answers,
-    // and mark_done calls from the agent would fail. Refuse to boot in that
+    // and transition calls from the agent would fail. Refuse to boot in that
     // shape so the misconfiguration surfaces at startup instead of mid-dispatch.
     if (http === null) {
       process.stderr.write(

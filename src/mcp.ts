@@ -1,73 +1,36 @@
 // Per-issue MCP server. Each active dispatch registers an entry here; the agent inside
 // the smolvm connects to /api/v1/issues/<id>/mcp with the per-dispatch bearer token and
-// sees exactly two tools:
+// sees these tools:
 //
-//   mark_done(summary)              ─ atomic file move into the terminal state, sets the
-//                                     marked_done flag on the RunningEntry so the runner
+//   transition(to_state, notes?)    ─ atomic file move into another declared state,
+//                                     optionally appending notes to the issue body
+//                                     first. Sets the marked_done flag so the runner
 //                                     exits cleanly on next post-turn check.
 //   request_human_steering(question, context?)
 //                                   ─ stashes the question on the RunningEntry, returns
 //                                     an ack to the agent. The runner then pauses the
 //                                     autonomous loop and awaits a human reply submitted
 //                                     via POST /api/v1/issues/<id>/steering-reply.
+//   propose_issue(title, ...)       ─ drops a new issue file into the first declared
+//                                     holding state directory for operator triage.
 //
 // The URL is the capability: the agent only ever knows its own /<id>/mcp endpoint. The
 // bearer token is belt-and-braces in case a non-agent caller can reach 8787.
 //
 // MCP wire format here is JSON-RPC 2.0 over HTTP (the "Streamable HTTP" transport's
-// non-SSE subset). We implement only the subset our two tools need: initialize, tools/list,
+// non-SSE subset). We implement only the subset our tools need: initialize, tools/list,
 // tools/call, plus a polite notifications/initialized acknowledgement.
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { lstat, mkdir, writeFile } from 'node:fs/promises';
-import path from 'node:path';
 import type { IssueTracker } from './trackers/types.js';
 import type { RunningEntry, StateConfig } from './types.js';
 import { log } from './logging.js';
 import { writeIssueFile, pickHoldingState } from './issues.js';
 
-const TERMINAL_STATE_FOR_DONE_DEFAULT = 'Done';
-
-/**
- * Pick the terminal state directory mark_done should move issues into.
- *
- * Shared between the orchestrator (which snapshots this at dispatch time onto
- * the RunningEntry) and the registry's fallback path. Prefers an entry whose
- * lowercase form is "done"; falls back to the first configured terminal state,
- * then to a hardcoded "Done" when the list is empty.
- */
-export function pickTerminalTarget(terminalStates: string[]): string {
-  const preferred = terminalStates.find((s) => s.toLowerCase() === 'done');
-  if (preferred) return preferred;
-  if (terminalStates.length > 0) return terminalStates[0]!;
-  return TERMINAL_STATE_FOR_DONE_DEFAULT;
-}
-
 const PROTOCOL_VERSION = '2025-06-18';
 
 const TOOL_LIST = [
-  {
-    name: 'mark_done',
-    description:
-      'Signal that this issue is fully complete. The orchestrator will move the issue file into the terminal Done state, persist the title/summary you provide for downstream tooling (PR title, PR body, transcripts), and stop dispatching new turns. Call this once, at the very end of a successful run. There is no RESULT.md to write — the structured fields here are the canonical record.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        title: {
-          type: 'string',
-          description:
-            'Short single-line title in imperative voice (≤72 chars recommended). Becomes the PR/commit title for the work. Example: "Add CHANGELOG.md with MCP entry".',
-        },
-        summary: {
-          type: 'string',
-          description:
-            'Multi-paragraph narrative describing what changed, why, and any follow-ups the agent noticed but did not do. Becomes the PR body / transcript record.',
-        },
-      },
-      required: ['title', 'summary'],
-    },
-  },
   {
     name: 'request_human_steering',
     description:
@@ -149,11 +112,11 @@ interface ActiveEntry {
   token: string;
   // Pending steering reply: resolved when a human POSTs a reply.
   pendingReply: { resolve: (text: string) => void; reject: (err: Error) => void } | null;
-  // Snapshots captured at activate time so a WORKFLOW.md reload mid-flight cannot
-  // redirect an in-flight `mark_done`. trackerRootSnapshot pins the filesystem
-  // root the tracker should scan; terminalTarget pins the directory we move into.
+  // Snapshot captured at activate time so a WORKFLOW.md reload mid-flight cannot
+  // redirect an in-flight `transition`. Pins the filesystem root the tracker
+  // should scan; the target state is supplied per-call by the agent and validated
+  // against the live `states:` map.
   trackerRootSnapshot: string | null;
-  terminalTarget: string;
 }
 
 export interface McpJsonRpcRequest {
@@ -180,21 +143,17 @@ export class McpRegistry {
   private effectivePort: number | null = null;
   // Live state-config map, kept in sync with the orchestrator's view via
   // `updateStates`. Used by `transition` to validate `to_state` and to resolve
-  // the role of the target (terminal => set cleanup_workspace_on_exit). Empty
-  // by default so test harnesses that don't supply a state map don't trip the
-  // "unknown_state" branch on legacy mark_done shims — those still resolve via
-  // the pinned terminal_target_at_dispatch.
+  // the role of the target (terminal => set cleanup_workspace_on_exit). An
+  // empty map means every transition call lands in the "unknown_state" branch,
+  // which is the correct behaviour: without a declared states map, the agent
+  // has no valid target to name.
   private states: Record<string, StateConfig> = {};
 
   constructor(
     private tracker: IssueTracker,
-    private opts: { terminalStates: string[]; states?: Record<string, StateConfig> },
+    opts: { states?: Record<string, StateConfig> } = {},
   ) {
     if (opts.states) this.states = opts.states;
-  }
-
-  updateTerminalStates(states: string[]): void {
-    this.opts.terminalStates = states;
   }
 
   /** Push the latest state-config map in after a workflow reload. */
@@ -233,12 +192,12 @@ export class McpRegistry {
     entry.steering_requested = false;
     entry.steering_question = null;
     entry.steering_context = null;
-    // Carry the dispatch-time snapshots through verbatim. Reading
-    // this.tracker.currentRoot() / this.preferredTerminalState() here would be
-    // wrong: activate runs AFTER workspace setup, before_run hook, and smolvm
-    // bring-up — a window during which a WORKFLOW.md reload can mutate tracker
-    // root or terminal_states. The dispatch-time values are the only ones that
-    // accurately reflect the world the run was started in.
+    // Carry the dispatch-time tracker-root snapshot through verbatim. Reading
+    // this.tracker.currentRoot() here would be wrong: activate runs AFTER
+    // workspace setup, before_run hook, and smolvm bring-up — a window during
+    // which a WORKFLOW.md reload can mutate tracker.root. The dispatch-time
+    // value is the only one that accurately reflects the world the run was
+    // started in.
     const active: ActiveEntry = {
       issueId: entry.issue_id,
       identifier: entry.identifier,
@@ -246,12 +205,10 @@ export class McpRegistry {
       token,
       pendingReply: null,
       trackerRootSnapshot: entry.tracker_root_at_dispatch,
-      terminalTarget: entry.terminal_target_at_dispatch,
     };
     this.byIdentifier.set(entry.identifier, active);
     log.debug('mcp activated', {
       issue_identifier: entry.identifier,
-      terminal_target: active.terminalTarget,
       tracker_root: active.trackerRootSnapshot,
     });
     return token;
@@ -372,9 +329,6 @@ export class McpRegistry {
           const params = (body.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
           const name = params.name;
           const args = params.arguments ?? {};
-          if (name === 'mark_done') {
-            return await this.callMarkDone(active, id, args);
-          }
           if (name === 'transition') {
             return await this.callTransition(active, id, args);
           }
@@ -405,18 +359,15 @@ export class McpRegistry {
   }
 
   /**
-   * Shared file-move + flag-flip path used by both `mark_done` (which targets the
-   * pinned terminal state with a synthesized notes block) and `transition` (which
-   * accepts any declared target plus operator-supplied notes). Returns the
-   * tracker's resolved {from, to, newPath} on success, throwing the underlying
-   * TrackerError on failure so the caller can wrap it in a tool-error response.
+   * Shared file-move + flag-flip path used by `transition`. Returns the tracker's
+   * resolved {from, to, newPath} on success, throwing the underlying TrackerError
+   * on failure so the caller can wrap it in a tool-error response.
    *
    * Cleanup-on-exit is decided by the role of the canonical target state: terminal
    * targets clean the workspace, active/holding targets preserve it so the same
-   * `agent/<id>` git branch survives across the handoff. When the registry has no
-   * live states map (e.g. a test harness that didn't wire one), we fall back to
-   * "any move that lands in the dispatch-pinned terminal target cleans" — which is
-   * the legacy `mark_done` semantics.
+   * `agent/<id>` git branch survives across the handoff. Callers must have already
+   * resolved `toState` to its canonical declared name via `canonicalStateName`, so
+   * this routine assumes the lookup is in the states map.
    */
   private async performTransition(
     active: ActiveEntry,
@@ -436,99 +387,13 @@ export class McpRegistry {
       actor,
     });
     active.entry.marked_done = true;
-    // Pick the canonical declared name (preserving operator-supplied casing) so
-    // the role lookup matches the workflow's `states:` map. When no states map
-    // is present, fall back to the dispatch-time terminal target — that's the
-    // path mark_done has always used.
-    let cleanup = false;
+    // Look up the canonical declared name (preserving operator-supplied casing)
+    // so the role lookup matches the workflow's `states:` map.
     const stateMap = this.states;
     const canonicalName = canonicalStateName(stateMap, result.toState);
-    if (canonicalName !== null) {
-      cleanup = stateMap[canonicalName]!.role === 'terminal';
-    } else {
-      cleanup = result.toState.toLowerCase() === active.terminalTarget.toLowerCase();
-    }
-    active.entry.cleanup_workspace_on_exit = cleanup;
+    active.entry.cleanup_workspace_on_exit =
+      canonicalName !== null && stateMap[canonicalName]!.role === 'terminal';
     return result;
-  }
-
-  private async callMarkDone(
-    active: ActiveEntry,
-    id: string | number | null,
-    args: Record<string, unknown>,
-  ): Promise<McpJsonRpcResponse> {
-    const titleRaw = typeof args.title === 'string' ? args.title.trim() : '';
-    const summary = typeof args.summary === 'string' ? args.summary : '';
-    if (!titleRaw) {
-      return makeToolError(id, 'title is required and must be a non-empty string');
-    }
-    if (titleRaw.includes('\n')) {
-      return makeToolError(id, 'title must be a single line (no embedded newlines)');
-    }
-    if (!summary.trim()) {
-      return makeToolError(id, 'summary is required and must be a non-empty string');
-    }
-    if (!this.tracker.moveIssueToState) {
-      return makeToolError(id, 'this tracker does not support state transitions');
-    }
-    // Target is the dispatch-pinned terminal state — same as before the transition
-    // refactor. A WORKFLOW.md reload that changes tracker.root or terminal_states
-    // between dispatch and mark_done must not redirect the move; the snapshot is
-    // the single source of truth.
-    //
-    // Notes block synthesised from title + summary so the dogfood after_run hook
-    // can read it in `issue.description` on the terminal side too, alongside the
-    // existing `mark_done.md` write that lives in the workspace's staging dir.
-    const target = active.terminalTarget;
-    const notes = `# ${titleRaw}\n\n${summary.trim()}`;
-    const actor = active.entry.resolved_actor;
-    try {
-      const result = await this.performTransition(active, target, notes, actor);
-      // Persist the structured title+summary into the workspace so the after_run
-      // hook (and any other consumers) can read them. Format is markdown so
-      // operators can `cat` it without parsing JSON:
-      //   # <title>
-      //
-      //   <summary>
-      try {
-        const stagingDir = await pickStagingDir(active.entry.workspace_path);
-        await mkdir(stagingDir, { recursive: true });
-        const body = `# ${titleRaw}\n\n${summary.trim()}\n`;
-        await writeFile(path.join(stagingDir, 'mark_done.md'), body, { mode: 0o644 });
-      } catch (err) {
-        // Persistence failure is non-fatal — the move already happened, the
-        // flag is set, and the title/summary are in the log line below. We
-        // surface it as a warning so the operator can investigate.
-        log.warn('mcp mark_done: failed to persist mark_done.md', {
-          issue_identifier: active.identifier,
-          error: (err as Error).message,
-        });
-      }
-      log.info('mcp mark_done', {
-        issue_identifier: active.identifier,
-        from: result.fromState,
-        to: result.toState,
-        title: titleRaw,
-        summary_chars: summary.length,
-        actor,
-        cleanup: active.entry.cleanup_workspace_on_exit,
-      });
-      return {
-        jsonrpc: '2.0',
-        id,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: `Marked ${active.identifier} as done (moved to ${result.toState}). Stop now; no further turns will be dispatched.`,
-            },
-          ],
-          isError: false,
-        },
-      };
-    } catch (err) {
-      return makeToolError(id, `failed to mark done: ${(err as Error).message}`);
-    }
   }
 
   /**
@@ -676,10 +541,6 @@ export class McpRegistry {
     };
   }
 
-  private preferredTerminalState(): string {
-    return pickTerminalTarget(this.opts.terminalStates);
-  }
-
   /**
    * Drop a new issue file into the tracker's Triage/ directory. The orchestrator
    * never dispatches Triage entries because the state isn't in active_states; the
@@ -687,7 +548,7 @@ export class McpRegistry {
    * dispatch this MCP call came from) is stamped into the front-matter as
    * `proposed_by` so provenance is visible in the file and the UI.
    *
-   * Uses the dispatch-time tracker root snapshot — same rationale as mark_done:
+   * Uses the dispatch-time tracker root snapshot — same rationale as `transition`:
    * a WORKFLOW.md reload that mutates tracker.root mid-flight must not redirect
    * an in-flight propose call to a different filesystem location.
    */
@@ -798,25 +659,6 @@ function constantTimeStringEqual(a: string, b: string): boolean {
   const bBuf = Buffer.from(b, 'utf8');
   if (aBuf.length !== bBuf.length) return false;
   return timingSafeEqual(aBuf, bBuf);
-}
-
-/**
- * Pick the symphony-runtime staging directory for a workspace. Mirrors the
- * adapter-staging policy in adapters.ts: when the workspace has its own
- * `.git/` directory, the runtime files live inside it (outside the working
- * tree, structurally untrackable); otherwise they sit at workspace root.
- * `mark_done` writes its persisted artifact here so the after_run hook can
- * find it via the same probe.
- */
-async function pickStagingDir(workspacePath: string): Promise<string> {
-  const gitPath = path.join(workspacePath, '.git');
-  try {
-    const st = await lstat(gitPath);
-    if (st.isDirectory()) return path.join(workspacePath, '.git', 'symphony-runtime');
-  } catch {
-    // .git missing or unstat-able — fall through to the workspace-root path.
-  }
-  return path.join(workspacePath, '.symphony-runtime');
 }
 
 function getId(body: unknown): string | number | null {

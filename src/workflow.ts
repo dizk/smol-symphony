@@ -337,8 +337,8 @@ export function buildServiceConfig(
     host: asString(serverRaw['host']) ?? '127.0.0.1',
   };
 
-  // mcp extension: per-issue MCP server (mark_done + request_human_steering tools) injected
-  // into each ACP session. `host` defaults to the QEMU slirp gateway; the port is the
+  // mcp extension: per-issue MCP server (transition + request_human_steering + propose_issue
+  // tools) injected into each ACP session. `host` defaults to the QEMU slirp gateway; the port is the
   // actually-bound HTTP server's port (resolved at runtime, not config-parse time, so
   // `--port` and an unset server.port can never desync). `host_url` is an explicit full-URL
   // override for cases where the VM can't reach the orchestrator via the host gateway.

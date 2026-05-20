@@ -15,7 +15,6 @@ import type { WorkflowSource } from './workflow.js';
 import { validateDispatch, WorkflowError } from './workflow.js';
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
-import { pickTerminalTarget } from './mcp.js';
 import { resolveDispatchConfig } from './agent/runner.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
@@ -224,16 +223,14 @@ export class Orchestrator {
 
     let candidates: Issue[];
     let snapshotTrackerRoot: string | null;
-    let snapshotTerminalTarget: string;
     try {
-      // Atomic fetch: the tracker returns the issues AND the root/terminal_states
-      // it used during the scan. That's the snapshot we pin onto each RunningEntry,
-      // so a workflow reload that races the dispatch loop can't cause `mark_done`
-      // to operate against a different tracker config than where the issue lives.
+      // Atomic fetch: the tracker returns the issues AND the root it used during
+      // the scan. That's the snapshot we pin onto each RunningEntry, so a workflow
+      // reload that races the dispatch loop can't cause `transition` to operate
+      // against a different tracker root than where the issue lives.
       const result = await this.tracker.fetchCandidateIssues();
       candidates = result.issues;
       snapshotTrackerRoot = result.root;
-      snapshotTerminalTarget = pickTerminalTarget(result.terminalStates);
     } catch (err) {
       log.warn('candidate fetch failed', { error: (err as Error).message });
       this.scheduleTick(this.cfg.polling.interval_ms);
@@ -245,7 +242,6 @@ export class Orchestrator {
       if (!this.isEligible(issue)) continue;
       void this.dispatchIssue(issue, null, {
         trackerRoot: snapshotTrackerRoot,
-        terminalTarget: snapshotTerminalTarget,
       });
     }
     this.scheduleTick(this.cfg.polling.interval_ms);
@@ -401,7 +397,7 @@ export class Orchestrator {
   private async dispatchIssue(
     issue: Issue,
     attempt: number | null,
-    snapshot?: { trackerRoot: string | null; terminalTarget: string },
+    snapshot?: { trackerRoot: string | null },
   ): Promise<void> {
     if (this.running.has(issue.id)) return;
     this.claimed.add(issue.id);
@@ -409,17 +405,15 @@ export class Orchestrator {
     const cancel = { cancelled: false };
     const startedAt = new Date().toISOString();
     const workspacePath = this.workspaces.workspacePathFor(issue.identifier);
-    // Snapshot tracker.root and the terminal target BEFORE workspace setup,
-    // before_run, or smolvm bring-up. A WORKFLOW.md reload during that window
-    // (or even between fetchCandidateIssues returning and this iteration of
-    // the dispatch loop) can mutate the live tracker config; pinning here closes
-    // that window. When the caller supplies a snapshot (the tick/retry path
-    // does — it captured at the fetch atomically), prefer those values; the
-    // optional fallback reads the live config for completeness.
+    // Snapshot tracker.root BEFORE workspace setup, before_run, or smolvm
+    // bring-up. A WORKFLOW.md reload during that window (or even between
+    // fetchCandidateIssues returning and this iteration of the dispatch loop)
+    // can mutate the live tracker config; pinning here closes that window.
+    // When the caller supplies a snapshot (the tick/retry path does — it
+    // captured at the fetch atomically), prefer that value; the optional
+    // fallback reads the live config for completeness.
     const trackerRootAtDispatch =
       snapshot?.trackerRoot ?? (this.tracker.currentRoot ? this.tracker.currentRoot() : null);
-    const terminalTargetAtDispatch =
-      snapshot?.terminalTarget ?? pickTerminalTarget(this.cfg.tracker.terminal_states);
     // Resolve "<adapter>/<model or 'default'>" at dispatch time and pin it on the
     // entry. The MCP transition tool stamps this into the notes-block header the
     // next agent reads in `issue.description`. resolveDispatchConfig already folds
@@ -463,7 +457,6 @@ export class Orchestrator {
       cleanup_workspace_on_exit: false,
       mcp_token: null,
       tracker_root_at_dispatch: trackerRootAtDispatch,
-      terminal_target_at_dispatch: terminalTargetAtDispatch,
       resolved_actor: resolvedActor,
       marked_done: false,
       steering_requested: false,
@@ -481,7 +474,6 @@ export class Orchestrator {
         issue_title: issue.title,
         workspace_path: workspacePath,
         tracker_root: trackerRootAtDispatch,
-        terminal_target: terminalTargetAtDispatch,
       });
     }
     logger.info('agent attempt started', { attempt });
@@ -663,12 +655,10 @@ export class Orchestrator {
     this.retryAttempts.delete(issueId);
     let candidates: Issue[];
     let snapshotTrackerRoot: string | null;
-    let snapshotTerminalTarget: string;
     try {
       const result = await this.tracker.fetchCandidateIssues();
       candidates = result.issues;
       snapshotTrackerRoot = result.root;
-      snapshotTerminalTarget = pickTerminalTarget(result.terminalStates);
     } catch (err) {
       log.debug('retry poll failed', {
         issue_id: issueId,
@@ -726,7 +716,6 @@ export class Orchestrator {
     }
     void this.dispatchIssue(issue, entry.attempt, {
       trackerRoot: snapshotTrackerRoot,
-      terminalTarget: snapshotTerminalTarget,
     });
   }
 

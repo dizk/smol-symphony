@@ -19,7 +19,7 @@ function makeTracker(root: string): LocalMarkdownTracker {
 function makeEntry(
   identifier: string,
   state: string,
-  over: Partial<Pick<RunningEntry, 'tracker_root_at_dispatch' | 'terminal_target_at_dispatch'>> = {},
+  over: Partial<Pick<RunningEntry, 'tracker_root_at_dispatch'>> = {},
 ): RunningEntry {
   const issue: Issue = {
     id: identifier,
@@ -62,7 +62,6 @@ function makeEntry(
     cleanup_workspace_on_exit: false,
     mcp_token: null,
     tracker_root_at_dispatch: over.tracker_root_at_dispatch ?? null,
-    terminal_target_at_dispatch: over.terminal_target_at_dispatch ?? 'Done',
     resolved_actor: 'claude/default',
     marked_done: false,
     steering_requested: false,
@@ -199,11 +198,11 @@ describe('LocalMarkdownTracker.moveIssueToState', () => {
 });
 
 describe('McpRegistry JSON-RPC', () => {
-  it('lists the four tools', async () => {
+  it('lists the three tools', async () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -215,7 +214,6 @@ describe('McpRegistry JSON-RPC', () => {
       const result = res.result as { tools: Array<{ name: string }> };
       const names = result.tools.map((t) => t.name).sort();
       assert.deepEqual(names, [
-        'mark_done',
         'propose_issue',
         'request_human_steering',
         'transition',
@@ -229,7 +227,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', 'wrong-token', {
@@ -239,112 +237,6 @@ describe('McpRegistry JSON-RPC', () => {
       });
       assert.ok(res && 'error' in res);
       assert.equal((res as { error: { code: number } }).error.code, -32002);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done moves the file and sets the flag', async () => {
-    const { root, cleanup } = await setupTree();
-    try {
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress');
-      const token = reg.activate(entry);
-      const res = await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { title: 'Demo', summary: 'all done' } },
-      });
-      assert.ok(res && 'result' in res);
-      const result = res.result as { isError: boolean; content: Array<{ text: string }> };
-      assert.equal(result.isError, false);
-      assert.match(result.content[0]!.text, /Marked ABC-1 as done/);
-      assert.equal(entry.marked_done, true);
-      const inProgress = await readdir(path.join(root, 'In Progress'));
-      const done = await readdir(path.join(root, 'Done'));
-      assert.deepEqual(inProgress, []);
-      assert.deepEqual(done, ['ABC-1.md']);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done uses the terminal target snapshotted at dispatch time, not the current registry config', async () => {
-    // Regression: if WORKFLOW.md reloads between dispatch and mark_done and
-    // changes terminal_states, in-flight mark_done must still use the target
-    // that was valid when the run was dispatched. The orchestrator pins
-    // terminal_target_at_dispatch on the RunningEntry BEFORE activate runs,
-    // so a reload that fires before activate (during workspace setup or the
-    // before_run hook) must also be ignored.
-    const { root, cleanup } = await setupTree();
-    try {
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress', { terminal_target_at_dispatch: 'Done' });
-      // Mutate the registry's live terminal_states BEFORE activate — simulating
-      // a workflow reload during workspace setup / before_run / VM bring-up.
-      reg.updateTerminalStates(['Cancelled', 'Archived']);
-      const token = reg.activate(entry);
-      await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
-      });
-      // File landed in the dispatch-time 'Done' target, NOT the post-reload first
-      // entry 'Cancelled'.
-      assert.deepEqual(await readdir(path.join(root, 'Done')), ['ABC-1.md']);
-      assert.deepEqual(await readdir(path.join(root, 'In Progress')), []);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done uses the tracker root snapshotted at dispatch time', async () => {
-    // Regression: workflow reload that mutates tracker.root must not redirect
-    // an in-flight mark_done to a different filesystem location. The orchestrator
-    // pins tracker_root_at_dispatch on the RunningEntry BEFORE activate runs, so
-    // a reload that fires before activate must also be ignored.
-    const { root, cleanup } = await setupTree();
-    try {
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
-      // Plant a decoy tracker root with an unrelated ABC-1 file.
-      const decoyRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-decoy-'));
-      await mkdir(path.join(decoyRoot, 'In Progress'), { recursive: true });
-      await mkdir(path.join(decoyRoot, 'Done'), { recursive: true });
-      await writeFile(
-        path.join(decoyRoot, 'In Progress', 'ABC-1.md'),
-        `---\ntitle: DECOY\n---\nthis file must not move`,
-      );
-      try {
-        // Mutate the tracker's live config to point at the decoy BEFORE activate —
-        // simulating a workflow reload during workspace setup / before_run.
-        t.updateConfig({
-          kind: 'local',
-          active_states: ['Todo', 'In Progress'],
-          terminal_states: ['Done', 'Cancelled'],
-          root: decoyRoot,
-        });
-        const token = reg.activate(entry);
-        await reg.handleJsonRpc('ABC-1', token, {
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'tools/call',
-          params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
-        });
-        // Original root's ABC-1 moved into its own Done/.
-        assert.deepEqual(await readdir(path.join(root, 'In Progress')), []);
-        assert.deepEqual(await readdir(path.join(root, 'Done')), ['ABC-1.md']);
-        // Decoy tracker root is untouched.
-        assert.deepEqual(await readdir(path.join(decoyRoot, 'In Progress')), ['ABC-1.md']);
-        assert.deepEqual(await readdir(path.join(decoyRoot, 'Done')), []);
-      } finally {
-        await rm(decoyRoot, { recursive: true, force: true });
-      }
     } finally {
       await cleanup();
     }
@@ -360,7 +252,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       const token = reg.activate(entry);
       assert.equal(reg.isActive('ABC-1', token), true);
@@ -381,183 +273,11 @@ describe('McpRegistry JSON-RPC', () => {
     }
   });
 
-  it('mark_done with a stale Done/<id>.md alongside the active In Progress copy returns tool error, not silent no-op', async () => {
-    // Regression: when a stale Done/ABC-1.md (e.g. an operator-leftover from a
-    // prior cycle) coexists with the live In Progress/ABC-1.md, the scan returns
-    // both. The pre-fix code did a blind `.find(...)` that could pick the stale
-    // Done copy and short-circuit because its state already equals the target —
-    // setting marked_done=true while leaving the live In Progress file stranded.
-    //
-    // After the fix, callMarkDone passes fromState='In Progress' (the entry's
-    // dispatched-from state), which disambiguates to the live file. The actual
-    // move then fails the existing overwrite-protection check because the stale
-    // Done basename collides, surfacing a clean tool error. Either way, the
-    // active file must NOT be silently abandoned with marked_done=true.
-    const { root, cleanup } = await setupTree();
-    try {
-      // Plant a stale Done/ABC-1.md (different front-matter id so the source
-      // lookup still finds the In Progress copy by id, but basenames collide).
-      await writeFile(
-        path.join(root, 'Done', 'ABC-1.md'),
-        `---\nid: ZOMBIE-1\ntitle: Stale Done\n---\nold body`,
-      );
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress');
-      const token = reg.activate(entry);
-      const res = await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
-      });
-      const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
-      assert.equal(result.isError, true);
-      assert.match(result.content[0]!.text, /failed to mark done/);
-      // The marked_done flag must stay false so the runner doesn't exit thinking
-      // the work landed — operator needs to clean up the stale Done file first.
-      assert.equal(entry.marked_done, false);
-      // The live In Progress file is still in place; nothing was destructively moved.
-      assert.deepEqual(await readdir(path.join(root, 'In Progress')), ['ABC-1.md']);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done sets cleanup_workspace_on_exit so onWorkerExit removes the workspace', async () => {
-    // Regression: the reconcile loop normally sets this flag when it sees a terminal-state
-    // transition, but the runner exits via marked_done before reconcile runs. Without this
-    // the workspace leaks.
-    const { root, cleanup } = await setupTree();
-    try {
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress');
-      assert.equal(entry.cleanup_workspace_on_exit, false);
-      const token = reg.activate(entry);
-      await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { title: 'Done', summary: 'done' } },
-      });
-      assert.equal(entry.cleanup_workspace_on_exit, true);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done rejects missing title', async () => {
-    const { root, cleanup } = await setupTree();
-    try {
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress');
-      const token = reg.activate(entry);
-      const res = await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { summary: 'ok' } },
-      });
-      const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
-      assert.equal(result.isError, true);
-      assert.match(result.content[0]!.text, /title is required/);
-      assert.equal(entry.marked_done, false);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done rejects multi-line title', async () => {
-    const { root, cleanup } = await setupTree();
-    try {
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress');
-      const token = reg.activate(entry);
-      const res = await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { title: 'two\nlines', summary: 'ok' } },
-      });
-      const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
-      assert.equal(result.isError, true);
-      assert.match(result.content[0]!.text, /must be a single line/);
-      assert.equal(entry.marked_done, false);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done rejects empty summary', async () => {
-    const { root, cleanup } = await setupTree();
-    try {
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress');
-      const token = reg.activate(entry);
-      const res = await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { title: 'Done', summary: '   ' } },
-      });
-      const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } }).result;
-      assert.equal(result.isError, true);
-      assert.match(result.content[0]!.text, /summary is required/);
-      assert.equal(entry.marked_done, false);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done persists title + summary as mark_done.md in the staging dir', async () => {
-    // Regression: the after_run hook reads the title/summary from mark_done.md.
-    // Confirm the structured artifact is written next to credentials (in .git/
-    // when a workspace has its own .git/, in .symphony-runtime/ otherwise) and
-    // that the markdown shape is "# <title>\n\n<summary>".
-    const { root, cleanup } = await setupTree();
-    const tmpWs = await mkdtemp(path.join(os.tmpdir(), 'symphony-mark-ws-'));
-    try {
-      // Workspace with its own .git/ dir so the staging-dir resolver picks the
-      // git path.
-      await mkdir(path.join(tmpWs, '.git'), { recursive: true });
-      const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
-      const entry = makeEntry('ABC-1', 'In Progress');
-      entry.workspace_path = tmpWs;
-      const token = reg.activate(entry);
-      const res = await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: {
-          name: 'mark_done',
-          arguments: {
-            title: 'Add CHANGELOG.md',
-            summary: 'Wrote a 16-line changelog summarizing recent work.\n\nNo follow-ups.',
-          },
-        },
-      });
-      const result = (res as { result: { isError: boolean } }).result;
-      assert.equal(result.isError, false);
-      const body = await readFile(path.join(tmpWs, '.git', 'symphony-runtime', 'mark_done.md'), 'utf8');
-      assert.match(body, /^# Add CHANGELOG\.md\n\n/);
-      assert.match(body, /16-line changelog/);
-      assert.match(body, /No follow-ups\./);
-    } finally {
-      await rm(tmpWs, { recursive: true, force: true });
-      await cleanup();
-    }
-  });
-
   it('request_human_steering stashes question, ack returns, submitSteeringReply unblocks waiter', async () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       const token = reg.activate(entry);
 
@@ -600,7 +320,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       const token = reg.activate(entry);
       await reg.handleJsonRpc('ABC-1', token, {
@@ -634,7 +354,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       reg.activate(entry);
       const cancel = { cancelled: false };
@@ -653,7 +373,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       reg.activate(entry);
       const ok = reg.submitSteeringReply('ABC-1', 'unsolicited');
@@ -667,7 +387,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       reg.activate(entry);
       const waiter = reg.awaitSteeringReply('ABC-1', { cancelled: false });
@@ -684,7 +404,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -703,7 +423,7 @@ describe('McpRegistry JSON-RPC', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress');
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -727,7 +447,7 @@ describe('McpRegistry.buildUrl', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const reg = new McpRegistry(t);
       // setEffectivePort has not been called (e.g. HTTP server disabled).
       const url = reg.buildUrl('ABC-1', { host: '10.0.2.2', explicit_host_url: null });
       assert.equal(url, null);
@@ -740,7 +460,7 @@ describe('McpRegistry.buildUrl', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const reg = new McpRegistry(t);
       reg.setEffectivePort(9090);
       const url = reg.buildUrl('ABC-1', { host: '10.0.2.2', explicit_host_url: null });
       assert.equal(url, 'http://10.0.2.2:9090/api/v1/issues/ABC-1/mcp');
@@ -753,7 +473,7 @@ describe('McpRegistry.buildUrl', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const reg = new McpRegistry(t);
       reg.setEffectivePort(8787);
       const url = reg.buildUrl('ABC-1', {
         host: '10.0.2.2',
@@ -769,7 +489,7 @@ describe('McpRegistry.buildUrl', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const reg = new McpRegistry(t);
       reg.setEffectivePort(8787);
       const url = reg.buildUrl('ABC-1 hi', { host: '10.0.2.2', explicit_host_url: null });
       assert.equal(url, 'http://10.0.2.2:8787/api/v1/issues/ABC-1%20hi/mcp');
@@ -784,7 +504,7 @@ describe('McpRegistry propose_issue', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -839,7 +559,7 @@ describe('McpRegistry propose_issue', () => {
         `---\ntitle: Fix the thing\n---\nbody.`,
       );
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -866,7 +586,7 @@ describe('McpRegistry propose_issue', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const noTitle = await reg.handleJsonRpc('ABC-1', token, {
@@ -905,12 +625,12 @@ describe('McpRegistry propose_issue', () => {
   });
 
   it('uses the tracker root snapshotted at dispatch time, not a post-reload root', async () => {
-    // Same rationale as mark_done: a workflow reload that mutates tracker.root mid-flight
+    // Same rationale as `transition`: a workflow reload that mutates tracker.root mid-flight
     // must not redirect an in-flight proposal to a different filesystem location.
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done'] });
+      const reg = new McpRegistry(t);
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const decoyRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-decoy-propose-'));
       try {
@@ -983,7 +703,7 @@ describe('McpRegistry transition', () => {
         `---\ntitle: Issue\n---\nOriginal body.`,
       );
       const t = makeStateTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(t, { states });
       const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
       entry.resolved_actor = 'claude/claude-opus-4-7';
       const token = reg.activate(entry);
@@ -1032,7 +752,7 @@ describe('McpRegistry transition', () => {
         `---\ntitle: Issue\n---\nbody`,
       );
       const t = makeStateTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(t, { states });
       const entry = makeEntry('ABC-1', 'Review', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -1057,7 +777,7 @@ describe('McpRegistry transition', () => {
     try {
       await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
       const t = makeStateTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(t, { states });
       const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -1103,7 +823,7 @@ describe('McpRegistry transition', () => {
     try {
       await writeFile(path.join(root, 'Review', 'ABC-1.md'), `---\ntitle: R\n---\nbody`);
       const t = makeStateTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(t, { states });
       const entry = makeEntry('ABC-1', 'Review', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -1140,7 +860,7 @@ describe('McpRegistry transition', () => {
     try {
       await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
       const t = makeStateTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(t, { states });
       const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       // Lowercase 'review' must resolve to the declared 'Review' state.
@@ -1156,47 +876,6 @@ describe('McpRegistry transition', () => {
       // The file lands in the declared-casing directory.
       assert.deepEqual(await readdir(path.join(root, 'Review')), ['ABC-1.md']);
     } finally {
-      await cleanup();
-    }
-  });
-
-  it('mark_done shim routes through the transition path, moves to first terminal, sets cleanup, persists mark_done.md', async () => {
-    const { root, cleanup } = await setupStateTree();
-    const tmpWs = await mkdtemp(path.join(os.tmpdir(), 'symphony-mark-ws-shim-'));
-    try {
-      await mkdir(path.join(tmpWs, '.git'), { recursive: true });
-      await writeFile(path.join(root, 'Review', 'ABC-1.md'), `---\ntitle: R\n---\nReview body`);
-      const t = makeStateTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
-      const entry = makeEntry('ABC-1', 'Review', {
-        tracker_root_at_dispatch: root,
-        terminal_target_at_dispatch: 'Done',
-      });
-      entry.workspace_path = tmpWs;
-      entry.resolved_actor = 'codex/gpt-5-codex';
-      const token = reg.activate(entry);
-      const res = await reg.handleJsonRpc('ABC-1', token, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: { name: 'mark_done', arguments: { title: 'Ship it', summary: 'All green.' } },
-      });
-      const result = (res as { result: { isError: boolean } }).result;
-      assert.equal(result.isError, false);
-      assert.equal(entry.marked_done, true);
-      assert.equal(entry.cleanup_workspace_on_exit, true);
-      // File moved to the dispatch-pinned terminal state.
-      assert.deepEqual(await readdir(path.join(root, 'Done')), ['ABC-1.md']);
-      // Notes were stamped onto the file too (transition path appends them).
-      const body = await readFile(path.join(root, 'Done', 'ABC-1.md'), 'utf8');
-      assert.match(body, /## codex\/gpt-5-codex — \S+ — Review → Done/);
-      assert.match(body, /# Ship it/);
-      assert.match(body, /All green\./);
-      // mark_done.md persisted to the workspace staging dir for the after_run hook.
-      const md = await readFile(path.join(tmpWs, '.git', 'symphony-runtime', 'mark_done.md'), 'utf8');
-      assert.match(md, /^# Ship it\n\nAll green\.\n$/);
-    } finally {
-      await rm(tmpWs, { recursive: true, force: true });
       await cleanup();
     }
   });
@@ -1221,7 +900,7 @@ describe('McpRegistry transition', () => {
         states: customStates,
         root,
       });
-      const reg = new McpRegistry(t, { terminalStates: ['Done'], states: customStates });
+      const reg = new McpRegistry(t, { states: customStates });
       const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -1267,7 +946,7 @@ describe('McpRegistry transition', () => {
         states: noHoldingStates,
         root,
       });
-      const reg = new McpRegistry(t, { terminalStates: ['Done'], states: noHoldingStates });
+      const reg = new McpRegistry(t, { states: noHoldingStates });
       const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -1294,7 +973,7 @@ describe('McpRegistry transition', () => {
     try {
       await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
       const t = makeStateTracker(root);
-      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(t, { states });
       const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -1324,7 +1003,7 @@ describe('McpRegistry transition', () => {
       const issuePath = (state: string) => path.join(root, state, 'ABC-1.md');
       await writeFile(issuePath('Todo'), `---\ntitle: Issue\n---\nInitial body.`);
       const tracker = makeStateTracker(root);
-      const reg = new McpRegistry(tracker, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(tracker, { states });
 
       // Hop 1: Todo → Review (implementer handoff).
       const todoEntry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
@@ -1394,7 +1073,7 @@ describe('McpRegistry transition', () => {
     try {
       await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: Issue\n---\nInitial body.`);
       const tracker = makeStateTracker(root);
-      const reg = new McpRegistry(tracker, { terminalStates: ['Done', 'Cancelled'], states });
+      const reg = new McpRegistry(tracker, { states });
 
       // Hop 1: Todo → Review.
       const todoEntry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
@@ -1445,7 +1124,6 @@ describe('McpRegistry transition', () => {
       const t = makeStateTracker(root);
       // Construct with a minimal map missing Review.
       const reg = new McpRegistry(t, {
-        terminalStates: ['Done', 'Cancelled'],
         states: { Todo: { role: 'active' }, Done: { role: 'terminal' } },
       });
       const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });

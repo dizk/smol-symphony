@@ -43,11 +43,11 @@ describe('local tracker', () => {
     }
   });
 
-  it('returns root and terminalStates alongside issues as an atomic snapshot', async () => {
+  it('returns root alongside issues as an atomic snapshot', async () => {
     // Regression: the orchestrator dispatch loop relies on fetchCandidateIssues
-    // returning the tracker config it actually used during the scan, so a
-    // workflow reload mid-tick can't make the fetched issues and the captured
-    // snapshot disagree.
+    // returning the tracker root it actually used during the scan, so a workflow
+    // reload mid-tick can't make the fetched issues and the captured snapshot
+    // disagree.
     const { root, cleanup } = await makeTree();
     try {
       const t = new LocalMarkdownTracker({
@@ -58,12 +58,6 @@ describe('local tracker', () => {
       });
       const result = await t.fetchCandidateIssues();
       assert.equal(result.root, root);
-      assert.deepEqual(result.terminalStates, ['Done', 'Cancelled']);
-      // Snapshot is a copy, not a live reference: mutating it must not affect
-      // future calls.
-      result.terminalStates.push('Tampered');
-      const second = await t.fetchCandidateIssues();
-      assert.deepEqual(second.terminalStates, ['Done', 'Cancelled']);
     } finally {
       await cleanup();
     }
@@ -289,7 +283,7 @@ describe('local tracker moveIssueToState with notes', () => {
     }
   });
 
-  it('skips notes append when notes is absent or empty (legacy mark_done path)', async () => {
+  it('skips notes append when notes is absent or empty', async () => {
     const { mkdtemp, mkdir, writeFile, rm, readFile } = await import('node:fs/promises');
     const os = await import('node:os');
     const path = await import('node:path');

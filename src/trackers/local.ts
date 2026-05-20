@@ -125,13 +125,12 @@ export class LocalMarkdownTracker implements IssueTracker {
   }
 
   async fetchCandidateIssues(): Promise<CandidateFetchResult> {
-    // Capture root + terminal_states atomically at method entry. A workflow
-    // reload during the fetch I/O cannot make the returned issues and the
-    // returned snapshot disagree — both come from this single view of cfg.
+    // Capture root atomically at method entry. A workflow reload during the
+    // fetch I/O cannot make the returned issues and the returned snapshot
+    // disagree — both come from this single view of cfg.
     const root = this.cfg.root!;
-    const terminalStates = [...this.cfg.terminal_states];
     const active = new Set(this.cfg.active_states.map((s) => s.toLowerCase()));
-    const terminal = new Set(terminalStates.map((s) => s.toLowerCase()));
+    const terminal = new Set(this.cfg.terminal_states.map((s) => s.toLowerCase()));
     const all = await this.scanAllAt(root);
     const filtered = all.filter((raw) => {
       const s = raw.state.toLowerCase();
@@ -140,7 +139,6 @@ export class LocalMarkdownTracker implements IssueTracker {
     return {
       issues: this.normalize(filtered, all),
       root,
-      terminalStates,
     };
   }
 
@@ -168,9 +166,8 @@ export class LocalMarkdownTracker implements IssueTracker {
 
   /**
    * Move an issue's .md file from its current state directory to `toState`. Used by the
-   * MCP mark_done / transition tools. Atomic on the same filesystem (fs.rename); throws
-   * TrackerError with a stable code on common failure modes so the MCP layer can surface
-   * them.
+   * MCP transition tool. Atomic on the same filesystem (fs.rename); throws TrackerError
+   * with a stable code on common failure modes so the MCP layer can surface them.
    *
    * When `opts.notes` is a non-empty string, a notes block is appended to the issue body
    * BEFORE the cross-directory rename: the new body is written to `<id>.md.tmp` in the
@@ -188,7 +185,7 @@ export class LocalMarkdownTracker implements IssueTracker {
   ): Promise<{ fromState: string; toState: string; newPath: string }> {
     // When the caller pins a root (snapshot from dispatch time), scan there.
     // Otherwise use whatever the live config says. This protects in-flight
-    // mark_done from a WORKFLOW.md reload that mutates tracker.root.
+    // transition calls from a WORKFLOW.md reload that mutates tracker.root.
     const root = opts?.fromRoot ?? this.root;
     const all = await this.scanAllAt(root);
     const candidates = all.filter((raw) => this.idOf(raw) === issueId);
@@ -330,7 +327,7 @@ export class LocalMarkdownTracker implements IssueTracker {
     return this.scanAllAt(this.root);
   }
 
-  /** Variant that scans an explicit root, used by mark_done with a pinned snapshot. */
+  /** Variant that scans an explicit root, used by `transition` with a pinned snapshot. */
   private async scanAllAt(root: string): Promise<RawIssueFile[]> {
     let entries: string[];
     try {

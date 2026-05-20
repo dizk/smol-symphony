@@ -55,7 +55,7 @@ export interface RunAttemptResult {
 }
 
 const CONTINUATION_PROMPT_WITH_MCP =
-  'Continue working on the same issue. Pick up where the prior turn left off and proceed with the next concrete action. If the work is fully complete, summarize what changed and call the symphony.mark_done tool.';
+  'Continue working on the same issue. Pick up where the prior turn left off and proceed with the next concrete action. If the work is fully complete, summarize what changed and call the symphony.transition tool to hand off to the next state.';
 
 const CONTINUATION_PROMPT_NO_MCP =
   'Continue working on the same issue. Pick up where the prior turn left off and proceed with the next concrete action. If the work is fully complete, summarize what changed and stop.';
@@ -76,7 +76,7 @@ function buildSteeringReplyPrompt(question: string, context: string | null, repl
     'The human responded:',
     reply,
     '',
-    'Continue work on the issue, taking the human response into account. If the work is fully complete, call symphony.mark_done. If you need to ask another question, call symphony.request_human_steering again.',
+    'Continue work on the issue, taking the human response into account. If the work is fully complete, call symphony.transition to hand off to the next state. If you need to ask another question, call symphony.request_human_steering again.',
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
@@ -487,7 +487,7 @@ export class AgentRunner {
     //   1. `client.cancel()` — sends `session/cancel` over ACP. The polite path; the
     //      adapter SHOULD respond to the in-flight `session/prompt` with
     //      `stop_reason: cancelled`. In practice the adapter often goes silent (e.g.
-    //      after the model has emitted its final text and called `mark_done`).
+    //      after the model has emitted its final text and called `transition`).
     //   2. `client.forceClose()` — explicitly ends the LineTap streams the SDK is reading
     //      from. This makes the SDK's `receive()` reader loop observe `done` and call its
     //      internal `close()`, which rejects every pending request including the in-flight
@@ -516,10 +516,11 @@ export class AgentRunner {
     const cancelCheckTimer = setInterval(onCancel, 500);
 
     // Register with the MCP registry so the agent's tool calls can be routed back.
-    // MCP is required for symphony operations: mark_done is the only way for the agent
-    // to signal completion, and request_human_steering is the only way to defer to a
-    // human. If we can't construct a reachable URL — no bound HTTP port and no explicit
-    // override — we abort the attempt rather than dispatch a tool-less agent.
+    // MCP is required for symphony operations: `transition` is the only way for the
+    // agent to signal completion (or hand off to another state), and
+    // request_human_steering is the only way to defer to a human. If we can't construct
+    // a reachable URL — no bound HTTP port and no explicit override — we abort the
+    // attempt rather than dispatch a tool-less agent.
     const mcpServers: McpServer[] = [];
     if (this.cfg.mcp.enabled && runningEntry) {
       if (!this.mcp) {
@@ -618,7 +619,7 @@ export class AgentRunner {
     // autonomous turns (turns without a pending human reply) count against max_turns.
     // Turns driven by a human steering reply run free; the human is in the loop and can
     // stop work at any time by walking away or by giving an instruction that ends in
-    // mark_done.
+    // a `transition` call.
     while (true) {
       if (cancelSignal.cancelled) {
         lastReason = 'cancelled_by_reconciliation';
@@ -658,9 +659,9 @@ export class AgentRunner {
       const outcome = await client.runPrompt(prompt);
 
       if (outcome.reason !== 'end_turn') {
-        // mark_done is authoritative: if the agent moved the issue to a terminal state
-        // mid-turn, reconcile may have tripped cancelSignal before the prompt returned.
-        // The work is done regardless of how the prompt ended; honor that.
+        // `marked_done` is authoritative: if the agent transitioned the issue
+        // mid-turn, reconcile may have tripped cancelSignal before the prompt
+        // returned. The work is done regardless of how the prompt ended; honor that.
         if (runningEntry?.marked_done) {
           lastReason = 'agent_marked_done';
           break;

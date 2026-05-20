@@ -3,18 +3,17 @@
 import type { Issue } from '../types.js';
 
 /**
- * Atomic candidate-fetch result. `issues` is the filtered list; `root` and
- * `terminalStates` are the tracker's config values *captured at the moment of
- * the fetch*, so callers can use them as snapshots immune to any subsequent
- * config mutation (e.g. a workflow reload that runs between the await returning
- * and the caller's dispatch loop). The orchestrator pins these onto each
- * RunningEntry so a later `mark_done` operates against the same root and
- * terminal state the issue was fetched from, not against a post-reload view.
+ * Atomic candidate-fetch result. `issues` is the filtered list; `root` is the
+ * tracker's storage location *captured at the moment of the fetch*, so callers
+ * can use it as a snapshot immune to any subsequent config mutation (e.g. a
+ * workflow reload that runs between the await returning and the caller's
+ * dispatch loop). The orchestrator pins this onto each RunningEntry so a later
+ * `symphony.transition` operates against the same root the issue was fetched
+ * from, not against a post-reload view.
  */
 export interface CandidateFetchResult {
   issues: Issue[];
   root: string | null;
-  terminalStates: string[];
 }
 
 export interface IssueTracker {
@@ -25,11 +24,11 @@ export interface IssueTracker {
   /** SPEC §11.1.3: refresh tracker state for the given issue ids. Missing ids omitted. */
   fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]>;
   /**
-   * Optional capability: transition an issue to a new state. Used by the MCP `mark_done`
-   * and `transition` tools so the agent can signal completion / hand off to the next
-   * state without shelling out to `mv`. Trackers that are read-only (e.g. external
-   * services accessed via a token without write scope) may omit this; the MCP server
-   * will reject `mark_done` / `transition` calls in that case.
+   * Optional capability: transition an issue to a new state. Used by the MCP `transition`
+   * tool so the agent can hand off to the next state (or to a terminal state) without
+   * shelling out to `mv`. Trackers that are read-only (e.g. external services accessed
+   * via a token without write scope) may omit this; the MCP server will reject
+   * `transition` calls in that case.
    *
    * `opts.fromRoot` lets callers pin the tracker storage location at the moment they
    * captured the issue, so a WORKFLOW.md reload that changes `tracker.root` mid-flight

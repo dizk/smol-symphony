@@ -21,7 +21,7 @@ import type { AgentRunner } from '../src/agent/runner.js';
 function makeTracker(): IssueTracker {
   return {
     async fetchCandidateIssues(): Promise<CandidateFetchResult> {
-      return { issues: [], root: null, terminalStates: [] };
+      return { issues: [], root: null };
     },
     async fetchIssuesByStates(): Promise<Issue[]> {
       return [];

@@ -160,8 +160,8 @@ export interface ServerConfig {
 
 // MCP server exposed to in-VM agents over HTTP. The orchestrator runs a JSON-RPC endpoint
 // scoped to each active issue at /api/v1/issues/<id>/mcp; the URL itself is the capability,
-// reinforced by a per-dispatch bearer token. Two tools live there today: mark_done and
-// request_human_steering.
+// reinforced by a per-dispatch bearer token. Tools live there: transition, propose_issue,
+// and request_human_steering.
 export interface McpConfig {
   enabled: boolean;
   // Hostname or IP the agent uses to reach the orchestrator from inside the smolvm.
@@ -240,14 +240,14 @@ export interface RunningEntry {
   // so the agent's tool calls can be routed back. Lifecycle: set on registration, cleared
   // when the worker exits.
   mcp_token: string | null;
-  // Snapshots captured at dispatch time so a WORKFLOW.md reload mid-flight cannot
-  // redirect an in-flight mark_done. The orchestrator pins these in dispatchIssue
+  // Snapshot of `tracker.root` captured at dispatch time so a WORKFLOW.md reload
+  // mid-flight cannot redirect an in-flight `transition` (or `propose_issue`) to
+  // a different filesystem location. The orchestrator pins this in dispatchIssue
   // BEFORE workspace setup, before_run hooks, or smolvm bring-up — anything that
   // happens during that window (including a workflow reload that mutates
-  // tracker.root or terminal_states) must not affect where mark_done lands.
-  // McpRegistry.activate copies these into the ActiveEntry as-is.
+  // tracker.root) must not affect where the move lands. McpRegistry.activate
+  // copies the value into the ActiveEntry as-is.
   tracker_root_at_dispatch: string | null;
-  terminal_target_at_dispatch: string;
   // Resolved "<adapter>/<model or 'default'>" identity at dispatch time. Stamped
   // into the notes header that `symphony.transition` writes onto the issue body so
   // the next agent (reading the issue in its new state) sees who handed off.
