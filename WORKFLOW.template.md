@@ -114,6 +114,33 @@ logs:
 # Plus any env var the operator exports before launching `symphony`. The
 # common pattern is to plumb tracker root / repo / base via env so the same
 # workflow file works against multiple repos. See WORKFLOW.md for an example.
+#
+# Env vars the shipped after_run hook in WORKFLOW.md additionally reads
+# (operator-tunable knobs; not parsed by symphony itself):
+#
+#   SYMPHONY_REPO                  — `owner/repo`. When set, the hook pushes
+#                                    the per-issue branch and opens a PR via
+#                                    `gh`. When unset, writes a patch bundle.
+#   SYMPHONY_BASE_BRANCH           — base branch for the PR / merge base.
+#                                    Default: 'main'.
+#   SYMPHONY_TRACKER_ROOT          — override the tracker root the hook checks
+#                                    for the Done/ transition. Default: the
+#                                    workflow's tracker.root resolved from cwd.
+#   SYMPHONY_PATCHES_DIR           — directory the format-patch bundle is
+#                                    written to. Default: ./.symphony/patches.
+#   SYMPHONY_NOTES_DIR             — directory mark_done.md is preserved into
+#                                    after each run. Default: ./.symphony/notes.
+#   SYMPHONY_AUTO_MERGE            — when truthy ('on', '1', 'true'), the
+#                                    hook queues the freshly-opened PR for
+#                                    GitHub's native auto-merge via
+#                                    `gh pr merge --auto`. Default unset (off).
+#                                    Requires `Allow auto-merge` on the repo
+#                                    and branch protection on the base branch
+#                                    — GitHub does the wait + gate, the hook
+#                                    only flips the bit.
+#   SYMPHONY_AUTO_MERGE_METHOD     — merge strategy passed to `gh pr merge`.
+#                                    One of: squash | merge | rebase.
+#                                    Default: squash.
 # ─────────────────────────────────────────────────────────────────────────────
 hooks:
   # timeout_ms (int): max wall time for a single hook invocation.

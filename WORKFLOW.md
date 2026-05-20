@@ -96,6 +96,72 @@ hooks:
   #   - If SYMPHONY_REPO is set: push branch + open (or update) a PR via gh.
   #   - Else (local-only mode): write the agent's work as a git format-patch
   #     bundle into ./.symphony/patches/<branch>.patch for human review.
+  #
+  # ── Auto-merge plan (also see SYMPHONY_AUTO_MERGE below) ──────────────────
+  #
+  # Goal: simple PRs land themselves; the operator's attention is reserved for
+  # the ones that need it. The plan is layered, top to bottom; each layer is
+  # optional and each one assumes the layer above is in place.
+  #
+  # 1. Mechanism — `gh pr merge --auto`. GitHub's native auto-merge already
+  #    knows how to "wait for required checks and reviews, then merge". We do
+  #    not reinvent that wait loop on the host. Once the PR is created we
+  #    optionally call `gh pr merge --auto --<method>` to queue it; GitHub
+  #    handles the rest. Requires the repo to have "Allow auto-merge" enabled
+  #    in Settings → General → Pull Requests.
+  #
+  # 2. Safety rails — branch protection on `main`. The real gate is GitHub's
+  #    own branch-protection rules: required status checks (lint, typecheck,
+  #    tests), required reviews, required linear history, etc. Auto-merge
+  #    refuses to land a PR until those pass, so the operator's existing CI
+  #    is the policy engine. If CI is weak, auto-merge is unsafe; tighten
+  #    branch protection first.
+  #
+  # 3. Decision — who decides "simple enough". Three plausible signals,
+  #    listed cheapest first:
+  #
+  #      a. Operator default. SYMPHONY_AUTO_MERGE=on opts in for every PR
+  #         symphony opens against this workflow. Useful when branch
+  #         protection is strong enough to be the only gate.
+  #
+  #      b. Per-issue label. Operator (or a future agent prompt) labels the
+  #         tracker issue with `auto-merge`; the after_run hook forwards the
+  #         label and only enables auto-merge when present. Cheap to add;
+  #         keeps the human in the loop for everything else. Not implemented
+  #         in this hook yet — see follow-ups.
+  #
+  #      c. Agent self-declaration. The agent decides at mark_done time
+  #         whether the change is small and reversible. Surfaced via a
+  #         dedicated MCP tool field or a `auto_merge: true` line in the
+  #         persisted mark_done.md. Highest fidelity but adds tool surface;
+  #         defer until (a) and (b) are working.
+  #
+  # 4. Diff heuristics (future, optional). Before queueing, the hook could
+  #    inspect the diff and refuse auto-merge if any of:
+  #      • touches files under a protected path list (e.g. .github/, scripts/,
+  #        anything matching CODEOWNERS),
+  #      • added/removed LOC exceeds a threshold (e.g. 200 lines),
+  #      • renames or deletes outside an allowlist.
+  #    Haystack-style "what does this PR actually touch" framing belongs here.
+  #    Branch protection covers the bulk of the risk, so this is a refinement,
+  #    not a prerequisite.
+  #
+  # 5. Failure mode — fall safe. If `gh pr merge --auto` errors (auto-merge
+  #    not enabled, missing permissions, conflicting branch-protection
+  #    config), the PR remains open exactly as it does today. The operator
+  #    sees it in the GitHub UI; nothing in the symphony workspace is lost.
+  #
+  # 6. Out of scope here. We deliberately do not implement:
+  #      • a post-merge cleanup step (branch deletion is GitHub-side via
+  #        "automatically delete head branches"),
+  #      • a merge-train / queue (`gh pr merge --auto` already serializes
+  #        against branch protection),
+  #      • a dashboard surface for "queued for auto-merge" (the PR list on
+  #        GitHub already shows this state).
+  #
+  # The built-in building block below is layer 1 + layer 3a only: a single
+  # env var that flips auto-merge on for every PR this workflow opens. Layers
+  # 3b/3c/4 are follow-ups, sized in the PR description that ships this plan.
   after_run: |
     set -eu
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
@@ -176,14 +242,49 @@ hooks:
       # Push + PR. On failure we leave the patch bundle (above) in place as the canonical
       # record; operators can `gh pr create` from it manually.
       if git push -u origin "${BRANCH}"; then
+        PR_READY=0
         if gh pr view "${BRANCH}" >/dev/null 2>&1; then
           echo "PR already exists for ${BRANCH}; pushed updates"
-        elif ! gh pr create \
+          PR_READY=1
+        elif gh pr create \
           --base "${BASE}" \
           --head "${BRANCH}" \
           --title "${ISSUE_ID}: ${TITLE}" \
           --body "${BODY}"; then
+          PR_READY=1
+        else
           echo "gh pr create failed; patch bundle preserved at ${PATCH_OUT}" >&2
+        fi
+
+        # Opt-in auto-merge (see "Auto-merge plan" comment block above for the
+        # full design). Off by default. When SYMPHONY_AUTO_MERGE is set to a
+        # truthy value, queue the PR for GitHub's native auto-merge using the
+        # method in SYMPHONY_AUTO_MERGE_METHOD (default: squash). GitHub will
+        # only merge once branch-protection requirements pass; if they never
+        # pass, the PR stays open. Failure here is non-fatal — the PR is
+        # still open and the patch bundle is still on disk.
+        AUTO_MERGE_FLAG="${SYMPHONY_AUTO_MERGE:-}"
+        if [ "${PR_READY}" = "1" ] && [ -n "${AUTO_MERGE_FLAG}" ] \
+          && [ "${AUTO_MERGE_FLAG}" != "0" ] \
+          && [ "${AUTO_MERGE_FLAG}" != "off" ] \
+          && [ "${AUTO_MERGE_FLAG}" != "false" ]; then
+          MERGE_METHOD="${SYMPHONY_AUTO_MERGE_METHOD:-squash}"
+          case "${MERGE_METHOD}" in
+            squash) MERGE_FLAG="--squash" ;;
+            merge)  MERGE_FLAG="--merge"  ;;
+            rebase) MERGE_FLAG="--rebase" ;;
+            *)
+              echo "auto-merge: unknown SYMPHONY_AUTO_MERGE_METHOD='${MERGE_METHOD}', expected squash|merge|rebase" >&2
+              MERGE_FLAG=""
+              ;;
+          esac
+          if [ -n "${MERGE_FLAG}" ]; then
+            if gh pr merge "${BRANCH}" --auto "${MERGE_FLAG}"; then
+              echo "auto-merge: queued ${BRANCH} for ${MERGE_METHOD} merge (waits for branch protection)"
+            else
+              echo "auto-merge: gh pr merge --auto failed for ${BRANCH}; PR left open" >&2
+            fi
+          fi
         fi
       else
         echo "git push failed; patch bundle preserved at ${PATCH_OUT}" >&2

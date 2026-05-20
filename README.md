@@ -215,7 +215,11 @@ operate on workspaces inside the credential file's ancestor repo.
 - **Pull request mode.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is
   exported. The hook pushes the per-issue branch to GitHub and runs
   `gh pr create --base $SYMPHONY_BASE_BRANCH ...`. Requires `gh auth status`
-  to be clean on the host. The token never enters the VM.
+  to be clean on the host. The token never enters the VM. Set
+  `SYMPHONY_AUTO_MERGE=on` to additionally queue each PR for GitHub's native
+  auto-merge (`gh pr merge --auto`, defaults to squash; override via
+  `SYMPHONY_AUTO_MERGE_METHOD=merge|rebase`). Branch protection on the base
+  branch is the real gate — GitHub waits for required checks before landing.
 - **Patch bundle mode** (default). Writes
   `.symphony/patches/<branch>.patch` via `git format-patch` so you can
   review and apply with `git am`. No remote required.
