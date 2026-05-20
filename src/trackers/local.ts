@@ -337,11 +337,10 @@ export class LocalMarkdownTracker implements IssueTracker {
       );
     }
     // Match directories against the declared state map case-insensitively, the
-    // same comparison the orchestrator uses for active/terminal classification.
-    // Unknown directories (operator-left scratch, a legacy state that was removed
-    // from `states:`) are ignored with a warning so a stale tree doesn't crash
-    // the dispatch loop. `states` is canonical (the workflow parser refuses
-    // configs without it) so there is no fallback path.
+    // same comparison the orchestrator uses for role-based classification.
+    // Unknown directories (operator-left scratch, a state that was removed from
+    // `states:`) are ignored with a warning so a stale tree doesn't crash the
+    // dispatch loop.
     const declared = new Map<string, string>();
     for (const name of Object.keys(this.cfg.states)) {
       declared.set(name.toLowerCase(), name);

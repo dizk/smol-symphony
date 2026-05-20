@@ -2,8 +2,8 @@
 //
 // We use the local `smolvm` binary because the npm package is a stub and the HTTP API does
 // not support bidirectional stdio for `machine exec`. The CLI form `machine exec -i` exposes
-// the VM-process stdin/stdout directly, which is exactly what the Codex app-server JSON-RPC
-// transport needs.
+// the VM-process stdin/stdout directly, which is exactly what the ACP JSON-RPC transport
+// needs.
 
 import { spawn, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
 import { promisify } from 'node:util';
