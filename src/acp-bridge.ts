@@ -59,6 +59,11 @@ export interface AcpBridgeRegistration {
   cancel: (reason: string) => void;
 }
 
+export interface AcpBridgeOptions {
+  /** Per-connection deadline for receiving the bearer line. Defaults to 10 s. */
+  authTimeoutMs?: number;
+}
+
 export class AcpBridge {
   private server: Server | null = null;
   private boundPort: number | null = null;
@@ -76,6 +81,11 @@ export class AcpBridge {
   // deadline to expire on each idle connection before SIGTERM completes.
   private preAuthSockets = new Set<Socket>();
   private stopped = false;
+  private readonly authTimeoutMs: number;
+
+  constructor(opts: AcpBridgeOptions = {}) {
+    this.authTimeoutMs = opts.authTimeoutMs ?? 10_000;
+  }
 
   /**
    * Start listening on (host, port). Pass 0 for an ephemeral port; the actually-bound
@@ -231,9 +241,10 @@ export class AcpBridge {
       }
     };
     // Authentication deadline: if the in-VM agent doesn't send the bearer line within
-    // 10s of connecting, the connection is almost certainly stuck or malformed. The
-    // dispatch's own timeout would also catch this; this is just a tighter guard.
-    const authDeadline = setTimeout(() => fail('auth timeout'), 10_000);
+    // the configured window of connecting, the connection is almost certainly stuck or
+    // malformed. The dispatch's own timeout would also catch this; this is just a tighter
+    // guard.
+    const authDeadline = setTimeout(() => fail('auth timeout'), this.authTimeoutMs);
     const onData = (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
       const nl = buf.indexOf(0x0a);
