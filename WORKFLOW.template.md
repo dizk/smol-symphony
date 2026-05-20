@@ -178,6 +178,15 @@ acp:
   #   codex    — codex-acp;        stages ~/.codex/auth.json
   adapter: claude
 
+  # model (string | null): optional model selector forwarded to the chosen adapter.
+  # Each adapter profile knows how to surface it natively:
+  #   claude  — exported as ANTHROPIC_MODEL on the adapter process. Accepts anything
+  #             claude-agent-acp would (aliases like "opus", "sonnet", or full IDs
+  #             like "claude-opus-4-7").
+  #   codex   — passed as `-c model="<value>"` argv to codex-acp (parsed as TOML).
+  # Leave unset / null to use the adapter's own default model. Default: null.
+  # model: claude-opus-4-7
+
   # NOTE: `acp.command` is intentionally not part of the TCP bridge contract. Under the
   # bridge transport every launch must exec the in-VM proxy (`/opt/symphony/vm-agent.mjs`)
   # so it can dial the host's bridge listener with the per-dispatch bearer token. A raw

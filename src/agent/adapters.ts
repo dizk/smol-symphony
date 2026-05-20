@@ -27,6 +27,18 @@ import os from 'node:os';
 
 export type AcpAdapterId = 'claude' | 'codex';
 
+/**
+ * How a chosen `acp.model` is surfaced to a specific adapter. Either an env var, extra
+ * argv passed to the adapter binary, or both. Adapters that take the model through a
+ * non-CLI/non-env channel (a config file, a session-init RPC) would need their own
+ * branch in the runner; that's why this returns a structured value rather than baking
+ * the mechanism into the registry.
+ */
+export interface ModelInjection {
+  env?: Record<string, string>;
+  extraArgs?: string[];
+}
+
 export interface AdapterProfile {
   id: AcpAdapterId;
   /** Path under $HOME on the host where the credential file lives. */
@@ -39,6 +51,13 @@ export interface AdapterProfile {
    * commands (e.g. `['opencode', 'acp']`) compose without shell-injection risk.
    */
   binary: readonly string[];
+  /**
+   * Map an `acp.model` string into the env vars / extra argv this adapter needs to
+   * actually select the model. Called only when `acp.model` is non-null; profiles can
+   * assume a non-empty string. Return shape lets new adapters pick whatever mechanism
+   * they natively support (e.g. opencode could pass `--model` here).
+   */
+  modelInjection(model: string): ModelInjection;
 }
 
 export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
@@ -47,12 +66,21 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     hostCredentialPath: '.claude/.credentials.json',
     guestCredentialPath: '/root/.claude/.credentials.json',
     binary: ['claude-agent-acp'],
+    // claude-agent-acp reads ANTHROPIC_MODEL on startup (see acp-agent.js getAvailableModels:
+    // ANTHROPIC_MODEL > settings.model > default). The adapter resolves aliases like
+    // "opus" or "claude-sonnet-4-5" against the SDK's model list, so anything the user
+    // would type into Claude Code works here.
+    modelInjection: (model) => ({ env: { ANTHROPIC_MODEL: model } }),
   },
   codex: {
     id: 'codex',
     hostCredentialPath: '.codex/auth.json',
     guestCredentialPath: '/root/.codex/auth.json',
     binary: ['codex-acp'],
+    // codex-acp takes config overrides via `-c key=value` where value is parsed as TOML
+    // (raw-string fallback on parse failure). We always emit a quoted TOML string so
+    // model names containing dots or hyphens don't surprise the TOML parser.
+    modelInjection: (model) => ({ extraArgs: ['-c', `model=${JSON.stringify(model)}`] }),
   },
 };
 

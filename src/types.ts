@@ -75,6 +75,12 @@ export interface AgentConfig {
 export interface AcpConfig {
   adapter: string;
   command: string | null;
+  /**
+   * Optional model selector forwarded to the adapter. Each adapter profile decides how
+   * to surface it (env var for claude-agent-acp's ANTHROPIC_MODEL; `-c model="..."` argv
+   * for codex-acp). Null means "use the adapter's own default".
+   */
+  model: string | null;
   shell: string;
   prompt_timeout_ms: number;
   read_timeout_ms: number;

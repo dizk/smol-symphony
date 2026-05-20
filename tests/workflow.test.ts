@@ -47,5 +47,32 @@ describe('workflow', () => {
     assert.equal(cfg.acp.command, null);
     assert.equal(cfg.acp.adapter, 'claude');
     assert.equal(cfg.acp.shell, 'bash');
+    // acp.model defaults to null: the adapter falls back to its own default model.
+    assert.equal(cfg.acp.model, null);
+  });
+
+  it('parses acp.model and trims whitespace', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'claude', model: '  claude-opus-4-7  ' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.acp.model, 'claude-opus-4-7');
+  });
+
+  it('treats empty acp.model as unset (null)', () => {
+    // Explicit empty string in YAML should not pin the adapter to "" — that would
+    // break adapters that look up the model by name. Normalize to null so the adapter
+    // picks its own default.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'claude', model: '   ' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.acp.model, null);
   });
 });

@@ -183,6 +183,20 @@ export class AgentRunner {
     const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath);
     const adapterBin = profile.binary[0]!;
     const adapterArgs = profile.binary.slice(1);
+    // Apply the workflow's acp.model selection (if any) to the adapter via its profile-
+    // specific mechanism: env var for claude-agent-acp, extra argv for codex-acp. The
+    // returned env/args are merged into the smolvm-exec invocation below so they reach
+    // the vm-agent proxy and then the spawned adapter.
+    const modelEnv: Record<string, string> = {};
+    const modelArgs: string[] = [];
+    if (this.cfg.acp.model) {
+      const inj = profile.modelInjection(this.cfg.acp.model);
+      if (inj.env) {
+        for (const [k, v] of Object.entries(inj.env)) modelEnv[k] = v;
+      }
+      if (inj.extraArgs) modelArgs.push(...inj.extraArgs);
+    }
+    const effectiveAdapterArgs = [...adapterArgs, ...modelArgs];
 
     // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
     // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
@@ -284,7 +298,8 @@ export class AgentRunner {
         SYMPHONY_ACP_URL: acpReachUrl,
         SYMPHONY_ACP_TOKEN: bridgeReg.token,
         SYMPHONY_ADAPTER_BIN: adapterBin,
-        SYMPHONY_ADAPTER_ARGS: JSON.stringify(adapterArgs),
+        SYMPHONY_ADAPTER_ARGS: JSON.stringify(effectiveAdapterArgs),
+        ...modelEnv,
       },
       timeoutMs: null,
     });
