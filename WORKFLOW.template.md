@@ -141,6 +141,24 @@ logs:
 # Plus any env var the operator exports before launching `symphony`. The
 # common pattern is to plumb tracker root / repo / base via env so the same
 # workflow file works against multiple repos. See WORKFLOW.md for an example.
+#
+# Env vars consumed by WORKFLOW.md's bundled after_run script (operator-set):
+#
+#   SYMPHONY_REPO          — "<owner>/<repo>". Enables PR-mode handoff: pushes
+#                            the per-issue branch and runs `gh pr create`.
+#                            Unset = patch-bundle mode.
+#   SYMPHONY_BASE_BRANCH   — base branch agents branch from and PRs target.
+#                            Default: main.
+#   SYMPHONY_AUTO_MERGE    — truthy ("1", "true", …) arms `gh pr merge --auto`
+#                            on the freshly created PR. Unset / "0" / "false"
+#                            leaves the PR for manual review.
+#   SYMPHONY_CRITICAL_FILES — newline-separated git pathspec entries. If any
+#                            commit on the per-issue branch touches a matching
+#                            path, auto-merge is suppressed. Blank lines are
+#                            ignored. Supports git pathspec magic, e.g.
+#                            ":(glob)src/**/*.sql".
+#   SYMPHONY_MERGE_METHOD  — squash | merge | rebase. Picks the strategy
+#                            `gh pr merge --auto` uses. Default: squash.
 # ─────────────────────────────────────────────────────────────────────────────
 hooks:
   # timeout_ms (int): max wall time for a single hook invocation.

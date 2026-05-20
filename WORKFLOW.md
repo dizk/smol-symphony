@@ -308,12 +308,17 @@ hooks:
           # empty pathspec (which would match every file).
           NORMALIZED_PATTERNS="$(printf '%s\n' "${SYMPHONY_CRITICAL_FILES}" | awk 'NF')"
           if [ -n "${NORMALIZED_PATTERNS}" ]; then
+            # Disable pathname expansion before splitting so pathspec entries
+            # like "*.md", "src/*.ts", or ":(glob)src/**/*.sql" are forwarded
+            # to git verbatim instead of being expanded against the worktree.
+            set -f
             OLD_IFS="$IFS"
             IFS='
 '
             # shellcheck disable=SC2086  # intentional newline word-splitting
             set -- ${NORMALIZED_PATTERNS}
             IFS="$OLD_IFS"
+            set +f
             TOUCHED_CRITICAL="$(git diff --name-only "${MERGE_BASE}..${BRANCH}" -- "$@" 2>/dev/null || true)"
           fi
         fi
