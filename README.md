@@ -27,7 +27,7 @@ bundle per issue.
 │                                       └───────────────────────────────┘ ││
 │                                                                         ││
 │              symphony MCP server  ◀─────────────────────────────────────┘│
-│              ( transition · request_human_steering )                     │
+│      ( transition · request_human_steering · propose_issue )             │
 │                                                                          │
 │    HTTP dashboard (HTMX):  /                                             │
 │      attention · sessions · on disk · new issue · totals                 │
@@ -78,17 +78,20 @@ npx symphony WORKFLOW.md     # the local bin
 ## Local Markdown tracker
 
 Issues live as `.md` files under `tracker.root`. The parent directory is the
-issue state.
+issue state; the set of valid state directories comes from the `states:` block
+in `WORKFLOW.md` (see below) and is auto-mkdir'd on startup.
 
 ```
 issues/
 ├── Todo/
 │   ├── 1.md
 │   └── 2.md
-├── In Progress/
+├── Review/
 │   └── 3.md
-└── Done/
-    └── 4.md
+├── Done/
+│   └── 4.md
+└── Triage/
+    └── 5.md
 ```
 
 The basename is the issue identifier. When a caller (dashboard form, MCP
@@ -122,6 +125,16 @@ through the MCP server and the orchestrator does the file move.
 this repo is the canonical project workflow; see
 [WORKFLOW.template.md](./WORKFLOW.template.md) for the annotated reference
 covering every supported option, its type, default, and example.
+
+The workflow is a **state machine**. A required top-level `states:` block
+declares every state an issue can occupy, its `role` (`active` — dispatched;
+`terminal` — triggers cleanup and handoff; `holding` — sits outside the
+dispatch loop, e.g. `Triage`), and optional per-state `adapter`, `model`,
+`max_turns`, and `allowed_transitions` overrides. A single issue can travel
+through any number of states with distinct adapters and instructions; the
+prompt body can branch on the current state with Liquid
+`{% case issue.state %}`. The shipped workflow uses a two-stage
+`Todo → Review → Done` flow (Claude implements, Codex reviews).
 
 Symphony watches the file and re-applies poll interval, concurrency, hooks,
 prompt body, smolvm settings, etc. on change without restart. In-flight runs
@@ -257,12 +270,16 @@ posture:
 
 ```bash
 npm run typecheck    # tsc --noEmit
-npm test             # 67 tests across workflow, tracker, prompt, workspace,
-                     # adapters, http, and mcp surfaces
+npm test             # 170 tests across workflow, tracker, prompt, workspace,
+                     # adapters, http, mcp, acp-bridge, orchestrator, run log,
+                     # runner state resolution, and tool-call summary surfaces
 npm run build        # tsc emit to dist/
 ```
 
 An end-to-end smoke run needs a real smolvm + VM image.
+
+See [CHANGELOG.md](./CHANGELOG.md) for operator-visible changes between
+releases.
 
 ## License
 
