@@ -33,13 +33,25 @@ export interface WorkflowDefinition {
 // `max_turns` override the workflow-level defaults when set; null/undefined means
 // "use the workflow default at dispatch time". `allowed_transitions`, when non-null,
 // restricts which states the agent may move to via the MCP `transition` tool; null
-// means "any declared state is reachable".
+// means "any declared state is reachable". `hooks.after_run`, when defined,
+// overrides the workflow-level `hooks.after_run` whenever the issue's current
+// state at hook-fire time is this state — including an explicit `null` to
+// suppress the workflow-level default for terminal states (e.g. Cancelled).
 export interface StateConfig {
   role: 'active' | 'terminal' | 'holding';
   adapter?: string;
   model?: string | null;
   max_turns?: number;
   allowed_transitions?: string[] | null;
+  hooks?: StateHooksConfig;
+}
+
+export interface StateHooksConfig {
+  // When the property is present, it wins over the workflow-level
+  // `hooks.after_run`. Explicit `null` means "no after_run for this state"; a
+  // string is the script to run. Omitting the key inherits the workflow-level
+  // hook.
+  after_run?: string | null;
 }
 
 export interface TrackerConfig {

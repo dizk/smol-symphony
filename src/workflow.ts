@@ -9,6 +9,7 @@ import { parse as parseYaml } from 'yaml';
 import type {
   ServiceConfig,
   StateConfig,
+  StateHooksConfig,
   WorkflowDefinition,
   TrackerConfig,
   PollingConfig,
@@ -428,14 +429,79 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
         `state "${name}": allowed_transitions must be a list of state names (or null/omitted)`,
       );
     }
+    const hooks = parseStateHooks(name, m['hooks']);
     const sc: StateConfig = { role: roleRaw };
     if (adapter !== null) sc.adapter = adapter;
     if (model !== undefined) sc.model = model;
     if (maxTurns !== undefined) sc.max_turns = maxTurns;
     if (allowed !== undefined) sc.allowed_transitions = allowed;
+    if (hooks !== undefined) sc.hooks = hooks;
     out[name] = sc;
   }
   return out;
+}
+
+// Parse the per-state `hooks:` sub-block. Only `after_run` is overridable today;
+// every other hook stays workflow-level (`hooks.after_create`, `before_run`,
+// `before_remove` are workspace-lifecycle hooks whose firing point isn't tied to
+// a transition into a particular state).
+//
+// Returns `undefined` when the state declared no `hooks` block at all (inherit
+// the workflow-level default). Returns an object — possibly with `after_run:
+// null` — when the state declared a `hooks` block, so the resolver can
+// distinguish "inherit" from "explicit suppress".
+function parseStateHooks(stateName: string, raw: unknown): StateHooksConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      `state "${stateName}": hooks must be a map (got ${Array.isArray(raw) ? 'list' : typeof raw})`,
+    );
+  }
+  const h = raw as Record<string, unknown>;
+  const out: StateHooksConfig = {};
+  if ('after_run' in h) {
+    const v = h['after_run'];
+    if (v === null) {
+      out.after_run = null;
+    } else if (typeof v === 'string') {
+      out.after_run = v;
+    } else {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${stateName}": hooks.after_run must be a string or null`,
+      );
+    }
+  }
+  return out;
+}
+
+// Resolve the effective `after_run` script for the issue's current state.
+// State-level config (when present) wins — including an explicit null which
+// suppresses the workflow-level fallback. State lookup is case-insensitive to
+// match the rest of symphony (eligibility, reconciliation, local-tracker dirs).
+export function resolveAfterRunScript(
+  cfg: ServiceConfig,
+  stateName: string,
+): string | null {
+  const sc = lookupStateCaseInsensitive(cfg.states, stateName);
+  if (sc?.hooks && Object.prototype.hasOwnProperty.call(sc.hooks, 'after_run')) {
+    return sc.hooks.after_run ?? null;
+  }
+  return cfg.hooks.after_run;
+}
+
+function lookupStateCaseInsensitive(
+  states: Record<string, StateConfig>,
+  state: string,
+): StateConfig | undefined {
+  if (Object.prototype.hasOwnProperty.call(states, state)) return states[state];
+  const lower = state.toLowerCase();
+  for (const name of Object.keys(states)) {
+    if (name.toLowerCase() === lower) return states[name];
+  }
+  return undefined;
 }
 
 // §6.3 dispatch preflight validation.

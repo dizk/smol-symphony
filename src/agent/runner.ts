@@ -14,6 +14,7 @@ import type {
 import type { IssueTracker } from '../trackers/types.js';
 import { WorkspaceManager, sanitizeWorkspaceKey } from '../workspace.js';
 import { renderPrompt } from '../prompt.js';
+import { resolveAfterRunScript } from '../workflow.js';
 import { SmolvmClient } from './smolvm.js';
 import { AcpClient } from './acp.js';
 import {
@@ -237,6 +238,29 @@ export class AgentRunner {
       return { ok: false, reason: 'workspace error', threadId: null, turnsCompleted: 0 };
     }
 
+    // Resolve the after_run script against the issue's *current* state on disk.
+    // The agent may have transitioned mid-attempt (via symphony.transition), so
+    // the dispatch-time state is stale; a fresh tracker fetch is the source of
+    // truth. The early-failure paths (before the loop runs) pass `issue.state`
+    // directly because no transition has happened yet.
+    const runAfterRun = async (stateForLookup: string): Promise<void> => {
+      const script = resolveAfterRunScript(this.cfg, stateForLookup);
+      await this.workspaces.runAfterRunBestEffort(
+        workspace.path,
+        script,
+        this.cfg.hooks.timeout_ms,
+        hookCapture('after_run'),
+      );
+    };
+    const currentStateForAfterRun = async (): Promise<string> => {
+      try {
+        const refreshed = await this.tracker.fetchIssueStatesByIds([issue.id]);
+        return refreshed[0]?.state ?? issue.state;
+      } catch {
+        return issue.state;
+      }
+    };
+
     try {
       await this.workspaces.runBeforeRun(workspace.path, this.cfg.hooks, hookCapture('before_run'));
     } catch (err) {
@@ -260,11 +284,7 @@ export class AgentRunner {
         adapter: profile.id,
         error: (err as Error).message,
       });
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        this.cfg.hooks,
-        hookCapture('after_run'),
-      );
+      await runAfterRun(issue.state);
       return { ok: false, reason: 'credential staging error', threadId: null, turnsCompleted: 0 };
     }
     const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath);
@@ -336,11 +356,7 @@ export class AgentRunner {
       // registration exists yet (intentional ordering); nothing else to cancel.
       runLog?.system('vm_destroy', { vm: vmName, reason: 'bring_up_failed' });
       await this.smolvm.destroy(vmName);
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        this.cfg.hooks,
-        hookCapture('after_run'),
-      );
+      await runAfterRun(issue.state);
       return { ok: false, reason: 'smolvm bring-up error', threadId: null, turnsCompleted: 0 };
     }
 
@@ -360,11 +376,7 @@ export class AgentRunner {
       logger.error('acp bridge register failed', { error: (err as Error).message });
       runLog?.system('vm_destroy', { vm: vmName, reason: 'bridge_register_failed' });
       await this.smolvm.destroy(vmName);
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        this.cfg.hooks,
-        hookCapture('after_run'),
-      );
+      await runAfterRun(issue.state);
       return {
         ok: false,
         reason: 'acp bridge register failed',
@@ -446,11 +458,7 @@ export class AgentRunner {
         this.mcp.deactivate(runningEntry.identifier);
       }
       logger.debug('agent runner cleanup', { reason });
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        this.cfg.hooks,
-        hookCapture('after_run'),
-      );
+      await runAfterRun(await currentStateForAfterRun());
       // Per the agreed lifecycle, every attempt gets a fresh VM. Destroy is best-effort:
       // smolvm.destroy already swallows errors and logs at warn, so a stuck/lost VM here
       // never aborts the attempt's return path. The next attempt's ensureRunning will

@@ -219,7 +219,10 @@ operate on workspaces inside the credential file's ancestor repo.
 
 ## After-run handoff: PR or patch
 
-`WORKFLOW.md`'s `after_run` hook ships in two modes:
+`WORKFLOW.md` scopes its handoff hook to the `Done` state via
+`states.Done.hooks.after_run` — non-terminal transitions and the `Cancelled`
+terminal state run no hook at all, so the script doesn't need to ask "is the
+issue terminal yet?" itself. The hook ships in two modes:
 
 - **Pull request mode.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is
   exported. The hook pushes the per-issue branch to GitHub and runs

@@ -60,6 +60,15 @@ tracker:
 #             allowed out of this state" — the agent's `transition` calls will
 #             always be rejected with `transition_not_allowed`. Useful for
 #             review-style states that should pause until a human re-routes.
+#   hooks     (object, optional): per-state hook overrides. Only `after_run`
+#             is supported today; set a shell-script string to run when the
+#             issue's current state is this one at after_run fire time, or
+#             explicit `null` to suppress the workflow-level `hooks.after_run`
+#             fallback for this state. Omitting `hooks` (or `hooks.after_run`)
+#             inherits the workflow-level default. Use this to scope merge /
+#             PR handoff to a single terminal state (e.g. Done) and make other
+#             terminal states (e.g. Cancelled) do nothing without writing a
+#             "did the issue land in a terminal state?" check inside the hook.
 #
 # Declaration order matters: role-filtered listings (active states, terminal
 # states) follow it, and the dashboard renders state columns in the same order.
@@ -78,7 +87,15 @@ states:
     allowed_transitions: [Todo, Done]
   Done:
     role: terminal
+    # State-scoped after_run runs only when the issue's current state at hook
+    # fire time is Done — i.e. an approval transition completed. No need to
+    # check the tracker yourself; the orchestrator did it.
+    hooks:
+      after_run: |
+        # ... merge / push / open PR ...
   Cancelled:
+    # No `hooks.after_run` declared and no workflow-level fallback: when an
+    # issue lands in Cancelled, the orchestrator runs nothing.
     role: terminal
   Triage:
     role: holding
@@ -162,7 +179,12 @@ hooks:
     # ... pre-turn checks ...
 
   # after_run (string | null): runs after each turn, regardless of outcome.
-  # Inspect cwd or the tracker to decide whether work is complete. Default: null.
+  # Default: null. Overridable per-state under `states.<name>.hooks.after_run`
+  # — when the issue's current state at hook fire time declares its own script
+  # (or explicit null), that wins over this workflow-level default. Typical
+  # pattern: leave this unset and scope after_run to a single terminal state
+  # like Done so the script doesn't need to ask "is the issue terminal yet?"
+  # itself.
   after_run: |
     set -eu
     # ... post-turn handoff (push, format-patch, …) ...

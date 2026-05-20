@@ -227,13 +227,18 @@ export class WorkspaceManager {
   }
 
   // Best-effort after_run hook (§9.4: failure logged and ignored — caller logs).
+  // The caller passes the resolved script (state-level override wins over
+  // workflow-level default; either may be null to mean "do nothing"). The script
+  // is decoupled from `HooksConfig.after_run` so the runner can pick a different
+  // script per the issue's current state without mutating the cached config.
   async runAfterRunBestEffort(
     workspacePath: string,
-    hooks: HooksConfig,
+    script: string | null,
+    timeoutMs: number,
     capture?: HookCapture,
   ): Promise<HookResult | null> {
-    if (!hooks.after_run) return null;
-    return runHookScript(hooks.after_run, workspacePath, hooks.timeout_ms, capture);
+    if (!script) return null;
+    return runHookScript(script, workspacePath, timeoutMs, capture);
   }
 
   // Best-effort before_remove + filesystem removal (§9.4).
