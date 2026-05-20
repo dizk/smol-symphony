@@ -49,6 +49,7 @@ import {
 import type { RuntimeEvent } from '../types.js';
 import { log } from '../logging.js';
 import type { RunLog } from '../runlog.js';
+import { summarizeToolCall, summarizeToolCallUpdate } from './tool-call-summary.js';
 
 export interface AcpClientOptions {
   stdin: Writable;
@@ -319,13 +320,11 @@ export class AcpClient {
         return;
       }
       case 'tool_call': {
-        const name = typeof update.title === 'string' ? update.title : String(update.toolCallId ?? '?');
-        this.emit('tool_call', `${name}: ${summarize(update)}`);
+        this.emit('tool_call', summarizeToolCall(update));
         return;
       }
       case 'tool_call_update': {
-        const status = typeof update.status === 'string' ? update.status : '';
-        this.emit('tool_call_update', `${status}: ${summarize(update)}`);
+        this.emit('tool_call_update', summarizeToolCallUpdate(update));
         return;
       }
       case 'plan': {
@@ -356,7 +355,8 @@ export class AcpClient {
       params.options.find((o) => o.kind === 'allow_once') ??
       params.options[0];
     const optionId = preferred?.optionId ?? '';
-    this.emit('approval_auto_approved', `${optionId || 'unknown'}: ${summarize(params.toolCall)}`);
+    const tool = summarizeToolCallUpdate(params.toolCall);
+    this.emit('approval_auto_approved', `${optionId || 'unknown'}: ${tool}`);
     return { outcome: { outcome: 'selected', optionId } };
   }
 
