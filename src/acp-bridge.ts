@@ -108,7 +108,10 @@ export class AcpBridge {
     log.info('acp bridge listening', { host, port: this.boundPort });
   }
 
-  /** Actually-bound port (differs from the requested port when 0 was passed). */
+  /**
+   * Actually-bound port (differs from the requested port when 0 was passed). Returns
+   * `null` before `start()` has bound the listener.
+   */
   port(): number | null {
     return this.boundPort;
   }
