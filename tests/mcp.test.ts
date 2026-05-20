@@ -1331,6 +1331,131 @@ describe('McpRegistry transition', () => {
     }
   });
 
+  it('end-to-end Todo → Review → Done: notes accumulate, workspace survives the middle hop, terminal cleans up', async () => {
+    // Drive a single issue file through the full implementer → reviewer → approval
+    // chain using two consecutive transition calls on the same registry. Verifies
+    // the dogfood handoff shape: the file moves through directories with both
+    // hop's notes appended, the same workspace key is preserved through Review,
+    // and cleanup only fires on the terminal hop.
+    const { root, cleanup } = await setupStateTree();
+    try {
+      const issuePath = (state: string) => path.join(root, state, 'ABC-1.md');
+      await writeFile(issuePath('Todo'), `---\ntitle: Issue\n---\nInitial body.`);
+      const tracker = makeStateTracker(root);
+      const reg = new McpRegistry(tracker, { terminalStates: ['Done', 'Cancelled'], states });
+
+      // Hop 1: Todo → Review (implementer handoff).
+      const todoEntry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      todoEntry.resolved_actor = 'claude/claude-opus-4-7';
+      const todoToken = reg.activate(todoEntry);
+      const reviewHop = await reg.handleJsonRpc('ABC-1', todoToken, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'transition',
+          arguments: { to_state: 'Review', notes: '# Implement thing\n\nMade the change.' },
+        },
+      });
+      const reviewHopResult = (reviewHop as {
+        result: { isError: boolean; structuredContent: { cleanup_workspace_on_exit: boolean } };
+      }).result;
+      assert.equal(reviewHopResult.isError, false);
+      // active→active: workspace preserved so the same `agent/<id>` branch survives.
+      assert.equal(todoEntry.cleanup_workspace_on_exit, false);
+      assert.equal(reviewHopResult.structuredContent.cleanup_workspace_on_exit, false);
+      assert.deepEqual(await readdir(path.join(root, 'Todo')), []);
+      assert.deepEqual(await readdir(path.join(root, 'Review')), ['ABC-1.md']);
+      reg.deactivate('ABC-1');
+
+      // Hop 2: Review → Done (reviewer approval). Simulates the next dispatch
+      // picking the file up in its new Review state; same workspace key.
+      const reviewEntry = makeEntry('ABC-1', 'Review', { tracker_root_at_dispatch: root });
+      reviewEntry.resolved_actor = 'codex/default';
+      reviewEntry.workspace_path = todoEntry.workspace_path;
+      const reviewToken = reg.activate(reviewEntry);
+      const doneHop = await reg.handleJsonRpc('ABC-1', reviewToken, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: 'transition',
+          arguments: { to_state: 'Done', notes: 'LGTM; tests pass.' },
+        },
+      });
+      const doneHopResult = (doneHop as {
+        result: { isError: boolean; structuredContent: { cleanup_workspace_on_exit: boolean } };
+      }).result;
+      assert.equal(doneHopResult.isError, false);
+      // active→terminal: workspace gets cleaned, no further dispatches.
+      assert.equal(reviewEntry.cleanup_workspace_on_exit, true);
+      assert.equal(doneHopResult.structuredContent.cleanup_workspace_on_exit, true);
+      assert.deepEqual(await readdir(path.join(root, 'Review')), []);
+      assert.deepEqual(await readdir(path.join(root, 'Done')), ['ABC-1.md']);
+      // Both handoff notes accumulated in the file body (the next reader — the
+      // dogfood after_run hook — extracts the final hop's title+summary).
+      const finalBody = await readFile(issuePath('Done'), 'utf8');
+      assert.match(finalBody, /Made the change\./);
+      assert.match(finalBody, /LGTM; tests pass\./);
+      assert.match(finalBody, /## claude\/claude-opus-4-7 — \S+ — Todo → Review/);
+      assert.match(finalBody, /## codex\/default — \S+ — Review → Done/);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('end-to-end Todo → Review → Todo: rework cycle preserves workspace across both hops, notes accumulate', async () => {
+    // Reviewer-rejects-back-to-Todo path. Both hops are active→active, so the
+    // workspace and branch must survive; the implementer's next dispatch sees
+    // both the original handoff and the reviewer's rework instructions.
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: Issue\n---\nInitial body.`);
+      const tracker = makeStateTracker(root);
+      const reg = new McpRegistry(tracker, { terminalStates: ['Done', 'Cancelled'], states });
+
+      // Hop 1: Todo → Review.
+      const todoEntry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      todoEntry.resolved_actor = 'claude/claude-opus-4-7';
+      const todoToken = reg.activate(todoEntry);
+      await reg.handleJsonRpc('ABC-1', todoToken, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Review', notes: 'first attempt' } },
+      });
+      assert.equal(todoEntry.cleanup_workspace_on_exit, false);
+      reg.deactivate('ABC-1');
+
+      // Hop 2: Review → Todo (rework). Reviewer rejects back; allowed because
+      // Review.allowed_transitions includes Todo.
+      const reviewEntry = makeEntry('ABC-1', 'Review', { tracker_root_at_dispatch: root });
+      reviewEntry.resolved_actor = 'codex/default';
+      const reviewToken = reg.activate(reviewEntry);
+      const reworkHop = await reg.handleJsonRpc('ABC-1', reviewToken, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: 'transition',
+          arguments: { to_state: 'Todo', notes: 'fix the off-by-one at src/foo.ts:42' },
+        },
+      });
+      const reworkHopResult = (reworkHop as { result: { isError: boolean } }).result;
+      assert.equal(reworkHopResult.isError, false);
+      // active→active again: workspace preserved.
+      assert.equal(reviewEntry.cleanup_workspace_on_exit, false);
+      assert.deepEqual(await readdir(path.join(root, 'Review')), []);
+      assert.deepEqual(await readdir(path.join(root, 'Todo')), ['ABC-1.md']);
+      // Both rounds' notes are on the file the next Todo dispatch will read.
+      const body = await readFile(path.join(root, 'Todo', 'ABC-1.md'), 'utf8');
+      assert.match(body, /first attempt/);
+      assert.match(body, /off-by-one at src\/foo\.ts:42/);
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('updateStates picks up workflow reload — a state added post-construction is reachable', async () => {
     const { root, cleanup } = await setupStateTree();
     try {

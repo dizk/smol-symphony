@@ -1209,6 +1209,18 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 - If the `linear_graphql` client-side tool extension is implemented, it is still part of the agent
   toolchain rather than orchestrator business logic.
 
+State-transition primitives are exposed to in-VM agents through the MCP surface — specifically the
+`symphony.transition({ to_state, notes? })` tool. The tracker is the authoritative writer: the MCP
+layer validates `to_state` against the workflow's declared `states:` map and any per-state
+`allowed_transitions`, then delegates the notes-append + atomic file move to `tracker.moveIssueToState`.
+The per-issue workspace and `agent/<id>` git branch persist across non-terminal transitions
+(active ↔ active, active → holding); cleanup is driven by the target state's role
+(`role: terminal` ⇒ remove workspace, otherwise keep). Workflow-defined `states:` are the canonical
+state list; legacy `tracker.active_states` / `tracker.terminal_states` lists are still accepted and
+synthesise into a `states` map (every active becomes `role: active`, every terminal becomes
+`role: terminal`, plus an implicit `Triage` holding state) so pre-`states:` workflows keep working
+unchanged.
+
 ## 12. Prompt Construction and Context Assembly
 
 ### 12.1 Inputs

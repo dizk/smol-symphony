@@ -21,15 +21,47 @@
 #
 # Every section and option is documented in WORKFLOW.template.md.
 
+# Declared workflow states. Drives dispatch eligibility (role: active),
+# terminal cleanup (role: terminal), and the propose_issue landing directory
+# (role: holding). The orchestrator derives `tracker.active_states` and
+# `tracker.terminal_states` from this block — do NOT set those alongside
+# `states:`; pick one or the other.
+#
+# Per-state `adapter` / `model` / `max_turns` override the workflow-level
+# `acp.*` and `agent.max_turns` defaults at dispatch time. `allowed_transitions`
+# narrows the targets the agent can pass to `symphony.transition` while
+# operating in this state (omit for "any declared state is reachable").
+states:
+  Todo:
+    role: active
+    adapter: claude
+    model: claude-opus-4-7
+    max_turns: 10
+  Review:
+    # Codex picks up the implementer's branch and approves or rejects. On
+    # approval it transitions the issue to Done with PR-body notes; on
+    # rejection it transitions back to Todo with rework instructions.
+    role: active
+    adapter: codex
+    # codex-acp accepts the model via `-c model="..."` argv (TOML); see
+    # src/agent/adapters.ts. `gpt-5-codex` was historically rejected with the
+    # ChatGPT-account user, so leave `model` unset and let codex-acp pick its
+    # own default code-review model. Operators with an API-key Codex setup can
+    # pin a specific model here once that's known-good.
+    max_turns: 6
+    allowed_transitions: [Todo, Done]
+  Done:
+    role: terminal
+  Cancelled:
+    role: terminal
+  Triage:
+    # Landing directory for `symphony.propose_issue`. Never dispatched; the
+    # operator approves or discards from the dashboard.
+    role: holding
+
 tracker:
   kind: local
   root: ./issues
-  active_states:
-    - Todo
-    - In Progress
-  terminal_states:
-    - Done
-    - Cancelled
 
 polling:
   interval_ms: 5000
@@ -91,11 +123,18 @@ hooks:
 
     echo "workspace ready: base=${BASE} branch=${BRANCH} source=${SOURCE_REPO}"
 
-  # Runs after every attempt. Gated on the issue file being in Done/ (i.e. the
-  # agent has called symphony.mark_done). Two outputs:
+  # Runs after every attempt. Gated on the issue file landing in a TERMINAL
+  # state directory (today: Done/ or Cancelled/) — i.e. the agent has called
+  # symphony.transition with role:terminal target (or the legacy mark_done
+  # shim, which is just `transition → first declared terminal state`). Two
+  # outputs once we hit a terminal state:
   #   - If SYMPHONY_REPO is set: push branch + open (or update) a PR via gh.
   #   - Else (local-only mode): write the agent's work as a git format-patch
   #     bundle into ./.symphony/patches/<branch>.patch for human review.
+  #
+  # Non-terminal transitions (e.g. Todo → Review) hit this hook too, but the
+  # terminal-dir walk below skips the handoff path; only the mark_done.md
+  # preservation runs unconditionally.
   after_run: |
     set -eu
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
@@ -103,14 +142,18 @@ hooks:
     BRANCH="agent/${ISSUE_ID}"
     TRACKER_ROOT="${SYMPHONY_TRACKER_ROOT:-$PWD/../../../issues}"
     PATCHES_DIR="${SYMPHONY_PATCHES_DIR:-$PWD/../../../.symphony/patches}"
+    # Terminal-state set. The orchestrator does not currently expose declared
+    # terminal states to the hook environment; until it does, hardcode the
+    # `states:` block's role:terminal entries here. Keep in sync with
+    # WORKFLOW.md's states block.
+    TERMINAL_STATES="${SYMPHONY_TERMINAL_STATES:-Done Cancelled}"
 
-    if [ ! -f "${TRACKER_ROOT}/Done/${ISSUE_ID}.md" ]; then
-      echo "issue ${ISSUE_ID} not in Done/ yet; skipping handoff"
-      exit 0
-    fi
-    # ALWAYS preserve mark_done.md early — before any other exit-0 path — so analytical
-    # issues that produce no commits still leave a durable record of the agent's reasoning
-    # outside the per-issue workspace (which is destroyed on terminal cleanup).
+    # ALWAYS preserve mark_done.md early — before any other exit-0 path — so
+    # analytical issues that produce no commits still leave a durable record of
+    # the agent's reasoning outside the per-issue workspace (which is destroyed
+    # on terminal cleanup). This block runs on every attempt, including
+    # non-terminal transitions (e.g. Todo → Review), so the reviewer's host can
+    # rummage through the notes even though the workspace survives.
     MARKDONE=""
     if [ -f .git/symphony-runtime/mark_done.md ]; then
       MARKDONE=.git/symphony-runtime/mark_done.md
@@ -128,6 +171,24 @@ hooks:
       TITLE="${ISSUE_ID}"
       BODY="Symphony run for ${ISSUE_ID}."
     fi
+
+    # Walk the configured terminal-state directories and see if the issue file
+    # has landed in any of them. If not, this is a non-terminal turn (still in
+    # Todo, handed off to Review, etc.); the mark_done.md preservation above
+    # has already run, and there's nothing else to do until the issue actually
+    # terminates.
+    FOUND_TERMINAL=""
+    for st in ${TERMINAL_STATES}; do
+      if [ -f "${TRACKER_ROOT}/${st}/${ISSUE_ID}.md" ]; then
+        FOUND_TERMINAL="${st}"
+        break
+      fi
+    done
+    if [ -z "${FOUND_TERMINAL}" ]; then
+      echo "issue ${ISSUE_ID} not in a terminal state yet (checked: ${TERMINAL_STATES}); skipping handoff"
+      exit 0
+    fi
+    echo "issue ${ISSUE_ID} reached terminal state ${FOUND_TERMINAL}; running handoff"
 
     if ! git rev-parse --verify "${BRANCH}" >/dev/null 2>&1; then
       echo "no branch ${BRANCH}; nothing to hand off"
@@ -274,21 +335,103 @@ Orientation:
   `npm run typecheck` before declaring work done.
 - You are on a per-issue branch (`agent/{{ issue.identifier }}`) checked out
   from the configured base branch. Commit your work locally. You do **not**
-  have network credentials; pushing is the host's job, after you mark done.
+  have network credentials; pushing is the host's job, after the issue lands
+  in a terminal state.
+- This workflow has two active states: **Todo** (you, implementing) and
+  **Review** (Codex, reviewing). Read the per-state instructions below.
 
-Workflow:
+{% case issue.state %}
+{% when "Todo" %}
+You are the **implementer**. Your job: turn the issue into a working change on
+the per-issue branch, then hand off to the reviewer.
 
 1. Read enough of the codebase to understand the change you need to make.
 2. Make the smallest correct change. Add or update tests where the change is
    testable. Run `npm run typecheck` and `npm test`; both must pass.
 3. Commit your work to the per-issue branch with a short message.
-4. Call `symphony.mark_done({ title, summary })`:
-   - `title`: a single line in imperative voice, ≤72 chars. Becomes the
-     PR/commit title.
-   - `summary`: a one- to three-paragraph narrative of what you did and why,
-     plus any follow-ups you noticed but didn't do. Becomes the PR body.
-   This is the only way to signal completion; nothing else will move the issue
-   out of an active state.
+4. Hand off to the reviewer by calling:
+
+   ```
+   symphony.transition({
+     to_state: "Review",
+     notes: "# <imperative-voice title, ≤72 chars>\n\n<one- to three-paragraph
+             summary of what you changed, why, files touched, tests added, and
+             any follow-ups you noticed but didn't do>"
+   })
+   ```
+
+   The notes block is appended to the issue body **before** the file moves to
+   `Review/`, so the reviewer sees it as part of `issue.description` on the
+   next dispatch. Write it as if it were the PR body — because if the reviewer
+   approves, it becomes one. Then end your turn; do not call any further tools.
+
+   `symphony.mark_done` still works as a single-shot terminal-direct shim (it
+   moves straight to Done without a review pass). Prefer `transition → Review`
+   for any change worth a second pair of eyes.
+
+{% when "Review" %}
+You are the **reviewer**. The implementer has committed work to the per-issue
+branch (`agent/{{ issue.identifier }}`) and handed off. Their summary is in
+the issue description above. Your job: decide whether the work is correct and
+either approve (→ Done) or send it back (→ Todo) with specific findings.
+
+1. Read the implementer's notes in the issue description carefully — title,
+   summary, files claimed touched, follow-ups noted.
+2. Inspect the diff against the base branch:
+
+   ```
+   git log --oneline main..HEAD
+   git diff main..HEAD
+   ```
+
+   Look at each file the implementer claimed to touch. Spot-check tests and
+   typecheck pass:
+
+   ```
+   npm run typecheck
+   npm test
+   ```
+
+3. Decide:
+
+   - **Approve**: the change is correct, tests pass, no blocking issues. Call
+
+     ```
+     symphony.transition({
+       to_state: "Done",
+       notes: "<approval rationale; this becomes the PR body>"
+     })
+     ```
+
+     Your notes are appended to the issue body and feed straight into the PR
+     description the host opens against the base branch. Be specific about
+     what you verified.
+
+   - **Reject**: the change is wrong, incomplete, or has issues that need
+     rework. Call
+
+     ```
+     symphony.transition({
+       to_state: "Todo",
+       notes: "<specific findings: file paths, line numbers, what's wrong,
+               what needs to change. Be concrete — the implementer will see
+               this as their next prompt.>"
+     })
+     ```
+
+     The issue goes back to Todo with your findings appended. The same
+     workspace and `agent/{{ issue.identifier }}` branch survive the round
+     trip, so the next implementer dispatch sees both your notes and their
+     prior commits.
+
+   Either way, end your turn after the transition call. Do not call any
+   further tools.
+
+{% else %}
+This state (`{{ issue.state }}`) does not have a state-specific prompt yet in
+this workflow. Re-read the issue body for instructions; if you can't infer
+what to do safely, call `symphony.request_human_steering` rather than guessing.
+{% endcase %}
 
 If you genuinely cannot proceed — ambiguous requirements, missing context that
 only a human can supply, a design decision that needs human input — call
@@ -319,6 +462,6 @@ your current task; keep your branch focused.
 This is continuation/retry attempt {{ attempt }}. Inspect the workspace before
 making new edits; your previous run may have left commits on the branch. Check
 `git log agent/{{ issue.identifier }}` to see what's there. If the work is
-already complete, call `symphony.mark_done` with an appropriate title and
-summary and stop.
+already complete in the current state, transition (or mark_done) with an
+appropriate title and summary and stop.
 {%- endif %}

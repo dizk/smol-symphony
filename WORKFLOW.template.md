@@ -86,6 +86,10 @@ tracker:
 #             states agents in this state may transition to via the MCP
 #             `transition` tool. Each entry must be a declared state. Omit (or
 #             explicitly set to null) for "any declared state is reachable".
+#             An empty list (`allowed_transitions: []`) means "no transitions
+#             allowed out of this state" — the agent's `transition` calls will
+#             always be rejected with `transition_not_allowed`. Useful for
+#             review-style states that should pause until a human re-routes.
 #
 # Declaration order matters: derived active/terminal lists track it, and the
 # dashboard renders state columns in the same order.
@@ -361,15 +365,28 @@ server:
 # mcp — Model Context Protocol server exposed to in-VM agents.
 #
 # The orchestrator runs a JSON-RPC endpoint scoped to each active issue at
-# /api/v1/issues/<id>/mcp, gated by a per-dispatch bearer token. Three tools
+# /api/v1/issues/<id>/mcp, gated by a per-dispatch bearer token. Four tools
 # live there:
 #
+#   • symphony.transition({ to_state, notes? })
+#     — canonical exit verb. Moves the issue into another declared state,
+#       optionally appending `notes` (markdown) to the issue body before the
+#       move so the next agent (in `to_state`) reads them as part of
+#       `issue.description`. Terminal targets clean the workspace; active and
+#       holding targets preserve it so the same `agent/<id>` git branch
+#       survives the handoff. Rejected transitions return MCP tool-result
+#       errors (isError:true) the agent can read and retry.
 #   • symphony.mark_done({ title, summary })
+#     — thin shim that targets the first declared `role: terminal` state with
+#       a synthesised "# <title>\n\n<summary>" notes block. Kept for
+#       single-agent flows that don't have a review state. Prefer `transition`
+#       in multi-state workflows.
 #   • symphony.request_human_steering({ question, context? })
 #   • symphony.propose_issue({ title, description?, labels?, priority? })
-#     — drops a new issue into the Triage/ state directory (not dispatched
-#       automatically). The operator approves or discards from the dashboard.
-#       The calling issue is recorded as proposed_by in the new file's
+#     — drops a new issue into the first declared `role: holding` state
+#       directory (literal Triage if none declared). The orchestrator does NOT
+#       dispatch it; the operator approves or discards from the dashboard. The
+#       calling issue is recorded as proposed_by in the new file's
 #       front-matter.
 # ─────────────────────────────────────────────────────────────────────────────
 mcp:
@@ -394,17 +411,28 @@ Liquid-templated prompt body. Rendered once per dispatched issue. Context:
 
   issue.identifier   — the issue's external id (e.g. "DEMO-42").
   issue.title        — issue title (string).
-  issue.state        — current state (string, matches active_states[]).
-  issue.description  — body text (string or empty).
+  issue.state        — current state (string, matches a key in `states:`).
+  issue.description  — body text (string or empty). `symphony.transition` and
+                       `symphony.mark_done` append their `notes` block here
+                       before the file moves, so the next state's agent reads
+                       the previous state's handoff message verbatim.
   issue.priority     — number or null.
   issue.labels       — list of strings (lowercased).
   attempt            — int, 1-based attempt counter; absent on first attempt.
 
 Available Liquid filters: standard Shopify Liquid plus `escape_once`.
 
+Per-state prompt branching (V1 pattern): when `states:` declares more than
+one active role (e.g. Todo + Review), wrap the state-specific instructions in
+a `{% case issue.state %}` / `{% when "..." %}` / `{% else %}` block. The
+runner renders the prompt fresh on every dispatch, so each state's agent sees
+only its own instructions plus whatever common preamble / postamble lives
+outside the case. See WORKFLOW.md in this repo for a worked example.
+
 The body below is the literal prompt sent to the agent. Keep it specific to
-this workflow; orchestrator behavior (mark_done, request_human_steering) is
-the same no matter what you write here.
+this workflow; orchestrator behavior (transition, mark_done,
+request_human_steering, propose_issue) is the same no matter what you write
+here.
 -->
 
 You are picking up a single issue and shepherding it through the workflow.
@@ -424,17 +452,20 @@ Goals:
 
 1. Work in the current directory only; treat it as the issue workspace.
 2. Make the smallest correct change that satisfies the issue.
-3. Call `symphony.mark_done({ title, summary })` when done. This is the only
-   way to signal completion. The orchestrator atomically moves the issue file
-   to the terminal state and stops dispatching.
+3. Hand off when done. `symphony.transition({ to_state, notes? })` is the
+   canonical exit verb: pass a declared state name and optional markdown
+   notes that get appended to the issue body for the next agent. For
+   single-agent workflows, `symphony.mark_done({ title, summary })` is a
+   thin shim that targets the first declared `role: terminal` state.
 4. If you cannot proceed without human input, call
    `symphony.request_human_steering({ question, context? })`. Your turn ends
    immediately; the human's reply arrives as your next prompt.
 5. If you notice work out of scope for this issue — unrelated bugs, follow-ups
    a human should size, refactors worth a separate dispatch — call
    `symphony.propose_issue({ title, description?, labels?, priority? })`. It
-   lands in `Triage/`; the operator approves or discards. Do not graft
-   unrelated edits onto this branch.
+   lands in the first declared `role: holding` state directory (defaults to
+   `Triage/`); the operator approves or discards. Do not graft unrelated
+   edits onto this branch.
 
 {% if attempt -%}
 This is continuation/retry attempt {{ attempt }}. Inspect the workspace before
