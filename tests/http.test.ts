@@ -483,6 +483,239 @@ describe('disk + triage rows link to the detail page', () => {
   });
 });
 
+describe('disk partial — dispatch-order sort and rerank controls', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-disk-sort-'));
+    await mkdir(path.join(root, 'Todo'), { recursive: true });
+    // Mixed priorities + creation dates so the sort needs all three keys to be correct:
+    //   • R-A: priority 1 (top)
+    //   • R-B: priority 2
+    //   • R-C: null priority, older created_at — sorts before R-D
+    //   • R-D: null priority, newer created_at — sorts last
+    await writeFile(
+      path.join(root, 'Todo', 'R-A.md'),
+      `---\nid: "R-A"\nidentifier: "R-A"\ntitle: "Top priority"\npriority: 1\ncreated_at: "2026-05-01T00:00:00Z"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Todo', 'R-B.md'),
+      `---\nid: "R-B"\nidentifier: "R-B"\ntitle: "Next priority"\npriority: 2\ncreated_at: "2026-05-02T00:00:00Z"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Todo', 'R-C.md'),
+      `---\nid: "R-C"\nidentifier: "R-C"\ntitle: "Older null"\ncreated_at: "2026-04-01T00:00:00Z"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Todo', 'R-D.md'),
+      `---\nid: "R-D"\nidentifier: "R-D"\ntitle: "Newer null"\ncreated_at: "2026-05-10T00:00:00Z"\n---\nbody.`,
+    );
+    server = await bootServer(root, { withTracker: true });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('sorts rows by dispatch key (priority asc null-last, then created_at)', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    const order = ['R-A', 'R-B', 'R-C', 'R-D'].map((id) => html.indexOf(`>${id}<`));
+    assert.ok(order.every((n) => n > -1), `every identifier appears: ${order}`);
+    for (let i = 1; i < order.length; i++) {
+      assert.ok(order[i]! > order[i - 1]!, `expected ${order} to be strictly increasing`);
+    }
+  });
+
+  it('renders ▲/▼ controls per row with the top/bottom rows disabled at the boundary', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // Top row (R-A) has ▲ disabled, ▼ active.
+    assert.match(html, /<span class="rerank" role="group" aria-label="reorder R-A">\s*<span class="rerank-btn rerank-btn-disabled" aria-hidden="true">▲<\/span>/);
+    assert.match(html, /aria-label="reorder R-A">[\s\S]*?hx-post="\/api\/v1\/issues\/R-A\/rerank\?direction=down"/);
+    // Bottom row (R-D) has ▲ active, ▼ disabled.
+    assert.match(html, /aria-label="reorder R-D">[\s\S]*?hx-post="\/api\/v1\/issues\/R-D\/rerank\?direction=up"[\s\S]*?<span class="rerank-btn rerank-btn-disabled" aria-hidden="true">▼<\/span>/);
+    // Middle row (R-B) has both buttons active.
+    assert.match(html, /aria-label="reorder R-B">[\s\S]*?hx-post="\/api\/v1\/issues\/R-B\/rerank\?direction=up"[\s\S]*?hx-post="\/api\/v1\/issues\/R-B\/rerank\?direction=down"/);
+  });
+});
+
+describe('POST /api/v1/issues/:id/rerank', () => {
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-rerank-'));
+    await mkdir(path.join(root, 'Todo'), { recursive: true });
+    await mkdir(path.join(root, 'Done'), { recursive: true });
+    // Three Todo issues in a known order: T-1 then T-2 then T-3 (by created_at).
+    await writeFile(
+      path.join(root, 'Todo', 'T-1.md'),
+      `---\nid: "T-1"\nidentifier: "T-1"\ntitle: "First"\ncreated_at: "2026-05-01T00:00:00Z"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Todo', 'T-2.md'),
+      `---\nid: "T-2"\nidentifier: "T-2"\ntitle: "Second"\ncreated_at: "2026-05-02T00:00:00Z"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Todo', 'T-3.md'),
+      `---\nid: "T-3"\nidentifier: "T-3"\ntitle: "Third"\ncreated_at: "2026-05-03T00:00:00Z"\n---\nbody.`,
+    );
+    await writeFile(
+      path.join(root, 'Done', 'D-1.md'),
+      `---\nid: "D-1"\nidentifier: "D-1"\ntitle: "Already done"\n---\nbody.`,
+    );
+    server = await bootServer(root, { withTracker: true });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('moves an issue up by writing priorities so the dispatcher sees the new order', async () => {
+    // Promote T-3 above T-2.
+    const res = await fetch(`${server.url}/api/v1/issues/T-3/rerank?direction=up`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as {
+      identifier: string;
+      direction: string;
+      from_index: number;
+      to_index: number;
+      changed: Array<{ identifier: string; priority: number }>;
+    };
+    assert.equal(data.identifier, 'T-3');
+    assert.equal(data.direction, 'up');
+    assert.equal(data.from_index, 2);
+    assert.equal(data.to_index, 1);
+    // T-3 should now have priority 2; T-2 should now have priority 3. T-1 keeps priority 1
+    // (it was the top of the null-bucket sort and stays at index 0).
+    const byId = new Map(data.changed.map((c) => [c.identifier, c.priority]));
+    assert.equal(byId.get('T-3'), 2);
+    assert.equal(byId.get('T-2'), 3);
+    // Verify the files reflect the new order.
+    const t3 = await readFile(path.join(root, 'Todo', 'T-3.md'), 'utf8');
+    assert.match(t3, /priority: 2/);
+    const t2 = await readFile(path.join(root, 'Todo', 'T-2.md'), 'utf8');
+    assert.match(t2, /priority: 3/);
+  });
+
+  it('moves an issue down by swapping with the next visible row', async () => {
+    // Continuing from the prior test: order is T-1, T-3, T-2. Push T-3 down to swap back.
+    const res = await fetch(`${server.url}/api/v1/issues/T-3/rerank?direction=down`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as {
+      identifier: string;
+      from_index: number;
+      to_index: number;
+    };
+    assert.equal(data.from_index, 1);
+    assert.equal(data.to_index, 2);
+    // The partial should now show T-1, T-2, T-3 again.
+    const partialRes = await fetch(`${server.url}/api/v1/partials/disk`);
+    const html = await partialRes.text();
+    const i1 = html.indexOf('>T-1<');
+    const i2 = html.indexOf('>T-2<');
+    const i3 = html.indexOf('>T-3<');
+    assert.ok(i1 < i2 && i2 < i3, `expected T-1<T-2<T-3, got ${i1}, ${i2}, ${i3}`);
+  });
+
+  it('is a no-op when moving the top row up', async () => {
+    // Re-derive the top row from the current sorted view rather than hard-coding.
+    const beforeRes = await fetch(`${server.url}/api/v1/partials/disk`);
+    const beforeHtml = await beforeRes.text();
+    const top = (/<a class="ident"[^>]*>([^<]+)<\/a>/.exec(beforeHtml) ?? [])[1]!;
+    assert.ok(top, 'top row exists');
+    const res = await fetch(`${server.url}/api/v1/issues/${top}/rerank?direction=up`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { from_index: number; to_index: number; changed: unknown[] };
+    assert.equal(data.from_index, data.to_index);
+    assert.deepEqual(data.changed, []);
+  });
+
+  it('refuses to rerank a terminal-state issue', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/D-1/rerank?direction=up`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 409);
+    const data = (await res.json()) as { error: { code: string } };
+    assert.equal(data.error.code, 'rerank_state_not_active');
+  });
+
+  it('returns 404 when the issue file does not exist', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/does-not-exist/rerank?direction=up`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 404);
+    const data = (await res.json()) as { error: { code: string } };
+    assert.equal(data.error.code, 'rerank_issue_not_found');
+  });
+
+  it('requires a direction', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/T-1/rerank`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 400);
+    const data = (await res.json()) as { error: { message: string } };
+    assert.match(data.error.message, /direction is required/);
+  });
+
+  it('accepts direction from the JSON body when the query string is absent', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/T-2/rerank`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ direction: 'down' }),
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { direction: string };
+    assert.equal(data.direction, 'down');
+  });
+
+  it('HTMX form POST returns the re-rendered disk partial', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/T-2/rerank?direction=up`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'hx-request': 'true',
+        origin: server.url,
+      },
+    });
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // The response is the disk partial — it should contain the list and identifiers.
+    assert.match(html, /<ul class="disk">/);
+    assert.match(html, />T-1</);
+    assert.match(html, />T-2</);
+    assert.match(html, />T-3</);
+  });
+
+  it('rejects form-encoded request without HX-Request (CSRF protection)', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues/T-1/rerank?direction=down`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+    });
+    assert.equal(res.status, 403);
+  });
+});
+
 describe('renderMarkdown — agent-flavoured Markdown', () => {
   it('wraps a plain question in a <p> and escapes raw HTML', () => {
     const out = renderMarkdown('Is the <script> tag here safe?');

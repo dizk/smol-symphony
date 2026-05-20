@@ -9,7 +9,14 @@ import { parse as parseYaml } from 'yaml';
 import type { Orchestrator } from './orchestrator.js';
 import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
-import { writeIssueFile, TRIAGE_STATE } from './issues.js';
+import {
+  compareDispatchOrder,
+  rerankIssueInState,
+  RerankError,
+  TRIAGE_STATE,
+  writeIssueFile,
+  type RerankDirection,
+} from './issues.js';
 import type { IssueTracker } from './trackers/types.js';
 
 function jsonResponse(res: ServerResponse, status: number, body: unknown): void {
@@ -131,10 +138,15 @@ async function readTextBody(req: IncomingMessage, maxBytes = 1_000_000): Promise
 // currently running nor in the retry queue. Triage entries additionally surface the
 // `proposed_by` / `proposed_at` front-matter so the dashboard can show provenance for
 // agent-authored proposals — fields are optional and null for hand-written issues.
+// `priority` and `created_at` are also surfaced so the disk listing can sort with the
+// same key the dispatcher uses (see Orchestrator.sortForDispatch §8.2) and so the rerank
+// controls can show/hide their boundary states without a second filesystem walk.
 async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
   identifier: string;
   state: string;
   title: string;
+  priority: number | null;
+  created_at: string | null;
   proposed_by: string | null;
   proposed_at: string | null;
 }>> {
@@ -142,6 +154,8 @@ async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
     identifier: string;
     state: string;
     title: string;
+    priority: number | null;
+    created_at: string | null;
     proposed_by: string | null;
     proposed_at: string | null;
   }> = [];
@@ -182,7 +196,19 @@ async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
       }
       const proposed_by = matchFrontMatterString(text, 'proposed_by');
       const proposed_at = matchFrontMatterString(text, 'proposed_at');
-      out.push({ identifier: f.slice(0, -3), state: stateDir, title, proposed_by, proposed_at });
+      const priorityStr = matchFrontMatterString(text, 'priority');
+      const priority =
+        priorityStr !== null && /^-?\d+$/.test(priorityStr) ? parseInt(priorityStr, 10) : null;
+      const created_at = matchFrontMatterString(text, 'created_at');
+      out.push({
+        identifier: f.slice(0, -3),
+        state: stateDir,
+        title,
+        priority,
+        created_at,
+        proposed_by,
+        proposed_at,
+      });
     }
   }
   out.sort((a, b) => a.identifier.localeCompare(b.identifier));
@@ -323,6 +349,8 @@ type DiskIssue = {
   identifier: string;
   state: string;
   title: string;
+  priority: number | null;
+  created_at: string | null;
   proposed_by: string | null;
   proposed_at: string | null;
 };
@@ -563,16 +591,62 @@ function renderDiskPartial(p: PartialInputs): string {
     return `<h2>on disk</h2>
 <p class="empty dim">tracker is clean. drop a markdown file into <code>${escapeHtml(p.activeStates[0] ?? 'Todo')}/</code> or open <em>new issue</em> below.</p>`;
   }
-  const items = filtered.map((i) => {
-    const href = `/issues/${encodeURIComponent(i.identifier)}`;
-    return `<li>
+  // Sort with the dispatcher's key (Orchestrator.sortForDispatch §8.2) so the order the
+  // operator sees on disk is the order the orchestrator will pick on the next tick.
+  // Bucket by state first so rows stay grouped (Todo before In Progress, etc.) — within
+  // each state the dispatch sort takes over. The activeStates index defines the bucket
+  // order to match WORKFLOW.md's declared priority of states.
+  const stateOrder = new Map(p.activeStates.map((s, idx) => [s, idx]));
+  const sorted = filtered.slice().sort((a, b) => {
+    const ai = stateOrder.get(a.state) ?? Number.POSITIVE_INFINITY;
+    const bi = stateOrder.get(b.state) ?? Number.POSITIVE_INFINITY;
+    if (ai !== bi) return ai - bi;
+    return compareDispatchOrder(
+      { priority: a.priority, createdAt: a.created_at, identifier: a.identifier },
+      { priority: b.priority, createdAt: b.created_at, identifier: b.identifier },
+    );
+  });
+  // For each row decide whether it sits at the top / bottom of its same-state run so the
+  // rerank arrows render disabled at boundaries instead of issuing no-op POSTs.
+  const items = sorted.map((i, idx) => {
+    const prev = sorted[idx - 1];
+    const next = sorted[idx + 1];
+    const isFirstInState = !prev || prev.state !== i.state;
+    const isLastInState = !next || next.state !== i.state;
+    return renderDiskRow(i, { canMoveUp: !isFirstInState, canMoveDown: !isLastInState });
+  }).join('');
+  return `<h2>on disk <span class="count dim">(${sorted.length})</span></h2>
+<ul class="disk">${items}</ul>`;
+}
+
+function renderDiskRow(
+  i: DiskIssue,
+  bounds: { canMoveUp: boolean; canMoveDown: boolean },
+): string {
+  const href = `/issues/${encodeURIComponent(i.identifier)}`;
+  // Arrow buttons HTMX-POST the rerank action and morph the disk partial in-place; at
+  // boundary rows they render disabled so the column width stays stable as items move.
+  const rerankUrl = `/api/v1/issues/${encodeURIComponent(i.identifier)}/rerank`;
+  const upBtn = bounds.canMoveUp
+    ? `<form class="rerank-action"
+            hx-post="${rerankUrl}?direction=up"
+            hx-target="#disk" hx-swap="morph:innerHTML">
+        <button type="submit" class="rerank-btn" aria-label="move ${escapeHtml(i.identifier)} up" title="move up">▲</button>
+      </form>`
+    : `<span class="rerank-btn rerank-btn-disabled" aria-hidden="true">▲</span>`;
+  const downBtn = bounds.canMoveDown
+    ? `<form class="rerank-action"
+            hx-post="${rerankUrl}?direction=down"
+            hx-target="#disk" hx-swap="morph:innerHTML">
+        <button type="submit" class="rerank-btn" aria-label="move ${escapeHtml(i.identifier)} down" title="move down">▼</button>
+      </form>`
+    : `<span class="rerank-btn rerank-btn-disabled" aria-hidden="true">▼</span>`;
+  return `<li>
     <a class="ident" href="${href}" title="open ${escapeHtml(i.identifier)}">${escapeHtml(i.identifier)}</a>
     <span class="state dim">${escapeHtml(i.state)}</span>
     <a class="title" href="${href}">${escapeHtml(i.title)}</a>
+    <span class="rerank" role="group" aria-label="reorder ${escapeHtml(i.identifier)}">${upBtn}${downBtn}</span>
   </li>`;
-  }).join('');
-  return `<h2>on disk <span class="count dim">(${filtered.length})</span></h2>
-<ul class="disk">${items}</ul>`;
 }
 
 function renderTotalsPartial(p: PartialInputs): string {
@@ -854,8 +928,8 @@ h2:first-child { margin-top: 0.4rem; }
 .disk { list-style: none; padding: 0; margin: 0; }
 .disk li {
   display: grid;
-  grid-template-columns: 10rem 5.5rem 1fr;
-  gap: 0.5rem; align-items: baseline;
+  grid-template-columns: 10rem 5.5rem 1fr max-content;
+  gap: 0.5rem; align-items: center;
   padding: 0.35rem 0; border-bottom: 1px solid var(--rule-soft);
   font-variant-numeric: tabular-nums;
 }
@@ -864,6 +938,35 @@ h2:first-child { margin-top: 0.4rem; }
 .disk .state { font-size: 0.85em; }
 .disk .title { color: var(--base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .count { font-weight: 400; font-size: 0.88em; margin-left: 0.4rem; }
+
+/* Rerank controls: a pair of arrow buttons on the right edge of each row that swap the
+   issue with its visible neighbour. Boundary rows render the arrow as a disabled span so
+   the column width stays stable while items move up and down. The buttons are visually
+   quiet by default (matching .ghost-sm density) and brighten on hover so the operator
+   can find them without the row looking busy. */
+.disk .rerank {
+  display: inline-flex; gap: 0.2rem;
+  font-variant-numeric: tabular-nums;
+}
+.disk form.rerank-action { display: inline; margin: 0; padding: 0; }
+.disk .rerank-btn {
+  background: transparent; color: var(--dim);
+  border: 1px solid var(--rule-firm); border-radius: 3px;
+  padding: 0.05rem 0.45rem;
+  font: inherit; font-size: 0.78em; line-height: 1.3;
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 1.8rem;
+  transition: color 180ms cubic-bezier(.22,1,.36,1),
+              border-color 180ms cubic-bezier(.22,1,.36,1);
+}
+.disk .rerank-btn:hover { color: var(--strong); border-color: var(--muted); }
+.disk .rerank-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.disk .rerank-btn-disabled {
+  cursor: default;
+  color: var(--rule-firm);
+  border-color: var(--rule-soft);
+}
 
 /* ── triage ──────────────────────────────────────────────────────────────
    Agent-proposed issues awaiting operator approval. Visually adjacent to the
@@ -1975,6 +2078,139 @@ async function handleRequest(
       return jsonResponse(res, status, {
         error: { code, message: (err as Error).message },
       });
+    }
+  }
+
+  // Rerank: swap an active-state issue with its visible neighbour in the disk listing
+  // by rewriting `priority:` in the front-matter so the dispatcher's sort (§8.2) honours
+  // the new order on the next poll. The dashboard renders ▲/▼ arrows on each row; the
+  // operator clicks one and we update at most two files (the moved issue and the
+  // neighbour it swapped with, plus any null-priority items the renumber materialises).
+  //
+  // CSRF posture mirrors the triage actions: form-encoded and empty Content-Type are
+  // both "simple" CORS requests, so they require HX-Request + same-origin; application/json
+  // is exempt because it triggers a preflight on cross-origin fetches.
+  const rerankMatch = /^\/api\/v1\/issues\/([^/]+)\/rerank$/.exec(pathname);
+  if (rerankMatch) {
+    if (method !== 'POST') return methodNotAllowed(res);
+    const root = view.trackerRoot;
+    if (!root) return badRequest(res, 'tracker.root not configured');
+    const identifier = decodeURIComponent(rerankMatch[1]!);
+    const isHtmx = req.headers['hx-request'] === 'true';
+    const ctype = (req.headers['content-type'] ?? '').toLowerCase();
+    const baseCtype = ctype.split(';', 1)[0]!.trim();
+    const isFormBody = baseCtype === 'application/x-www-form-urlencoded';
+    const isJsonBody = baseCtype === 'application/json';
+    const isEmptyCtype = baseCtype === '';
+    if (!isFormBody && !isJsonBody && !isEmptyCtype) {
+      return jsonResponse(res, 415, {
+        error: {
+          code: 'unsupported_media_type',
+          message: 'content-type must be application/json or application/x-www-form-urlencoded',
+        },
+      });
+    }
+    if (isFormBody || isEmptyCtype) {
+      if (!isHtmx || !isSameOriginRequest(req)) {
+        return jsonResponse(res, 403, {
+          error: {
+            code: 'forbidden',
+            message: 'rerank actions require an HTMX same-origin request or application/json',
+          },
+        });
+      }
+    }
+    // Direction can come from the query string (HTMX wires the URL with ?direction=…) or
+    // from a JSON body (direct API callers). Query wins when both are present.
+    let direction: RerankDirection | null = null;
+    try {
+      const url = new URL(req.url ?? '/', 'http://symphony.local');
+      const q = url.searchParams.get('direction');
+      if (q === 'up' || q === 'down') direction = q;
+    } catch {
+      /* re-parsed below if needed */
+    }
+    if (direction === null && isJsonBody) {
+      try {
+        const body = (await readJsonBody(req)) as Record<string, unknown>;
+        if (body && typeof body === 'object' && !Array.isArray(body)) {
+          const d = body['direction'];
+          if (d === 'up' || d === 'down') direction = d;
+        }
+      } catch (err) {
+        return badRequest(res, (err as Error).message);
+      }
+    }
+    if (direction === null) {
+      return badRequest(res, 'direction is required and must be "up" or "down"');
+    }
+    // Locate the issue and refuse to reorder anything that isn't in an active state. The
+    // dashboard's disk listing already only shows active-state rows, but a direct API
+    // caller could try to rerank a Done/Cancelled file — that's never what's wanted.
+    const issue = await readIssueFromDisk(root, identifier);
+    if (!issue) {
+      const code = 'rerank_issue_not_found';
+      const message = `no .md file matches ${identifier}`;
+      if (isHtmx) {
+        const p = await gatherPartialInputs(orch, view);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end(renderDiskPartial(p));
+        return;
+      }
+      return jsonResponse(res, 404, { error: { code, message } });
+    }
+    if (!view.activeStates.includes(issue.state)) {
+      const message = `issue ${identifier} is in ${issue.state}, which is not an active state`;
+      if (isHtmx) {
+        const p = await gatherPartialInputs(orch, view);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end(renderDiskPartial(p));
+        return;
+      }
+      return jsonResponse(res, 409, { error: { code: 'rerank_state_not_active', message } });
+    }
+    try {
+      const result = await rerankIssueInState(root, issue.state, identifier, direction);
+      log.info('issue reranked', {
+        identifier,
+        state: issue.state,
+        direction,
+        from_index: result.fromIndex,
+        to_index: result.toIndex,
+        changed: result.changed.length,
+      });
+      if (isHtmx) {
+        const p = await gatherPartialInputs(orch, view);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end(renderDiskPartial(p));
+        return;
+      }
+      return jsonResponse(res, 200, {
+        identifier,
+        state: issue.state,
+        direction,
+        from_index: result.fromIndex,
+        to_index: result.toIndex,
+        changed: result.changed,
+      });
+    } catch (err) {
+      const code = err instanceof RerankError ? err.code : 'rerank_failed';
+      const status = code === 'rerank_issue_not_found' ? 404 : 409;
+      if (isHtmx) {
+        const p = await gatherPartialInputs(orch, view);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.end(renderDiskPartial(p));
+        return;
+      }
+      return jsonResponse(res, status, { error: { code, message: (err as Error).message } });
     }
   }
 
