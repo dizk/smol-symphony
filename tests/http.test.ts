@@ -88,7 +88,7 @@ describe('POST /api/v1/issues — relaxed input', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('creates an issue when only title is supplied (derives identifier + default state)', async () => {
+  it('creates an issue when only title is supplied (assigns next numeric identifier + default state)', async () => {
     const res = await fetch(`${server.url}/api/v1/issues`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -96,18 +96,18 @@ describe('POST /api/v1/issues — relaxed input', () => {
     });
     assert.equal(res.status, 201);
     const data = (await res.json()) as { identifier: string; state: string; path: string };
-    assert.equal(data.identifier, 'fix-the-login-bug');
+    assert.equal(data.identifier, '1');
     assert.equal(data.state, 'Todo');
 
     const files = await readdir(path.join(root, 'Todo'));
-    assert.deepEqual(files, ['fix-the-login-bug.md']);
+    assert.deepEqual(files, ['1.md']);
 
-    const text = await readFile(path.join(root, 'Todo', 'fix-the-login-bug.md'), 'utf8');
+    const text = await readFile(path.join(root, 'Todo', '1.md'), 'utf8');
     assert.match(text, /title: "Fix the login bug"/);
-    assert.match(text, /id: "fix-the-login-bug"/);
+    assert.match(text, /id: "1"/);
   });
 
-  it('appends a numeric suffix when the derived slug collides', async () => {
+  it('counts up to the next free identifier on subsequent creates', async () => {
     const res = await fetch(`${server.url}/api/v1/issues`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -115,7 +115,7 @@ describe('POST /api/v1/issues — relaxed input', () => {
     });
     assert.equal(res.status, 201);
     const data = (await res.json()) as { identifier: string };
-    assert.equal(data.identifier, 'fix-the-login-bug-2');
+    assert.equal(data.identifier, '2');
   });
 
   it('still rejects requests missing a title', async () => {
@@ -160,7 +160,7 @@ describe('POST /api/v1/issues — relaxed input', () => {
     assert.match(data.error.message, /state must be one of/);
   });
 
-  it('falls back to "issue" when the title slugifies to nothing', async () => {
+  it('ignores the title when assigning identifiers — even an unslugifiable title gets a numeric one', async () => {
     const res = await fetch(`${server.url}/api/v1/issues`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -168,7 +168,7 @@ describe('POST /api/v1/issues — relaxed input', () => {
     });
     assert.equal(res.status, 201);
     const data = (await res.json()) as { identifier: string };
-    assert.equal(data.identifier, 'issue');
+    assert.match(data.identifier, /^\d+$/);
   });
 });
 

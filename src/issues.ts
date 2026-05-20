@@ -64,23 +64,10 @@ export function terminalStateNames(states: Record<string, StateConfig>): string[
   return out;
 }
 
-// Slugify a title into a filename-safe identifier. Lowercase ASCII with single-dash
-// separators; trims to a sensible length so the on-disk path stays readable. Falls back to
-// `issue` when the title is empty after stripping.
-export function slugifyTitle(title: string): string {
-  const slug = title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60)
-    .replace(/-+$/g, '');
-  return slug.length > 0 ? slug : 'issue';
-}
-
 // Walk every state directory under `trackerRoot` and return the set of issue identifiers
-// (filename stem) currently present. Used to pick a unique suffix when deriving an
-// identifier from a title — checking only the target state directory would let a `Done/foo.md`
-// silently shadow a freshly created `Todo/foo.md` once it moves out of Todo.
+// (filename stem) currently present. Used to pick the next free numeric identifier —
+// checking only the target state directory would let a `Done/3.md` silently shadow a
+// freshly created `Todo/3.md` once it moves out of Todo.
 export async function collectExistingIdentifiers(trackerRoot: string): Promise<Set<string>> {
   const out = new Set<string>();
   let entries: string[];
@@ -159,17 +146,14 @@ export async function writeIssueFile(input: WriteIssueFileInput): Promise<WriteI
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
   } else {
-    // No identifier supplied → derive a slug from the title and disambiguate against
-    // collisions across every state directory under the tracker root, so a `-2` suffix
-    // appears whenever the same titled issue already exists anywhere (Todo / Done / etc).
-    const base = slugifyTitle(input.title);
+    // No identifier supplied → pick the next free numeric identifier by counting up from 1
+    // until we find a basename that doesn't already exist in any state directory. Title-slug
+    // files from prior cycles are inert here: only numeric basenames consume IDs, so legacy
+    // `add-changelog.md` files coexist with the numeric scheme without claiming a slot.
     const existing = await collectExistingIdentifiers(input.trackerRoot);
-    ident = base;
-    let n = 2;
-    while (existing.has(ident)) {
-      ident = `${base}-${n}`;
-      n += 1;
-    }
+    let n = 1;
+    while (existing.has(String(n))) n += 1;
+    ident = String(n);
     filePath = path.join(stateDir, `${ident}.md`);
   }
   const now = new Date().toISOString();
