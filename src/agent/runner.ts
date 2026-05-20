@@ -82,6 +82,67 @@ function buildSteeringReplyPrompt(question: string, context: string | null, repl
     .replace(/\n{3,}/g, '\n\n');
 }
 
+/**
+ * Effective dispatch parameters for a single attempt against `state`. Computed once at the
+ * top of runAttempt so a workflow reload (or a per-state override) cannot redirect the
+ * adapter / model / loop budget mid-attempt; downstream code in the runner reads only
+ * from this object, never from `this.cfg.acp.*` or `this.cfg.agent.max_turns` directly.
+ */
+export interface ResolvedDispatchConfig {
+  adapter: AcpAdapterId;
+  model: string | null;
+  max_turns: number;
+}
+
+/**
+ * Resolve effective adapter/model/max_turns for an issue's current state. Per-state
+ * overrides declared under `states.<name>` win; otherwise the workflow-level
+ * `acp.adapter` / `acp.model` / `agent.max_turns` defaults apply.
+ *
+ * Throws when `state` is not declared in `cfg.states`. The orchestrator should never
+ * dispatch an issue whose state is not declared (validateDispatch + reconciliation both
+ * gate on that), but defense in depth: returning a silent fallback here would mask a
+ * tracker/workflow drift bug as a confusing default-adapter run.
+ */
+export function resolveDispatchConfig(
+  cfg: ServiceConfig,
+  state: string,
+): ResolvedDispatchConfig {
+  const states = cfg.states ?? {};
+  // Case-insensitive lookup matches the rest of symphony (eligibility, reconciliation,
+  // local-tracker state directories all compare lowercase). A workflow that declares
+  // `Todo` and a tracker file living under `todo/` still resolves correctly.
+  let key: string | null = null;
+  if (Object.prototype.hasOwnProperty.call(states, state)) {
+    key = state;
+  } else {
+    const lower = state.toLowerCase();
+    for (const name of Object.keys(states)) {
+      if (name.toLowerCase() === lower) {
+        key = name;
+        break;
+      }
+    }
+  }
+  if (key === null) {
+    const declared = Object.keys(states).join(', ');
+    throw new Error(
+      `resolveDispatchConfig: state "${state}" is not declared in workflow states (declared: ${
+        declared.length > 0 ? declared : '<none>'
+      })`,
+    );
+  }
+  const s = states[key]!;
+  const adapter = (s.adapter ?? cfg.acp.adapter) as AcpAdapterId;
+  // Distinguish "not overridden" (undefined) from "explicitly null" (means: use adapter
+  // default). Only fall back to workflow-level acp.model when the state did not declare
+  // a model key at all; an explicit null in the state config means the operator wants
+  // the adapter's own default for this state.
+  const model = s.model === undefined ? cfg.acp.model : s.model;
+  const max_turns = s.max_turns ?? cfg.agent.max_turns;
+  return { adapter, model, max_turns };
+}
+
 export class AgentRunner {
   constructor(
     private cfg: ServiceConfig,
@@ -123,6 +184,35 @@ export class AgentRunner {
     runLog?: RunLog,
   ): Promise<RunAttemptResult> {
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
+    // Resolve adapter/model/max_turns once for this attempt against the issue's current
+    // state. Every downstream read in this method goes through `resolved`, not the live
+    // `this.cfg.acp.*` / `this.cfg.agent.max_turns` — that way a workflow reload between
+    // here and the final loop iteration cannot redirect the adapter or change the budget.
+    let resolved: ResolvedDispatchConfig;
+    try {
+      resolved = resolveDispatchConfig(this.cfg, issue.state);
+    } catch (err) {
+      logger.error('dispatch resolution failed', {
+        error: (err as Error).message,
+        state: issue.state,
+      });
+      return {
+        ok: false,
+        reason: 'dispatch resolution error',
+        threadId: null,
+        turnsCompleted: 0,
+      };
+    }
+    if (!isKnownAdapter(resolved.adapter)) {
+      // Defense in depth: validateDispatch + per-state validation should have caught
+      // this. The state name is in the error so an operator who sees this in the logs
+      // can spot a typo in their per-state adapter override.
+      logger.error('unknown acp adapter for state', {
+        adapter: resolved.adapter,
+        state: issue.state,
+      });
+      return { ok: false, reason: 'unknown acp adapter', threadId: null, turnsCompleted: 0 };
+    }
     const hookCapture = (hook: string): HookCapture | undefined =>
       runLog
         ? {
@@ -157,14 +247,11 @@ export class AgentRunner {
     // launch shape: scrub the in-VM credential dir, stage the host credential into the
     // workspace, exec the in-VM proxy at /opt/symphony/vm-agent.mjs. The proxy reads its
     // config (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from env, dials the
-    // host's bridge, and spawns the adapter. validateDispatch already rejected unknown
-    // adapters and any `acp.command` override; the branches below are pure data binding.
-    if (!isKnownAdapter(this.cfg.acp.adapter)) {
-      // Should be unreachable after validateDispatch; defend in depth.
-      logger.error('unknown acp adapter', { adapter: this.cfg.acp.adapter });
-      return { ok: false, reason: 'unknown acp adapter', threadId: null, turnsCompleted: 0 };
-    }
-    const profile = ADAPTERS[this.cfg.acp.adapter as AcpAdapterId];
+    // host's bridge, and spawns the adapter. The adapter id was already validated up
+    // top via `resolved` (which folds in any per-state override), and `acp.command`
+    // overrides are rejected by validateDispatch; the branches below are pure data
+    // binding off the resolved profile.
+    const profile = ADAPTERS[resolved.adapter];
     let staged;
     try {
       staged = await stageCredential(workspace.path, profile);
@@ -183,14 +270,15 @@ export class AgentRunner {
     const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath);
     const adapterBin = profile.binary[0]!;
     const adapterArgs = profile.binary.slice(1);
-    // Apply the workflow's acp.model selection (if any) to the adapter via its profile-
+    // Apply the resolved model selection (if any) to the adapter via its profile-
     // specific mechanism: env var for claude-agent-acp, extra argv for codex-acp. The
     // returned env/args are merged into the smolvm-exec invocation below so they reach
-    // the vm-agent proxy and then the spawned adapter.
+    // the vm-agent proxy and then the spawned adapter. `resolved.model` is the per-state
+    // override (when set) or the workflow-level acp.model fallback.
     const modelEnv: Record<string, string> = {};
     const modelArgs: string[] = [];
-    if (this.cfg.acp.model) {
-      const inj = profile.modelInjection(this.cfg.acp.model);
+    if (resolved.model) {
+      const inj = profile.modelInjection(resolved.model);
       if (inj.env) {
         for (const [k, v] of Object.entries(inj.env)) modelEnv[k] = v;
       }
@@ -503,7 +591,7 @@ export class AgentRunner {
       clearInterval(cancelCheckTimer);
       logger.error('acp init failed', {
         error: (err as Error).message,
-        adapter: this.cfg.acp.adapter,
+        adapter: resolved.adapter,
       });
       this.events.onRuntimeEvent(issue.id, {
         at: new Date().toISOString(),
@@ -650,7 +738,7 @@ export class AgentRunner {
         lastReason = 'issue_no_longer_active';
         break;
       }
-      if (autonomousTurns >= this.cfg.agent.max_turns) {
+      if (autonomousTurns >= resolved.max_turns) {
         lastReason = 'max_turns_reached';
         break;
       }

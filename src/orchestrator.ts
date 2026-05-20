@@ -135,16 +135,37 @@ export class Orchestrator {
       log.error('startup validation failed', { error: validation });
       throw new WorkflowError('workflow_parse_error', validation);
     }
-    // Fail fast when symphony will auto-stage credentials but the host file the
+    // Fail fast when symphony will auto-stage credentials but the host file an
     // adapter needs is missing. Operators who set acp.command explicitly own their
     // own credential plumbing, so skip the check in that branch.
-    if (this.cfg.acp.command === null && isKnownAdapter(this.cfg.acp.adapter)) {
-      const profile = ADAPTERS[this.cfg.acp.adapter as AcpAdapterId];
-      try {
-        await assertHostCredentialReadable(profile);
-      } catch (err) {
-        log.error('startup credential check failed', { error: (err as Error).message });
-        throw new WorkflowError('missing_host_credential', (err as Error).message);
+    //
+    // Per-state overrides can change the adapter for individual states (e.g. Review
+    // running on codex while Todo runs on claude), so the set of credentials symphony
+    // needs at runtime is the union of `cfg.acp.adapter` and every distinct
+    // `states.<name>.adapter`. validateDispatch already rejects unknown adapter ids
+    // and re-checks credentials in its own walk, but the orchestrator-startup probe
+    // is the operator-visible failure point: surface it the same way for every
+    // adapter, not just the workflow-level default.
+    if (this.cfg.acp.command === null) {
+      const adapters = new Set<AcpAdapterId>();
+      if (isKnownAdapter(this.cfg.acp.adapter)) {
+        adapters.add(this.cfg.acp.adapter as AcpAdapterId);
+      }
+      for (const s of Object.values(this.cfg.states ?? {})) {
+        if (s.adapter && isKnownAdapter(s.adapter)) {
+          adapters.add(s.adapter as AcpAdapterId);
+        }
+      }
+      for (const id of adapters) {
+        try {
+          await assertHostCredentialReadable(ADAPTERS[id]);
+        } catch (err) {
+          log.error('startup credential check failed', {
+            adapter: id,
+            error: (err as Error).message,
+          });
+          throw new WorkflowError('missing_host_credential', (err as Error).message);
+        }
       }
     }
     await this.startupTerminalCleanup();
