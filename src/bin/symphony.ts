@@ -104,7 +104,10 @@ async function main() {
   // false to true takes effect without a process restart. The runner and HTTP routes
   // gate behavior on cfg.mcp.enabled at runtime; an inactive registry holds no entries
   // and answers all routes with "not active."
-  const mcp = new McpRegistry(tracker, { terminalStates: config.tracker.terminal_states });
+  const mcp = new McpRegistry(tracker, {
+    terminalStates: config.tracker.terminal_states,
+    states: config.states,
+  });
   // ACP transport. The bridge listens on a TCP port for the in-VM agent's dial-back,
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
   // bind failure surfaces before we accept any dispatches.
@@ -144,6 +147,7 @@ async function main() {
     workspaces.updateConfig(cfg);
     runner.updateConfig(cfg, def);
     mcp.updateTerminalStates(cfg.tracker.terminal_states);
+    mcp.updateStates(cfg.states);
     liveCfg = cfg;
     // Materialize any state directory the reload introduced. Best-effort: a
     // mkdir failure here would normally come from a tracker.root rotation that

@@ -19,7 +19,7 @@
 // The state of an issue is taken verbatim from the parent directory name.
 // State comparison is case-insensitive (SPEC §4.2 "Normalized Issue State").
 
-import { mkdir, readdir, readFile, rename, stat } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, rename, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { Issue, BlockerRef, TrackerConfig } from '../types.js';
@@ -168,13 +168,23 @@ export class LocalMarkdownTracker implements IssueTracker {
 
   /**
    * Move an issue's .md file from its current state directory to `toState`. Used by the
-   * MCP mark_done tool. Atomic on the same filesystem (fs.rename); throws TrackerError
-   * with a stable code on common failure modes so the MCP layer can surface them.
+   * MCP mark_done / transition tools. Atomic on the same filesystem (fs.rename); throws
+   * TrackerError with a stable code on common failure modes so the MCP layer can surface
+   * them.
+   *
+   * When `opts.notes` is a non-empty string, a notes block is appended to the issue body
+   * BEFORE the cross-directory rename: the new body is written to `<id>.md.tmp` in the
+   * source state directory, fsync'd, then atomically renamed onto `<id>.md` so the file
+   * is still in the source state directory but now carries the notes. The
+   * cross-directory rename then moves the updated file into the target state. This
+   * sequencing means a crash between the two renames leaves the notes persisted in the
+   * source directory — the next dispatch sees them on the live issue and the operator
+   * can finish the move by hand.
    */
   async moveIssueToState(
     issueId: string,
     toState: string,
-    opts?: { fromRoot?: string; fromState?: string },
+    opts?: { fromRoot?: string; fromState?: string; notes?: string; actor?: string },
   ): Promise<{ fromState: string; toState: string; newPath: string }> {
     // When the caller pins a root (snapshot from dispatch time), scan there.
     // Otherwise use whatever the live config says. This protects in-flight
@@ -212,6 +222,63 @@ export class LocalMarkdownTracker implements IssueTracker {
     }
     if (match.state.toLowerCase() === toState.toLowerCase()) {
       return { fromState: match.state, toState: match.state, newPath: match.filePath };
+    }
+    // Notes append. We re-read the file (the scan parsed front-matter + body but discarded
+    // the verbatim text) so the rewrite preserves operator-visible whitespace, comments,
+    // and any trailing newlines exactly. The append block format is fixed across the
+    // tracker so the dashboard / downstream tooling can recognise it.
+    const notes = typeof opts?.notes === 'string' ? opts.notes : '';
+    if (notes.length > 0) {
+      let original: string;
+      try {
+        original = await readFile(match.filePath, 'utf8');
+      } catch (err) {
+        throw new TrackerError(
+          'local_issue_notes_read_error',
+          `failed to read ${match.filePath} for notes append: ${(err as Error).message}`,
+        );
+      }
+      const actor = opts?.actor && opts.actor.length > 0 ? opts.actor : 'unknown';
+      const ts = new Date().toISOString();
+      const header = `## ${actor} — ${ts} — ${match.state} → ${toState}`;
+      // Guarantee a blank line between the prior body and the new header. The block
+      // itself ends with a newline so subsequent appends stay readable.
+      const sep = original.endsWith('\n\n') ? '' : original.endsWith('\n') ? '\n' : '\n\n';
+      const appended = `${original}${sep}${header}\n\n${notes}\n`;
+      // Write to <id>.md.tmp in the SAME source state directory, fsync the file
+      // descriptor for durability, then atomic-rename onto <id>.md. Same-directory rename
+      // is atomic on POSIX filesystems; both files live under the source state directory
+      // so the cross-directory move below operates on a single up-to-date file.
+      const tmpPath = match.filePath + '.tmp';
+      let fh;
+      try {
+        fh = await open(tmpPath, 'w', 0o644);
+        await fh.writeFile(appended, 'utf8');
+        await fh.sync();
+      } catch (err) {
+        try {
+          if (fh) await fh.close();
+        } catch {
+          // best-effort close — surfacing the original error is more useful.
+        }
+        throw new TrackerError(
+          'local_issue_notes_write_error',
+          `failed to write notes tmp file ${tmpPath}: ${(err as Error).message}`,
+        );
+      }
+      try {
+        await fh.close();
+      } catch {
+        // The file is on disk and fsync'd; close failures are not load-bearing.
+      }
+      try {
+        await rename(tmpPath, match.filePath);
+      } catch (err) {
+        throw new TrackerError(
+          'local_issue_notes_rename_error',
+          `failed to atomic-rename ${tmpPath} -> ${match.filePath}: ${(err as Error).message}`,
+        );
+      }
     }
     const targetDir = path.join(root, toState);
     await mkdir(targetDir, { recursive: true });

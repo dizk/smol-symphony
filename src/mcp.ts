@@ -23,7 +23,7 @@ import { Buffer } from 'node:buffer';
 import { lstat, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { IssueTracker } from './trackers/types.js';
-import type { RunningEntry } from './types.js';
+import type { RunningEntry, StateConfig } from './types.js';
 import { log } from './logging.js';
 import { writeIssueFile, TRIAGE_STATE } from './issues.js';
 
@@ -87,6 +87,27 @@ const TOOL_LIST = [
         },
       },
       required: ['question'],
+    },
+  },
+  {
+    name: 'transition',
+    description:
+      'Move this issue into another declared state, optionally appending notes to its body for the next agent. Use this for handoffs — implementer → reviewer, reviewer → implementer (rework), or implementer → terminal Done — rather than only at the very end of the work. Notes are appended to the issue file BEFORE the state move, so the next dispatch sees them in `issue.description` along with everything the previous agents wrote. `to_state` must be one of the states declared in WORKFLOW.md; if the current state declares `allowed_transitions`, `to_state` must also be in that list. On a terminal target, the workspace is removed after your turn ends and no further turns will be dispatched. On a non-terminal target, the same workspace and `agent/<id>` git branch survive into the next state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to_state: {
+          type: 'string',
+          description:
+            'Declared state to transition into (case-insensitive match against `states:` in WORKFLOW.md). Examples: "Review", "Done", "Todo".',
+        },
+        notes: {
+          type: 'string',
+          description:
+            'Optional markdown notes to append to the issue body before the move. These become part of the issue description the next agent (in `to_state`) reads. Use this for review findings, rework instructions, or PR-body content on a terminal transition.',
+        },
+      },
+      required: ['to_state'],
     },
   },
   {
@@ -157,11 +178,28 @@ export type McpJsonRpcResponse =
 export class McpRegistry {
   private byIdentifier = new Map<string, ActiveEntry>();
   private effectivePort: number | null = null;
+  // Live state-config map, kept in sync with the orchestrator's view via
+  // `updateStates`. Used by `transition` to validate `to_state` and to resolve
+  // the role of the target (terminal => set cleanup_workspace_on_exit). Empty
+  // by default so test harnesses that don't supply a state map don't trip the
+  // "unknown_state" branch on legacy mark_done shims — those still resolve via
+  // the pinned terminal_target_at_dispatch.
+  private states: Record<string, StateConfig> = {};
 
-  constructor(private tracker: IssueTracker, private opts: { terminalStates: string[] }) {}
+  constructor(
+    private tracker: IssueTracker,
+    private opts: { terminalStates: string[]; states?: Record<string, StateConfig> },
+  ) {
+    if (opts.states) this.states = opts.states;
+  }
 
   updateTerminalStates(states: string[]): void {
     this.opts.terminalStates = states;
+  }
+
+  /** Push the latest state-config map in after a workflow reload. */
+  updateStates(states: Record<string, StateConfig>): void {
+    this.states = states;
   }
 
   /** Called once after the HTTP server binds, so URL construction uses the real port. */
@@ -337,6 +375,9 @@ export class McpRegistry {
           if (name === 'mark_done') {
             return await this.callMarkDone(active, id, args);
           }
+          if (name === 'transition') {
+            return await this.callTransition(active, id, args);
+          }
           if (name === 'request_human_steering') {
             return this.callRequestHumanSteering(active, id, args);
           }
@@ -363,6 +404,54 @@ export class McpRegistry {
     }
   }
 
+  /**
+   * Shared file-move + flag-flip path used by both `mark_done` (which targets the
+   * pinned terminal state with a synthesized notes block) and `transition` (which
+   * accepts any declared target plus operator-supplied notes). Returns the
+   * tracker's resolved {from, to, newPath} on success, throwing the underlying
+   * TrackerError on failure so the caller can wrap it in a tool-error response.
+   *
+   * Cleanup-on-exit is decided by the role of the canonical target state: terminal
+   * targets clean the workspace, active/holding targets preserve it so the same
+   * `agent/<id>` git branch survives across the handoff. When the registry has no
+   * live states map (e.g. a test harness that didn't wire one), we fall back to
+   * "any move that lands in the dispatch-pinned terminal target cleans" — which is
+   * the legacy `mark_done` semantics.
+   */
+  private async performTransition(
+    active: ActiveEntry,
+    toState: string,
+    notes: string,
+    actor: string,
+  ): Promise<{ fromState: string; toState: string; newPath: string }> {
+    if (!this.tracker.moveIssueToState) {
+      throw new Error('this tracker does not support state transitions');
+    }
+    const fromRoot = active.trackerRootSnapshot ?? undefined;
+    const fromState = active.entry.issue.state;
+    const result = await this.tracker.moveIssueToState(active.issueId, toState, {
+      fromRoot,
+      fromState,
+      notes: notes.length > 0 ? notes : undefined,
+      actor,
+    });
+    active.entry.marked_done = true;
+    // Pick the canonical declared name (preserving operator-supplied casing) so
+    // the role lookup matches the workflow's `states:` map. When no states map
+    // is present, fall back to the dispatch-time terminal target — that's the
+    // path mark_done has always used.
+    let cleanup = false;
+    const stateMap = this.states;
+    const canonicalName = canonicalStateName(stateMap, result.toState);
+    if (canonicalName !== null) {
+      cleanup = stateMap[canonicalName]!.role === 'terminal';
+    } else {
+      cleanup = result.toState.toLowerCase() === active.terminalTarget.toLowerCase();
+    }
+    active.entry.cleanup_workspace_on_exit = cleanup;
+    return result;
+  }
+
   private async callMarkDone(
     active: ActiveEntry,
     id: string | number | null,
@@ -382,29 +471,19 @@ export class McpRegistry {
     if (!this.tracker.moveIssueToState) {
       return makeToolError(id, 'this tracker does not support state transitions');
     }
-    // Use the snapshots captured at activate time, not the registry's live config.
-    // A WORKFLOW.md reload that changes tracker.root or terminal_states between
-    // dispatch and mark_done must not redirect the move.
+    // Target is the dispatch-pinned terminal state — same as before the transition
+    // refactor. A WORKFLOW.md reload that changes tracker.root or terminal_states
+    // between dispatch and mark_done must not redirect the move; the snapshot is
+    // the single source of truth.
     //
-    // Pass the entry's dispatched-from state as `fromState` so the tracker can
-    // disambiguate when a stale terminal copy (e.g. a leftover Done/ABC-1.md
-    // from a prior cycle) shares the issue id with the active In Progress copy.
-    // Without this, a blind first-match could pick the stale terminal file and
-    // silently no-op via the same-state short-circuit.
+    // Notes block synthesised from title + summary so the dogfood after_run hook
+    // can read it in `issue.description` on the terminal side too, alongside the
+    // existing `mark_done.md` write that lives in the workspace's staging dir.
     const target = active.terminalTarget;
-    const fromRoot = active.trackerRootSnapshot ?? undefined;
-    const fromState = active.entry.issue.state;
+    const notes = `# ${titleRaw}\n\n${summary.trim()}`;
+    const actor = active.entry.resolved_actor;
     try {
-      const result = await this.tracker.moveIssueToState(active.issueId, target, {
-        fromRoot,
-        fromState,
-      });
-      active.entry.marked_done = true;
-      // The reconcile loop normally sets cleanup_workspace_on_exit when it observes a
-      // terminal-state transition, but the runner can exit (via the marked_done flag)
-      // before the next reconcile tick. Set it here so the workspace is cleaned up on
-      // worker exit regardless of which path got there first.
-      active.entry.cleanup_workspace_on_exit = true;
+      const result = await this.performTransition(active, target, notes, actor);
       // Persist the structured title+summary into the workspace so the after_run
       // hook (and any other consumers) can read them. Format is markdown so
       // operators can `cat` it without parsing JSON:
@@ -431,6 +510,8 @@ export class McpRegistry {
         to: result.toState,
         title: titleRaw,
         summary_chars: summary.length,
+        actor,
+        cleanup: active.entry.cleanup_workspace_on_exit,
       });
       return {
         jsonrpc: '2.0',
@@ -447,6 +528,112 @@ export class McpRegistry {
       };
     } catch (err) {
       return makeToolError(id, `failed to mark done: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * `symphony.transition({ to_state, notes? })`: validate the target against the
+   * declared `states:` map + the current state's `allowed_transitions` list, then
+   * delegate to `performTransition` which owns the actual file move and flag flip.
+   *
+   * Validation failures return MCP tool-result errors (`isError: true`) with a
+   * human-readable text block AND a structured JSON block describing the error
+   * shape. This is NOT a JSON-RPC `error` envelope — the SDK delivers it as a
+   * normal tool result and the agent reads the structured payload to pick a valid
+   * target on its next call. `marked_done` stays false; no file is touched.
+   */
+  private async callTransition(
+    active: ActiveEntry,
+    id: string | number | null,
+    args: Record<string, unknown>,
+  ): Promise<McpJsonRpcResponse> {
+    const toStateRaw = typeof args.to_state === 'string' ? args.to_state.trim() : '';
+    const notes = typeof args.notes === 'string' ? args.notes : '';
+    if (!toStateRaw) {
+      return makeToolError(id, 'to_state is required and must be a non-empty string');
+    }
+    if (!this.tracker.moveIssueToState) {
+      return makeToolError(id, 'this tracker does not support state transitions');
+    }
+    const stateMap = this.states;
+    const declaredNames = Object.keys(stateMap);
+    const canonicalTarget = canonicalStateName(stateMap, toStateRaw);
+    if (canonicalTarget === null) {
+      const text = `state "${toStateRaw}" is not declared. declared: ${
+        declaredNames.length > 0 ? declaredNames.join(', ') : '<none>'
+      }`;
+      log.info('mcp transition rejected: unknown_state', {
+        issue_identifier: active.identifier,
+        requested_to_state: toStateRaw,
+        declared_states: declaredNames,
+      });
+      return makeStructuredToolError(id, text, {
+        error: 'unknown_state',
+        declared_states: declaredNames,
+      });
+    }
+    const fromStateRaw = active.entry.issue.state;
+    const canonicalFrom = canonicalStateName(stateMap, fromStateRaw);
+    if (canonicalFrom !== null) {
+      // Per the brief: `allowed_transitions: null | undefined` => "any declared
+      // state is reachable"; a present array => restrict to that list (empty
+      // list => no transitions out, agent must wait for human cleanup).
+      const allowed = stateMap[canonicalFrom]!.allowed_transitions;
+      if (allowed) {
+        const allowedLower = new Set(allowed.map((s) => s.toLowerCase()));
+        if (!allowedLower.has(canonicalTarget.toLowerCase())) {
+          const text = `transition to "${canonicalTarget}" is not allowed from "${canonicalFrom}". allowed: ${
+            allowed.length > 0 ? allowed.join(', ') : '<none>'
+          }`;
+          log.info('mcp transition rejected: transition_not_allowed', {
+            issue_identifier: active.identifier,
+            from_state: canonicalFrom,
+            requested_to_state: canonicalTarget,
+            allowed_transitions: allowed,
+          });
+          return makeStructuredToolError(id, text, {
+            error: 'transition_not_allowed',
+            from_state: canonicalFrom,
+            requested_to_state: canonicalTarget,
+            allowed_transitions: allowed,
+          });
+        }
+      }
+    }
+    const actor = active.entry.resolved_actor;
+    try {
+      const result = await this.performTransition(active, canonicalTarget, notes, actor);
+      log.info('mcp transition', {
+        issue_identifier: active.identifier,
+        from: result.fromState,
+        to: result.toState,
+        notes_len: notes.length,
+        actor,
+        cleanup: active.entry.cleanup_workspace_on_exit,
+      });
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: `Transitioned ${active.identifier} from ${result.fromState} to ${result.toState}${
+                notes.length > 0 ? ` with notes (${notes.length} chars) appended` : ''
+              }. End this turn now; the next dispatch will pick up under the new state.`,
+            },
+          ],
+          isError: false,
+          structuredContent: {
+            from_state: result.fromState,
+            to_state: result.toState,
+            cleanup_workspace_on_exit: active.entry.cleanup_workspace_on_exit,
+            notes_appended: notes.length > 0,
+          },
+        },
+      };
+    } catch (err) {
+      return makeToolError(id, `failed to transition: ${(err as Error).message}`);
     }
   }
 
@@ -494,6 +681,18 @@ export class McpRegistry {
   }
 
   /**
+   * First declared `holding` state in declaration order, or the literal
+   * "Triage" when no holding state is declared. Used by `propose_issue` to
+   * decide where new agent-proposed issues land.
+   */
+  private pickProposeLandingState(): string {
+    for (const [name, cfg] of Object.entries(this.states)) {
+      if (cfg.role === 'holding') return name;
+    }
+    return TRIAGE_STATE;
+  }
+
+  /**
    * Drop a new issue file into the tracker's Triage/ directory. The orchestrator
    * never dispatches Triage entries because the state isn't in active_states; the
    * operator approves or discards from the dashboard. Parent issue (the active
@@ -535,10 +734,16 @@ export class McpRegistry {
         'tracker root is not available; cannot create issue files (is this a non-local tracker?)',
       );
     }
+    // Landing state: first declared `holding` state in declaration order, falling
+    // back to the literal "Triage" string when no holding state is declared. Phase
+    // 1's legacy-fallback synthesis adds an implicit Triage holding state to every
+    // workflow that didn't migrate to the `states:` block, so this path keeps
+    // existing operators' Triage directories working unchanged.
+    const landingState = this.pickProposeLandingState();
     try {
       const result = await writeIssueFile({
         trackerRoot: root,
-        state: TRIAGE_STATE,
+        state: landingState,
         title: titleRaw,
         description,
         priority,
@@ -654,4 +859,50 @@ function makeToolError(id: string | number | null, message: string): McpJsonRpcR
       isError: true,
     },
   };
+}
+
+/**
+ * MCP tool error with both a human-readable text block and a structured JSON
+ * block. Used by `symphony.transition` so agents can read the rejection's
+ * structured payload (`declared_states`, `allowed_transitions`, etc.) to pick a
+ * valid target on their next call without re-parsing the prose. Pairs with
+ * `makeToolError` (text-only) for everything else.
+ */
+function makeStructuredToolError(
+  id: string | number | null,
+  text: string,
+  json: Record<string, unknown>,
+): McpJsonRpcResponse {
+  return {
+    jsonrpc: '2.0',
+    id,
+    result: {
+      // MCP 2025-06-18 `CallToolResult.content` is `ContentBlock[]` and does not
+      // define a `json` block type; the canonical home for machine-readable
+      // payloads is `structuredContent`. Keep only the text block in `content[]`
+      // for human display and put the structured shape on the SDK-recognised slot.
+      content: [{ type: 'text', text }],
+      isError: true,
+      structuredContent: json,
+    },
+  };
+}
+
+/**
+ * Resolve a caller-supplied state name to its canonical declared form (the
+ * casing the operator wrote in `states:`). Comparison is case-insensitive to
+ * mirror the rest of symphony (eligibility, reconciliation, the local-tracker
+ * directory scan all compare lowercase). Returns null when no declared name
+ * matches.
+ */
+function canonicalStateName(
+  states: Record<string, StateConfig>,
+  name: string,
+): string | null {
+  if (Object.prototype.hasOwnProperty.call(states, name)) return name;
+  const lower = name.toLowerCase();
+  for (const declared of Object.keys(states)) {
+    if (declared.toLowerCase() === lower) return declared;
+  }
+  return null;
 }

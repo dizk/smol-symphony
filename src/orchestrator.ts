@@ -16,6 +16,7 @@ import { validateDispatch, WorkflowError } from './workflow.js';
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
 import { pickTerminalTarget } from './mcp.js';
+import { resolveDispatchConfig } from './agent/runner.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
 // snapshot endpoint can attach whatever shape a future ACP `_meta` extension produces.
@@ -292,6 +293,19 @@ export class Orchestrator {
     const byId = new Map(refreshed.map((i) => [i.id, i]));
     const terminal = new Set(this.cfg.tracker.terminal_states.map((s) => s.toLowerCase()));
     const active = new Set(this.cfg.tracker.active_states.map((s) => s.toLowerCase()));
+    // Look up canonical state config (declaration-cased) so the cleanup decision flows
+    // through `role` rather than a hardcoded "terminal => cleanup". Today the role-based
+    // branch lines up exactly with the legacy active/terminal classification (terminal
+    // cleans, anything else doesn't), but routing through `role` lets a future per-state
+    // `cleanup_workspace` flag override the policy without touching reconcile again.
+    const stateMap = this.cfg.states ?? {};
+    const stateLower = new Map<string, string>();
+    for (const name of Object.keys(stateMap)) stateLower.set(name.toLowerCase(), name);
+    const cleanupForState = (stateName: string): boolean => {
+      const canonical = stateLower.get(stateName.toLowerCase());
+      if (!canonical) return false;
+      return stateMap[canonical]!.role === 'terminal';
+    };
     for (const id of ids) {
       const fresh = byId.get(id);
       if (!fresh) {
@@ -301,7 +315,7 @@ export class Orchestrator {
       }
       const s = fresh.state.toLowerCase();
       if (terminal.has(s)) {
-        this.terminateRunning(id, true, 'tracker_state_terminal');
+        this.terminateRunning(id, cleanupForState(fresh.state), 'tracker_state_terminal');
       } else if (active.has(s)) {
         const entry = this.running.get(id);
         if (entry) entry.issue = fresh;
@@ -411,6 +425,20 @@ export class Orchestrator {
       snapshot?.trackerRoot ?? (this.tracker.currentRoot ? this.tracker.currentRoot() : null);
     const terminalTargetAtDispatch =
       snapshot?.terminalTarget ?? pickTerminalTarget(this.cfg.tracker.terminal_states);
+    // Resolve "<adapter>/<model or 'default'>" at dispatch time and pin it on the
+    // entry. The MCP transition tool stamps this into the notes-block header the
+    // next agent reads in `issue.description`. resolveDispatchConfig already folds
+    // any per-state override on top of the workflow defaults; falling back to a
+    // workflow-default-only string when no states map is declared (e.g. an older
+    // test harness) keeps the field non-null without falsely advertising a
+    // per-state binding the orchestrator never saw.
+    let resolvedActor: string;
+    try {
+      const resolved = resolveDispatchConfig(this.cfg, issue.state);
+      resolvedActor = `${resolved.adapter}/${resolved.model ?? 'default'}`;
+    } catch {
+      resolvedActor = `${this.cfg.acp.adapter}/${this.cfg.acp.model ?? 'default'}`;
+    }
     const entry: RunningEntry = {
       issue_id: issue.id,
       identifier: issue.identifier,
@@ -441,6 +469,7 @@ export class Orchestrator {
       mcp_token: null,
       tracker_root_at_dispatch: trackerRootAtDispatch,
       terminal_target_at_dispatch: terminalTargetAtDispatch,
+      resolved_actor: resolvedActor,
       marked_done: false,
       steering_requested: false,
       steering_question: null,

@@ -255,6 +255,10 @@ export interface RunningEntry {
   // McpRegistry.activate copies these into the ActiveEntry as-is.
   tracker_root_at_dispatch: string | null;
   terminal_target_at_dispatch: string;
+  // Resolved "<adapter>/<model or 'default'>" identity at dispatch time. Stamped
+  // into the notes header that `symphony.transition` writes onto the issue body so
+  // the next agent (reading the issue in its new state) sees who handed off.
+  resolved_actor: string;
   // Tool-driven exit signals. The runner reads these between turns.
   marked_done: boolean;
   // The MCP request_human_steering tool sets steering_requested = true and stashes the

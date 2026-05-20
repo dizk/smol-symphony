@@ -66,6 +66,7 @@ function makeEntry(
     mcp_token: null,
     tracker_root_at_dispatch: over.tracker_root_at_dispatch ?? null,
     terminal_target_at_dispatch: over.terminal_target_at_dispatch ?? 'Done',
+    resolved_actor: 'claude/default',
     marked_done: false,
     steering_requested: false,
     steering_question: null,
@@ -201,7 +202,7 @@ describe('LocalMarkdownTracker.moveIssueToState', () => {
 });
 
 describe('McpRegistry JSON-RPC', () => {
-  it('lists the two tools', async () => {
+  it('lists the four tools', async () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
@@ -216,7 +217,12 @@ describe('McpRegistry JSON-RPC', () => {
       assert.ok(res && 'result' in res);
       const result = res.result as { tools: Array<{ name: string }> };
       const names = result.tools.map((t) => t.name).sort();
-      assert.deepEqual(names, ['mark_done', 'propose_issue', 'request_human_steering']);
+      assert.deepEqual(names, [
+        'mark_done',
+        'propose_issue',
+        'request_human_steering',
+        'transition',
+      ]);
     } finally {
       await cleanup();
     }
@@ -942,6 +948,421 @@ describe('McpRegistry propose_issue', () => {
       } finally {
         await rm(decoyRoot, { recursive: true, force: true });
       }
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe('McpRegistry transition', () => {
+  // Build a 5-state workflow shape (Todo/Review active, Done/Cancelled terminal,
+  // Triage holding) on disk and feed the same states map into the registry. This
+  // mirrors what bin/symphony.ts wires up at runtime.
+  async function setupStateTree(): Promise<{ root: string; cleanup: () => Promise<void> }> {
+    const r = await mkdtemp(path.join(os.tmpdir(), 'symphony-mcp-states-'));
+    for (const dir of ['Todo', 'Review', 'Done', 'Cancelled', 'Triage']) {
+      await mkdir(path.join(r, dir), { recursive: true });
+    }
+    return { root: r, cleanup: () => rm(r, { recursive: true, force: true }) };
+  }
+
+  const states = {
+    Todo: { role: 'active' as const },
+    Review: { role: 'active' as const, allowed_transitions: ['Todo', 'Done'] },
+    Done: { role: 'terminal' as const },
+    Cancelled: { role: 'terminal' as const },
+    Triage: { role: 'holding' as const },
+  };
+
+  function makeStateTracker(root: string): LocalMarkdownTracker {
+    return new LocalMarkdownTracker({
+      kind: 'local',
+      endpoint: null,
+      api_key: null,
+      project_slug: null,
+      active_states: ['Todo', 'Review'],
+      terminal_states: ['Done', 'Cancelled'],
+      states,
+      root,
+    });
+  }
+
+  it('appends notes, moves the file, sets marked_done and preserves workspace for active→active', async () => {
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(
+        path.join(root, 'Todo', 'ABC-1.md'),
+        `---\ntitle: Issue\n---\nOriginal body.`,
+      );
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      entry.resolved_actor = 'claude/claude-opus-4-7';
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'transition',
+          arguments: {
+            to_state: 'Review',
+            notes: 'Implementation done; please review the workspace cleanup logic.',
+          },
+        },
+      });
+      assert.ok(res && 'result' in res);
+      const result = res.result as {
+        isError: boolean;
+        content: Array<{ type: string; text?: string }>;
+        structuredContent: { from_state: string; to_state: string; cleanup_workspace_on_exit: boolean };
+      };
+      assert.equal(result.isError, false);
+      assert.equal(entry.marked_done, true);
+      // Active→active: workspace NOT cleaned up so the same agent/<id> branch
+      // survives into the next state.
+      assert.equal(entry.cleanup_workspace_on_exit, false);
+      assert.equal(result.structuredContent.from_state, 'Todo');
+      assert.equal(result.structuredContent.to_state, 'Review');
+      assert.equal(result.structuredContent.cleanup_workspace_on_exit, false);
+      // File landed in Review/ with the notes block appended.
+      assert.deepEqual(await readdir(path.join(root, 'Todo')), []);
+      assert.deepEqual(await readdir(path.join(root, 'Review')), ['ABC-1.md']);
+      const body = await readFile(path.join(root, 'Review', 'ABC-1.md'), 'utf8');
+      assert.match(body, /## claude\/claude-opus-4-7 — \S+ — Todo → Review/);
+      assert.match(body, /please review the workspace cleanup logic\./);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('active→terminal sets cleanup_workspace_on_exit', async () => {
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(
+        path.join(root, 'Review', 'ABC-1.md'),
+        `---\ntitle: Issue\n---\nbody`,
+      );
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const entry = makeEntry('ABC-1', 'Review', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Done', notes: 'LGTM' } },
+      });
+      const result = (res as { result: { isError: boolean; structuredContent: { cleanup_workspace_on_exit: boolean } } })
+        .result;
+      assert.equal(result.isError, false);
+      assert.equal(entry.cleanup_workspace_on_exit, true);
+      assert.equal(result.structuredContent.cleanup_workspace_on_exit, true);
+      assert.deepEqual(await readdir(path.join(root, 'Done')), ['ABC-1.md']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('rejects unknown to_state with a structured error listing declared states', async () => {
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Reveiw' } },
+      });
+      assert.ok(res && 'result' in res);
+      const result = res.result as {
+        isError: boolean;
+        content: Array<{ type: string; text?: string }>;
+        structuredContent?: Record<string, unknown>;
+      };
+      assert.equal(result.isError, true);
+      // Human-readable text block.
+      const text = result.content.find((c) => c.type === 'text');
+      assert.ok(text && /not declared/.test(text.text ?? ''));
+      assert.ok(text && /Todo, Review, Done, Cancelled, Triage/.test(text.text ?? ''));
+      // Structured payload on the SDK's structuredContent slot (MCP 2025-06-18).
+      assert.ok(result.structuredContent);
+      assert.equal(result.structuredContent!['error'], 'unknown_state');
+      assert.deepEqual(result.structuredContent!['declared_states'], [
+        'Todo',
+        'Review',
+        'Done',
+        'Cancelled',
+        'Triage',
+      ]);
+      // No file move, no flag flip.
+      assert.equal(entry.marked_done, false);
+      assert.equal(entry.cleanup_workspace_on_exit, false);
+      assert.deepEqual(await readdir(path.join(root, 'Todo')), ['ABC-1.md']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('rejects disallowed transitions with allowed_transitions list', async () => {
+    // Review declares allowed_transitions: [Todo, Done]; attempting to jump to
+    // Cancelled must be rejected with a structured payload.
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Review', 'ABC-1.md'), `---\ntitle: R\n---\nbody`);
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const entry = makeEntry('ABC-1', 'Review', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Cancelled' } },
+      });
+      const result = (res as {
+        result: {
+          isError: boolean;
+          content: Array<{ type: string; text?: string }>;
+          structuredContent?: Record<string, unknown>;
+        };
+      }).result;
+      assert.equal(result.isError, true);
+      const text = result.content.find((c) => c.type === 'text');
+      assert.ok(text && /not allowed from "Review"/.test(text.text ?? ''));
+      assert.ok(result.structuredContent);
+      assert.equal(result.structuredContent!['error'], 'transition_not_allowed');
+      assert.equal(result.structuredContent!['from_state'], 'Review');
+      assert.equal(result.structuredContent!['requested_to_state'], 'Cancelled');
+      assert.deepEqual(result.structuredContent!['allowed_transitions'], ['Todo', 'Done']);
+      // No-op on disk.
+      assert.equal(entry.marked_done, false);
+      assert.deepEqual(await readdir(path.join(root, 'Review')), ['ABC-1.md']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('case-insensitive target match preserves declared casing in the move', async () => {
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      // Lowercase 'review' must resolve to the declared 'Review' state.
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'review', notes: 'x' } },
+      });
+      const result = (res as { result: { isError: boolean; structuredContent: { to_state: string } } }).result;
+      assert.equal(result.isError, false);
+      assert.equal(result.structuredContent.to_state, 'Review');
+      // The file lands in the declared-casing directory.
+      assert.deepEqual(await readdir(path.join(root, 'Review')), ['ABC-1.md']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('mark_done shim routes through the transition path, moves to first terminal, sets cleanup, persists mark_done.md', async () => {
+    const { root, cleanup } = await setupStateTree();
+    const tmpWs = await mkdtemp(path.join(os.tmpdir(), 'symphony-mark-ws-shim-'));
+    try {
+      await mkdir(path.join(tmpWs, '.git'), { recursive: true });
+      await writeFile(path.join(root, 'Review', 'ABC-1.md'), `---\ntitle: R\n---\nReview body`);
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const entry = makeEntry('ABC-1', 'Review', {
+        tracker_root_at_dispatch: root,
+        terminal_target_at_dispatch: 'Done',
+      });
+      entry.workspace_path = tmpWs;
+      entry.resolved_actor = 'codex/gpt-5-codex';
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'mark_done', arguments: { title: 'Ship it', summary: 'All green.' } },
+      });
+      const result = (res as { result: { isError: boolean } }).result;
+      assert.equal(result.isError, false);
+      assert.equal(entry.marked_done, true);
+      assert.equal(entry.cleanup_workspace_on_exit, true);
+      // File moved to the dispatch-pinned terminal state.
+      assert.deepEqual(await readdir(path.join(root, 'Done')), ['ABC-1.md']);
+      // Notes were stamped onto the file too (transition path appends them).
+      const body = await readFile(path.join(root, 'Done', 'ABC-1.md'), 'utf8');
+      assert.match(body, /## codex\/gpt-5-codex — \S+ — Review → Done/);
+      assert.match(body, /# Ship it/);
+      assert.match(body, /All green\./);
+      // mark_done.md persisted to the workspace staging dir for the after_run hook.
+      const md = await readFile(path.join(tmpWs, '.git', 'symphony-runtime', 'mark_done.md'), 'utf8');
+      assert.match(md, /^# Ship it\n\nAll green\.\n$/);
+    } finally {
+      await rm(tmpWs, { recursive: true, force: true });
+      await cleanup();
+    }
+  });
+
+  it('propose_issue lands in the first declared holding state, not literal Triage', async () => {
+    // Workflow with a holding state named something other than "Triage" — the
+    // proposal must land there, not in a hardcoded Triage directory.
+    const customStates = {
+      Todo: { role: 'active' as const },
+      Done: { role: 'terminal' as const },
+      Inbox: { role: 'holding' as const },
+    };
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-propose-holding-'));
+    try {
+      for (const dir of ['Todo', 'Done', 'Inbox']) {
+        await mkdir(path.join(root, dir), { recursive: true });
+      }
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo'],
+        terminal_states: ['Done'],
+        states: customStates,
+        root,
+      });
+      const reg = new McpRegistry(t, { terminalStates: ['Done'], states: customStates });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'propose_issue', arguments: { title: 'New idea' } },
+      });
+      const result = (res as {
+        result: { isError: boolean; structuredContent: { state: string; identifier: string } };
+      }).result;
+      assert.equal(result.isError, false);
+      assert.equal(result.structuredContent.state, 'Inbox');
+      assert.deepEqual(await readdir(path.join(root, 'Inbox')), ['new-idea.md']);
+      // Triage directory got materialized only because we mkdir'd nothing in
+      // setupStateTree; here we never created one and none was implicitly used.
+      let triageFiles: string[] = [];
+      try {
+        triageFiles = await readdir(path.join(root, 'Triage'));
+      } catch {
+        triageFiles = [];
+      }
+      assert.deepEqual(triageFiles, []);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('propose_issue falls back to literal "Triage" when no holding state is declared', async () => {
+    const noHoldingStates = {
+      Todo: { role: 'active' as const },
+      Done: { role: 'terminal' as const },
+    };
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-propose-fallback-'));
+    try {
+      for (const dir of ['Todo', 'Done']) {
+        await mkdir(path.join(root, dir), { recursive: true });
+      }
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo'],
+        terminal_states: ['Done'],
+        states: noHoldingStates,
+        root,
+      });
+      const reg = new McpRegistry(t, { terminalStates: ['Done'], states: noHoldingStates });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'propose_issue', arguments: { title: 'Triage me' } },
+      });
+      const result = (res as {
+        result: { isError: boolean; structuredContent: { state: string } };
+      }).result;
+      assert.equal(result.isError, false);
+      assert.equal(result.structuredContent.state, 'Triage');
+      // writeIssueFile mkdir's the target state directory; Triage was created
+      // implicitly even though it wasn't in `states`.
+      assert.deepEqual(await readdir(path.join(root, 'Triage')), ['triage-me.md']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects transition when to_state is missing', async () => {
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { terminalStates: ['Done', 'Cancelled'], states });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: {} },
+      });
+      const result = (res as { result: { isError: boolean; content: Array<{ text: string }> } })
+        .result;
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /to_state is required/);
+      assert.equal(entry.marked_done, false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('updateStates picks up workflow reload — a state added post-construction is reachable', async () => {
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
+      const t = makeStateTracker(root);
+      // Construct with a minimal map missing Review.
+      const reg = new McpRegistry(t, {
+        terminalStates: ['Done', 'Cancelled'],
+        states: { Todo: { role: 'active' }, Done: { role: 'terminal' } },
+      });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      // First call: Review isn't declared yet.
+      const beforeReload = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Review' } },
+      });
+      const beforeReloadResult = (beforeReload as { result: { isError: boolean } }).result;
+      assert.equal(beforeReloadResult.isError, true);
+      // Reload pushes the full state map in.
+      reg.updateStates(states);
+      const afterReload = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Review', notes: 'ok' } },
+      });
+      const afterReloadResult = (afterReload as { result: { isError: boolean } }).result;
+      assert.equal(afterReloadResult.isError, false);
+      assert.deepEqual(await readdir(path.join(root, 'Review')), ['ABC-1.md']);
     } finally {
       await cleanup();
     }

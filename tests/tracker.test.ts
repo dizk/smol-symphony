@@ -222,3 +222,140 @@ describe('local tracker state-machine integration', () => {
     }
   });
 });
+
+describe('local tracker moveIssueToState with notes', () => {
+  it('appends a notes block before the cross-directory rename', async () => {
+    // Phase 3 contract: when `opts.notes` is non-empty, the tracker writes the
+    // appended body to a same-dir tmp file, atomically renames it onto the source
+    // .md (so the file is still in the source state directory but now carries the
+    // notes), then does the cross-directory rename. The final moved file at the
+    // destination must contain BOTH the original body and the notes block in the
+    // documented header shape.
+    const { mkdtemp, mkdir, writeFile, rm, readFile } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-tracker-notes-'));
+    try {
+      await mkdir(path.join(root, 'Todo'), { recursive: true });
+      await mkdir(path.join(root, 'Review'), { recursive: true });
+      await writeFile(
+        path.join(root, 'Todo', 'A-1.md'),
+        `---\nidentifier: A-1\ntitle: First\n---\nOriginal body.`,
+      );
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo', 'Review'],
+        terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Review: { role: 'active' },
+          Done: { role: 'terminal' },
+        },
+        root,
+      });
+      const before = Date.now();
+      const result = await t.moveIssueToState('A-1', 'Review', {
+        notes: 'Looks good overall, but please rename `foo` -> `bar`.',
+        actor: 'claude/claude-opus-4-7',
+      });
+      const after = Date.now();
+      assert.equal(result.fromState, 'Todo');
+      assert.equal(result.toState, 'Review');
+      // Source dir is empty (file moved), and there's no leftover .tmp.
+      const todoFiles = await (await import('node:fs/promises')).readdir(path.join(root, 'Todo'));
+      assert.deepEqual(todoFiles, []);
+      const reviewFiles = await (await import('node:fs/promises')).readdir(path.join(root, 'Review'));
+      assert.deepEqual(reviewFiles, ['A-1.md']);
+      const body = await readFile(path.join(root, 'Review', 'A-1.md'), 'utf8');
+      // Original body preserved verbatim.
+      assert.match(body, /^---\nidentifier: A-1\ntitle: First\n---\nOriginal body\./);
+      // Header has actor + ISO timestamp + arrow.
+      const header = /## claude\/claude-opus-4-7 — (\S+) — Todo → Review/;
+      const m = body.match(header);
+      assert.ok(m, `expected notes header in body, got: ${body}`);
+      const ts = Date.parse(m![1]!);
+      assert.ok(ts >= before && ts <= after, `header timestamp out of range: ${m![1]}`);
+      // Notes body present below the header with a blank line in between.
+      assert.match(body, /## claude\/claude-opus-4-7.*\n\nLooks good overall/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('uses "unknown" actor when none supplied', async () => {
+    const { mkdtemp, mkdir, writeFile, rm, readFile } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-tracker-notes-anon-'));
+    try {
+      await mkdir(path.join(root, 'Todo'), { recursive: true });
+      await mkdir(path.join(root, 'Review'), { recursive: true });
+      await writeFile(path.join(root, 'Todo', 'A-1.md'), `---\ntitle: First\n---\nBody.`);
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo', 'Review'],
+        terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Review: { role: 'active' },
+          Done: { role: 'terminal' },
+        },
+        root,
+      });
+      await t.moveIssueToState('A-1', 'Review', { notes: 'hello' });
+      const body = await readFile(path.join(root, 'Review', 'A-1.md'), 'utf8');
+      assert.match(body, /## unknown — \S+ — Todo → Review\n\nhello/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips notes append when notes is absent or empty (legacy mark_done path)', async () => {
+    const { mkdtemp, mkdir, writeFile, rm, readFile } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-tracker-notes-skip-'));
+    try {
+      await mkdir(path.join(root, 'Todo'), { recursive: true });
+      await mkdir(path.join(root, 'Done'), { recursive: true });
+      await writeFile(
+        path.join(root, 'Todo', 'A-1.md'),
+        `---\ntitle: First\n---\nUntouched body.`,
+      );
+      const t = new LocalMarkdownTracker({
+        kind: 'local',
+        endpoint: null,
+        api_key: null,
+        project_slug: null,
+        active_states: ['Todo'],
+        terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+        },
+        root,
+      });
+      // No notes passed.
+      await t.moveIssueToState('A-1', 'Done');
+      const a = await readFile(path.join(root, 'Done', 'A-1.md'), 'utf8');
+      assert.equal(a, `---\ntitle: First\n---\nUntouched body.`);
+
+      // Reset and try with empty-string notes.
+      await writeFile(
+        path.join(root, 'Todo', 'A-2.md'),
+        `---\ntitle: Two\n---\nbody2`,
+      );
+      await t.moveIssueToState('A-2', 'Done', { notes: '' });
+      const b = await readFile(path.join(root, 'Done', 'A-2.md'), 'utf8');
+      assert.equal(b, `---\ntitle: Two\n---\nbody2`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
