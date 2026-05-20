@@ -25,6 +25,7 @@ import { parse as parseYaml } from 'yaml';
 import type { Issue, BlockerRef, TrackerConfig } from '../types.js';
 import type { IssueTracker, CandidateFetchResult } from './types.js';
 import { TrackerError } from './types.js';
+import { activeStateNames, terminalStateNames } from '../issues.js';
 import { log } from '../logging.js';
 
 interface RawIssueFile {
@@ -126,8 +127,8 @@ export class LocalMarkdownTracker implements IssueTracker {
     // fetch I/O cannot make the returned issues and the returned snapshot
     // disagree — both come from this single view of cfg.
     const root = this.cfg.root!;
-    const active = new Set(this.cfg.active_states.map((s) => s.toLowerCase()));
-    const terminal = new Set(this.cfg.terminal_states.map((s) => s.toLowerCase()));
+    const active = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
+    const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
     const all = await this.scanAllAt(root);
     const filtered = all.filter((raw) => {
       const s = raw.state.toLowerCase();

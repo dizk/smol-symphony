@@ -24,8 +24,6 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     workflow_dir: '/tmp',
     tracker: {
       kind: 'local',
-      active_states: ['Todo'],
-      terminal_states: ['Done'],
       states,
       root: '/tmp/issues',
     },

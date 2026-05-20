@@ -40,8 +40,6 @@ async function bootServer(
   const tracker = opts?.withTracker
     ? new LocalMarkdownTracker({
         kind: 'local',
-        active_states: ['Todo', 'In Progress'],
-        terminal_states: ['Done', 'Cancelled'],
         states: {
           Todo: { role: 'active' },
           'In Progress': { role: 'active' },
@@ -57,8 +55,6 @@ async function bootServer(
     host: '127.0.0.1',
     getTrackerView: () => ({
       trackerRoot,
-      activeStates: ['Todo', 'In Progress'],
-      terminalStates: ['Done', 'Cancelled'],
       states: [
         { name: 'Todo', role: 'active' },
         { name: 'In Progress', role: 'active' },
@@ -605,8 +601,6 @@ describe('attention partial — Markdown rendering for steering questions', () =
       host: '127.0.0.1',
       getTrackerView: () => ({
         trackerRoot: root,
-        activeStates: ['Todo', 'In Progress'],
-        terminalStates: ['Done', 'Cancelled'],
         states: [
           { name: 'Todo', role: 'active' },
           { name: 'In Progress', role: 'active' },
@@ -644,21 +638,15 @@ describe('attention partial — Markdown rendering for steering questions', () =
 
 interface BespokeServerOpts {
   states: Array<{ name: string; role: 'active' | 'terminal' | 'holding' }>;
-  trackerActiveStates?: string[];
-  trackerTerminalStates?: string[];
 }
 
 async function bootBespoke(
   trackerRoot: string,
   bespoke: BespokeServerOpts,
 ): Promise<{ url: string; close: () => Promise<void> }> {
-  const activeNames = bespoke.trackerActiveStates ?? bespoke.states.filter((s) => s.role === 'active').map((s) => s.name);
-  const terminalNames = bespoke.trackerTerminalStates ?? bespoke.states.filter((s) => s.role === 'terminal').map((s) => s.name);
   const orch = makeStubOrchestrator();
   const tracker = new LocalMarkdownTracker({
     kind: 'local',
-    active_states: activeNames,
-    terminal_states: terminalNames,
     states: Object.fromEntries(bespoke.states.map((s) => [s.name, { role: s.role }])),
     root: trackerRoot,
   });
@@ -667,8 +655,6 @@ async function bootBespoke(
     host: '127.0.0.1',
     getTrackerView: () => ({
       trackerRoot,
-      activeStates: activeNames,
-      terminalStates: terminalNames,
       states: bespoke.states,
       workflowPath: '/tmp/WORKFLOW.md',
     }),

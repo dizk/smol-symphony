@@ -24,6 +24,7 @@ import {
   type AcpAdapterId,
 } from './adapters.js';
 import type { McpRegistry } from '../mcp.js';
+import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { RunLog } from '../runlog.js';
@@ -613,7 +614,7 @@ export class AgentRunner {
     let currentIssue = issue;
     let pendingSteering: { question: string; context: string | null; reply: string } | null = null;
     let firstTurn = true;
-    const activeStates = new Set(this.cfg.tracker.active_states.map((s) => s.toLowerCase()));
+    const activeStates = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
 
     // Decoupled from max_turns: the loop runs as long as the agent keeps engaging. Only
     // autonomous turns (turns without a pending human reply) count against max_turns.

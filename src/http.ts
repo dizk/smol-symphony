@@ -296,8 +296,6 @@ async function gatherPartialInputs(
   orch: Orchestrator,
   view: {
     trackerRoot: string | null;
-    activeStates: string[];
-    terminalStates: string[];
     states: StateView[];
     workflowPath: string;
   },
@@ -315,8 +313,6 @@ async function gatherPartialInputs(
     workflowName: path.basename(view.workflowPath || 'workflow.md'),
     workflowPath: view.workflowPath || '',
     trackerRoot,
-    activeStates: view.activeStates,
-    terminalStates: view.terminalStates,
     states: view.states,
     snapshot: orch.snapshot(),
     diskIssues,
@@ -344,14 +340,10 @@ interface PartialInputs {
   workflowName: string;
   workflowPath: string;
   trackerRoot: string;
-  activeStates: string[];
-  terminalStates: string[];
   // Declared per-state config in workflow declaration order. Drives the role-based
-  // pill class (active → running, terminal → done, holding → idle) and the column
-  // ordering in the on-disk listing. `activeStates` / `terminalStates` are derived
-  // snapshots kept around so the form-default and existing filter call sites don't
-  // need to switch in this pass — the role-based lookup is the new source of truth
-  // for everything where the role itself matters.
+  // pill class (active → running, terminal → done, holding → idle), the on-disk
+  // column ordering, and (via role filters at the call sites) the form-default
+  // active state and triage approve/discard targets.
   states: StateView[];
   snapshot: Snapshot;
   diskIssues: DiskIssue[];
@@ -498,8 +490,9 @@ function renderRetryBlock(rows: RetryRow[]): string {
 function renderSessionsPartial(p: PartialInputs): string {
   const rows = p.snapshot.running;
   if (rows.length === 0) {
+    const firstActive = p.states.find((s) => s.role === 'active')?.name ?? 'Todo';
     return `<h2>sessions</h2>
-<p class="empty dim">no sessions running. agents wake when an issue lands in <code>${escapeHtml(p.activeStates[0] ?? 'Todo')}/</code>.</p>`;
+<p class="empty dim">no sessions running. agents wake when an issue lands in <code>${escapeHtml(firstActive)}/</code>.</p>`;
   }
   const sessionItems = rows.map((r) => renderSessionRow(r)).join('');
   return `<h2>sessions <span class="count dim">(${rows.length})</span></h2>
@@ -560,7 +553,7 @@ function renderTriagePartial(p: PartialInputs): string {
     return '';
   }
   const firstActive = p.states.find((s) => s.role === 'active');
-  const approveTarget = firstActive?.name ?? p.activeStates[0] ?? 'Todo';
+  const approveTarget = firstActive?.name ?? 'Todo';
   const items = triage.map((i) => renderTriageRow(i, approveTarget)).join('');
   return `<h2 class="triage-title">triage <span class="count dim">(${triage.length})</span></h2>
 <ul class="triage">${items}</ul>`;
@@ -640,8 +633,9 @@ function renderDiskPartial(p: PartialInputs): string {
     return a.identifier.localeCompare(b.identifier);
   });
   if (filtered.length === 0) {
+    const firstActive = p.states.find((s) => s.role === 'active')?.name ?? 'Todo';
     return `<h2>on disk</h2>
-<p class="empty dim">tracker is clean. drop a markdown file into <code>${escapeHtml(p.activeStates[0] ?? 'Todo')}/</code> or open <em>new issue</em> below.</p>`;
+<p class="empty dim">tracker is clean. drop a markdown file into <code>${escapeHtml(firstActive)}/</code> or open <em>new issue</em> below.</p>`;
   }
   const items = filtered.map((i) => {
     const href = `/issues/${encodeURIComponent(i.identifier)}`;
@@ -662,8 +656,10 @@ function renderTotalsPartial(p: PartialInputs): string {
 }
 
 function renderDashboardHtml(p: PartialInputs): string {
-  const defaultState = p.activeStates[0] ?? 'Todo';
-  const diskCount = p.diskIssues.filter((i) => p.activeStates.includes(i.state)).length;
+  const activeNames = p.states.filter((s) => s.role === 'active').map((s) => s.name);
+  const defaultState = activeNames[0] ?? 'Todo';
+  const activeNameSet = new Set(activeNames);
+  const diskCount = p.diskIssues.filter((i) => activeNameSet.has(i.state)).length;
   const formOpen =
     diskCount === 0 && p.snapshot.running.length === 0 && p.snapshot.retrying.length === 0;
 
@@ -1303,7 +1299,7 @@ function formatTimestamp(v: unknown): string | null {
 
 function renderIssueDetailPage(
   issue: DiskIssueDetail,
-  view: { workflowPath: string; activeStates: string[]; terminalStates: string[]; states: StateView[] },
+  view: { workflowPath: string; states: StateView[] },
 ): string {
   const fm = issue.frontMatter;
   const title = asString(fm['title']) ?? issue.identifier;
@@ -1556,19 +1552,15 @@ export interface HttpServerOptions {
   port: number;
   host: string;
   /**
-   * Returns the current tracker root, state lists, and the declared per-state
-   * config in workflow order. Wired to the orchestrator's live cfg so a workflow
-   * reload (which mutates the live config object in place) is reflected on the
-   * next request without rebinding the server. `activeStates` / `terminalStates`
-   * are kept as derived snapshots so existing call sites that just want a flat
-   * list of names — the form-default, the issue-creation validation — don't have
-   * to filter `states` themselves; `states` is the canonical role-bearing source
-   * for everything that cares about role.
+   * Returns the current tracker root and the declared per-state config in
+   * workflow order. Wired to the orchestrator's live cfg so a workflow reload
+   * (which mutates the live config object in place) is reflected on the next
+   * request without rebinding the server. The active/terminal/holding splits
+   * are derived inside each consumer by filtering `states` on role; there are
+   * no separate flat lists on the view.
    */
   getTrackerView: () => {
     trackerRoot: string | null;
-    activeStates: string[];
-    terminalStates: string[];
     states: StateView[];
     workflowPath: string;
   };
@@ -1748,12 +1740,13 @@ async function handleRequest(
       const stateInput = typeof b.state === 'string' ? b.state.trim() : '';
       if (!title) return badRequest(res, 'title is required');
       // `identifier` and `state` are optional: identifier is derived from the title when
-      // omitted, state defaults to the first active state (typically `Todo`). This keeps
-      // the dispatch surface to a single required field for callers that just want to
+      // omitted, state defaults to the first declared active state (typically `Todo`). This
+      // keeps the dispatch surface to a single required field for callers that just want to
       // hand the orchestrator a task.
-      const state = stateInput || view.activeStates[0] || '';
+      const firstActiveName = view.states.find((s) => s.role === 'active')?.name ?? '';
+      const state = stateInput || firstActiveName;
       if (!state) {
-        return badRequest(res, 'state is required (no active_states configured to default to)');
+        return badRequest(res, 'state is required (no active states declared to default to)');
       }
       // Restrict `state` to one of the declared states with role in {active, terminal}.
       // Holding states (Triage) are reachable through `propose_issue` and the on-disk
@@ -2009,12 +2002,12 @@ async function handleRequest(
     }
     let toState: string;
     if (action === 'approve') {
-      // First declared `active` state, falling back to the snapshot list (which
-      // Phase 1 derives from `states:` in declaration order) and ultimately to
-      // the literal "Todo" so a workflow without any active states still produces
-      // a defined error path rather than crashing the handler.
+      // First declared `active` state in declaration order, falling back to the
+      // literal "Todo" so a workflow without any active states still produces a
+      // defined error path rather than crashing the handler. (validateStates
+      // refuses configs without an active role, so the fallback is defensive.)
       const firstActive = view.states.find((s) => s.role === 'active');
-      toState = firstActive?.name ?? view.activeStates[0] ?? 'Todo';
+      toState = firstActive?.name ?? 'Todo';
     } else {
       // Discard prefers a state literally named "Cancelled" (case-insensitive)
       // and falls back to the first declared `terminal` state. If neither is

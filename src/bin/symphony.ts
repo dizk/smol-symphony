@@ -176,15 +176,13 @@ async function main() {
         host: config.server.host,
         getTrackerView: () => ({
           trackerRoot: liveCfg.tracker.root,
-          activeStates: liveCfg.tracker.active_states,
-          terminalStates: liveCfg.tracker.terminal_states,
           // Canonical per-state config in workflow declaration order. The HTTP
           // dashboard reads role from here for pill colours, declared order for
-          // the on-disk listing, and approve/discard targets. The closure reads
-          // `liveCfg.states` on every request, and the reload callback reassigns
-          // `liveCfg` to the freshly-parsed config, so a workflow reload is
-          // reflected here without rebinding the server — same pattern as the
-          // active/terminal lists above. Phase 3 wired the equivalent for the
+          // the on-disk listing, and approve/discard targets — each consumer
+          // filters by role on demand. The closure reads `liveCfg.states` on
+          // every request, and the reload callback reassigns `liveCfg` to the
+          // freshly-parsed config, so a workflow reload is reflected here
+          // without rebinding the server. Phase 3 wired the equivalent for the
           // MCP registry via `mcp.updateStates`; this view is its dashboard twin.
           states: Object.entries(liveCfg.states).map(([name, cfg]) => ({
             name,

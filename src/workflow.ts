@@ -161,16 +161,12 @@ export function buildServiceConfig(
     // Default local tracker root: <workflow-dir>/issues
     trackerRoot = path.resolve(workflowDir, 'issues');
   }
-  // `states:` is the canonical schema; tracker.active_states / terminal_states
-  // are derived from it (Cleanup 4 will drop them entirely). Operators who set
-  // either explicitly are ignored — the `states:` block is the only source of
-  // truth.
+  // `states:` is the canonical schema. Consumers that previously read derived
+  // lists (`tracker.active_states` / `tracker.terminal_states`) now filter the
+  // map by role via the helpers in src/issues.ts.
   const states = parseStatesBlock(raw['states']);
-  const { activeStates, terminalStates } = deriveStateLists(states);
   const tracker: TrackerConfig = {
     kind: trackerKind,
-    active_states: activeStates,
-    terminal_states: terminalStates,
     states,
     root: trackerRoot,
   };
@@ -368,9 +364,9 @@ export function buildServiceConfig(
 // Parse the top-level `states:` block. The block is mandatory: every workflow
 // must declare at least one `active`, one `terminal`, and one `holding` state
 // (validation happens in `validateStates`). Insertion order matters —
-// downstream consumers (dashboard, derived active/terminal lists) follow
-// declaration order — so we build a plain object incrementally rather than
-// reconstructing via `Object.fromEntries`.
+// downstream consumers (dashboard, role-filtered active/terminal listings)
+// follow declaration order — so we build a plain object incrementally rather
+// than reconstructing via `Object.fromEntries`.
 function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
   if (raw === undefined || raw === null) {
     throw new WorkflowError(
@@ -443,22 +439,6 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     out[name] = sc;
   }
   return out;
-}
-
-// Project the canonical state map onto the legacy active/terminal-state lists so
-// downstream consumers (tracker queries, dashboard grouping) see consistent
-// values regardless of how the operator declared the workflow.
-function deriveStateLists(states: Record<string, StateConfig>): {
-  activeStates: string[];
-  terminalStates: string[];
-} {
-  const activeStates: string[] = [];
-  const terminalStates: string[] = [];
-  for (const [name, cfg] of Object.entries(states)) {
-    if (cfg.role === 'active') activeStates.push(name);
-    else if (cfg.role === 'terminal') terminalStates.push(name);
-  }
-  return { activeStates, terminalStates };
 }
 
 // §6.3 dispatch preflight validation.

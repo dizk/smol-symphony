@@ -30,18 +30,12 @@ tracker:
   # Resolved relative to the workflow file if not absolute.
   root: ./issues
 
-  # NOTE: `tracker.active_states` and `tracker.terminal_states` are no longer
-  # read from the workflow YAML. They are derived from the required top-level
-  # `states:` map below (every `role: active` entry becomes an active state in
-  # declaration order; every `role: terminal` entry becomes a terminal state).
-  # Do not set them here — they will be silently ignored.
-
 # ─────────────────────────────────────────────────────────────────────────────
 # states — per-state configuration map. REQUIRED. Every workflow must declare
 # at least one `active`, one `terminal`, and one `holding` state; a workflow
 # missing the `states:` block (or missing any of those roles) is rejected at
-# parse time. The orchestrator derives `tracker.active_states` and
-# `tracker.terminal_states` from this map, so do not set those alongside it.
+# parse time. This map is the only place state names and roles are configured;
+# there are no separate active/terminal lists to keep in sync.
 #
 # Keys are state names; values are config objects with these fields:
 #   role (required, enum):
@@ -67,8 +61,8 @@ tracker:
 #             always be rejected with `transition_not_allowed`. Useful for
 #             review-style states that should pause until a human re-routes.
 #
-# Declaration order matters: derived active/terminal lists track it, and the
-# dashboard renders state columns in the same order.
+# Declaration order matters: role-filtered listings (active states, terminal
+# states) follow it, and the dashboard renders state columns in the same order.
 # ─────────────────────────────────────────────────────────────────────────────
 states:
   Todo:

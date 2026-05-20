@@ -44,12 +44,9 @@ export interface StateConfig {
 
 export interface TrackerConfig {
   kind: string;
-  // Derived from `states` after workflow parse so existing consumers keep working
-  // unchanged. `active_states` lists every state with role `active`, in declaration
-  // order; `terminal_states` lists every state with role `terminal`, in declaration
-  // order. `states` is the canonical map.
-  active_states: string[];
-  terminal_states: string[];
+  // Canonical per-state map. Active/terminal/holding membership is read by role
+  // via the helpers in src/issues.ts (`activeStateNames`, `terminalStateNames`)
+  // — no separate derived lists live on this config.
   states: Record<string, StateConfig>;
   // local-tracker only:
   root: string | null;
@@ -188,9 +185,9 @@ export interface ServiceConfig {
   smolvm: SmolvmConfig;
   server: ServerConfig;
   mcp: McpConfig;
-  // Canonical per-state configuration map. `tracker.active_states` /
-  // `tracker.terminal_states` / `tracker.states` are derived from this at parse
-  // time so the tracker (which only sees its slice of config) keeps working.
+  // Canonical per-state configuration map. The same map is mirrored onto
+  // `tracker.states` so the tracker (which only sees its slice of config)
+  // keeps the state set without reaching back into the full ServiceConfig.
   states: Record<string, StateConfig>;
 }
 

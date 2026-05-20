@@ -9,6 +9,7 @@ import {
   expandVar,
   validateDispatch,
 } from '../src/workflow.js';
+import { activeStateNames, terminalStateNames } from '../src/issues.js';
 
 // Reused across the tests that don't care about the states block itself; covers
 // the three required roles so the workflow parser accepts the config.
@@ -142,10 +143,10 @@ describe('workflow states block', () => {
     assert.equal(cfg.states.Todo!.model, 'claude-opus-4-7');
     assert.equal(cfg.states.Todo!.max_turns, 10);
     assert.deepEqual(cfg.states.Review!.allowed_transitions, ['Todo', 'Done']);
-    // Derived active/terminal lists track declaration order so the dashboard's
+    // Role-filtered listings track declaration order so the dashboard's
     // grouping stays deterministic.
-    assert.deepEqual(cfg.tracker.active_states, ['Todo', 'Review']);
-    assert.deepEqual(cfg.tracker.terminal_states, ['Done', 'Cancelled']);
+    assert.deepEqual(activeStateNames(cfg.tracker.states), ['Todo', 'Review']);
+    assert.deepEqual(terminalStateNames(cfg.tracker.states), ['Done', 'Cancelled']);
   });
 
   it('trims and normalizes per-state model overrides', () => {

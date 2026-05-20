@@ -38,6 +38,33 @@ export function pickHoldingState(states: Record<string, StateConfig>): string {
   throw new NoHoldingStateError();
 }
 
+/**
+ * Names of every `role: active` state in declaration order. Used by the
+ * orchestrator's eligibility/reconciliation paths, the local tracker's
+ * candidate filter, and the HTTP dashboard's default-state lookup. Replaces
+ * the derived `tracker.active_states` list that was removed in Cleanup 4.
+ */
+export function activeStateNames(states: Record<string, StateConfig>): string[] {
+  const out: string[] = [];
+  for (const [name, cfg] of Object.entries(states)) {
+    if (cfg.role === 'active') out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Names of every `role: terminal` state in declaration order. Mirror of
+ * `activeStateNames` for the terminal role — used by the orchestrator's
+ * reconcile/eligibility/cleanup paths and by the local tracker.
+ */
+export function terminalStateNames(states: Record<string, StateConfig>): string[] {
+  const out: string[] = [];
+  for (const [name, cfg] of Object.entries(states)) {
+    if (cfg.role === 'terminal') out.push(name);
+  }
+  return out;
+}
+
 // Slugify a title into a filename-safe identifier. Lowercase ASCII with single-dash
 // separators; trims to a sensible length so the on-disk path stays readable. Falls back to
 // `issue` when the title is empty after stripping.

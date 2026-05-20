@@ -22,8 +22,6 @@ const trackerStates = {
 function makeTracker(root: string): LocalMarkdownTracker {
   return new LocalMarkdownTracker({
     kind: 'local',
-    active_states: ['Todo', 'In Progress'],
-    terminal_states: ['Done', 'Cancelled'],
     states: trackerStates,
     root,
   });
@@ -649,8 +647,6 @@ describe('McpRegistry propose_issue', () => {
       try {
         t.updateConfig({
           kind: 'local',
-          active_states: ['Todo', 'In Progress'],
-          terminal_states: ['Done'],
           states: {
             Todo: { role: 'active' },
             'In Progress': { role: 'active' },
@@ -707,8 +703,6 @@ describe('McpRegistry transition', () => {
   function makeStateTracker(root: string): LocalMarkdownTracker {
     return new LocalMarkdownTracker({
       kind: 'local',
-      active_states: ['Todo', 'Review'],
-      terminal_states: ['Done', 'Cancelled'],
       states,
       root,
     });
@@ -914,8 +908,6 @@ describe('McpRegistry transition', () => {
       }
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        active_states: ['Todo'],
-        terminal_states: ['Done'],
         states: customStates,
         root,
       });
@@ -965,8 +957,6 @@ describe('McpRegistry transition', () => {
       }
       const t = new LocalMarkdownTracker({
         kind: 'local',
-        active_states: ['Todo'],
-        terminal_states: ['Done'],
         states: noHoldingStates,
         root,
       });

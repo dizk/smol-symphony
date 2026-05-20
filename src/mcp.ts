@@ -543,8 +543,8 @@ export class McpRegistry {
 
   /**
    * Drop a new issue file into the tracker's Triage/ directory. The orchestrator
-   * never dispatches Triage entries because the state isn't in active_states; the
-   * operator approves or discards from the dashboard. Parent issue (the active
+   * never dispatches Triage entries because the state's role is `holding`, not
+   * `active`; the operator approves or discards from the dashboard. Parent issue (the active
    * dispatch this MCP call came from) is stamped into the front-matter as
    * `proposed_by` so provenance is visible in the file and the UI.
    *

@@ -16,6 +16,7 @@ import { validateDispatch, WorkflowError } from './workflow.js';
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
 import { resolveDispatchConfig } from './agent/runner.js';
+import { activeStateNames, terminalStateNames } from './issues.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
 // snapshot endpoint can attach whatever shape a future ACP `_meta` extension produces.
@@ -282,8 +283,8 @@ export class Orchestrator {
       return;
     }
     const byId = new Map(refreshed.map((i) => [i.id, i]));
-    const terminal = new Set(this.cfg.tracker.terminal_states.map((s) => s.toLowerCase()));
-    const active = new Set(this.cfg.tracker.active_states.map((s) => s.toLowerCase()));
+    const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
+    const active = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
     // Look up canonical state config (declaration-cased) so the cleanup decision flows
     // through `role` rather than a hardcoded "terminal => cleanup". Today the role-based
     // branch lines up exactly with the legacy active/terminal classification (terminal
@@ -346,8 +347,8 @@ export class Orchestrator {
       return 'missing required issue fields';
     }
     const state = issue.state.toLowerCase();
-    const active = new Set(this.cfg.tracker.active_states.map((s) => s.toLowerCase()));
-    const terminal = new Set(this.cfg.tracker.terminal_states.map((s) => s.toLowerCase()));
+    const active = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
+    const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
     if (!active.has(state) || terminal.has(state)) return 'state not active';
     if (this.running.has(issue.id)) return 'already running';
     if (!ignoreOwnClaim && this.claimed.has(issue.id)) return 'already claimed';
@@ -357,7 +358,7 @@ export class Orchestrator {
   }
 
   private hasNonTerminalBlocker(issue: Issue): boolean {
-    const terminal = new Set(this.cfg.tracker.terminal_states.map((s) => s.toLowerCase()));
+    const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
     for (const b of issue.blocked_by) {
       if (!b.state) return true;
       if (!terminal.has(b.state.toLowerCase())) return true;
@@ -722,7 +723,7 @@ export class Orchestrator {
   /** §8.6 startup terminal workspace cleanup. */
   private async startupTerminalCleanup(): Promise<void> {
     try {
-      const terminals = await this.tracker.fetchIssuesByStates(this.cfg.tracker.terminal_states);
+      const terminals = await this.tracker.fetchIssuesByStates(terminalStateNames(this.cfg.states));
       for (const issue of terminals) {
         try {
           await this.workspaces.remove(issue.identifier, this.cfg.hooks);

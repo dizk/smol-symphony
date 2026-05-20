@@ -23,9 +23,8 @@
 
 # Declared workflow states. Drives dispatch eligibility (role: active),
 # terminal cleanup (role: terminal), and the propose_issue landing directory
-# (role: holding). The orchestrator derives `tracker.active_states` and
-# `tracker.terminal_states` from this block — do NOT set those alongside
-# `states:`; pick one or the other.
+# (role: holding). This map is the single source of truth — there are no
+# separate active/terminal lists to keep in sync.
 #
 # Per-state `adapter` / `model` / `max_turns` override the workflow-level
 # `acp.*` and `agent.max_turns` defaults at dispatch time. `allowed_transitions`
