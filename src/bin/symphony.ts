@@ -163,6 +163,7 @@ async function main() {
           workflowPath,
         }),
         mcp,
+        tracker,
       });
       // Tell the registry the actually-bound port (which differs from httpPort when
       // --port 0 is used and the kernel picks an ephemeral port). MCP URLs injected into

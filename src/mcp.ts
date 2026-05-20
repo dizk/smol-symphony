@@ -25,6 +25,7 @@ import path from 'node:path';
 import type { IssueTracker } from './trackers/types.js';
 import type { RunningEntry } from './types.js';
 import { log } from './logging.js';
+import { writeIssueFile, TRIAGE_STATE } from './issues.js';
 
 const TERMINAL_STATE_FOR_DONE_DEFAULT = 'Done';
 
@@ -86,6 +87,36 @@ const TOOL_LIST = [
         },
       },
       required: ['question'],
+    },
+  },
+  {
+    name: 'propose_issue',
+    description:
+      'Propose a new issue for the human to triage. The orchestrator drops the proposal into a non-active "Triage" state directory and does NOT dispatch it — the operator approves (moves to the active queue) or discards it from the dashboard. Use this when you notice work that is out of scope for your current task: an unrelated bug, a follow-up the operator should size, a refactor a future agent could pick up. The parent issue you are working on is automatically recorded; do not paste it into the body.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description:
+            'Short single-line title in imperative voice (≤72 chars recommended). Example: "Fix race condition in workspace cleanup".',
+        },
+        description: {
+          type: 'string',
+          description:
+            'Optional multi-paragraph body for the issue. Explain what you observed, where (file paths), and why it is worth handling separately from your current task.',
+        },
+        labels: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of label strings.',
+        },
+        priority: {
+          type: 'number',
+          description: 'Optional integer priority hint (tracker-defined meaning).',
+        },
+      },
+      required: ['title'],
     },
   },
 ] as const;
@@ -309,6 +340,9 @@ export class McpRegistry {
           if (name === 'request_human_steering') {
             return this.callRequestHumanSteering(active, id, args);
           }
+          if (name === 'propose_issue') {
+            return await this.callProposeIssue(active, id, args);
+          }
           return makeError(id, -32601, `unknown tool: ${name}`);
         }
         case 'ping': {
@@ -457,6 +491,94 @@ export class McpRegistry {
 
   private preferredTerminalState(): string {
     return pickTerminalTarget(this.opts.terminalStates);
+  }
+
+  /**
+   * Drop a new issue file into the tracker's Triage/ directory. The orchestrator
+   * never dispatches Triage entries because the state isn't in active_states; the
+   * operator approves or discards from the dashboard. Parent issue (the active
+   * dispatch this MCP call came from) is stamped into the front-matter as
+   * `proposed_by` so provenance is visible in the file and the UI.
+   *
+   * Uses the dispatch-time tracker root snapshot — same rationale as mark_done:
+   * a WORKFLOW.md reload that mutates tracker.root mid-flight must not redirect
+   * an in-flight propose call to a different filesystem location.
+   */
+  private async callProposeIssue(
+    active: ActiveEntry,
+    id: string | number | null,
+    args: Record<string, unknown>,
+  ): Promise<McpJsonRpcResponse> {
+    const titleRaw = typeof args.title === 'string' ? args.title.trim() : '';
+    const description = typeof args.description === 'string' ? args.description : '';
+    if (!titleRaw) {
+      return makeToolError(id, 'title is required and must be a non-empty string');
+    }
+    if (titleRaw.includes('\n')) {
+      return makeToolError(id, 'title must be a single line (no embedded newlines)');
+    }
+    const labels = Array.isArray(args.labels)
+      ? args.labels.filter((x): x is string => typeof x === 'string')
+      : [];
+    const priority =
+      typeof args.priority === 'number' && Number.isFinite(args.priority) ? args.priority : null;
+
+    // Resolve the tracker root: prefer the dispatch-time snapshot, fall back to the
+    // tracker's live root (e.g. for tests / trackers without a snapshot). Without a
+    // resolvable root we can't write the file, so surface a clean tool error.
+    const root =
+      active.trackerRootSnapshot ??
+      (this.tracker.currentRoot ? this.tracker.currentRoot() : null);
+    if (!root) {
+      return makeToolError(
+        id,
+        'tracker root is not available; cannot create issue files (is this a non-local tracker?)',
+      );
+    }
+    try {
+      const result = await writeIssueFile({
+        trackerRoot: root,
+        state: TRIAGE_STATE,
+        title: titleRaw,
+        description,
+        priority,
+        labels,
+        extra_front_matter: {
+          proposed_by: active.identifier,
+          proposed_at: new Date().toISOString(),
+        },
+      });
+      log.info('mcp propose_issue', {
+        proposed_by: active.identifier,
+        identifier: result.identifier,
+        state: result.state,
+        title: titleRaw,
+        description_chars: description.length,
+      });
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: `Proposed issue ${result.identifier} in ${result.state}/. The operator will approve or discard from the dashboard; do not wait for it. Continue your current task.`,
+            },
+          ],
+          isError: false,
+          // Structured data alongside the human-readable text — MCP clients that
+          // surface this make the identifier programmatically available without
+          // re-parsing the content string.
+          structuredContent: {
+            identifier: result.identifier,
+            state: result.state,
+            path: result.path,
+          },
+        },
+      };
+    } catch (err) {
+      return makeToolError(id, `failed to propose issue: ${(err as Error).message}`);
+    }
   }
 
   /** Snapshot of currently active issues, used by HTTP for routing lookups. */

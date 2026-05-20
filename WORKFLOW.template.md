@@ -297,11 +297,16 @@ server:
 # mcp — Model Context Protocol server exposed to in-VM agents.
 #
 # The orchestrator runs a JSON-RPC endpoint scoped to each active issue at
-# /api/v1/issues/<id>/mcp, gated by a per-dispatch bearer token. Two tools live
-# there:
+# /api/v1/issues/<id>/mcp, gated by a per-dispatch bearer token. Three tools
+# live there:
 #
 #   • symphony.mark_done({ title, summary })
 #   • symphony.request_human_steering({ question, context? })
+#   • symphony.propose_issue({ title, description?, labels?, priority? })
+#     — drops a new issue into the Triage/ state directory (not dispatched
+#       automatically). The operator approves or discards from the dashboard.
+#       The calling issue is recorded as proposed_by in the new file's
+#       front-matter.
 # ─────────────────────────────────────────────────────────────────────────────
 mcp:
   # enabled (bool): when false, the orchestrator refuses to dispatch (MCP is
@@ -361,6 +366,11 @@ Goals:
 4. If you cannot proceed without human input, call
    `symphony.request_human_steering({ question, context? })`. Your turn ends
    immediately; the human's reply arrives as your next prompt.
+5. If you notice work out of scope for this issue — unrelated bugs, follow-ups
+   a human should size, refactors worth a separate dispatch — call
+   `symphony.propose_issue({ title, description?, labels?, priority? })`. It
+   lands in `Triage/`; the operator approves or discards. Do not graft
+   unrelated edits onto this branch.
 
 {% if attempt -%}
 This is continuation/retry attempt {{ attempt }}. Inspect the workspace before

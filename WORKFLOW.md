@@ -305,6 +305,16 @@ Steering tips:
   inspected, what you've already tried, what constraint is forcing the
   question.
 
+If during your work you notice something worth fixing that is **out of scope**
+for your current task — an unrelated bug, a follow-up the operator should
+size, a refactor a future agent could pick up — call
+`symphony.propose_issue({ title, description?, labels?, priority? })`. The
+proposal lands in a Triage state directory that the orchestrator does **not**
+dispatch; the operator approves or discards it from the dashboard. Your
+current issue is automatically recorded as the proposal's parent — do not
+paste it into the body. Use this instead of grafting unrelated changes onto
+your current task; keep your branch focused.
+
 {% if attempt -%}
 This is continuation/retry attempt {{ attempt }}. Inspect the workspace before
 making new edits; your previous run may have left commits on the branch. Check
