@@ -147,7 +147,7 @@ export class Orchestrator {
     if (isKnownAdapter(this.cfg.acp.adapter)) {
       adapters.add(this.cfg.acp.adapter as AcpAdapterId);
     }
-    for (const s of Object.values(this.cfg.states ?? {})) {
+    for (const s of Object.values(this.cfg.states)) {
       if (s.adapter && isKnownAdapter(s.adapter)) {
         adapters.add(s.adapter as AcpAdapterId);
       }
@@ -289,7 +289,7 @@ export class Orchestrator {
     // branch lines up exactly with the legacy active/terminal classification (terminal
     // cleans, anything else doesn't), but routing through `role` lets a future per-state
     // `cleanup_workspace` flag override the policy without touching reconcile again.
-    const stateMap = this.cfg.states ?? {};
+    const stateMap = this.cfg.states;
     const stateLower = new Map<string, string>();
     for (const name of Object.keys(stateMap)) stateLower.set(name.toLowerCase(), name);
     const cleanupForState = (stateName: string): boolean => {

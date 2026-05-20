@@ -20,6 +20,7 @@ describe('resolveDispatchConfig', () => {
           Todo: { role: 'active', adapter: 'claude', model: 'claude-sonnet-4-5', max_turns: 5 },
           Review: { role: 'active', adapter: 'codex', model: 'gpt-5-codex', max_turns: 4 },
           Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
@@ -45,6 +46,7 @@ describe('resolveDispatchConfig', () => {
         states: {
           Todo: { role: 'active' },
           Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
@@ -66,6 +68,7 @@ describe('resolveDispatchConfig', () => {
         states: {
           Review: { role: 'active', adapter: 'codex' },
           Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
@@ -89,6 +92,7 @@ describe('resolveDispatchConfig', () => {
         states: {
           Todo: { role: 'active', max_turns: 7 },
           Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
@@ -105,6 +109,7 @@ describe('resolveDispatchConfig', () => {
         states: {
           Todo: { role: 'active' },
           Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
@@ -125,6 +130,7 @@ describe('resolveDispatchConfig', () => {
         states: {
           Todo: { role: 'active', model: '   ' },
           Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',

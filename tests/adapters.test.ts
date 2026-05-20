@@ -14,6 +14,11 @@ import { validateDispatch } from '../src/workflow.js';
 import type { ServiceConfig } from '../src/types.js';
 
 function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
+  const states: ServiceConfig['states'] = {
+    Todo: { role: 'active' },
+    Done: { role: 'terminal' },
+    Triage: { role: 'holding' },
+  };
   return {
     workflow_path: '/tmp/WORKFLOW.md',
     workflow_dir: '/tmp',
@@ -21,6 +26,7 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
       kind: 'local',
       active_states: ['Todo'],
       terminal_states: ['Done'],
+      states,
       root: '/tmp/issues',
     },
     polling: { interval_ms: 30_000 },
@@ -68,6 +74,7 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     },
     server: { port: null, host: '127.0.0.1' },
     mcp: { enabled: true, host: '10.0.2.2', explicit_host_url: null },
+    states,
   } as ServiceConfig;
 }
 

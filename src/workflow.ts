@@ -161,18 +161,11 @@ export function buildServiceConfig(
     // Default local tracker root: <workflow-dir>/issues
     trackerRoot = path.resolve(workflowDir, 'issues');
   }
-  // Legacy active/terminal lists are still parsed so they can drive the fallback
-  // state-map synthesis below when no `states:` block is declared. Once `states`
-  // is canonical, these get replaced by the derived view computed from the map.
-  const legacyActive = asStringList(trackerRaw['active_states'], ['Todo', 'In Progress']);
-  const legacyTerminal = asStringList(trackerRaw['terminal_states'], [
-    'Closed',
-    'Cancelled',
-    'Canceled',
-    'Duplicate',
-    'Done',
-  ]);
-  const states = parseStatesBlock(raw['states'], legacyActive, legacyTerminal);
+  // `states:` is the canonical schema; tracker.active_states / terminal_states
+  // are derived from it (Cleanup 4 will drop them entirely). Operators who set
+  // either explicitly are ignored — the `states:` block is the only source of
+  // truth.
+  const states = parseStatesBlock(raw['states']);
   const { activeStates, terminalStates } = deriveStateLists(states);
   const tracker: TrackerConfig = {
     kind: trackerKind,
@@ -372,25 +365,31 @@ export function buildServiceConfig(
   };
 }
 
-// Parse the top-level `states:` block. When absent, synthesize a map from the
-// legacy `tracker.active_states` / `tracker.terminal_states` lists so workflows
-// written before the state-machine refactor keep working unchanged. Insertion
-// order matters — downstream consumers (dashboard, derived active/terminal
-// lists) follow declaration order — so we build a plain object incrementally
-// rather than reconstructing via `Object.fromEntries`.
-function parseStatesBlock(
-  raw: unknown,
-  legacyActive: string[],
-  legacyTerminal: string[],
-): Record<string, StateConfig> {
+// Parse the top-level `states:` block. The block is mandatory: every workflow
+// must declare at least one `active`, one `terminal`, and one `holding` state
+// (validation happens in `validateStates`). Insertion order matters —
+// downstream consumers (dashboard, derived active/terminal lists) follow
+// declaration order — so we build a plain object incrementally rather than
+// reconstructing via `Object.fromEntries`.
+function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
   if (raw === undefined || raw === null) {
-    return synthesizeLegacyStates(legacyActive, legacyTerminal);
+    throw new WorkflowError(
+      'workflow_parse_error',
+      'workflow YAML must declare a top-level `states:` block with at least one active, one terminal, and one holding state. See WORKFLOW.template.md for the schema.',
+    );
   }
   if (typeof raw !== 'object' || Array.isArray(raw)) {
     throw new WorkflowError('workflow_parse_error', 'states: must be a map of name → config');
   }
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (entries.length === 0) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      'workflow YAML `states:` block is empty; declare at least one active, one terminal, and one holding state. See WORKFLOW.template.md for the schema.',
+    );
+  }
   const out: Record<string, StateConfig> = {};
-  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+  for (const [name, value] of entries) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new WorkflowError(
         'workflow_parse_error',
@@ -471,12 +470,9 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   if (!existsSync(cfg.tracker.root) || !statSync(cfg.tracker.root).isDirectory()) {
     return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
   }
-  // `cfg.states` is set by buildServiceConfig in every real run; test harnesses
-  // that synthesize a ServiceConfig literal sometimes omit it, so fall back to
-  // the legacy active/terminal lists rather than refusing to validate.
-  const stateMap: Record<string, StateConfig> =
-    cfg.states ?? synthesizeLegacyStates(cfg.tracker.active_states, cfg.tracker.terminal_states);
-  const statesError = validateStates(stateMap);
+  // `cfg.states` is always populated by buildServiceConfig — the parser refuses
+  // workflows without a `states:` block — so callers never need a fallback here.
+  const statesError = validateStates(cfg.states);
   if (statesError) return statesError;
   if (!isKnownAdapter(cfg.acp.adapter)) {
     return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex`;
@@ -494,24 +490,6 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   return null;
 }
 
-// Synthesize a state map from the legacy `tracker.active_states` /
-// `tracker.terminal_states` lists. Includes `Triage` as an implicit holding
-// state so workflows that pre-date the `states:` block — and rely on the
-// propose_issue tool dropping files into a `Triage/` directory — keep working
-// unchanged: the dashboard's approve/discard surface and the local-tracker
-// directory scan both treat it as declared.
-function synthesizeLegacyStates(
-  active: string[],
-  terminal: string[],
-): Record<string, StateConfig> {
-  const out: Record<string, StateConfig> = {};
-  for (const name of active) out[name] = { role: 'active' };
-  for (const name of terminal) out[name] = { role: 'terminal' };
-  const seen = new Set(Object.keys(out).map((n) => n.toLowerCase()));
-  if (!seen.has('triage')) out['Triage'] = { role: 'holding' };
-  return out;
-}
-
 // State-map validation, exposed as a string|null so it composes with the rest of
 // `validateDispatch`. Checks declared in the same order the operator would hit
 // them while iterating on a malformed workflow: structural (roles, uniqueness),
@@ -522,12 +500,17 @@ function validateStates(states: Record<string, StateConfig>): string | null {
   if (names.length === 0) return 'states: at least one state must be declared';
   let hasActive = false;
   let hasTerminal = false;
+  let hasHolding = false;
   for (const cfg of Object.values(states)) {
     if (cfg.role === 'active') hasActive = true;
     else if (cfg.role === 'terminal') hasTerminal = true;
+    else if (cfg.role === 'holding') hasHolding = true;
   }
   if (!hasActive) return 'states: at least one state must have role: active';
   if (!hasTerminal) return 'states: at least one state must have role: terminal';
+  // `holding` is required so `propose_issue` always has a declared landing
+  // directory; the dashboard's triage approve/discard surface also needs it.
+  if (!hasHolding) return 'states: at least one state must have role: holding';
   const seen = new Map<string, string>();
   for (const name of names) {
     const key = name.toLowerCase();

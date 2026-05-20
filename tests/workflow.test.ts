@@ -10,6 +10,14 @@ import {
   validateDispatch,
 } from '../src/workflow.js';
 
+// Reused across the tests that don't care about the states block itself; covers
+// the three required roles so the workflow parser accepts the config.
+const minimalStates = {
+  Todo: { role: 'active' as const },
+  Done: { role: 'terminal' as const },
+  Triage: { role: 'holding' as const },
+};
+
 describe('workflow', () => {
   it('parses front matter + body', () => {
     const r = splitFrontMatter('---\nfoo: 1\n---\nhello body');
@@ -34,7 +42,10 @@ describe('workflow', () => {
     delete process.env.SYM_DOES_NOT_EXIST;
     assert.throws(() =>
       buildServiceConfig(
-        { tracker: { kind: 'local', root: '$SYM_DOES_NOT_EXIST' } },
+        {
+          tracker: { kind: 'local', root: '$SYM_DOES_NOT_EXIST' },
+          states: minimalStates,
+        },
         '/tmp/WORKFLOW.md',
       ),
     );
@@ -47,7 +58,10 @@ describe('workflow', () => {
   });
 
   it('builds defaults', () => {
-    const cfg = buildServiceConfig({ tracker: { kind: 'local', root: '/tmp/issues' } }, '/tmp/WORKFLOW.md');
+    const cfg = buildServiceConfig(
+      { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
+      '/tmp/WORKFLOW.md',
+    );
     assert.equal(cfg.polling.interval_ms, 30000);
     assert.equal(cfg.agent.max_concurrent_agents, 10);
     assert.equal(cfg.agent.max_turns, 20);
@@ -61,6 +75,7 @@ describe('workflow', () => {
     const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
         acp: { adapter: 'claude', model: '  claude-opus-4-7  ' },
       },
       '/tmp/WORKFLOW.md',
@@ -75,11 +90,34 @@ describe('workflow', () => {
     const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
         acp: { adapter: 'claude', model: '   ' },
       },
       '/tmp/WORKFLOW.md',
     );
     assert.equal(cfg.acp.model, null);
+  });
+
+  it('rejects a workflow YAML with no states block', () => {
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          { tracker: { kind: 'local', root: '/tmp/issues' } },
+          '/tmp/WORKFLOW.md',
+        ),
+      /must declare a top-level `states:` block/,
+    );
+  });
+
+  it('rejects a workflow YAML whose states block is empty', () => {
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          { tracker: { kind: 'local', root: '/tmp/issues' }, states: {} },
+          '/tmp/WORKFLOW.md',
+        ),
+      /`states:` block is empty/,
+    );
   });
 });
 
@@ -110,30 +148,6 @@ describe('workflow states block', () => {
     assert.deepEqual(cfg.tracker.terminal_states, ['Done', 'Cancelled']);
   });
 
-  it('synthesizes a states map from legacy active/terminal lists when absent', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: {
-          kind: 'local',
-          root: '/tmp/issues',
-          active_states: ['Todo', 'In Progress'],
-          terminal_states: ['Done', 'Cancelled'],
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(cfg.states['Todo']!.role, 'active');
-    assert.equal(cfg.states['In Progress']!.role, 'active');
-    assert.equal(cfg.states['Done']!.role, 'terminal');
-    assert.equal(cfg.states['Cancelled']!.role, 'terminal');
-    // Triage falls in implicitly as a holding state so workflows using the
-    // propose_issue tool keep functioning without re-declaring it.
-    assert.equal(cfg.states['Triage']!.role, 'holding');
-    // No per-state overrides come from the legacy synthesis.
-    assert.equal(cfg.states['Todo']!.adapter, undefined);
-    assert.equal(cfg.states['Todo']!.model, undefined);
-  });
-
   it('trims and normalizes per-state model overrides', () => {
     const cfg = buildServiceConfig(
       {
@@ -142,6 +156,7 @@ describe('workflow states block', () => {
           Todo: { role: 'active', model: '  claude-opus-4-7  ' },
           Review: { role: 'active', model: '   ' },
           Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
@@ -192,6 +207,20 @@ describe('workflow states validation', () => {
     });
   });
 
+  it('rejects a workflow with no holding state', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: { Todo: { role: 'active' }, Done: { role: 'terminal' } },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /at least one state must have role: holding/);
+    });
+  });
+
   it('rejects duplicate state names (case-insensitive)', async () => {
     await withTrackerRoot(async (root) => {
       const cfg = buildServiceConfig(
@@ -201,6 +230,7 @@ describe('workflow states validation', () => {
             Todo: { role: 'active' },
             todo: { role: 'active' },
             Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
           },
         },
         '/tmp/WORKFLOW.md',
@@ -218,6 +248,7 @@ describe('workflow states validation', () => {
           states: {
             Todo: { role: 'active', allowed_transitions: ['Mystery'] },
             Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
           },
         },
         '/tmp/WORKFLOW.md',
@@ -235,6 +266,7 @@ describe('workflow states validation', () => {
           states: {
             Todo: { role: 'active', adapter: 'opencode' },
             Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
           },
         },
         '/tmp/WORKFLOW.md',
@@ -259,6 +291,7 @@ describe('workflow states validation', () => {
             states: {
               Todo: { role: 'active', adapter: 'claude' },
               Done: { role: 'terminal' },
+              Triage: { role: 'holding' },
             },
           },
           '/tmp/WORKFLOW.md',
@@ -288,6 +321,7 @@ describe('workflow states validation', () => {
             states: {
               Todo: { role: 'active' },
               Done: { role: 'terminal' },
+              Triage: { role: 'holding' },
             },
           },
           '/tmp/WORKFLOW.md',

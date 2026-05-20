@@ -26,7 +26,7 @@ import { Buffer } from 'node:buffer';
 import type { IssueTracker } from './trackers/types.js';
 import type { RunningEntry, StateConfig } from './types.js';
 import { log } from './logging.js';
-import { writeIssueFile, pickHoldingState } from './issues.js';
+import { writeIssueFile, pickHoldingState, NoHoldingStateError } from './issues.js';
 
 const PROTOCOL_VERSION = '2025-06-18';
 
@@ -583,12 +583,26 @@ export class McpRegistry {
         'tracker root is not available; cannot create issue files (is this a non-local tracker?)',
       );
     }
-    // Landing state: first declared `holding` state in declaration order, falling
-    // back to the literal "Triage" string when no holding state is declared. Phase
-    // 1's legacy-fallback synthesis adds an implicit Triage holding state to every
-    // workflow that didn't migrate to the `states:` block, so this path keeps
-    // existing operators' Triage directories working unchanged.
-    const landingState = pickHoldingState(this.states);
+    // Landing state: first declared `holding` state in declaration order. The
+    // workflow parser refuses configs without one, but if validation was
+    // bypassed we surface a structured `no_holding_state` error so the agent
+    // doesn't keep retrying against a misconfigured workflow.
+    let landingState: string;
+    try {
+      landingState = pickHoldingState(this.states);
+    } catch (err) {
+      if (err instanceof NoHoldingStateError) {
+        return makeStructuredToolError(
+          id,
+          'cannot propose issue: workflow has no holding-role state declared',
+          {
+            error: 'no_holding_state',
+            declared_states: Object.keys(this.states),
+          },
+        );
+      }
+      throw err;
+    }
     try {
       const result = await writeIssueFile({
         trackerRoot: root,

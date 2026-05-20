@@ -9,7 +9,7 @@ import { parse as parseYaml } from 'yaml';
 import type { Orchestrator } from './orchestrator.js';
 import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
-import { writeIssueFile, TRIAGE_STATE } from './issues.js';
+import { writeIssueFile } from './issues.js';
 import type { IssueTracker } from './trackers/types.js';
 import type { StateConfig } from './types.js';
 
@@ -546,15 +546,13 @@ function renderSessionRow(r: RunningRow): string {
 // minus the "from <parent>" bit — meaning operators can also pre-stage human proposals
 // in that directory.
 function renderTriagePartial(p: PartialInputs): string {
-  // Surface every issue whose on-disk state has role `holding`. The legacy
-  // synthesis path stamps an implicit "Triage" state onto un-migrated workflows
-  // so the panel keeps working there; workflows that declare alternative holding
-  // names (e.g. "Backlog") get them surfaced through the same panel without
-  // touching this code again.
+  // Surface every issue whose on-disk state has role `holding`. The workflow
+  // parser refuses configs without at least one holding state, so this set is
+  // always non-empty in production; the dashboard simply mirrors whatever the
+  // operator declared (alternative names like "Backlog" surface here too).
   const holdingNames = new Set(
     p.states.filter((s) => s.role === 'holding').map((s) => s.name.toLowerCase()),
   );
-  if (holdingNames.size === 0) holdingNames.add(TRIAGE_STATE.toLowerCase());
   const triage = p.diskIssues.filter((i) => holdingNames.has(i.state.toLowerCase()));
   if (triage.length === 0) {
     // Empty state is silent rather than narrated — operators see "triage" only when
@@ -2035,14 +2033,21 @@ async function handleRequest(
       }
       toState = target.name;
     }
-    // From-state for the move: the first declared `holding` state in declaration
-    // order, with the literal "Triage" as a final fallback. Phase 1's legacy
-    // synthesis stamps Triage onto every un-migrated workflow, so this is the
-    // same string the dashboard's renderTriagePartial filter and the MCP
-    // propose_issue tool both target. Kept in sync with `pickHoldingState` in
-    // src/issues.ts.
-    const holdingFromState =
-      view.states.find((s) => s.role === 'holding')?.name ?? TRIAGE_STATE;
+    // From-state for the move: the first declared `holding` state in
+    // declaration order. The workflow parser refuses configs without one, so a
+    // missing entry here would be a programmer error; refuse the action with a
+    // clear error rather than silently picking a wrong state. Kept in sync with
+    // `pickHoldingState` in src/issues.ts.
+    const holdingState = view.states.find((s) => s.role === 'holding');
+    if (!holdingState) {
+      return jsonResponse(res, 409, {
+        error: {
+          code: 'no_holding_state',
+          message: 'no holding state declared in workflow; cannot resolve triage from-state',
+        },
+      });
+    }
+    const holdingFromState = holdingState.name;
     try {
       const result = await tracker.moveIssueToState(identifier, toState, {
         fromRoot: root,

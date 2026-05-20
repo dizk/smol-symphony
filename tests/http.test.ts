@@ -42,6 +42,13 @@ async function bootServer(
         kind: 'local',
         active_states: ['Todo', 'In Progress'],
         terminal_states: ['Done', 'Cancelled'],
+        states: {
+          Todo: { role: 'active' },
+          'In Progress': { role: 'active' },
+          Done: { role: 'terminal' },
+          Cancelled: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
         root: trackerRoot,
       })
     : null;

@@ -109,13 +109,10 @@ export class LocalMarkdownTracker implements IssueTracker {
    */
   async start(): Promise<void> {
     if (!this.cfg.root) throw new TrackerError('local_no_root', 'tracker.root is required');
-    const names = Object.keys(this.cfg.states ?? {});
-    // When no `states` map is set (e.g. an older test harness building
-    // TrackerConfig directly), fall back to the union of active + terminal so
-    // boot still produces a usable tree.
-    const decl =
-      names.length > 0 ? names : [...this.cfg.active_states, ...this.cfg.terminal_states];
-    for (const name of decl) {
+    // `states` is canonical (the workflow parser refuses configs without it);
+    // mkdir each declared state directory so the dashboard sees every column
+    // even before issues land.
+    for (const name of Object.keys(this.cfg.states)) {
       await mkdir(path.join(this.cfg.root, name), { recursive: true });
     }
   }
@@ -342,17 +339,11 @@ export class LocalMarkdownTracker implements IssueTracker {
     // same comparison the orchestrator uses for active/terminal classification.
     // Unknown directories (operator-left scratch, a legacy state that was removed
     // from `states:`) are ignored with a warning so a stale tree doesn't crash
-    // the dispatch loop. When the caller didn't provide a states map (e.g. a
-    // test constructs TrackerConfig directly), fall back to active + terminal +
-    // the implicit `Triage` holding state so legacy callers keep working.
+    // the dispatch loop. `states` is canonical (the workflow parser refuses
+    // configs without it) so there is no fallback path.
     const declared = new Map<string, string>();
-    const stateNames = Object.keys(this.cfg.states ?? {});
-    if (stateNames.length > 0) {
-      for (const name of stateNames) declared.set(name.toLowerCase(), name);
-    } else {
-      for (const name of [...this.cfg.active_states, ...this.cfg.terminal_states, 'Triage']) {
-        declared.set(name.toLowerCase(), name);
-      }
+    for (const name of Object.keys(this.cfg.states)) {
+      declared.set(name.toLowerCase(), name);
     }
     const out: RawIssueFile[] = [];
     for (const dirEntry of entries) {

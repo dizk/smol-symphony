@@ -7,11 +7,24 @@ import { LocalMarkdownTracker } from '../src/trackers/local.js';
 import { McpRegistry } from '../src/mcp.js';
 import type { RunningEntry, Issue } from '../src/types.js';
 
+// Shared states map used across tests that need both the tracker and the
+// registry to agree on the workflow shape. The MCP registry now requires a
+// holding state for `propose_issue` (workflow validation guarantees this in
+// production); tests construct fixtures directly so they must declare it too.
+const trackerStates = {
+  Todo: { role: 'active' as const },
+  'In Progress': { role: 'active' as const },
+  Done: { role: 'terminal' as const },
+  Cancelled: { role: 'terminal' as const },
+  Triage: { role: 'holding' as const },
+};
+
 function makeTracker(root: string): LocalMarkdownTracker {
   return new LocalMarkdownTracker({
     kind: 'local',
     active_states: ['Todo', 'In Progress'],
     terminal_states: ['Done', 'Cancelled'],
+    states: trackerStates,
     root,
   });
 }
@@ -504,7 +517,7 @@ describe('McpRegistry propose_issue', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t);
+      const reg = new McpRegistry(t, { states: trackerStates });
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -559,7 +572,7 @@ describe('McpRegistry propose_issue', () => {
         `---\ntitle: Fix the thing\n---\nbody.`,
       );
       const t = makeTracker(root);
-      const reg = new McpRegistry(t);
+      const reg = new McpRegistry(t, { states: trackerStates });
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const res = await reg.handleJsonRpc('ABC-1', token, {
@@ -586,7 +599,7 @@ describe('McpRegistry propose_issue', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t);
+      const reg = new McpRegistry(t, { states: trackerStates });
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const token = reg.activate(entry);
       const noTitle = await reg.handleJsonRpc('ABC-1', token, {
@@ -630,7 +643,7 @@ describe('McpRegistry propose_issue', () => {
     const { root, cleanup } = await setupTree();
     try {
       const t = makeTracker(root);
-      const reg = new McpRegistry(t);
+      const reg = new McpRegistry(t, { states: trackerStates });
       const entry = makeEntry('ABC-1', 'In Progress', { tracker_root_at_dispatch: root });
       const decoyRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-decoy-propose-'));
       try {
@@ -638,6 +651,12 @@ describe('McpRegistry propose_issue', () => {
           kind: 'local',
           active_states: ['Todo', 'In Progress'],
           terminal_states: ['Done'],
+          states: {
+            Todo: { role: 'active' },
+            'In Progress': { role: 'active' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
           root: decoyRoot,
         });
         const token = reg.activate(entry);
@@ -929,12 +948,17 @@ describe('McpRegistry transition', () => {
     }
   });
 
-  it('propose_issue falls back to literal "Triage" when no holding state is declared', async () => {
+  it('propose_issue surfaces a tool error when no holding state is declared', async () => {
+    // Defense in depth: workflow validation refuses configs without a holding
+    // state, so this branch should be unreachable in production. The registry
+    // still catches the throw and converts it to a tool error so a misconfigured
+    // test harness or a future code path that bypasses validation gets a clean
+    // failure rather than an unhandled promise rejection.
     const noHoldingStates = {
       Todo: { role: 'active' as const },
       Done: { role: 'terminal' as const },
     };
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-propose-fallback-'));
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-propose-no-holding-'));
     try {
       for (const dir of ['Todo', 'Done']) {
         await mkdir(path.join(root, dir), { recursive: true });
@@ -956,13 +980,17 @@ describe('McpRegistry transition', () => {
         params: { name: 'propose_issue', arguments: { title: 'Triage me' } },
       });
       const result = (res as {
-        result: { isError: boolean; structuredContent: { state: string } };
+        result: {
+          isError: boolean;
+          content: Array<{ text: string }>;
+          structuredContent?: Record<string, unknown>;
+        };
       }).result;
-      assert.equal(result.isError, false);
-      assert.equal(result.structuredContent.state, 'Triage');
-      // writeIssueFile mkdir's the target state directory; Triage was created
-      // implicitly even though it wasn't in `states`.
-      assert.deepEqual(await readdir(path.join(root, 'Triage')), ['triage-me.md']);
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /no holding-role state declared/);
+      assert.ok(result.structuredContent);
+      assert.equal(result.structuredContent!['error'], 'no_holding_state');
+      assert.deepEqual(result.structuredContent!['declared_states'], ['Todo', 'Done']);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

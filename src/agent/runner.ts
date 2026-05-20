@@ -108,7 +108,7 @@ export function resolveDispatchConfig(
   cfg: ServiceConfig,
   state: string,
 ): ResolvedDispatchConfig {
-  const states = cfg.states ?? {};
+  const states = cfg.states;
   // Case-insensitive lookup matches the rest of symphony (eligibility, reconciliation,
   // local-tracker state directories all compare lowercase). A workflow that declares
   // `Todo` and a tracker file living under `todo/` still resolves correctly.

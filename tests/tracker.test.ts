@@ -32,6 +32,10 @@ describe('local tracker', () => {
         kind: 'local',
         active_states: ['Todo'],
         terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+        },
         root,
       });
       const { issues } = await t.fetchCandidateIssues();
@@ -54,6 +58,11 @@ describe('local tracker', () => {
         kind: 'local',
         active_states: ['Todo'],
         terminal_states: ['Done', 'Cancelled'],
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+          Cancelled: { role: 'terminal' },
+        },
         root,
       });
       const result = await t.fetchCandidateIssues();
@@ -70,6 +79,10 @@ describe('local tracker', () => {
         kind: 'local',
         active_states: ['Todo'],
         terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+        },
         root,
       });
       const { issues } = await t.fetchCandidateIssues();
@@ -89,6 +102,10 @@ describe('local tracker', () => {
         kind: 'local',
         active_states: ['Todo'],
         terminal_states: ['Done'],
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+        },
         root,
       });
       assert.deepEqual(await t.fetchIssuesByStates([]), []);
