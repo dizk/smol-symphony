@@ -38,6 +38,12 @@ export interface StateConfig {
   role: 'active' | 'terminal' | 'holding';
   adapter?: string;
   model?: string | null;
+  // Per-state override of the adapter's effort/reasoning level. Same
+  // undefined-vs-null semantics as `model`: undefined inherits the workflow-level
+  // `acp.effort`, an explicit null clears it (use the adapter's own default).
+  // Valid values are adapter- and model-specific; symphony does not enforce an
+  // enum so it does not drift from the adapter's own supported list.
+  effort?: string | null;
   max_turns?: number;
   allowed_transitions?: string[] | null;
 }
@@ -94,6 +100,16 @@ export interface AcpConfig {
    * for codex-acp). Null means "use the adapter's own default".
    */
   model: string | null;
+  /**
+   * Optional effort / reasoning level forwarded to the adapter. Profile-specific: for
+   * claude-agent-acp symphony stages a `settings.json` with `{"effortLevel": "<value>"}`
+   * alongside the credential and copies it into `/root/.claude/settings.json` in the VM
+   * (the wrapper reads this via the SDK's `resolveSettings`). Valid values are
+   * adapter- and model-specific; symphony does not enforce an enum (the adapter's own
+   * `supportedEffortLevels` is the source of truth — e.g. Opus supports `xhigh`, Haiku
+   * does not). Null means "use the adapter's own default".
+   */
+  effort: string | null;
   shell: string;
   prompt_timeout_ms: number;
   read_timeout_ms: number;

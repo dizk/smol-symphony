@@ -250,9 +250,12 @@ export function buildServiceConfig(
   const bridgeRaw = getObject(acpRaw, 'bridge');
   const modelRaw = asString(acpRaw['model']);
   const modelTrimmed = modelRaw === null ? null : modelRaw.trim();
+  const effortRaw = asString(acpRaw['effort']);
+  const effortTrimmed = effortRaw === null ? null : effortRaw.trim();
   const acp: AcpConfig = {
     adapter: asString(acpRaw['adapter']) ?? 'claude',
     model: modelTrimmed && modelTrimmed.length > 0 ? modelTrimmed : null,
+    effort: effortTrimmed && effortTrimmed.length > 0 ? effortTrimmed : null,
     shell: asString(acpRaw['shell']) ?? 'bash',
     prompt_timeout_ms: asInt(acpRaw['prompt_timeout_ms'], 3_600_000),
     read_timeout_ms: asInt(acpRaw['read_timeout_ms'], 30_000),
@@ -402,6 +405,13 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     const modelTrimmed = modelRaw === null ? undefined : modelRaw.trim();
     const model =
       modelTrimmed === undefined ? undefined : modelTrimmed.length > 0 ? modelTrimmed : null;
+    // Same undefined-vs-null semantics as `model`: a missing key inherits the
+    // workflow-level `acp.effort`; a blank/whitespace string normalizes to null
+    // (an explicit "use the adapter default for this state" signal).
+    const effortRaw = asString(m['effort']);
+    const effortTrimmed = effortRaw === null ? undefined : effortRaw.trim();
+    const effort =
+      effortTrimmed === undefined ? undefined : effortTrimmed.length > 0 ? effortTrimmed : null;
     let maxTurns: number | undefined;
     if (m['max_turns'] !== undefined) {
       const n = asInt(m['max_turns'], -1);
@@ -431,6 +441,7 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     const sc: StateConfig = { role: roleRaw };
     if (adapter !== null) sc.adapter = adapter;
     if (model !== undefined) sc.model = model;
+    if (effort !== undefined) sc.effort = effort;
     if (maxTurns !== undefined) sc.max_turns = maxTurns;
     if (allowed !== undefined) sc.allowed_transitions = allowed;
     out[name] = sc;

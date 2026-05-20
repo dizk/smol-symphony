@@ -20,22 +20,45 @@
 // file is never exposed via a bind mount.
 
 import { constants as fsConstants } from 'node:fs';
-import { access, copyFile, mkdir, chmod, lstat, rm, realpath } from 'node:fs/promises';
+import { access, copyFile, mkdir, chmod, lstat, rm, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
 export type AcpAdapterId = 'claude' | 'codex';
 
 /**
- * How a chosen `acp.model` is surfaced to a specific adapter. Either an env var, extra
- * argv passed to the adapter binary, or both. Adapters that take the model through a
- * non-CLI/non-env channel (a config file, a session-init RPC) would need their own
- * branch in the runner; that's why this returns a structured value rather than baking
- * the mechanism into the registry.
+ * How a chosen runtime knob (model, effort, …) is surfaced to a specific adapter.
+ * Three orthogonal channels: env vars, extra argv passed to the adapter binary, and
+ * files staged into the workspace runtime dir then copied into the VM before the
+ * adapter starts. Adapters pick whichever channel matches their native mechanism —
+ * env for claude-agent-acp's ANTHROPIC_MODEL, argv for codex-acp's `-c key=value`,
+ * staged file for claude-agent-acp's settings.json (effortLevel lives there).
+ *
+ * `stagedFiles` entries declare both the staging-dir filename and the absolute guest
+ * path the in-VM launch command must copy them to. The runner stages each file like
+ * a credential (same staging-root logic, same symlink defenses) and `deriveAcpCommand`
+ * emits an additional `cp` line per file before exec'ing the proxy.
  */
 export interface ModelInjection {
   env?: Record<string, string>;
   extraArgs?: string[];
+  stagedFiles?: StagedFileSpec[];
+}
+
+/** Alias for symmetry with effortInjection; same shape as ModelInjection. */
+export type EffortInjection = ModelInjection;
+
+export interface StagedFileSpec {
+  /**
+   * File name inside the workspace runtime staging dir. Must be unique vs the
+   * credential file (named `<adapter-id>`) and vs any other staged file for the same
+   * attempt — collisions would silently overwrite earlier writes.
+   */
+  stagedName: string;
+  /** UTF-8 content to write. */
+  content: string;
+  /** Absolute path inside the VM where deriveAcpCommand should copy the file. */
+  guestPath: string;
 }
 
 export interface AdapterProfile {
@@ -57,6 +80,14 @@ export interface AdapterProfile {
    * they natively support (e.g. opencode could pass `--model` here).
    */
   modelInjection(model: string): ModelInjection;
+  /**
+   * Map an `acp.effort` string into env / argv / staged files. Optional because not
+   * every adapter has a native effort knob. Called only when `acp.effort` is non-null;
+   * profiles can assume a non-empty string. Symphony does not validate the value
+   * (Anthropic's `supportedEffortLevels` is model-dependent — `xhigh` is only valid
+   * on models with `supportsEffort`); the adapter rejects invalid values at startup.
+   */
+  effortInjection?(effort: string): EffortInjection;
 }
 
 export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
@@ -70,6 +101,23 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // "opus" or "claude-sonnet-4-5" against the SDK's model list, so anything the user
     // would type into Claude Code works here.
     modelInjection: (model) => ({ env: { ANTHROPIC_MODEL: model } }),
+    // claude-agent-acp reads `effortLevel` out of merged settings (the SDK's
+    // `resolveSettings` walks `$CLAUDE_CONFIG_DIR/settings.json`, `<cwd>/.claude/settings.json`,
+    // etc.) and applies it via `query.applyFlagSettings`. There is no ANTHROPIC_EFFORT env var
+    // and the wrapper does not expose a CLI flag, so the only reachable channel from symphony
+    // is a settings.json staged next to the credential and copied to /root/.claude/settings.json
+    // before the proxy execs the adapter. Valid values are `low|medium|high|xhigh|max`, gated
+    // per-model by claude-agent-acp's `supportedEffortLevels`; symphony lets the adapter reject
+    // invalid choices rather than mirroring the gate.
+    effortInjection: (effort) => ({
+      stagedFiles: [
+        {
+          stagedName: 'claude-settings.json',
+          content: JSON.stringify({ effortLevel: effort }),
+          guestPath: '/root/.claude/settings.json',
+        },
+      ],
+    }),
   },
   codex: {
     id: 'codex',
@@ -195,6 +243,66 @@ export async function stageCredential(
   }
 
   const relPath = path.posix.join(stagingRootRel, 'credentials', profile.id);
+  return { absPath: dst, relPath };
+}
+
+/**
+ * Write an arbitrary content file into the same staging dir as the credential. Used
+ * for adapter runtime files (today: claude's settings.json carrying `effortLevel`).
+ * Reuses `resolveStagingLocation` + `ensureRealDir` + the symlink-replace dance from
+ * `stageCredential` so a planted symlink at the leaf cannot redirect the write.
+ *
+ * Caller picks `stagedName`; collisions with the credential file (named `<adapter-id>`)
+ * or with other staged files for the same attempt would silently overwrite. The
+ * registry's `effortInjection` returns adapter-prefixed names (e.g. `claude-settings.json`)
+ * to keep the namespace cleanly partitioned.
+ */
+export interface StagedRuntimePaths {
+  /** Absolute path on the host (where stageRuntimeFile actually writes). */
+  absPath: string;
+  /** POSIX path relative to workspacePath (used in the in-VM launch command). */
+  relPath: string;
+}
+
+export async function stageRuntimeFile(
+  workspacePath: string,
+  stagedName: string,
+  content: string,
+): Promise<StagedRuntimePaths> {
+  if (!/^[A-Za-z0-9._-]+$/.test(stagedName)) {
+    throw new Error(
+      `stageRuntimeFile: stagedName ${JSON.stringify(stagedName)} contains characters outside ` +
+        `[A-Za-z0-9._-]; refuse to compose into the staging path.`,
+    );
+  }
+  const { stagingRootAbs, stagingRootRel } = await resolveStagingLocation(workspacePath);
+  const credsDir = path.join(stagingRootAbs, 'credentials');
+  await ensureRealDir(stagingRootAbs);
+  await ensureRealDir(credsDir);
+
+  const dst = path.join(credsDir, stagedName);
+  await rm(dst, { force: true, recursive: false });
+  // writeFile follows a symlink at the leaf path; we already rm'd it above, but a race
+  // could plant a new one. Use the same realpath check the credential staging does.
+  await writeFile(dst, content, { mode: 0o600, flag: 'wx' });
+
+  const expectedReal = path.join(
+    await realpath(workspacePath),
+    stagingRootRel,
+    'credentials',
+    stagedName,
+  );
+  const actualReal = await realpath(dst);
+  if (actualReal !== expectedReal) {
+    await rm(dst, { force: true }).catch(() => undefined);
+    throw new Error(
+      `staging path redirected: wrote to ${actualReal}, expected ${expectedReal}. ` +
+        `A symlink raced in during staging; manually inspect and remove any leaked ` +
+        `file at the actual path before retrying.`,
+    );
+  }
+
+  const relPath = path.posix.join(stagingRootRel, 'credentials', stagedName);
   return { absPath: dst, relPath };
 }
 
@@ -371,19 +479,48 @@ async function ensureRealDir(p: string): Promise<void> {
  * metacharacters compose safely. `stagedRelPath` comes from `stageCredential`, which
  * picks a path outside the working tree when git is present.
  */
-export function deriveAcpCommand(profile: AdapterProfile, stagedRelPath: string): string {
+/**
+ * Additional file to copy into the VM before exec'ing the proxy. Used by adapter
+ * runtime knobs that surface through files (today: claude's settings.json for the
+ * `effortLevel` knob). `stagedRelPath` is the POSIX path within the workspace mount
+ * (relative to the in-VM cwd) and `guestPath` is the absolute destination in the VM.
+ *
+ * deriveAcpCommand emits `mkdir -p $(dirname guestPath)` defensively in case the
+ * destination directory is outside the credential's guestDir; for the common case
+ * (claude's settings.json next to its credential at /root/.claude/) the prior
+ * `mkdir -p` of guestDir already covers it, but the extra mkdir is idempotent.
+ */
+export interface ExtraGuestFile {
+  stagedRelPath: string;
+  guestPath: string;
+}
+
+export function deriveAcpCommand(
+  profile: AdapterProfile,
+  stagedRelPath: string,
+  extraFiles: readonly ExtraGuestFile[] = [],
+): string {
   if (profile.binary.length === 0) {
     throw new Error(`adapter "${profile.id}" has an empty binary launch vector`);
   }
   const guestDir = path.posix.dirname(profile.guestCredentialPath);
   const guestPath = profile.guestCredentialPath;
-  return [
+  const steps: string[] = [
     `rm -rf ${shQuote(guestDir)}`,
     `mkdir -p ${shQuote(guestDir)}`,
     `cp ${shQuote(stagedRelPath)} ${shQuote(guestPath)}`,
     `chmod 600 ${shQuote(guestPath)}`,
-    `exec node /opt/symphony/vm-agent.mjs`,
-  ].join(' && ');
+  ];
+  for (const f of extraFiles) {
+    const extraDir = path.posix.dirname(f.guestPath);
+    if (extraDir !== guestDir) {
+      steps.push(`mkdir -p ${shQuote(extraDir)}`);
+    }
+    steps.push(`cp ${shQuote(f.stagedRelPath)} ${shQuote(f.guestPath)}`);
+    steps.push(`chmod 600 ${shQuote(f.guestPath)}`);
+  }
+  steps.push(`exec node /opt/symphony/vm-agent.mjs`);
+  return steps.join(' && ');
 }
 
 // Minimal POSIX-shell single-quoting. None of the paths we emit contain `'`, but be

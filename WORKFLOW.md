@@ -298,6 +298,13 @@ acp:
   # under the TCP bridge transport — the launch shape is fixed; fork
   # scripts/vm-agent.js if you need to customize what the proxy spawns.
   adapter: claude
+  # Reasoning effort forwarded to claude-agent-acp via a staged settings.json
+  # (`{"effortLevel": "xhigh"}`) copied into /root/.claude/settings.json before the
+  # adapter starts. xhigh is the second-highest tier under Opus 4.7 (max is the top
+  # but is meaningfully slower); operators on a Haiku-backed model must drop this
+  # because Haiku rejects xhigh at adapter startup. Valid set is `low|medium|high|xhigh|max`,
+  # model-gated by claude-agent-acp's `supportedEffortLevels`.
+  effort: xhigh
   shell: bash
   prompt_timeout_ms: 1800000
   read_timeout_ms: 30000

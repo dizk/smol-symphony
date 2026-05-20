@@ -28,11 +28,13 @@ describe('resolveDispatchConfig', () => {
     assert.deepEqual(resolveDispatchConfig(cfg, 'Todo'), {
       adapter: 'claude',
       model: 'claude-sonnet-4-5',
+      effort: null,
       max_turns: 5,
     });
     assert.deepEqual(resolveDispatchConfig(cfg, 'Review'), {
       adapter: 'codex',
       model: 'gpt-5-codex',
+      effort: null,
       max_turns: 4,
     });
   });
@@ -54,6 +56,7 @@ describe('resolveDispatchConfig', () => {
     assert.deepEqual(resolveDispatchConfig(cfg, 'Todo'), {
       adapter: 'codex',
       model: 'gpt-5-codex',
+      effort: null,
       max_turns: 17,
     });
   });
@@ -76,6 +79,7 @@ describe('resolveDispatchConfig', () => {
     assert.deepEqual(resolveDispatchConfig(cfg, 'Review'), {
       adapter: 'codex',
       model: 'claude-opus-4-7',
+      effort: null,
       max_turns: 30,
     });
   });
@@ -115,6 +119,47 @@ describe('resolveDispatchConfig', () => {
       '/tmp/WORKFLOW.md',
     );
     assert.throws(() => resolveDispatchConfig(cfg, 'Mystery'), /Mystery/);
+  });
+
+  it('per-state effort wins over workflow-level acp.effort', () => {
+    // Same undefined-vs-null contract as model: per-state effort overrides the
+    // workflow-level default; the value is forwarded verbatim (symphony does
+    // not validate against the adapter's supportedEffortLevels list).
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'claude', effort: 'medium' },
+        states: {
+          Todo: { role: 'active', effort: 'xhigh' },
+          Review: { role: 'active' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(resolveDispatchConfig(cfg, 'Todo').effort, 'xhigh');
+    assert.equal(resolveDispatchConfig(cfg, 'Review').effort, 'medium');
+  });
+
+  it('treats an explicit per-state effort: null as "use adapter default"', () => {
+    // Same null semantics as model: an explicit per-state null clears the
+    // workflow-level effort for that state rather than inheriting it. Operators
+    // can carve out one state that runs at the adapter's own default while the
+    // rest of the workflow uses an elevated effort.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'claude', effort: 'xhigh' },
+        states: {
+          Todo: { role: 'active', effort: '   ' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(resolveDispatchConfig(cfg, 'Todo').effort, null);
   });
 
   it('treats an explicit per-state model: null as "use adapter default"', () => {
