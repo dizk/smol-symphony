@@ -19,7 +19,7 @@ function makeStubOrchestrator(): Orchestrator {
     counts: { running: 0, retrying: 0 },
     running: [],
     retrying: [],
-    codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+    session_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
     rate_limits: null,
   };
   return {
@@ -581,7 +581,7 @@ describe('attention partial — Markdown rendering for steering questions', () =
       counts: { running: 1, retrying: 0 },
       running: [row],
       retrying: [],
-      codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
+      session_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
       rate_limits: null,
     };
     return {

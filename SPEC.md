@@ -227,23 +227,18 @@ Fields (logical):
 
 State tracked while a coding-agent subprocess is running.
 
-The `codex_*` and `*_codex_*` field names below are historical — they pre-date the move to ACP
-with multiple adapter profiles and now refer to whichever adapter is configured. A field-rename
-to drop the codex prefix is a planned follow-up; the names below match the live `RunningEntry`
-shape in the reference implementation.
-
 Fields:
 
 - `session_id` (string, `<thread_id>-<turn_id>`)
 - `thread_id` (string)
 - `turn_id` (string)
-- `codex_app_server_pid` (string or null) — pid of the adapter subprocess
-- `last_codex_event` (string/enum or null) — last ACP event seen from the adapter
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
+- `adapter_pid` (string or null) — pid of the adapter subprocess
+- `last_event` (string/enum or null) — last ACP event seen from the adapter
+- `last_event_at` (timestamp or null)
+- `last_message` (summarized payload)
+- `input_tokens` (integer)
+- `output_tokens` (integer)
+- `total_tokens` (integer)
 - `last_reported_input_tokens` (integer)
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
@@ -275,7 +270,7 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
+- `session_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
 
 ### 4.2 Stable Identifiers and Normalization Rules
@@ -822,7 +817,7 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - `last_event_at` if any event has been seen, else
   - `started_at`
 - If `elapsed_ms > acp.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
@@ -1037,7 +1032,7 @@ include:
 
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
+- `adapter_pid` (if available)
 - OPTIONAL `usage` map (token counts)
 - payload fields as needed
 
@@ -1271,7 +1266,7 @@ SHOULD return:
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
-- `codex_totals`
+- `session_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
@@ -1413,7 +1408,7 @@ Minimum endpoints:
           "error": "no available orchestrator slots"
         }
       ],
-      "codex_totals": {
+      "session_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,
         "total_tokens": 7400,
@@ -1680,7 +1675,7 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    session_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
     codex_rate_limits: null
   }
 
@@ -1774,13 +1769,13 @@ function dispatch_issue(issue, state, attempt):
     identifier: issue.identifier,
     issue,
     session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
+    adapter_pid: null,
+    last_message: null,
+    last_event: null,
+    last_event_at: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
     last_reported_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,

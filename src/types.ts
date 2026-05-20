@@ -197,8 +197,8 @@ export interface Workspace {
   created_now: boolean;
 }
 
-// Aggregate token totals tracked by orchestrator (§4.1.8 codex_totals).
-export interface CodexTotals {
+// Aggregate token totals tracked by orchestrator across all sessions.
+export interface SessionTotals {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
@@ -213,13 +213,13 @@ export interface RunningEntry {
   session_id: string | null;
   thread_id: string | null;
   turn_id: string | null;
-  codex_app_server_pid: string | null;
-  last_codex_event: string | null;
-  last_codex_timestamp: string | null;
-  last_codex_message: string | null;
-  codex_input_tokens: number;
-  codex_output_tokens: number;
-  codex_total_tokens: number;
+  adapter_pid: string | null;
+  last_event: string | null;
+  last_event_at: string | null;
+  last_message: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
   last_reported_input_tokens: number;
   last_reported_output_tokens: number;
   last_reported_total_tokens: number;

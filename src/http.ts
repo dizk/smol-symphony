@@ -650,7 +650,7 @@ function renderDiskPartial(p: PartialInputs): string {
 }
 
 function renderTotalsPartial(p: PartialInputs): string {
-  const t = p.snapshot.codex_totals;
+  const t = p.snapshot.session_totals;
   if (!t || (t.input_tokens === 0 && t.output_tokens === 0 && t.seconds_running === 0)) return '';
   return `${formatTokens(t.input_tokens)} in · ${formatTokens(t.output_tokens)} out · ${formatTokens(t.total_tokens)} total · ${formatRuntime(t.seconds_running)} runtime`;
 }

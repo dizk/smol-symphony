@@ -7,7 +7,7 @@ import type {
   RunningEntry,
   RuntimeEvent,
   ServiceConfig,
-  CodexTotals,
+  SessionTotals,
   WorkflowDefinition,
 } from './types.js';
 import type { IssueTracker } from './trackers/types.js';
@@ -53,7 +53,7 @@ export interface Snapshot {
     due_at: string;
     error: string | null;
   }>;
-  codex_totals: CodexTotals;
+  session_totals: SessionTotals;
   rate_limits: JsonValue | null;
 }
 
@@ -82,13 +82,13 @@ export class Orchestrator {
   // ~1s after worker exit (before the hook finishes) and we'd lose the cleanup hook lines
   // in the JSONL log.
   private cleanupInFlight = new Set<string>();
-  private codexTotals: CodexTotals = {
+  private sessionTotals: SessionTotals = {
     input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
     seconds_running: 0,
   };
-  private codexRateLimits: JsonValue | null = null;
+  private rateLimits: JsonValue | null = null;
   private tickTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   private refreshRequested = false;
@@ -260,7 +260,7 @@ export class Orchestrator {
         // (the runner's awaitSteeringReply respects it) for non-stall reasons like
         // terminal-state transitions or operator-initiated cancels.
         if (entry.steering_requested) continue;
-        const ref = entry.last_codex_timestamp ?? entry.started_at;
+        const ref = entry.last_event_at ?? entry.started_at;
         const elapsed = now - Date.parse(ref);
         if (Number.isFinite(elapsed) && elapsed > this.cfg.acp.stall_timeout_ms) {
           log.warn('stall detected', {
@@ -436,13 +436,13 @@ export class Orchestrator {
       session_id: null,
       thread_id: null,
       turn_id: null,
-      codex_app_server_pid: null,
-      last_codex_event: null,
-      last_codex_timestamp: null,
-      last_codex_message: null,
-      codex_input_tokens: 0,
-      codex_output_tokens: 0,
-      codex_total_tokens: 0,
+      adapter_pid: null,
+      last_event: null,
+      last_event_at: null,
+      last_message: null,
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
       last_reported_input_tokens: 0,
       last_reported_output_tokens: 0,
       last_reported_total_tokens: 0,
@@ -555,7 +555,7 @@ export class Orchestrator {
     this.running.delete(issueId);
     const elapsedMs = Date.now() - Date.parse(entry.started_at);
     if (Number.isFinite(elapsedMs)) {
-      this.codexTotals.seconds_running += elapsedMs / 1000;
+      this.sessionTotals.seconds_running += elapsedMs / 1000;
     }
     const identifier = entry.identifier;
     const logger = withIssue({ issue_id: issueId, issue_identifier: identifier });
@@ -747,27 +747,27 @@ export class Orchestrator {
     const dIn = Math.max(0, usage.input_tokens - e.last_reported_input_tokens);
     const dOut = Math.max(0, usage.output_tokens - e.last_reported_output_tokens);
     const dTot = Math.max(0, usage.total_tokens - e.last_reported_total_tokens);
-    e.codex_input_tokens = usage.input_tokens;
-    e.codex_output_tokens = usage.output_tokens;
-    e.codex_total_tokens = usage.total_tokens;
+    e.input_tokens = usage.input_tokens;
+    e.output_tokens = usage.output_tokens;
+    e.total_tokens = usage.total_tokens;
     e.last_reported_input_tokens = usage.input_tokens;
     e.last_reported_output_tokens = usage.output_tokens;
     e.last_reported_total_tokens = usage.total_tokens;
-    this.codexTotals.input_tokens += dIn;
-    this.codexTotals.output_tokens += dOut;
-    this.codexTotals.total_tokens += dTot;
+    this.sessionTotals.input_tokens += dIn;
+    this.sessionTotals.output_tokens += dOut;
+    this.sessionTotals.total_tokens += dTot;
   }
 
   reportRateLimits(_issueId: string, snapshot: JsonValue) {
-    this.codexRateLimits = snapshot;
+    this.rateLimits = snapshot;
   }
 
   reportRuntimeEvent(issueId: string, ev: RuntimeEvent) {
     const e = this.running.get(issueId);
     if (!e) return;
-    e.last_codex_event = ev.event;
-    e.last_codex_timestamp = ev.at;
-    e.last_codex_message = ev.message;
+    e.last_event = ev.event;
+    e.last_event_at = ev.at;
+    e.last_message = ev.message;
     e.recent_events.push(ev);
     if (e.recent_events.length > 50) e.recent_events.shift();
   }
@@ -777,7 +777,7 @@ export class Orchestrator {
     if (!e) return;
     e.session_id = info.sessionId;
     e.thread_id = info.threadId;
-    e.codex_app_server_pid = info.pid;
+    e.adapter_pid = info.pid;
   }
 
   reportTurnStarted(issueId: string, turnNumber: number) {
@@ -803,14 +803,14 @@ export class Orchestrator {
         state: e.issue.state,
         session_id: e.session_id,
         turn_count: e.turn_count,
-        last_event: e.last_codex_event,
-        last_message: e.last_codex_message,
+        last_event: e.last_event,
+        last_message: e.last_message,
         started_at: e.started_at,
-        last_event_at: e.last_codex_timestamp,
+        last_event_at: e.last_event_at,
         tokens: {
-          input_tokens: e.codex_input_tokens,
-          output_tokens: e.codex_output_tokens,
-          total_tokens: e.codex_total_tokens,
+          input_tokens: e.input_tokens,
+          output_tokens: e.output_tokens,
+          total_tokens: e.total_tokens,
         },
         steering_requested: e.steering_requested,
         steering_question: e.steering_question,
@@ -824,11 +824,11 @@ export class Orchestrator {
         due_at: new Date(r.due_at_ms).toISOString(),
         error: r.error,
       })),
-      codex_totals: {
-        ...this.codexTotals,
-        seconds_running: this.codexTotals.seconds_running + liveExtraSeconds,
+      session_totals: {
+        ...this.sessionTotals,
+        seconds_running: this.sessionTotals.seconds_running + liveExtraSeconds,
       },
-      rate_limits: this.codexRateLimits,
+      rate_limits: this.rateLimits,
     };
   }
 
@@ -863,13 +863,13 @@ export class Orchestrator {
             turn_count: entry.turn_count,
             state: entry.issue.state,
             started_at: entry.started_at,
-            last_event: entry.last_codex_event,
-            last_message: entry.last_codex_message,
-            last_event_at: entry.last_codex_timestamp,
+            last_event: entry.last_event,
+            last_message: entry.last_message,
+            last_event_at: entry.last_event_at,
             tokens: {
-              input_tokens: entry.codex_input_tokens,
-              output_tokens: entry.codex_output_tokens,
-              total_tokens: entry.codex_total_tokens,
+              input_tokens: entry.input_tokens,
+              output_tokens: entry.output_tokens,
+              total_tokens: entry.total_tokens,
             },
           }
         : null,
