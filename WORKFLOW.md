@@ -192,10 +192,11 @@ hooks:
         exit
       }
     ' "${ISSUE_FILE}")"
+    # The gh pr create call below prefixes ISSUE_ID; just pass the raw title here.
     if [ -n "${RAW_TITLE}" ]; then
-      TITLE="${ISSUE_ID}: ${RAW_TITLE}"
+      TITLE="${RAW_TITLE}"
     else
-      TITLE="${ISSUE_ID}"
+      TITLE=""
     fi
     # Skip the leading `---` … `---` fence and emit the body verbatim. The awk
     # walks state: 0 = before opening fence (or no fence at all), 1 = inside
@@ -272,7 +273,7 @@ hooks:
         elif ! gh pr create \
           --base "${BASE}" \
           --head "${BRANCH}" \
-          --title "${ISSUE_ID}: ${TITLE}" \
+          --title "${ISSUE_ID}${TITLE:+: ${TITLE}}" \
           --body "${BODY}"; then
           echo "gh pr create failed; patch bundle preserved at ${PATCH_OUT}" >&2
         fi
