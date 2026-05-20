@@ -9,6 +9,7 @@ import {
   isKnownAdapter,
   deriveAcpCommand,
   stageCredential,
+  stageRuntimeFile,
 } from '../src/agent/adapters.js';
 import { validateDispatch } from '../src/workflow.js';
 import type { ServiceConfig } from '../src/types.js';
@@ -45,6 +46,7 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     acp: {
       adapter: 'claude',
       model: null,
+      effort: null,
       shell: 'bash',
       prompt_timeout_ms: 1000,
       read_timeout_ms: 1000,
@@ -159,6 +161,50 @@ describe('adapters registry', () => {
     assert.match(cmd, /cp 'has spaces\/creds'/);
   });
 
+  it('deriveAcpCommand copies extra staged files (e.g. claude settings.json) before exec', () => {
+    // Effort flows through a settings.json staged next to the credential, then copied
+    // to /root/.claude/settings.json before the proxy execs the adapter. The order
+    // matters: the staged file must land before `exec` replaces the shell.
+    const cmd = deriveAcpCommand(
+      ADAPTERS.claude,
+      '.git/symphony-runtime/credentials/claude',
+      [
+        {
+          stagedRelPath: '.git/symphony-runtime/credentials/claude-settings.json',
+          guestPath: '/root/.claude/settings.json',
+        },
+      ],
+    );
+    assert.match(
+      cmd,
+      /cp \.git\/symphony-runtime\/credentials\/claude-settings\.json \/root\/\.claude\/settings\.json/,
+    );
+    // settings.json sits in the same guestDir as the credential; deriveAcpCommand
+    // skips an extra mkdir for that case.
+    assert.doesNotMatch(cmd, /mkdir -p \/root\/\.claude && mkdir -p \/root\/\.claude/);
+    // Still ends with the proxy exec — extra cp lines are inserted before, not after.
+    assert.match(cmd, /exec node \/opt\/symphony\/vm-agent\.mjs$/);
+    // Sanity: the extra copy precedes exec.
+    const cpIdx = cmd.indexOf('settings.json');
+    const execIdx = cmd.indexOf('exec node');
+    assert.ok(cpIdx > 0 && cpIdx < execIdx, 'extra cp must precede exec');
+  });
+
+  it('deriveAcpCommand emits an extra mkdir when an extra file targets a different guestDir', () => {
+    const cmd = deriveAcpCommand(
+      ADAPTERS.claude,
+      '.git/symphony-runtime/credentials/claude',
+      [
+        {
+          stagedRelPath: '.git/symphony-runtime/credentials/other',
+          guestPath: '/etc/some/other.conf',
+        },
+      ],
+    );
+    assert.match(cmd, /mkdir -p \/etc\/some/);
+    assert.match(cmd, /cp \.git\/symphony-runtime\/credentials\/other \/etc\/some\/other\.conf/);
+  });
+
   it('claude profile surfaces the selected model via ANTHROPIC_MODEL env', () => {
     // claude-agent-acp reads ANTHROPIC_MODEL on startup and resolves it against the SDK
     // model list. Env-based selection avoids per-attempt argv leaks (model isn't a
@@ -181,6 +227,32 @@ describe('adapters registry', () => {
     // concatenation. JSON.stringify handles it; verify defensively.
     const inj = ADAPTERS.codex.modelInjection('weird"name');
     assert.deepEqual(inj, { extraArgs: ['-c', 'model="weird\\"name"'] });
+  });
+
+  it('claude profile surfaces effort via a staged settings.json (not env, not argv)', () => {
+    // claude-agent-acp reads effortLevel only out of merged settings (the SDK's
+    // resolveSettings reads $CLAUDE_CONFIG_DIR/settings.json + cwd .claude/settings.json
+    // + platform managed-settings). There is no ANTHROPIC_EFFORT env and no CLI flag
+    // on the ACP wrapper; staging a settings.json is the only reachable channel.
+    const inj = ADAPTERS.claude.effortInjection!('xhigh');
+    assert.equal(inj.env, undefined);
+    assert.equal(inj.extraArgs, undefined);
+    assert.ok(inj.stagedFiles, 'expected stagedFiles');
+    assert.equal(inj.stagedFiles!.length, 1);
+    const f = inj.stagedFiles![0]!;
+    assert.equal(f.guestPath, '/root/.claude/settings.json');
+    assert.deepEqual(JSON.parse(f.content), { effortLevel: 'xhigh' });
+    // Adapter-prefixed name keeps the staging-dir namespace partitioned: the
+    // credential file is named after the adapter id, so collisions are avoided.
+    assert.match(f.stagedName, /^claude-/);
+  });
+
+  it('codex profile does not expose an effortInjection (no native effort knob)', () => {
+    // codex-acp does not surface a generic effort lever on the wrapper today.
+    // The runner skips effort wiring entirely when this is undefined, so an
+    // operator who sets acp.effort under a codex-backed state still dispatches
+    // cleanly — symphony just doesn't inject anything.
+    assert.equal(ADAPTERS.codex.effortInjection, undefined);
   });
 });
 
@@ -450,6 +522,48 @@ describe('stageCredential', () => {
       );
     } finally {
       (os as { homedir: () => string }).homedir = origHome;
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('stageRuntimeFile', () => {
+  it('writes content into the same staging dir as the credential, 0600', async () => {
+    // Effort's settings.json staging mirrors the credential's defenses:
+    // resolveStagingLocation picks .git/symphony-runtime/credentials/ inside a
+    // normal git clone, and the symlink-replace dance prevents writing through
+    // an attacker-planted leaf symlink.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-runtime-'));
+    const ws = path.join(tmp, 'ws');
+    await mkdir(path.join(ws, '.git'), { recursive: true });
+    try {
+      const staged = await stageRuntimeFile(ws, 'claude-settings.json', '{"effortLevel":"xhigh"}');
+      assert.equal(
+        staged.relPath,
+        '.git/symphony-runtime/credentials/claude-settings.json',
+      );
+      const body = await readFile(staged.absPath, 'utf8');
+      assert.equal(body, '{"effortLevel":"xhigh"}');
+      const st = await stat(staged.absPath);
+      assert.equal(st.mode & 0o777, 0o600);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a stagedName containing path separators or shell metachars', async () => {
+    // Defense in depth: stagedName composes into a host path, then into the
+    // POSIX-relative path baked into the bash command. Refuse anything outside
+    // [A-Za-z0-9._-] so a future caller cannot escape the staging dir or
+    // smuggle shell metacharacters through the rel path.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-runtime-'));
+    const ws = path.join(tmp, 'ws');
+    await mkdir(path.join(ws, '.git'), { recursive: true });
+    try {
+      await assert.rejects(() => stageRuntimeFile(ws, '../escape', 'x'), /stagedName/);
+      await assert.rejects(() => stageRuntimeFile(ws, 'with space', 'x'), /stagedName/);
+      await assert.rejects(() => stageRuntimeFile(ws, 'pipe|cmd', 'x'), /stagedName/);
+    } finally {
       await rm(tmp, { recursive: true, force: true });
     }
   });

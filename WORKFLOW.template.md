@@ -51,6 +51,11 @@ tracker:
 #   model     (string, optional): override `acp.model` for this state.
 #             Blank or whitespace-only values normalize to "use the adapter
 #             default" (same as the workflow-level acp.model semantics).
+#   effort    (string, optional): override `acp.effort` for this state. Same
+#             undefined-vs-null semantics as `model`: omit to inherit
+#             `acp.effort`; blank/whitespace normalizes to null ("use the
+#             adapter default for this state"). Valid values are adapter- and
+#             model-specific (see `acp.effort`).
 #   max_turns (int, optional): override `agent.max_turns` for this state.
 #   allowed_transitions (string[]|null, optional): when set, restricts which
 #             states agents in this state may transition to via the MCP
@@ -80,6 +85,7 @@ states:
     role: active
     adapter: claude
     model: claude-opus-4-7
+    effort: xhigh
     max_turns: 10
   Review:
     role: active
@@ -236,6 +242,20 @@ acp:
   #   codex   — passed as `-c model="<value>"` argv to codex-acp (parsed as TOML).
   # Leave unset / null to use the adapter's own default model. Default: null.
   # model: claude-opus-4-7
+
+  # effort (string | null): optional reasoning-effort lever forwarded to the chosen
+  # adapter. Profile-specific surface:
+  #   claude  — written into a staged `settings.json` ({"effortLevel": "<value>"})
+  #             copied to /root/.claude/settings.json in the VM before claude-agent-acp
+  #             starts. Valid values are `low|medium|high|xhigh|max`, gated per-model
+  #             by claude-agent-acp's `supportedEffortLevels` (Opus supports `xhigh` and
+  #             `max`; Haiku does not). Symphony does not validate the value — the
+  #             adapter rejects unsupported choices at startup, which keeps symphony
+  #             from drifting from the adapter's own supported list.
+  #   codex   — not wired (codex-acp has no first-class effort knob on the wrapper);
+  #             setting `acp.effort` for a codex-backed state is a no-op.
+  # Leave unset / null for the adapter's own default. Default: null.
+  # effort: xhigh
 
   # NOTE: the launch shape is fixed (in-VM proxy dialing back over the bridge);
   # fork `scripts/vm-agent.js` if you need to customize what the proxy spawns.

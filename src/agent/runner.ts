@@ -21,7 +21,10 @@ import {
   deriveAcpCommand,
   isKnownAdapter,
   stageCredential,
+  stageRuntimeFile,
   type AcpAdapterId,
+  type ExtraGuestFile,
+  type ModelInjection,
 } from './adapters.js';
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
@@ -93,6 +96,7 @@ function buildSteeringReplyPrompt(question: string, context: string | null, repl
 export interface ResolvedDispatchConfig {
   adapter: AcpAdapterId;
   model: string | null;
+  effort: string | null;
   max_turns: number;
 }
 
@@ -141,8 +145,9 @@ export function resolveDispatchConfig(
   // a model key at all; an explicit null in the state config means the operator wants
   // the adapter's own default for this state.
   const model = s.model === undefined ? cfg.acp.model : s.model;
+  const effort = s.effort === undefined ? cfg.acp.effort : s.effort;
   const max_turns = s.max_turns ?? cfg.agent.max_turns;
-  return { adapter, model, max_turns };
+  return { adapter, model, effort, max_turns };
 }
 
 export class AgentRunner {
@@ -277,24 +282,58 @@ export class AgentRunner {
       );
       return { ok: false, reason: 'credential staging error', threadId: null, turnsCompleted: 0 };
     }
-    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath);
     const adapterBin = profile.binary[0]!;
     const adapterArgs = profile.binary.slice(1);
-    // Apply the resolved model selection (if any) to the adapter via its profile-
-    // specific mechanism: env var for claude-agent-acp, extra argv for codex-acp. The
-    // returned env/args are merged into the smolvm-exec invocation below so they reach
-    // the vm-agent proxy and then the spawned adapter. `resolved.model` is the per-state
-    // override (when set) or the workflow-level acp.model fallback.
-    const modelEnv: Record<string, string> = {};
-    const modelArgs: string[] = [];
-    if (resolved.model) {
-      const inj = profile.modelInjection(resolved.model);
+    // Apply the resolved model / effort selections (if any) to the adapter via its
+    // profile-specific mechanisms: env var for claude-agent-acp's ANTHROPIC_MODEL, extra
+    // argv for codex-acp's `-c model=...`, staged file for claude-agent-acp's
+    // settings.json (effortLevel lives there). The injections compose along three
+    // orthogonal channels — env, extraArgs, stagedFiles — so codex (argv-based) and
+    // claude (env + file-based) coexist without per-adapter branching here.
+    const runtimeEnv: Record<string, string> = {};
+    const runtimeArgs: string[] = [];
+    const runtimeExtraFiles: ExtraGuestFile[] = [];
+    const applyInjection = async (inj: ModelInjection): Promise<void> => {
       if (inj.env) {
-        for (const [k, v] of Object.entries(inj.env)) modelEnv[k] = v;
+        for (const [k, v] of Object.entries(inj.env)) runtimeEnv[k] = v;
       }
-      if (inj.extraArgs) modelArgs.push(...inj.extraArgs);
+      if (inj.extraArgs) runtimeArgs.push(...inj.extraArgs);
+      if (inj.stagedFiles) {
+        for (const f of inj.stagedFiles) {
+          const stagedFile = await stageRuntimeFile(workspace.path, f.stagedName, f.content);
+          runtimeExtraFiles.push({
+            stagedRelPath: stagedFile.relPath,
+            guestPath: f.guestPath,
+          });
+        }
+      }
+    };
+    try {
+      if (resolved.model) {
+        await applyInjection(profile.modelInjection(resolved.model));
+      }
+      if (resolved.effort && profile.effortInjection) {
+        await applyInjection(profile.effortInjection(resolved.effort));
+      }
+    } catch (err) {
+      logger.error('runtime injection staging failed', {
+        adapter: profile.id,
+        error: (err as Error).message,
+      });
+      await this.workspaces.runAfterRunBestEffort(
+        workspace.path,
+        this.cfg.hooks,
+        hookCapture('after_run'),
+      );
+      return {
+        ok: false,
+        reason: 'runtime injection staging error',
+        threadId: null,
+        turnsCompleted: 0,
+      };
     }
-    const effectiveAdapterArgs = [...adapterArgs, ...modelArgs];
+    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, runtimeExtraFiles);
+    const effectiveAdapterArgs = [...adapterArgs, ...runtimeArgs];
 
     // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
     // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
@@ -394,7 +433,7 @@ export class AgentRunner {
         SYMPHONY_ACP_TOKEN: bridgeReg.token,
         SYMPHONY_ADAPTER_BIN: adapterBin,
         SYMPHONY_ADAPTER_ARGS: JSON.stringify(effectiveAdapterArgs),
-        ...modelEnv,
+        ...runtimeEnv,
       },
       timeoutMs: null,
     });
