@@ -28,11 +28,13 @@ describe('resolveDispatchConfig', () => {
     assert.deepEqual(resolveDispatchConfig(cfg, 'Todo'), {
       adapter: 'claude',
       model: 'claude-sonnet-4-5',
+      effort: null,
       max_turns: 5,
     });
     assert.deepEqual(resolveDispatchConfig(cfg, 'Review'), {
       adapter: 'codex',
       model: 'gpt-5-codex',
+      effort: null,
       max_turns: 4,
     });
   });
@@ -54,6 +56,7 @@ describe('resolveDispatchConfig', () => {
     assert.deepEqual(resolveDispatchConfig(cfg, 'Todo'), {
       adapter: 'codex',
       model: 'gpt-5-codex',
+      effort: null,
       max_turns: 17,
     });
   });
@@ -76,6 +79,7 @@ describe('resolveDispatchConfig', () => {
     assert.deepEqual(resolveDispatchConfig(cfg, 'Review'), {
       adapter: 'codex',
       model: 'claude-opus-4-7',
+      effort: null,
       max_turns: 30,
     });
   });
@@ -138,5 +142,44 @@ describe('resolveDispatchConfig', () => {
     // Parser normalizes a blank model string to null; resolveDispatchConfig
     // must keep that null instead of replacing it with the workflow fallback.
     assert.equal(resolveDispatchConfig(cfg, 'Todo').model, null);
+  });
+
+  it('resolves effort with per-state precedence and workflow fallback', () => {
+    // Same undefined / null cascade as `model`: per-state effort wins when set;
+    // omitting the key inherits acp.effort; explicit blank/null clears the
+    // workflow default for that state.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'codex', effort: 'high' },
+        states: {
+          Todo: { role: 'active', effort: 'xhigh' },
+          Review: { role: 'active' },
+          NoEffort: { role: 'active', effort: '   ' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(resolveDispatchConfig(cfg, 'Todo').effort, 'xhigh');
+    assert.equal(resolveDispatchConfig(cfg, 'Review').effort, 'high');
+    assert.equal(resolveDispatchConfig(cfg, 'NoEffort').effort, null);
+  });
+
+  it('defaults effort to null when neither workflow nor state declares it', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'codex' },
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(resolveDispatchConfig(cfg, 'Todo').effort, null);
   });
 });

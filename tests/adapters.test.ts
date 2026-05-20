@@ -182,6 +182,37 @@ describe('adapters registry', () => {
     const inj = ADAPTERS.codex.modelInjection('weird"name');
     assert.deepEqual(inj, { extraArgs: ['-c', 'model="weird\\"name"'] });
   });
+
+  it('codex profile surfaces the selected effort via -c model_reasoning_effort="..." argv', () => {
+    // codex-acp accepts model_reasoning_effort via the same `-c key=value` TOML
+    // override mechanism. Wrap the value in JSON.stringify so future enum values with
+    // dashes/dots/quotes round-trip safely.
+    const inj = ADAPTERS.codex.effortInjection('xhigh');
+    assert.deepEqual(inj, { extraArgs: ['-c', 'model_reasoning_effort="xhigh"'] });
+    assert.equal(inj.env, undefined);
+  });
+
+  it('claude profile has no effort knob and returns an empty injection', () => {
+    // claude-agent-acp does not expose a reasoning-effort selector today; the profile
+    // accepts acp.effort for schema symmetry but contributes nothing to the launch so
+    // workflows can declare effort without breaking the claude state.
+    const inj = ADAPTERS.claude.effortInjection('xhigh');
+    assert.deepEqual(inj, {});
+  });
+
+  it('codex effort + model both set: extraArgs concatenate without override', () => {
+    // Belt-and-braces: when both knobs are set, the runner concatenates each profile's
+    // contributions in turn. Verify they don't share an array reference or clobber
+    // each other.
+    const modelArgs = ADAPTERS.codex.modelInjection('gpt-5-codex').extraArgs ?? [];
+    const effortArgs = ADAPTERS.codex.effortInjection('xhigh').extraArgs ?? [];
+    assert.deepEqual([...modelArgs, ...effortArgs], [
+      '-c',
+      'model="gpt-5-codex"',
+      '-c',
+      'model_reasoning_effort="xhigh"',
+    ]);
+  });
 });
 
 describe('stageCredential', () => {

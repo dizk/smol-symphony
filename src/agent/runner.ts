@@ -92,6 +92,7 @@ function buildSteeringReplyPrompt(question: string, context: string | null, repl
 export interface ResolvedDispatchConfig {
   adapter: AcpAdapterId;
   model: string | null;
+  effort: string | null;
   max_turns: number;
 }
 
@@ -140,8 +141,11 @@ export function resolveDispatchConfig(
   // a model key at all; an explicit null in the state config means the operator wants
   // the adapter's own default for this state.
   const model = s.model === undefined ? cfg.acp.model : s.model;
+  // Same undefined/null cascade as `model`: a per-state `effort: ~` clears the workflow
+  // default for this state rather than inheriting it.
+  const effort = s.effort === undefined ? cfg.acp.effort : s.effort;
   const max_turns = s.max_turns ?? cfg.agent.max_turns;
-  return { adapter, model, max_turns };
+  return { adapter, model, effort, max_turns };
 }
 
 export class AgentRunner {
@@ -270,21 +274,29 @@ export class AgentRunner {
     const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath);
     const adapterBin = profile.binary[0]!;
     const adapterArgs = profile.binary.slice(1);
-    // Apply the resolved model selection (if any) to the adapter via its profile-
-    // specific mechanism: env var for claude-agent-acp, extra argv for codex-acp. The
-    // returned env/args are merged into the smolvm-exec invocation below so they reach
-    // the vm-agent proxy and then the spawned adapter. `resolved.model` is the per-state
-    // override (when set) or the workflow-level acp.model fallback.
-    const modelEnv: Record<string, string> = {};
-    const modelArgs: string[] = [];
+    // Apply the resolved model + effort selection (if any) to the adapter via its
+    // profile-specific mechanism: env var for claude-agent-acp, extra argv for codex-acp.
+    // The returned env/args are merged into the smolvm-exec invocation below so they
+    // reach the vm-agent proxy and then the spawned adapter. Each value falls back to
+    // the workflow-level default when the per-state override is absent (see
+    // `resolveDispatchConfig`).
+    const launchEnv: Record<string, string> = {};
+    const launchArgs: string[] = [];
     if (resolved.model) {
       const inj = profile.modelInjection(resolved.model);
       if (inj.env) {
-        for (const [k, v] of Object.entries(inj.env)) modelEnv[k] = v;
+        for (const [k, v] of Object.entries(inj.env)) launchEnv[k] = v;
       }
-      if (inj.extraArgs) modelArgs.push(...inj.extraArgs);
+      if (inj.extraArgs) launchArgs.push(...inj.extraArgs);
     }
-    const effectiveAdapterArgs = [...adapterArgs, ...modelArgs];
+    if (resolved.effort) {
+      const inj = profile.effortInjection(resolved.effort);
+      if (inj.env) {
+        for (const [k, v] of Object.entries(inj.env)) launchEnv[k] = v;
+      }
+      if (inj.extraArgs) launchArgs.push(...inj.extraArgs);
+    }
+    const effectiveAdapterArgs = [...adapterArgs, ...launchArgs];
 
     // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
     // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
@@ -384,7 +396,7 @@ export class AgentRunner {
         SYMPHONY_ACP_TOKEN: bridgeReg.token,
         SYMPHONY_ADAPTER_BIN: adapterBin,
         SYMPHONY_ADAPTER_ARGS: JSON.stringify(effectiveAdapterArgs),
-        ...modelEnv,
+        ...launchEnv,
       },
       timeoutMs: null,
     });

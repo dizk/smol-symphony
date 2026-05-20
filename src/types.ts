@@ -38,6 +38,13 @@ export interface StateConfig {
   role: 'active' | 'terminal' | 'holding';
   adapter?: string;
   model?: string | null;
+  /**
+   * Reasoning-effort selector for adapters that surface one (codex:
+   * `-c model_reasoning_effort="<value>"`). Same undefined/null semantics as
+   * `model`: undefined means "inherit acp.effort"; explicit null means "use
+   * adapter default for this state regardless of workflow effort".
+   */
+  effort?: string | null;
   max_turns?: number;
   allowed_transitions?: string[] | null;
 }
@@ -94,6 +101,12 @@ export interface AcpConfig {
    * for codex-acp). Null means "use the adapter's own default".
    */
   model: string | null;
+  /**
+   * Optional reasoning-effort selector forwarded to adapters that expose one. Codex
+   * surfaces this as `-c model_reasoning_effort="<value>"` (TOML). Claude has no
+   * equivalent today and ignores the field. Null means "let the adapter pick".
+   */
+  effort: string | null;
   shell: string;
   prompt_timeout_ms: number;
   read_timeout_ms: number;

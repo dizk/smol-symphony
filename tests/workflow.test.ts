@@ -99,6 +99,34 @@ describe('workflow', () => {
     assert.equal(cfg.acp.model, null);
   });
 
+  it('parses acp.effort and trims whitespace; defaults to null', () => {
+    const cfgDefault = buildServiceConfig(
+      { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfgDefault.acp.effort, null);
+
+    const cfgSet = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        acp: { adapter: 'codex', effort: '  xhigh  ' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfgSet.acp.effort, 'xhigh');
+
+    const cfgBlank = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        acp: { adapter: 'codex', effort: '   ' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfgBlank.acp.effort, null);
+  });
+
   it('rejects a workflow YAML with no states block', () => {
     assert.throws(
       () =>
@@ -165,6 +193,28 @@ describe('workflow states block', () => {
     assert.equal(cfg.states.Todo!.model, 'claude-opus-4-7');
     // Blank model trims to null — same normalization as the workflow-level acp.model.
     assert.equal(cfg.states.Review!.model, null);
+  });
+
+  it('trims and normalizes per-state effort overrides; preserves undefined when absent', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active' },
+          Review: { role: 'active', effort: '  xhigh  ' },
+          Blank: { role: 'active', effort: '   ' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    // No `effort:` declared → undefined (so resolveDispatchConfig can fall through to
+    // the workflow-level acp.effort).
+    assert.equal(cfg.states.Todo!.effort, undefined);
+    assert.equal(cfg.states.Review!.effort, 'xhigh');
+    // Explicit blank string clears the workflow default (same shape as model).
+    assert.equal(cfg.states.Blank!.effort, null);
   });
 });
 

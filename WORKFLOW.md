@@ -47,6 +47,9 @@ states:
     # ChatGPT-account user, so leave `model` unset and let codex-acp pick its
     # own default code-review model. Operators with an API-key Codex setup can
     # pin a specific model here once that's known-good.
+    # Pin reasoning effort high so review-mode codex chews on the diff before
+    # writing the verdict. Forwarded as `-c model_reasoning_effort="xhigh"`.
+    effort: xhigh
     max_turns: 6
     allowed_transitions: [Todo, Done]
   Done:

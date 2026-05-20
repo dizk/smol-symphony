@@ -38,6 +38,17 @@ export interface ModelInjection {
   extraArgs?: string[];
 }
 
+/**
+ * Same shape as ModelInjection but for the reasoning-effort selector. Surfaced
+ * separately because not every adapter exposes one (claude has no equivalent today)
+ * and because effort + model are independent knobs the runner merges into a single
+ * launch shape.
+ */
+export interface EffortInjection {
+  env?: Record<string, string>;
+  extraArgs?: string[];
+}
+
 export interface AdapterProfile {
   id: AcpAdapterId;
   /** Path under $HOME on the host where the credential file lives. */
@@ -57,6 +68,13 @@ export interface AdapterProfile {
    * they natively support (e.g. opencode could pass `--model` here).
    */
   modelInjection(model: string): ModelInjection;
+  /**
+   * Map an `acp.effort` string into env / extra argv. Called only when effort is
+   * non-null. Adapters with no reasoning-effort knob return an empty object; the
+   * runner then contributes nothing extra to the launch. codex-acp emits
+   * `-c model_reasoning_effort="<value>"`; claude-agent-acp has no equivalent today.
+   */
+  effortInjection(effort: string): EffortInjection;
 }
 
 export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
@@ -70,6 +88,9 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // "opus" or "claude-sonnet-4-5" against the SDK's model list, so anything the user
     // would type into Claude Code works here.
     modelInjection: (model) => ({ env: { ANTHROPIC_MODEL: model } }),
+    // claude-agent-acp has no reasoning-effort knob today. Accept the field for
+    // schema symmetry but contribute nothing to the launch.
+    effortInjection: () => ({}),
   },
   codex: {
     id: 'codex',
@@ -80,6 +101,13 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // (raw-string fallback on parse failure). We always emit a quoted TOML string so
     // model names containing dots or hyphens don't surprise the TOML parser.
     modelInjection: (model) => ({ extraArgs: ['-c', `model=${JSON.stringify(model)}`] }),
+    // codex's reasoning effort is set via the same `-c key=value` mechanism. Accepted
+    // values include `minimal | low | medium | high | xhigh` (confirmed against the
+    // codex Rust binary). JSON.stringify guards against future enum values containing
+    // characters TOML's bare-key parser would choke on.
+    effortInjection: (effort) => ({
+      extraArgs: ['-c', `model_reasoning_effort=${JSON.stringify(effort)}`],
+    }),
   },
 };
 

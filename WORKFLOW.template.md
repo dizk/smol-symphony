@@ -51,6 +51,10 @@ tracker:
 #   model     (string, optional): override `acp.model` for this state.
 #             Blank or whitespace-only values normalize to "use the adapter
 #             default" (same as the workflow-level acp.model semantics).
+#   effort    (string, optional): override `acp.effort` for this state. Same
+#             undefined/null semantics as `model` (omit to inherit; blank or
+#             null to clear). Only adapters with a reasoning-effort knob
+#             surface this — see `acp.effort` below.
 #   max_turns (int, optional): override `agent.max_turns` for this state.
 #   allowed_transitions (string[]|null, optional): when set, restricts which
 #             states agents in this state may transition to via the MCP
@@ -74,6 +78,7 @@ states:
     role: active
     adapter: codex
     model: gpt-5-codex
+    effort: xhigh
     max_turns: 4
     allowed_transitions: [Todo, Done]
   Done:
@@ -213,6 +218,20 @@ acp:
   #   codex   — passed as `-c model="<value>"` argv to codex-acp (parsed as TOML).
   # Leave unset / null to use the adapter's own default model. Default: null.
   # model: claude-opus-4-7
+
+  # effort (string | null): optional reasoning-effort selector forwarded to adapters
+  # that expose one. Per-state `effort:` overrides this; same undefined/null cascade
+  # as `model`.
+  #   codex   — passed as `-c model_reasoning_effort="<value>"` argv to codex-acp
+  #             (parsed as TOML). Accepted values include `minimal | low | medium |
+  #             high | xhigh`. Codex also exposes related knobs
+  #             (`model_reasoning_summary`, `model_verbosity`,
+  #             `plan_mode_reasoning_effort`) that are out of scope for `acp.effort`;
+  #             surface them via a custom hook if you need them today.
+  #   claude  — no reasoning-effort knob today; the field is accepted for schema
+  #             symmetry and contributes nothing to the launch.
+  # Default: null.
+  # effort: xhigh
 
   # NOTE: the launch shape is fixed (in-VM proxy dialing back over the bridge);
   # fork `scripts/vm-agent.js` if you need to customize what the proxy spawns.
