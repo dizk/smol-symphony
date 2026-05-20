@@ -785,6 +785,55 @@ describe('McpRegistry transition', () => {
     }
   });
 
+  it('updates entry.issue.state on successful transition so per-state hooks resolve correctly', async () => {
+    // The runner's after_run and the orchestrator's before_remove resolve hooks
+    // against runningEntry.issue.state. If the MCP handler did not mutate it, the
+    // resolver would pick up the pre-transition state and a terminal-state hook
+    // (e.g. Done's PR-create after_run) would never fire.
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { states });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      assert.equal(entry.issue.state, 'Todo');
+      const res = await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Review' } },
+      });
+      const result = (res as { result: { isError: boolean } }).result;
+      assert.equal(result.isError, false);
+      assert.equal(entry.issue.state, 'Review');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('preserves declared-casing for the post-transition entry state under case-insensitive input', async () => {
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(path.join(root, 'Todo', 'ABC-1.md'), `---\ntitle: T\n---\nbody`);
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, { states });
+      const entry = makeEntry('ABC-1', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      await reg.handleJsonRpc('ABC-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'review' } },
+      });
+      // The lowercase 'review' input still lands as the declared casing 'Review' on
+      // the entry, matching the directory name and the workflow's `states:` key.
+      assert.equal(entry.issue.state, 'Review');
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('rejects unknown to_state with a structured error listing declared states', async () => {
     const { root, cleanup } = await setupStateTree();
     try {

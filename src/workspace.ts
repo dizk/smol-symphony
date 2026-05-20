@@ -156,7 +156,13 @@ export class WorkspaceManager {
   }
 
   // Ensure the per-issue workspace directory exists. Runs after_create when created_now.
-  async ensureFor(identifier: string, captureAfterCreate?: HookCapture): Promise<Workspace> {
+  // `hooks` is resolved per the issue's current state by the caller (so a state-level
+  // hooks override applies); pass the workflow-level hooks for state-agnostic callers.
+  async ensureFor(
+    identifier: string,
+    hooks: HooksConfig,
+    captureAfterCreate?: HookCapture,
+  ): Promise<Workspace> {
     const workspaceRoot = this.cfg.workspace.root;
     await mkdir(workspaceRoot, { recursive: true });
     const wsPath = this.workspacePathFor(identifier);
@@ -189,11 +195,11 @@ export class WorkspaceManager {
       }
     }
 
-    if (createdNow && this.cfg.hooks.after_create) {
+    if (createdNow && hooks.after_create) {
       const res = await runHookScript(
-        this.cfg.hooks.after_create,
+        hooks.after_create,
         wsPath,
-        this.cfg.hooks.timeout_ms,
+        hooks.timeout_ms,
         captureAfterCreate,
       );
       if (hookFailed(res)) {

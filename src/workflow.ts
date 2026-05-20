@@ -9,6 +9,7 @@ import { parse as parseYaml } from 'yaml';
 import type {
   ServiceConfig,
   StateConfig,
+  StateHooksConfig,
   WorkflowDefinition,
   TrackerConfig,
   PollingConfig,
@@ -428,14 +429,87 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
         `state "${name}": allowed_transitions must be a list of state names (or null/omitted)`,
       );
     }
+    const stateHooks = parseStateHooksBlock(name, m['hooks']);
     const sc: StateConfig = { role: roleRaw };
     if (adapter !== null) sc.adapter = adapter;
     if (model !== undefined) sc.model = model;
     if (maxTurns !== undefined) sc.max_turns = maxTurns;
     if (allowed !== undefined) sc.allowed_transitions = allowed;
+    if (stateHooks !== undefined) sc.hooks = stateHooks;
     out[name] = sc;
   }
   return out;
+}
+
+// Per-state `hooks:` block. Each field is optional and accepts either a script string
+// or `null` to mean "explicitly suppress this hook for this state". A missing key falls
+// through to the workflow-level hook of the same name at resolution time.
+function parseStateHooksBlock(stateName: string, raw: unknown): StateHooksConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      `state "${stateName}": hooks must be a map of hook name → script (or null/omitted)`,
+    );
+  }
+  const m = raw as Record<string, unknown>;
+  const out: StateHooksConfig = {};
+  const fields: Array<keyof StateHooksConfig> = [
+    'after_create',
+    'before_run',
+    'after_run',
+    'before_remove',
+  ];
+  for (const name of fields) {
+    if (!Object.prototype.hasOwnProperty.call(m, name)) continue;
+    const v = m[name];
+    if (v === null) {
+      out[name] = null;
+    } else if (typeof v === 'string') {
+      out[name] = v;
+    } else {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${stateName}": hooks.${name} must be a string or null`,
+      );
+    }
+  }
+  return out;
+}
+
+// Effective hooks for an issue currently in `stateName`. Per-state hook fields override
+// the workflow-level ones; absent fields fall through. An explicit `null` in a state's
+// hooks block suppresses that hook for the state even if the workflow declares it. The
+// shared `timeout_ms` is always the workflow-level value — it bounds runtime cost, not
+// behavior, and states are not allowed to weaken or strengthen it.
+export function resolveHooksForState(cfg: ServiceConfig, stateName: string): HooksConfig {
+  const base = cfg.hooks;
+  const states = cfg.states;
+  let key: string | null = null;
+  if (Object.prototype.hasOwnProperty.call(states, stateName)) {
+    key = stateName;
+  } else {
+    const lower = stateName.toLowerCase();
+    for (const name of Object.keys(states)) {
+      if (name.toLowerCase() === lower) {
+        key = name;
+        break;
+      }
+    }
+  }
+  if (key === null) return base;
+  const sh = states[key]!.hooks;
+  if (!sh) return base;
+  const pick = (k: keyof StateHooksConfig): string | null =>
+    Object.prototype.hasOwnProperty.call(sh, k) ? sh[k] ?? null : base[k];
+  return {
+    after_create: pick('after_create'),
+    before_run: pick('before_run'),
+    after_run: pick('after_run'),
+    before_remove: pick('before_remove'),
+    timeout_ms: base.timeout_ms,
+  };
 }
 
 // §6.3 dispatch preflight validation.

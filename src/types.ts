@@ -26,6 +26,19 @@ export interface WorkflowDefinition {
   prompt_template: string;
 }
 
+// Per-state hook overrides. Any field set here replaces the workflow-level hook of
+// the same name when an issue is in this state at hook-fire time. `undefined` (key
+// absent) means "fall through to the workflow-level hook"; an explicit `null` means
+// "no hook for this state, even if workflow-level declares one" so a terminal state
+// can opt out of a global after_run that otherwise no-ops on it. `timeout_ms` is
+// not overridable per state — it's a global safety bound, not behavior.
+export interface StateHooksConfig {
+  after_create?: string | null;
+  before_run?: string | null;
+  after_run?: string | null;
+  before_remove?: string | null;
+}
+
 // Per-state configuration declared in the `states:` block of a workflow file. The
 // orchestrator dispatches against `active`; `terminal` ends a run and triggers
 // workspace cleanup; `holding` keeps a file in the tracker tree without ever
@@ -33,13 +46,17 @@ export interface WorkflowDefinition {
 // `max_turns` override the workflow-level defaults when set; null/undefined means
 // "use the workflow default at dispatch time". `allowed_transitions`, when non-null,
 // restricts which states the agent may move to via the MCP `transition` tool; null
-// means "any declared state is reachable".
+// means "any declared state is reachable". `hooks`, when set, overrides individual
+// workflow-level hook fields for issues in this state — used to give terminal states
+// (e.g. Done, Merge, Cancelled) divergent handoff behavior without an inline
+// terminal-state switch inside a single global hook.
 export interface StateConfig {
   role: 'active' | 'terminal' | 'holding';
   adapter?: string;
   model?: string | null;
   max_turns?: number;
   allowed_transitions?: string[] | null;
+  hooks?: StateHooksConfig;
 }
 
 export interface TrackerConfig {
