@@ -108,6 +108,27 @@ hooks:
       echo "issue ${ISSUE_ID} not in Done/ yet; skipping handoff"
       exit 0
     fi
+    # ALWAYS preserve mark_done.md early — before any other exit-0 path — so analytical
+    # issues that produce no commits still leave a durable record of the agent's reasoning
+    # outside the per-issue workspace (which is destroyed on terminal cleanup).
+    MARKDONE=""
+    if [ -f .git/symphony-runtime/mark_done.md ]; then
+      MARKDONE=.git/symphony-runtime/mark_done.md
+    elif [ -f .symphony-runtime/mark_done.md ]; then
+      MARKDONE=.symphony-runtime/mark_done.md
+    fi
+    if [ -n "${MARKDONE}" ]; then
+      NOTES_DIR="${SYMPHONY_NOTES_DIR:-$PWD/../../../.symphony/notes}"
+      mkdir -p "${NOTES_DIR}"
+      cp "${MARKDONE}" "${NOTES_DIR}/${ISSUE_ID}.md"
+      echo "preserved mark_done.md at ${NOTES_DIR}/${ISSUE_ID}.md"
+      TITLE="$(sed -n '1 s/^# //p' "${MARKDONE}")"
+      BODY="$(tail -n +3 "${MARKDONE}")"
+    else
+      TITLE="${ISSUE_ID}"
+      BODY="Symphony run for ${ISSUE_ID}."
+    fi
+
     if ! git rev-parse --verify "${BRANCH}" >/dev/null 2>&1; then
       echo "no branch ${BRANCH}; nothing to hand off"
       exit 0
@@ -128,46 +149,48 @@ hooks:
     fi
 
     if [ -z "$(git log --oneline "${MERGE_BASE}..${BRANCH}" 2>/dev/null)" ]; then
-      echo "no new commits on ${BRANCH}; nothing to hand off"
+      echo "no new commits on ${BRANCH}; nothing to hand off (diagnosis at .symphony/notes/${ISSUE_ID}.md)"
       exit 0
     fi
 
-    # The mark_done MCP tool persists its title + summary into a structured
-    # markdown file at <staging>/mark_done.md. The staging dir is inside .git/
-    # when the workspace has its own clone; .symphony-runtime/ otherwise.
-    MARKDONE=""
-    if [ -f .git/symphony-runtime/mark_done.md ]; then
-      MARKDONE=.git/symphony-runtime/mark_done.md
-    elif [ -f .symphony-runtime/mark_done.md ]; then
-      MARKDONE=.symphony-runtime/mark_done.md
-    fi
-    if [ -n "${MARKDONE}" ]; then
-      TITLE="$(sed -n '1 s/^# //p' "${MARKDONE}")"
-      BODY="$(tail -n +3 "${MARKDONE}")"
-    else
-      TITLE="${ISSUE_ID}"
-      BODY="Symphony run for ${ISSUE_ID}."
-    fi
+    # Always materialize a patch bundle BEFORE attempting the remote push. This is the
+    # robust artifact: if anything in the gh/origin chain fails — missing origin remote
+    # because an older after_create ran without SYMPHONY_REPO set, a network blip, a gh
+    # auth glitch — the agent's work survives at .symphony/patches/<branch>.patch and can
+    # be replayed by hand. The push + PR path below is best-effort on top.
+    mkdir -p "${PATCHES_DIR}"
+    PATCH_OUT="${PATCHES_DIR}/$(echo "${BRANCH}" | tr '/' '_').patch"
+    git format-patch --stdout "${MERGE_BASE}..${BRANCH}" > "${PATCH_OUT}"
+    echo "wrote patch bundle: ${PATCH_OUT}"
 
     if [ -n "${SYMPHONY_REPO:-}" ]; then
-      # Remote PR mode.
-      git push -u origin "${BRANCH}"
-      if gh pr view "${BRANCH}" >/dev/null 2>&1; then
-        echo "PR already exists for ${BRANCH}; pushed updates"
-      else
-        gh pr create \
+      # Remote PR mode. Be defensive about origin: an earlier workspace creation may have
+      # happened with SYMPHONY_REPO unset (after_create's remote-add branch was skipped),
+      # leaving the workspace without an origin remote even though we're now in PR mode.
+      # Re-create it idempotently before pushing.
+      if ! git remote get-url origin >/dev/null 2>&1; then
+        echo "after_run: origin remote missing; re-adding"
+        git remote add origin "https://github.com/${SYMPHONY_REPO}.git"
+        gh auth setup-git 2>/dev/null || true
+      fi
+      # Push + PR. On failure we leave the patch bundle (above) in place as the canonical
+      # record; operators can `gh pr create` from it manually.
+      if git push -u origin "${BRANCH}"; then
+        if gh pr view "${BRANCH}" >/dev/null 2>&1; then
+          echo "PR already exists for ${BRANCH}; pushed updates"
+        elif ! gh pr create \
           --base "${BASE}" \
           --head "${BRANCH}" \
           --title "${ISSUE_ID}: ${TITLE}" \
-          --body "${BODY}"
+          --body "${BODY}"; then
+          echo "gh pr create failed; patch bundle preserved at ${PATCH_OUT}" >&2
+        fi
+      else
+        echo "git push failed; patch bundle preserved at ${PATCH_OUT}" >&2
       fi
     else
-      # Local-only mode: bundle the diff for human review.
-      mkdir -p "${PATCHES_DIR}"
-      OUT="${PATCHES_DIR}/$(echo "${BRANCH}" | tr '/' '_').patch"
-      git format-patch --stdout "${MERGE_BASE}..${BRANCH}" > "${OUT}"
-      echo "wrote patch bundle: ${OUT}"
-      echo "  apply with:  git -C <target-repo> am ${OUT}"
+      # Local-only mode: the patch bundle above is the canonical output.
+      echo "  apply with:  git -C <target-repo> am ${PATCH_OUT}"
     fi
 
 agent:
