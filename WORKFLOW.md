@@ -177,11 +177,22 @@ hooks:
     # If SYMPHONY_REPO is set, restore an `origin` pointing at the GitHub remote
     # so the after_run hook can push. The URL is the canonical HTTPS form (no
     # token); auth comes from the host's `gh`, which never enters the VM.
+    #
+    # In PR mode the canonical integration ref lives on `origin` — that is
+    # where the orchestrator's post-Done merge pushes — NOT the source-repo
+    # copy we cloned from. So after fetching origin/${INTEGRATION} we reset
+    # the local integration branch to it, ensuring the `agent/<id>` branch we
+    # cut next is based on the live remote tip rather than a possibly-stale
+    # source-repo branch. If origin has no integration ref yet (very first
+    # run after opting into the flow) we fall through and keep the local seed
+    # that the SOURCE_REPO step above produced from base.
     if [ -n "${SYMPHONY_REPO:-}" ]; then
       git remote add origin "https://github.com/${SYMPHONY_REPO}.git"
       gh auth setup-git 2>/dev/null || true
       git fetch --no-tags origin "${BASE}:refs/remotes/origin/${BASE}" || true
-      git fetch --no-tags origin "${INTEGRATION}:refs/remotes/origin/${INTEGRATION}" || true
+      if git fetch --no-tags origin "${INTEGRATION}:refs/remotes/origin/${INTEGRATION}"; then
+        git checkout -B "${INTEGRATION}" "refs/remotes/origin/${INTEGRATION}"
+      fi
     fi
 
     git config --local user.name  "symphony-agent"
