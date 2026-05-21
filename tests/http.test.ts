@@ -195,14 +195,14 @@ describe('triage approve / discard', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('triage partial renders one row per file with provenance + action buttons', async () => {
-    const res = await fetch(`${server.url}/api/v1/partials/triage`);
+  it('board partial places triage rows in the Triage column with approve/discard actions', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/board`);
     assert.equal(res.status, 200);
     const html = await res.text();
-    assert.match(html, /triage <span class="count dim">\(2\)<\/span>/);
+    // Triage column header shows the count.
+    assert.match(html, /data-state="Triage"[^>]*>\s*<header class="col-head">\s*<span class="col-name">Triage<\/span>\s*<span class="col-count">2<\/span>/);
     assert.match(html, /investigate-cleanup/);
     assert.match(html, /Investigate cleanup/);
-    assert.match(html, /from agent-issues/);
     assert.match(html, /hx-post="\/api\/v1\/issues\/investigate-cleanup\/approve"/);
     assert.match(html, /hx-post="\/api\/v1\/issues\/investigate-cleanup\/discard"/);
     assert.match(html, /another-thing/);
@@ -237,7 +237,7 @@ describe('triage approve / discard', () => {
     assert.ok(cancelledFiles.includes('another-thing.md'));
   });
 
-  it('approve via HTMX returns the re-rendered triage partial (200 OK)', async () => {
+  it('approve via HTMX returns the re-rendered board partial (200 OK)', async () => {
     // Stage a new proposal so the previous tests don't drain the section.
     await writeFile(
       path.join(root, 'Triage', 'htmx-flow.md'),
@@ -255,9 +255,22 @@ describe('triage approve / discard', () => {
     });
     assert.equal(res.status, 200);
     const html = await res.text();
-    // The htmx flow returns the triage partial. htmx-flow.md should now be gone from
-    // the section since it moved to Todo/.
-    assert.ok(!html.includes('htmx-flow'));
+    // The htmx flow now returns the full board partial; the row still appears,
+    // but inside the Todo column rather than the Triage column. Slice the HTML
+    // around the Triage column header to confirm the row is no longer there.
+    assert.match(html, /<div class="kanban">/);
+    assert.ok(html.includes('htmx-flow'), 'expected htmx-flow to still render somewhere on the board');
+    const triageStart = html.indexOf('data-state="Triage"');
+    const todoStart = html.indexOf('data-state="Todo"');
+    assert.ok(triageStart > -1 && todoStart > -1, 'both columns should render');
+    // The Triage column is rendered LAST in the default workflow's declared
+    // order, so its body runs from triageStart to end-of-document.
+    const triageSlice = html.slice(triageStart);
+    assert.ok(!triageSlice.includes('htmx-flow'), 'htmx-flow should have left the Triage column');
+    // The row should now sit in the Todo column. The default workflow declares
+    // Todo first, so its body runs from todoStart up to the next column.
+    const todoSlice = html.slice(todoStart, triageStart);
+    assert.ok(todoSlice.includes('htmx-flow'), 'htmx-flow should now be in the Todo column');
   });
 
   it('rejects form-encoded request without HX-Request (CSRF protection)', async () => {
@@ -449,7 +462,7 @@ describe('GET /issues/:identifier — issue detail page', () => {
   });
 });
 
-describe('disk + triage rows link to the detail page', () => {
+describe('board rows link to the detail page', () => {
   let root: string;
   let server: { url: string; close: () => Promise<void> };
 
@@ -473,20 +486,20 @@ describe('disk + triage rows link to the detail page', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('on-disk row identifier is an anchor pointing at /issues/<id>', async () => {
-    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+  it('active-column row identifier and title are anchors pointing at /issues/<id>', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/board`);
     assert.equal(res.status, 200);
     const html = await res.text();
-    assert.match(html, /<a class="ident" href="\/issues\/PILE-1"[^>]*>PILE-1<\/a>/);
-    assert.match(html, /<a class="title" href="\/issues\/PILE-1">On disk task<\/a>/);
+    assert.match(html, /<a class="row-ident" href="\/issues\/PILE-1"[^>]*>PILE-1<\/a>/);
+    assert.match(html, /<a class="row-title" href="\/issues\/PILE-1">On disk task<\/a>/);
   });
 
-  it('triage row identifier is an anchor pointing at /issues/<id>', async () => {
-    const res = await fetch(`${server.url}/api/v1/partials/triage`);
+  it('holding-column (Triage) row identifier and title are anchors pointing at /issues/<id>', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/board`);
     assert.equal(res.status, 200);
     const html = await res.text();
-    assert.match(html, /<a class="ident" href="\/issues\/TRI-1"[^>]*><strong>TRI-1<\/strong><\/a>/);
-    assert.match(html, /<a class="title" href="\/issues\/TRI-1">Proposed task<\/a>/);
+    assert.match(html, /<a class="row-ident" href="\/issues\/TRI-1"[^>]*>TRI-1<\/a>/);
+    assert.match(html, /<a class="row-title" href="\/issues\/TRI-1">Proposed task<\/a>/);
   });
 });
 
@@ -556,7 +569,7 @@ describe('renderMarkdown — agent-flavoured Markdown', () => {
   });
 });
 
-describe('attention partial — Markdown rendering for steering questions', () => {
+describe('board partial — inline steering Markdown rendering for awaiting rows', () => {
   function makeOrchestratorWithSteering(question: string): Orchestrator {
     const row: RunningRow = {
       issue_id: 'q1',
@@ -591,11 +604,19 @@ describe('attention partial — Markdown rendering for steering questions', () =
     } as unknown as Orchestrator;
   }
 
-  it('renders Markdown inside the question-primary container instead of a raw <p>', async () => {
+  it('renders Markdown inside the inline steering panel of the awaiting row', async () => {
     const orch = makeOrchestratorWithSteering(
       ['Should I:', '', '- **delete** the file', '- or rename it to `foo.bak`?'].join('\n'),
     );
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-md-'));
+    // The awaiting row must exist on disk for the kanban to place it — the orchestrator
+    // dispatches an issue by moving its file into an active state directory, so writing
+    // q1.md into In Progress/ mirrors how production dispatch arrives at this state.
+    await mkdir(path.join(root, 'In Progress'), { recursive: true });
+    await writeFile(
+      path.join(root, 'In Progress', 'q1.md'),
+      `---\nid: "q1"\nidentifier: "q1"\ntitle: "Sample issue"\n---\nbody.`,
+    );
     const handle = await startHttpServer(orch, {
       port: 0,
       host: '127.0.0.1',
@@ -614,13 +635,18 @@ describe('attention partial — Markdown rendering for steering questions', () =
       tracker: null,
     });
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/v1/partials/attention`);
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/v1/partials/board`);
       assert.equal(res.status, 200);
       const html = await res.text();
-      assert.match(html, /<div class="question-primary">/);
+      assert.match(html, /<div class="steering-q">/);
       assert.match(html, /<strong>delete<\/strong>/);
       assert.match(html, /<code>foo\.bak<\/code>/);
       assert.match(html, /<ul><li>/);
+      // The ticker should also surface a jump-link to the awaiting row.
+      const tickerRes = await fetch(`http://127.0.0.1:${handle.port}/api/v1/partials/attention`);
+      const tickerHtml = await tickerRes.text();
+      assert.match(tickerHtml, /1 awaiting/);
+      assert.match(tickerHtml, /href="#row-q1"/);
     } finally {
       await handle.close();
       await rm(root, { recursive: true, force: true });
@@ -724,7 +750,7 @@ describe('role-based state pill on the issue-detail page', () => {
   });
 });
 
-describe('disk partial includes terminal-state issues but excludes holding', () => {
+describe('board partial omits terminal columns; includes active and holding', () => {
   let root: string;
   let server: { url: string; close: () => Promise<void> };
 
@@ -759,22 +785,25 @@ describe('disk partial includes terminal-state issues but excludes holding', () 
     await rm(root, { recursive: true, force: true });
   });
 
-  it('includes active-state and terminal-state rows; excludes holding rows', async () => {
-    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+  it('renders active and holding columns but skips terminal — finished work lives on its detail page', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/board`);
     assert.equal(res.status, 200);
     const html = await res.text();
-    // Active state appears.
-    assert.ok(html.includes('active-1'), 'expected active-1 in the disk panel');
-    // Terminal state now appears (Phase 4 broadened the visibility rule from
-    // "active only" to "every declared non-holding state with issues").
-    assert.ok(html.includes('finished-1'), 'expected terminal finished-1 in the disk panel');
-    // Holding state is rendered in the separate triage panel; it must not
-    // double-list here.
-    assert.ok(!html.includes('pending-1'), 'holding-state pending-1 should not appear in the disk panel');
+    // Active and holding columns are rendered.
+    assert.match(html, /data-state="Todo"/);
+    assert.match(html, /data-state="Triage"/);
+    // Terminal column is deliberately absent from the board.
+    assert.ok(!/data-state="Done"/.test(html), 'Done (terminal) column should not appear on the kanban');
+    // Active row sits inside its column.
+    assert.ok(html.includes('active-1'), 'expected active-1 in the Todo column');
+    // Terminal row is hidden from the board (still reachable via /issues/<id>).
+    assert.ok(!html.includes('finished-1'), 'finished-1 (terminal) should not appear on the board');
+    // Holding row sits inside the Triage column.
+    assert.ok(html.includes('pending-1'), 'expected holding pending-1 in the Triage column');
   });
 });
 
-describe('disk partial renders states in declared order', () => {
+describe('board partial renders columns in declared order', () => {
   let root: string;
   let server: { url: string; close: () => Promise<void> };
 
@@ -813,16 +842,17 @@ describe('disk partial renders states in declared order', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('orders rows by declared state position (not identifier)', async () => {
-    const res = await fetch(`${server.url}/api/v1/partials/disk`);
+  it('orders columns by declared state position so rows render in workflow order', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/board`);
     assert.equal(res.status, 200);
     const html = await res.text();
     const cIdx = html.indexOf('item-c');
     const bIdx = html.indexOf('item-b');
     const aIdx = html.indexOf('item-a');
     assert.ok(cIdx > -1 && bIdx > -1 && aIdx > -1, 'all three identifiers should render');
-    // Declared order is Backlog → Doing → Review, so item-c (Backlog) should
-    // render before item-b (Doing) which should render before item-a (Review).
+    // Declared order is Backlog → Doing → Review, so item-c (Backlog column)
+    // should appear before item-b (Doing column) which should appear before
+    // item-a (Review column) in the rendered HTML.
     assert.ok(cIdx < bIdx, `expected item-c (Backlog) before item-b (Doing); got positions ${cIdx} vs ${bIdx}`);
     assert.ok(bIdx < aIdx, `expected item-b (Doing) before item-a (Review); got positions ${bIdx} vs ${aIdx}`);
   });
@@ -926,7 +956,7 @@ describe('triage discard falls back to first terminal when no "cancelled" is dec
   });
 });
 
-describe('POST /api/v1/issues accepts declared active+terminal states and rejects holding/undeclared', () => {
+describe('POST /api/v1/issues accepts declared non-terminal states and rejects terminal/undeclared', () => {
   let root: string;
   let server: { url: string; close: () => Promise<void> };
 
@@ -955,25 +985,25 @@ describe('POST /api/v1/issues accepts declared active+terminal states and reject
     assert.equal(res.status, 201);
   });
 
-  it('accepts a terminal state', async () => {
-    const res = await fetch(`${server.url}/api/v1/issues`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ title: 'item two', state: 'Shipped' }),
-    });
-    assert.equal(res.status, 201);
-  });
-
-  it('rejects a holding state name', async () => {
+  it('accepts a holding state (kanban + column adds a row directly into Triage)', async () => {
     const res = await fetch(`${server.url}/api/v1/issues`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ title: 'item three', state: 'Holding' }),
     });
+    assert.equal(res.status, 201);
+  });
+
+  it('rejects a terminal state name (Done/Cancelled are archives, not dispatch targets)', async () => {
+    const res = await fetch(`${server.url}/api/v1/issues`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'item two', state: 'Shipped' }),
+    });
     assert.equal(res.status, 400);
     const data = (await res.json()) as { error: { message: string } };
     assert.match(data.error.message, /state must be one of/);
-    assert.ok(!data.error.message.includes('Holding'), 'holding state should not appear in the allow-list message');
+    assert.ok(!data.error.message.includes('Shipped'), 'terminal state should not appear in the allow-list message');
   });
 
   it('rejects an undeclared state name', async () => {
@@ -983,5 +1013,153 @@ describe('POST /api/v1/issues accepts declared active+terminal states and reject
       body: JSON.stringify({ title: 'item four', state: 'NotDeclared' }),
     });
     assert.equal(res.status, 400);
+  });
+});
+
+describe('board partial groups disk state directories case-insensitively', () => {
+  // LocalMarkdownTracker matches state directories case-insensitively against
+  // the declared `states:` keys, so a `todo/` directory under a declared `Todo`
+  // is a valid layout. The board must group those rows under the declared Todo
+  // column rather than splitting them off as an "undeclared" orphan column.
+  let root: string;
+  let server: { url: string; close: () => Promise<void> };
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-board-case-'));
+    await mkdir(path.join(root, 'todo'), { recursive: true });
+    await writeFile(
+      path.join(root, 'todo', 'lowercase-state.md'),
+      `---\nid: "lowercase-state"\nidentifier: "lowercase-state"\ntitle: "lives in todo/"\n---\nbody.`,
+    );
+    server = await bootBespoke(root, {
+      states: [
+        { name: 'Todo', role: 'active' },
+        { name: 'Done', role: 'terminal' },
+        { name: 'Triage', role: 'holding' },
+      ],
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('places a row from `todo/` inside the declared `Todo` column (no orphan column)', async () => {
+    const res = await fetch(`${server.url}/api/v1/partials/board`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // The row appears.
+    assert.ok(html.includes('lowercase-state'), 'expected lowercase-state row on the board');
+    // It's inside the declared Todo column.
+    const todoStart = html.indexOf('data-state="Todo"');
+    const nextColStart = (() => {
+      const candidates = [
+        html.indexOf('data-state="Triage"', todoStart + 1),
+        html.length,
+      ].filter((n) => n > 0);
+      return Math.min(...candidates);
+    })();
+    const todoSlice = html.slice(todoStart, nextColStart);
+    assert.ok(todoSlice.includes('lowercase-state'), 'row should sit inside the Todo column slice');
+    // No orphan column was synthesised for the lowercase directory name.
+    assert.ok(!/data-state="todo"/.test(html), 'no orphan column should be rendered for the lowercase directory');
+    assert.ok(!html.includes('undeclared'), 'undeclared badge should not appear for a case-only mismatch');
+  });
+});
+
+describe('board partial respects front-matter `identifier:` overrides', () => {
+  // The orchestrator dispatches under the front-matter identifier when present
+  // (mirrors LocalMarkdownTracker.normalize: `fm.identifier ?? filename`). If
+  // the dashboard used the filename stem as the row key, awaiting/running state
+  // would never overlay onto the row and the ticker jump-link would point at a
+  // missing #row anchor.
+  function makeOrchestratorWithRunningIdentifier(identifier: string): Orchestrator {
+    const row: RunningRow = {
+      issue_id: identifier,
+      issue_identifier: identifier,
+      issue_title: 'overridden identifier',
+      issue_body: '',
+      state: 'Todo',
+      session_id: 'abcd5678',
+      turn_count: 1,
+      last_event: null,
+      last_message: 'editing src/foo.ts…',
+      started_at: new Date().toISOString(),
+      last_event_at: null,
+      tokens: { input_tokens: 0, output_tokens: 0, total_tokens: 42 },
+      steering_requested: false,
+      steering_question: null,
+      steering_context: null,
+      transitioned: false,
+    };
+    const snap: Snapshot = {
+      generated_at: new Date().toISOString(),
+      counts: { running: 1, retrying: 0 },
+      running: [row],
+      retrying: [],
+      session_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 42, seconds_running: 5 },
+      rate_limits: null,
+    };
+    return {
+      snapshot: () => snap,
+      triggerRefresh: () => ({ status: 'ok' as const }),
+      detailByIdentifier: () => null,
+    } as unknown as Orchestrator;
+  }
+
+  let root: string;
+  let handle: { port: number; close: () => Promise<void> };
+  const FRONT_MATTER_ID = 'ACTUAL-ID';
+  const FILENAME_STEM = 'some-other-slug';
+
+  before(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), 'symphony-fm-id-'));
+    await mkdir(path.join(root, 'Todo'), { recursive: true });
+    await writeFile(
+      path.join(root, 'Todo', `${FILENAME_STEM}.md`),
+      `---\nid: "${FRONT_MATTER_ID}"\nidentifier: "${FRONT_MATTER_ID}"\ntitle: "Frontmatter identifier wins"\n---\nbody.`,
+    );
+    const orch = makeOrchestratorWithRunningIdentifier(FRONT_MATTER_ID);
+    handle = await startHttpServer(orch, {
+      port: 0,
+      host: '127.0.0.1',
+      getTrackerView: () => ({
+        trackerRoot: root,
+        states: [
+          { name: 'Todo', role: 'active' },
+          { name: 'Done', role: 'terminal' },
+          { name: 'Triage', role: 'holding' },
+        ],
+        workflowPath: '/tmp/WORKFLOW.md',
+      }),
+      mcp: null,
+      tracker: null,
+    });
+  });
+
+  after(async () => {
+    await handle.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('uses the front-matter identifier as the row key so running state overlays correctly', async () => {
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/v1/partials/board`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // Row id and href use the front-matter identifier, not the filename stem.
+    assert.match(html, new RegExp(`id="row-${FRONT_MATTER_ID}"`));
+    assert.ok(!html.includes(`id="row-${FILENAME_STEM}"`), 'row id should not use the filename stem');
+    // The running pill overlays because runningById lookup hits.
+    assert.match(html, /<span class="pill running">running<\/span>/);
+    // The last-message peek is rendered (proves the row's `running` is the live row).
+    assert.match(html, /editing src\/foo\.ts/);
+  });
+
+  it('detail page resolves /issues/<front-matter-id> by walking files when filename differs', async () => {
+    const res = await fetch(`http://127.0.0.1:${handle.port}/issues/${FRONT_MATTER_ID}`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<h1>Frontmatter identifier wins<\/h1>/);
   });
 });

@@ -96,10 +96,12 @@ function isSameOriginRequest(req: IncomingMessage): boolean {
 }
 
 // HTMX's default response handling does not swap content on 4xx/5xx responses, so
-// returning a 4xx with an HTML partial silently leaves the panel stale. For HTMX
-// callers we therefore return 200 with the attention partial plus a one-line error
-// banner; the operator's textarea text survives via hx-preserve. JSON callers still
-// get the appropriate status code and a structured error.
+// returning a 4xx with an HTML partial silently leaves the region stale. For HTMX
+// callers (currently only steering-reply, which targets the #ticker region) we
+// return 200 with the ticker partial plus an inline error chip; the operator's
+// textarea content sits in the board row (separate hx-preserve cycle) and is
+// unaffected. JSON callers still get the appropriate status code and a structured
+// error.
 async function htmxOrJsonError(
   res: ServerResponse,
   isHtmx: boolean,
@@ -193,7 +195,15 @@ async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
       }
       const proposed_by = matchFrontMatterString(text, 'proposed_by');
       const proposed_at = matchFrontMatterString(text, 'proposed_at');
-      out.push({ identifier: f.slice(0, -3), state: stateDir, title, proposed_by, proposed_at });
+      // Prefer the front-matter `identifier:` when set so the dashboard reports the
+      // same identifier the orchestrator dispatches under (LocalMarkdownTracker's
+      // normalize() at src/trackers/local.ts uses `fm.identifier ?? filename`).
+      // Without this, an issue whose front-matter identifier differs from its
+      // filename loses its overlaid running/retrying/awaiting state on the board
+      // and its ticker jump-link points at a missing #row anchor.
+      const fmIdent = matchFrontMatterString(text, 'identifier');
+      const identifier = fmIdent && fmIdent.length > 0 ? fmIdent : f.slice(0, -3);
+      out.push({ identifier, state: stateDir, title, proposed_by, proposed_at });
     }
   }
   out.sort((a, b) => a.identifier.localeCompare(b.identifier));
@@ -234,6 +244,8 @@ async function readIssueFromDisk(
   } catch {
     return null;
   }
+  // Fast path: filename stem matches. Common case where the operator never set
+  // a front-matter identifier and the file is just `<identifier>.md`.
   const target = `${identifier}.md`;
   for (const stateDir of entries) {
     const dirPath = path.join(trackerRoot, stateDir);
@@ -253,6 +265,42 @@ async function readIssueFromDisk(
     }
     const { frontMatter, body } = splitMarkdownFrontMatter(text);
     return { identifier, state: stateDir, filePath, frontMatter, body };
+  }
+  // Fallback: scan every .md file in every state directory and match by the
+  // front-matter `identifier:` field. Handles the case where the orchestrator
+  // dispatches under a front-matter identifier that differs from the filename
+  // stem — same resolution the tracker uses in normalize() (`fm.identifier ??
+  // filename`). Slower (reads every issue file) but only on the not-found path,
+  // and only for trackers that actually exercise the override.
+  for (const stateDir of entries) {
+    const dirPath = path.join(trackerRoot, stateDir);
+    let st;
+    try {
+      st = await stat(dirPath);
+    } catch {
+      continue;
+    }
+    if (!st.isDirectory()) continue;
+    let files: string[];
+    try {
+      files = await readdir(dirPath);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith('.md')) continue;
+      const filePath = path.join(dirPath, f);
+      let text: string;
+      try {
+        text = await readFile(filePath, 'utf8');
+      } catch {
+        continue;
+      }
+      const fmIdent = matchFrontMatterString(text, 'identifier');
+      if (fmIdent !== identifier) continue;
+      const { frontMatter, body } = splitMarkdownFrontMatter(text);
+      return { identifier, state: stateDir, filePath, frontMatter, body };
+    }
   }
   return null;
 }
@@ -320,9 +368,12 @@ async function gatherPartialInputs(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Dashboard render. The page is a single server-rendered HTML shell whose four
-// live regions poll their own partials at 2s via HTMX. The shell embeds the
-// first render of each partial inline so the page is correct on first paint.
+// Dashboard render. The page is a single server-rendered HTML shell whose live
+// regions (#tracker-state, #ticker, #board, footer.totals) poll their own
+// partials at 2s via HTMX. The shell embeds the first render of each partial
+// inline so the page is correct on first paint. The board is a kanban: one
+// column per declared state, with the new-issue composer living in a right-side
+// slide-in panel (the only card-shaped surface — see DESIGN.md One-Card Rule).
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Snapshot = ReturnType<Orchestrator['snapshot']>;
@@ -340,10 +391,11 @@ interface PartialInputs {
   workflowName: string;
   workflowPath: string;
   trackerRoot: string;
-  // Declared per-state config in workflow declaration order. Drives the role-based
-  // pill class (active → running, terminal → done, holding → idle), the on-disk
-  // column ordering, and (via role filters at the call sites) the form-default
-  // active state and triage approve/discard targets.
+  // Declared per-state config in workflow declaration order. Drives the kanban
+  // column order, the per-column add-issue affordance (active + holding only),
+  // the per-row triage approve/discard buttons (holding only), the form-default
+  // active state, and the still-used role-based pill class on the issue detail
+  // page (which sits outside the kanban).
   states: StateView[];
   snapshot: Snapshot;
   diskIssues: DiskIssue[];
@@ -415,42 +467,282 @@ function renderHeaderPartial(p: PartialInputs): string {
   return `<span class="badge badge-${status}" aria-label="tracker state: ${statusLabel}">${statusLabel}</span>`;
 }
 
+// ─── Top-of-page attention ticker ───────────────────────────────────────
+// A horizontal strip listing what currently needs the operator's eyes: pending
+// steering replies and stuck retries. Each identifier is an anchor link to the
+// row inside the board — the operator scans the ticker, jumps to the column,
+// and replies in place. The steering reply form itself now lives inline on its
+// row in the board, so this ticker stays thin.
 function renderAttentionPartial(p: PartialInputs, opts?: { errorMessage?: string }): string {
   const awaiting = p.snapshot.running.filter((r) => r.steering_requested);
   const retrying = p.snapshot.retrying;
   const errorMessage = opts?.errorMessage?.trim() ?? '';
-  if (awaiting.length === 0 && retrying.length === 0 && !errorMessage) return '';
-
-  const errorBanner = errorMessage
-    ? `<div class="steering-error" role="alert">${escapeHtml(errorMessage)}</div>`
-    : '';
-  const steeringBlocks = awaiting.map((r) => renderSteeringBlock(r)).join('');
-  const retryBlocks = retrying.length > 0 ? renderRetryBlock(retrying) : '';
-  return `<h2 class="attention-title">attention</h2>
-${errorBanner}${steeringBlocks}${retryBlocks}`;
+  const segments: string[] = [];
+  if (awaiting.length > 0) {
+    const links = awaiting
+      .map((r) =>
+        `<a href="#row-${escapeHtml(r.issue_identifier)}" class="tick-id">${escapeHtml(r.issue_identifier)}</a>`,
+      )
+      .join(' ');
+    segments.push(
+      `<span class="tick tick-await"><span class="tick-label">${awaiting.length} awaiting</span> ${links}</span>`,
+    );
+  }
+  if (retrying.length > 0) {
+    const stuck = retrying.filter((r) => r.error).length;
+    const links = retrying
+      .map((r) =>
+        `<a href="#row-${escapeHtml(r.issue_identifier)}" class="tick-id">${escapeHtml(r.issue_identifier)}</a>`,
+      )
+      .join(' ');
+    const label = stuck > 0
+      ? `${retrying.length} retrying · ${stuck} with error`
+      : `${retrying.length} retrying`;
+    segments.push(
+      `<span class="tick tick-retry"><span class="tick-label">${label}</span> ${links}</span>`,
+    );
+  }
+  if (errorMessage) {
+    segments.push(`<span class="tick tick-err" role="alert">${escapeHtml(errorMessage)}</span>`);
+  }
+  return segments.join('');
 }
 
-function renderSteeringBlock(r: RunningRow): string {
+// ─── Board (kanban) ─────────────────────────────────────────────────────
+// One column per declared state in workflow declaration order. Each on-disk
+// issue renders as a flat row in its state's column; transient orchestrator
+// state (running / retrying / awaiting steering) is overlaid via a pill, a
+// metadata trail, and — for awaiting — an inline question + reply form. Issues
+// sitting in an undeclared state directory (e.g. after a workflow rename) get
+// trailing columns so they stay visible until reconciled rather than silently
+// dropping out of the dashboard.
+function renderBoardPartial(p: PartialInputs): string {
+  const runningById = new Map<string, RunningRow>();
+  for (const r of p.snapshot.running) runningById.set(r.issue_identifier, r);
+  const retryingById = new Map<string, RetryRow>();
+  for (const r of p.snapshot.retrying) retryingById.set(r.issue_identifier, r);
+
+  // Group disk issues by lower-cased state name. LocalMarkdownTracker matches
+  // state directories case-insensitively against the declared `states:` keys
+  // (src/trackers/local.ts §scanAllAt: `declared.has(dirEntry.toLowerCase())`),
+  // so the dashboard must mirror that or a `todo/` directory under declared
+  // `Todo` would be misclassified as an orphan and split off into its own
+  // trailing column. `displayName` keeps the on-disk casing for orphan column
+  // headers (the only place we need to show a non-declared name).
+  const byStateLower = new Map<string, { displayName: string; items: DiskIssue[] }>();
+  for (const i of p.diskIssues) {
+    const key = i.state.toLowerCase();
+    const entry = byStateLower.get(key);
+    if (entry) entry.items.push(i);
+    else byStateLower.set(key, { displayName: i.state, items: [i] });
+  }
+
+  // Terminal columns (Done, Cancelled, …) are deliberately omitted from the
+  // board. The orchestrator's glance test — "is anything stuck, is anything
+  // running" — doesn't read off finished work, and a wall of archived rows
+  // dilutes the active surface. Terminal issues stay reachable through their
+  // /issues/<id> detail page; a dedicated history surface is the natural place
+  // to surface them again once we have something to anchor the row on (a PR
+  // link, a final token total, a closed-at timestamp).
+  const declared = p.states
+    .filter((state) => state.role !== 'terminal')
+    .map((state) => {
+      const items = byStateLower.get(state.name.toLowerCase())?.items ?? [];
+      return renderColumn(state, items, runningById, retryingById);
+    });
+
+  // Orphan columns: on-disk state directories whose names are not in the
+  // declared `states:` set. These render even when they look "terminal" because
+  // they're an error condition the operator needs to see (a workflow rename
+  // left files behind), not a clean archive.
+  const declaredLower = new Set(p.states.map((s) => s.name.toLowerCase()));
+  const orphans: Array<{ name: string; items: DiskIssue[] }> = [];
+  for (const [key, entry] of byStateLower) {
+    if (declaredLower.has(key)) continue;
+    orphans.push({ name: entry.displayName, items: entry.items });
+  }
+  orphans.sort((a, b) => a.name.localeCompare(b.name));
+  const orphanColumns = orphans.map((o) =>
+    renderColumn(
+      { name: o.name, role: 'terminal' },
+      o.items,
+      runningById,
+      retryingById,
+      { orphan: true },
+    ),
+  );
+
+  return `<div class="kanban">${declared.join('')}${orphanColumns.join('')}</div>`;
+}
+
+function renderColumn(
+  state: StateView,
+  items: DiskIssue[],
+  runningById: Map<string, RunningRow>,
+  retryingById: Map<string, RetryRow>,
+  opts?: { orphan?: boolean },
+): string {
+  const orphan = opts?.orphan === true;
+  const canAdd = !orphan && state.role !== 'terminal';
+
+  // Sort within a column so anything needing attention floats to the top:
+  // awaiting → running → retrying → idle. Ties break on identifier for stability.
+  const sorted = items.slice().sort((a, b) => {
+    const rank = (id: string) => {
+      const run = runningById.get(id);
+      if (run?.steering_requested) return 0;
+      if (run) return 1;
+      if (retryingById.get(id)) return 2;
+      return 3;
+    };
+    const ar = rank(a.identifier);
+    const br = rank(b.identifier);
+    if (ar !== br) return ar - br;
+    return a.identifier.localeCompare(b.identifier);
+  });
+
+  const rowsHtml = sorted
+    .map((i) =>
+      renderIssueRow(
+        i,
+        state,
+        runningById.get(i.identifier),
+        retryingById.get(i.identifier),
+        { orphan },
+      ),
+    )
+    .join('');
+
+  const addBtn = canAdd
+    ? `<button type="button" class="col-add"
+              data-target-state="${escapeHtml(state.name)}"
+              aria-label="add issue to ${escapeHtml(state.name)}"
+              title="add issue to ${escapeHtml(state.name)}">+</button>`
+    : '';
+
+  const emptyHint =
+    sorted.length === 0 && state.role === 'active' && !orphan
+      ? `<p class="col-empty">drop into <code>${escapeHtml(state.name)}/</code></p>`
+      : '';
+
+  const orphanBadge = orphan
+    ? `<span class="col-orphan" title="state not declared in workflow.md">undeclared</span>`
+    : '';
+
+  return `<section class="col col-${escapeHtml(state.role)}${orphan ? ' col-orphan-wrap' : ''}" data-state="${escapeHtml(state.name)}">
+  <header class="col-head">
+    <span class="col-name">${escapeHtml(state.name)}</span>
+    <span class="col-count">${sorted.length}</span>
+    ${orphanBadge}
+    <span class="grow"></span>
+    ${addBtn}
+  </header>
+  <div class="col-body">${rowsHtml}${emptyHint}</div>
+</section>`;
+}
+
+function renderIssueRow(
+  i: DiskIssue,
+  state: StateView,
+  running: RunningRow | undefined,
+  retrying: RetryRow | undefined,
+  opts?: { orphan?: boolean },
+): string {
+  const orphan = opts?.orphan === true;
+  const isAwaiting = !!running?.steering_requested;
+  const isRunning = !!running && !isAwaiting;
+  const isRetrying = !!retrying;
+  const isHolding = !orphan && state.role === 'holding';
+  const ident = i.identifier;
+  const escIdent = escapeHtml(ident);
+  const href = `/issues/${encodeURIComponent(ident)}`;
+
+  let pill = '';
+  if (isAwaiting) pill = '<span class="pill awaiting">awaiting</span>';
+  else if (isRunning) pill = '<span class="pill running">running</span>';
+  else if (isRetrying) pill = '<span class="pill retrying">retrying</span>';
+
+  let meta = '';
+  if (running) {
+    const tokens = formatTokens(running.tokens.total_tokens || 0);
+    meta = `<span class="row-meta">turn ${running.turn_count} · ${escapeHtml(tokens)} tok</span>`;
+  } else if (retrying) {
+    const dueAt = formatTimeShort(retrying.due_at) || '—';
+    meta = `<span class="row-meta">attempt ${retrying.attempt} · due ${escapeHtml(dueAt)}</span>`;
+  }
+
+  let peek = '';
+  if (running && !isAwaiting) {
+    const text = truncate(running.last_message ?? running.last_event ?? '', 110);
+    if (text) peek = `<div class="row-peek dim">${escapeHtml(text)}</div>`;
+  }
+
+  let retryErr = '';
+  if (retrying && retrying.error) {
+    retryErr = `<div class="row-err">${escapeHtml(truncate(retrying.error, 200))}</div>`;
+  }
+
+  let triageActions = '';
+  if (isHolding && !isRunning && !isAwaiting && !isRetrying) {
+    triageActions = `<div class="row-actions">
+    <form class="row-action"
+          hx-post="/api/v1/issues/${encodeURIComponent(ident)}/approve"
+          hx-target="#board" hx-swap="morph:innerHTML">
+      <button type="submit" class="ghost-sm" title="approve into the first active state">approve</button>
+    </form>
+    <form class="row-action"
+          hx-post="/api/v1/issues/${encodeURIComponent(ident)}/discard"
+          hx-target="#board" hx-swap="morph:innerHTML">
+      <button type="submit" class="ghost-sm danger" title="discard the proposal">discard</button>
+    </form>
+  </div>`;
+  }
+
+  const steering = isAwaiting ? renderSteeringInline(running!) : '';
+
+  const rowClasses = [
+    'row',
+    isAwaiting ? 'row-await' : '',
+    isRunning ? 'row-run' : '',
+    isRetrying && retrying?.error ? 'row-retry-stuck' : '',
+    orphan ? 'row-orphan' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  return `<article class="${rowClasses}" id="row-${escIdent}">
+  <div class="row-head">
+    <a class="row-ident" href="${href}" title="open ${escIdent}">${escIdent}</a>
+    ${pill}
+    <span class="grow"></span>
+    ${meta}
+  </div>
+  <a class="row-title" href="${href}">${escapeHtml(i.title)}</a>
+  ${peek}
+  ${retryErr}
+  ${triageActions}
+  ${steering}
+</article>`;
+}
+
+function renderSteeringInline(r: RunningRow): string {
   const question = (r.steering_question ?? '').trim() || '(no question text)';
   const context = (r.steering_context ?? '').trim();
   const issueTitle = (r.issue_title ?? '').trim();
   const issueBody = (r.issue_body ?? '').trim();
   const hasOriginalTask = issueTitle.length > 0 || issueBody.length > 0;
   const hasAnyExtra = hasOriginalTask || context.length > 0;
-  // The textarea is given a stable id and hx-preserve="true" so the every-2s repoll of
-  // the attention zone doesn't wipe the operator's in-progress reply.
+  // Stable textarea id + hx-preserve so the every-2s board repoll keeps the
+  // operator's draft reply intact across morph swaps.
   const textareaId = `reply-${r.issue_identifier}`;
   const summaryLabel =
-    hasOriginalTask && context ? 'original task & agent’s context'
-    : hasOriginalTask ? 'original task'
-    : 'agent’s context';
-  return `<article class="steering" data-identifier="${escapeHtml(r.issue_identifier)}">
-  <header class="steering-head">
-    <strong class="ident">${escapeHtml(r.issue_identifier)}</strong>
-    <span class="pill awaiting">awaiting</span>
-    <span class="turn"><span class="dim">turn</span> ${r.turn_count}</span>
-  </header>
-  <div class="question-primary">${renderMarkdown(question)}</div>
+    hasOriginalTask && context
+      ? 'original task & agent’s context'
+      : hasOriginalTask
+        ? 'original task'
+        : 'agent’s context';
+  return `<div class="steering">
+  <div class="steering-q">${renderMarkdown(question)}</div>
   ${hasAnyExtra ? `<details class="steering-task">
     <summary>${escapeHtml(summaryLabel)}</summary>
     <div class="steering-task-body">
@@ -463,7 +755,7 @@ function renderSteeringBlock(r: RunningRow): string {
   </details>` : ''}
   <form class="reply"
         hx-post="/api/v1/issues/${encodeURIComponent(r.issue_identifier)}/steering-reply"
-        hx-target="#attention" hx-swap="morph:innerHTML">
+        hx-target="#ticker" hx-swap="morph:innerHTML">
     <textarea id="${escapeHtml(textareaId)}" name="text" required
               placeholder="your reply…"
               aria-label="reply to ${escapeHtml(r.issue_identifier)}"
@@ -473,180 +765,43 @@ function renderSteeringBlock(r: RunningRow): string {
       <button type="submit" class="ghost">send reply</button>
     </div>
   </form>
-</article>`;
+</div>`;
 }
 
-function renderRetryBlock(rows: RetryRow[]): string {
-  const items = rows.map((r) => `<li>
-    <strong class="ident">${escapeHtml(r.issue_identifier)}</strong>
-    <span class="pill retrying">retrying</span>
-    <span class="dim">attempt ${r.attempt}</span>
-    <span class="dim">due ${escapeHtml(formatTimeShort(r.due_at) || '—')}</span>
-    ${r.error ? `<div class="retry-err">${escapeHtml(truncate(r.error, 200))}</div>` : ''}
-  </li>`).join('');
-  return `<ul class="retry-list" aria-label="retry queue">${items}</ul>`;
-}
-
-function renderSessionsPartial(p: PartialInputs): string {
-  const rows = p.snapshot.running;
-  if (rows.length === 0) {
-    const firstActive = p.states.find((s) => s.role === 'active')?.name ?? 'Todo';
-    return `<h2>sessions</h2>
-<p class="empty dim">no sessions running. agents wake when an issue lands in <code>${escapeHtml(firstActive)}/</code>.</p>`;
-  }
-  const sessionItems = rows.map((r) => renderSessionRow(r)).join('');
-  return `<h2>sessions <span class="count dim">(${rows.length})</span></h2>
-<ul class="sessions">${sessionItems}</ul>`;
-}
-
-function renderSessionRow(r: RunningRow): string {
-  const awaiting = r.steering_requested;
-  const pill = awaiting
-    ? '<span class="pill awaiting">awaiting</span>'
-    : r.transitioned
-      ? '<span class="pill done">done</span>'
-      : '<span class="pill running">running</span>';
-  const tokens = r.tokens.total_tokens || 0;
-  const sessionId = r.session_id ? r.session_id.slice(0, 8) : '—';
-  const lastMsg = truncate(r.last_message ?? r.last_event ?? '', 140);
-  // The session row is two lines max: identifier + pill + turn + tokens + time on top,
-  // last-message on bottom. Session id / state / last-event detail is surfaced via the
-  // row's title attr so it's available on hover without adding a third line of noise.
-  const rowTitle = [
-    `session ${sessionId}`,
-    r.state,
-    r.last_event ?? null,
-    `started ${formatTimeShort(r.started_at) || '—'}`,
-  ]
-    .filter(Boolean)
-    .join(' · ');
-  return `<li class="session" title="${escapeHtml(rowTitle)}">
-  <div class="session-row">
-    <strong class="ident">${escapeHtml(r.issue_identifier)}</strong>
-    ${pill}
-    <span class="turn"><span class="dim">turn</span> ${r.turn_count}</span>
-    <span class="grow"></span>
-    <span class="tokens dim">${formatTokens(tokens)} tok</span>
-  </div>
-  ${lastMsg ? `<div class="session-msg dim">${escapeHtml(lastMsg)}</div>` : ''}
-</li>`;
-}
-
-// Pending agent proposals. Empty when no issues sit in the Triage/ directory; otherwise a
-// two-line row per item with an approve (→ first active state) and discard (→ first
-// terminal state, prefers Cancelled) action. Provenance (`proposed_by`, `proposed_at`) is
-// surfaced as a dim meta line. Hand-written files dropped into Triage/ render the same way
-// minus the "from <parent>" bit — meaning operators can also pre-stage human proposals
-// in that directory.
-function renderTriagePartial(p: PartialInputs): string {
-  // Surface every issue whose on-disk state has role `holding`. The workflow
-  // parser refuses configs without at least one holding state, so this set is
-  // always non-empty in production; the dashboard simply mirrors whatever the
-  // operator declared (alternative names like "Backlog" surface here too).
-  const holdingNames = new Set(
-    p.states.filter((s) => s.role === 'holding').map((s) => s.name.toLowerCase()),
-  );
-  const triage = p.diskIssues.filter((i) => holdingNames.has(i.state.toLowerCase()));
-  if (triage.length === 0) {
-    // Empty state is silent rather than narrated — operators see "triage" only when
-    // there is something to triage. This matches PRODUCT.md "show real state".
-    return '';
-  }
+// ─── Right-side new-issue panel (the One Card) ─────────────────────────
+// The dashboard's only card-shaped surface (DESIGN.md §5 One-Card Rule). Slides
+// in from the right edge when the operator clicks a column's `+` button; the
+// column the click came from pre-selects the state field. Non-modal: the board
+// stays visible and interactive on the left. Esc closes; backdrop clicks do not
+// (avoid accidental discards of in-progress drafts).
+function renderNewIssuePanel(p: PartialInputs): string {
+  const targets = p.states.filter((s) => s.role !== 'terminal');
   const firstActive = p.states.find((s) => s.role === 'active');
-  const approveTarget = firstActive?.name ?? 'Todo';
-  const items = triage.map((i) => renderTriageRow(i, approveTarget)).join('');
-  return `<h2 class="triage-title">triage <span class="count dim">(${triage.length})</span></h2>
-<ul class="triage">${items}</ul>`;
-}
-
-function renderTriageRow(i: DiskIssue, approveTarget: string): string {
-  const meta: string[] = [];
-  if (i.proposed_by) meta.push(`from ${escapeHtml(i.proposed_by)}`);
-  if (i.proposed_at) {
-    const when = formatTimeShort(i.proposed_at);
-    if (when) meta.push(when);
-  }
-  const metaLine = meta.length > 0 ? meta.join(' · ') : '';
-  const ident = escapeHtml(i.identifier);
-  // The buttons POST via HTMX and morph #triage so the row vanishes in place when the
-  // file moves. We send hx-target=#triage rather than swapping the row inline because the
-  // section header's count needs to update too.
-  const href = `/issues/${encodeURIComponent(i.identifier)}`;
-  return `<li class="triage-row">
-  <div class="triage-line-1">
-    <a class="ident" href="${href}" title="open ${ident}"><strong>${ident}</strong></a>
-    <a class="title" href="${href}">${escapeHtml(i.title)}</a>
-  </div>
-  <div class="triage-line-2">
-    ${metaLine ? `<span class="meta dim">${metaLine}</span>` : '<span class="meta dim">proposed</span>'}
-    <span class="grow"></span>
-    <form class="triage-actions"
-          hx-post="/api/v1/issues/${encodeURIComponent(i.identifier)}/approve"
-          hx-target="#triage" hx-swap="morph:innerHTML">
-      <button type="submit" class="ghost-sm" title="move to ${escapeHtml(approveTarget)}/">approve</button>
-    </form>
-    <form class="triage-actions"
-          hx-post="/api/v1/issues/${encodeURIComponent(i.identifier)}/discard"
-          hx-target="#triage" hx-swap="morph:innerHTML">
-      <button type="submit" class="ghost-sm danger" title="discard proposal">discard</button>
-    </form>
-  </div>
-</li>`;
-}
-
-function renderDiskPartial(p: PartialInputs): string {
-  const runIds = new Set(p.snapshot.running.map((r) => r.issue_identifier));
-  const retryIds = new Set(p.snapshot.retrying.map((r) => r.issue_identifier));
-  // Visibility rule (Phase 4 brief): "include every state that has at least one
-  // issue OR is declared active". Concretely:
-  //   • Declared `active` states appear in the panel's ordering even when they
-  //     have no rows (their heading is implicit since the flat list uses a
-  //     per-row state label rather than per-state subheaders, so this only
-  //     matters for the "tracker is clean" empty-state hint).
-  //   • Declared `terminal` states surface their rows here when they hold files
-  //     — operators get one place to see finished work without leaving the
-  //     dashboard. Today's design hid these; the role-based config now decides.
-  //   • Declared `holding` states are surfaced through the separate triage
-  //     panel above; we exclude them here to avoid double-listing.
-  //   • Undeclared on-disk states (a directory whose name isn't in `states:`)
-  //     surface too, so a workflow rename leaves a paper trail rather than
-  //     silently dropping the rows. They sort to the end of the list.
-  const declaredLower = new Map(p.states.map((s) => [s.name.toLowerCase(), s]));
-  const candidates = p.diskIssues.filter((i) => {
-    if (runIds.has(i.identifier) || retryIds.has(i.identifier)) return false;
-    const declared = declaredLower.get(i.state.toLowerCase());
-    if (!declared) return true;
-    return declared.role !== 'holding';
-  });
-  // Order: declared-state position first (so Todo before In Progress before any
-  // ad-hoc state), then identifier within a state. Undeclared states sort to the
-  // end alphabetically by state name so stray rows still cluster together.
-  const declaredOrder = p.states.map((s) => s.name);
-  const orderIndex = new Map(declaredOrder.map((name, idx) => [name.toLowerCase(), idx]));
-  const filtered = candidates.slice().sort((a, b) => {
-    const ai = orderIndex.get(a.state.toLowerCase());
-    const bi = orderIndex.get(b.state.toLowerCase());
-    if (ai !== undefined && bi !== undefined && ai !== bi) return ai - bi;
-    if (ai !== undefined && bi === undefined) return -1;
-    if (ai === undefined && bi !== undefined) return 1;
-    if (a.state !== b.state) return a.state.localeCompare(b.state);
-    return a.identifier.localeCompare(b.identifier);
-  });
-  if (filtered.length === 0) {
-    const firstActive = p.states.find((s) => s.role === 'active')?.name ?? 'Todo';
-    return `<h2>on disk</h2>
-<p class="empty dim">tracker is clean. drop a markdown file into <code>${escapeHtml(firstActive)}/</code> or open <em>new issue</em> below.</p>`;
-  }
-  const items = filtered.map((i) => {
-    const href = `/issues/${encodeURIComponent(i.identifier)}`;
-    return `<li>
-    <a class="ident" href="${href}" title="open ${escapeHtml(i.identifier)}">${escapeHtml(i.identifier)}</a>
-    <span class="state dim">${escapeHtml(i.state)}</span>
-    <a class="title" href="${href}">${escapeHtml(i.title)}</a>
-  </li>`;
-  }).join('');
-  return `<h2>on disk <span class="count dim">(${filtered.length})</span></h2>
-<ul class="disk">${items}</ul>`;
+  const defaultState = (firstActive ?? targets[0])?.name ?? '';
+  const options = targets
+    .map((s) => {
+      const sel = s.name === defaultState ? ' selected' : '';
+      return `<option value="${escapeHtml(s.name)}"${sel}>${escapeHtml(s.name)}</option>`;
+    })
+    .join('');
+  return `<aside id="new-panel" class="new-panel" aria-hidden="true" aria-labelledby="np-title">
+  <header class="np-head">
+    <h2 id="np-title">new issue</h2>
+    <button type="button" class="np-close" aria-label="close" title="close (esc)">×</button>
+  </header>
+  <form class="np-form" id="np-form">
+    <label for="np-state">column</label>
+    <select id="np-state" name="state" required>${options}</select>
+    <label for="np-title-input">title</label>
+    <input id="np-title-input" name="title" required autocomplete="off" placeholder="what needs doing?" />
+    <label for="np-description">description</label>
+    <textarea id="np-description" name="description" rows="6" placeholder="optional — context for the agent"></textarea>
+    <div class="np-actions">
+      <span class="np-msg" id="np-msg" role="status" aria-live="polite"></span>
+      <button type="submit" class="np-submit">create</button>
+    </div>
+  </form>
+</aside>`;
 }
 
 function renderTotalsPartial(p: PartialInputs): string {
@@ -656,13 +811,6 @@ function renderTotalsPartial(p: PartialInputs): string {
 }
 
 function renderDashboardHtml(p: PartialInputs): string {
-  const activeNames = p.states.filter((s) => s.role === 'active').map((s) => s.name);
-  const defaultState = activeNames[0] ?? 'Todo';
-  const activeNameSet = new Set(activeNames);
-  const diskCount = p.diskIssues.filter((i) => activeNameSet.has(i.state)).length;
-  const formOpen =
-    diskCount === 0 && p.snapshot.running.length === 0 && p.snapshot.retrying.length === 0;
-
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -683,36 +831,20 @@ function renderDashboardHtml(p: PartialInputs): string {
   --err: #ff7676;
 }
 * { box-sizing: border-box; }
-html, body { background: var(--bench); color: var(--base); }
+html, body { background: var(--bench); color: var(--base); margin: 0; }
 body {
   font: 14px/1.45 ui-sans-serif, system-ui, sans-serif;
-  margin: 0; padding: 0;
-  display: flex; flex-direction: column; min-height: 100vh;
-}
-main {
-  width: 100%; max-width: 1080px; margin: 0 auto;
-  padding: 1rem 1.5rem 2rem; flex: 1;
+  min-height: 100vh;
+  display: flex; flex-direction: column;
 }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; color: var(--strong); }
-/* List-row links (issue identifier / title in the disk + triage sections) inherit type
-   from their parent and drop the default underline; hover and focus surface affordance
-   through colour shift only — matches the no-glow rule. */
-.disk a, .triage a { color: inherit; text-decoration: none; }
-.disk a:hover, .disk a:focus-visible,
-.triage a:hover, .triage a:focus-visible { color: #9cc0ff; outline: none; }
 .dim { color: var(--dim); }
-.grow { flex: 1; }
-h2 {
-  font-size: 1rem; font-weight: 500; margin: 1.6rem 0 0.5rem;
-  padding-bottom: 0.35rem; border-bottom: 1px solid var(--rule-firm);
-  letter-spacing: 0.01em;
-}
-h2:first-child { margin-top: 0.4rem; }
+.grow { flex: 1 1 auto; }
 
 /* ── header strip ─────────────────────────────────────────────────────── */
 #header {
   display: flex; align-items: center; gap: 0.5rem;
-  padding: 0.65rem 1.5rem;
+  padding: 0.65rem 1.25rem;
   background: var(--bench); border-bottom: 1px solid var(--rule-firm);
   font-size: 13px;
   position: sticky; top: 0; z-index: 10;
@@ -746,120 +878,201 @@ h2:first-child { margin-top: 0.4rem; }
 #header .refresh:hover { border-color: var(--muted); }
 #header .refresh:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* ── pills ────────────────────────────────────────────────────────────── */
+/* ── ticker ──────────────────────────────────────────────────────────── */
+#ticker {
+  display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; align-items: center;
+  padding: 0 1.25rem; background: var(--bench);
+  border-bottom: 1px solid var(--rule-soft);
+  font-size: 13px;
+  transition: padding 200ms cubic-bezier(.22,1,.36,1),
+              border-bottom-color 200ms cubic-bezier(.22,1,.36,1);
+}
+#ticker:empty { padding-top: 0; padding-bottom: 0; border-bottom-color: transparent; }
+#ticker:not(:empty) { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+.tick { display: inline-flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.tick-label { color: var(--muted); font-variant-numeric: tabular-nums; }
+.tick-await .tick-label { color: var(--await-fg); }
+.tick-retry .tick-label { color: var(--retry-fg); }
+.tick-err { color: var(--err); }
+.tick-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--base); text-decoration: none;
+  border-bottom: 1px solid var(--rule-firm);
+  font-size: 0.92em;
+  padding-bottom: 1px;
+}
+.tick-id:hover, .tick-id:focus-visible { color: #9cc0ff; border-bottom-color: #9cc0ff; outline: none; }
+
+/* ── board ───────────────────────────────────────────────────────────── */
+#board {
+  flex: 1 1 auto; min-height: 0;
+  padding: 1rem 1.25rem 2.5rem;
+  overflow-x: auto;
+}
+.kanban {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(260px, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+  min-width: min-content;
+}
+.col { display: flex; flex-direction: column; min-width: 0; }
+.col-head {
+  display: flex; align-items: baseline; gap: 0.4rem;
+  padding: 0 0 0.35rem;
+  border-bottom: 1px solid var(--rule-firm);
+  margin-bottom: 0.5rem;
+}
+.col-name {
+  color: var(--muted); font-weight: 500; font-size: 14px;
+  letter-spacing: 0.01em;
+}
+.col-holding .col-name { color: var(--retry-fg); }
+.col-terminal .col-name { color: var(--dim); }
+.col-count { color: var(--dim); font-size: 0.82em; font-variant-numeric: tabular-nums; }
+.col-orphan {
+  color: var(--err); font-size: 0.7em; letter-spacing: 0.05em;
+  text-transform: uppercase; margin-left: 0.3rem;
+}
+.col-add {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--rule-firm); border-radius: 4px;
+  width: 22px; height: 22px;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; font: inherit; line-height: 1; font-size: 16px;
+  transition: color 160ms cubic-bezier(.22,1,.36,1), border-color 160ms cubic-bezier(.22,1,.36,1);
+}
+.col-add:hover { color: var(--strong); border-color: var(--muted); }
+.col-add:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.col-body { display: flex; flex-direction: column; }
+.col-empty {
+  padding: 0.4rem 0; margin: 0;
+  font-size: 0.9em; color: var(--dim);
+}
+.col-empty code { color: var(--muted); }
+
+/* ── row ─────────────────────────────────────────────────────────────── */
+.row {
+  padding: 0.55rem 0.6rem; margin: 0 -0.6rem;
+  border-bottom: 1px solid var(--rule-soft);
+  display: flex; flex-direction: column; gap: 0.2rem;
+  border-radius: 3px;
+}
+.row:last-child { border-bottom: 0; }
+.row-await { background: rgba(127, 181, 212, 0.07); }
+.row-retry-stuck { background: rgba(240, 192, 96, 0.05); }
+.row-orphan { opacity: 0.7; }
+.row-head {
+  display: flex; align-items: center; gap: 0.5rem;
+  font-variant-numeric: tabular-nums;
+}
+.row-ident {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--strong); text-decoration: none;
+  font-size: 13px;
+}
+.row-ident:hover, .row-ident:focus-visible { color: #9cc0ff; outline: none; }
 .pill {
   display: inline-block; padding: 0.1rem 0.55rem; border-radius: 999px;
-  font-size: 0.82em; line-height: 1.4;
+  font-size: 0.78em; line-height: 1.4;
   font-variant-numeric: tabular-nums;
 }
 .pill.running { background: var(--run-bg); color: var(--run-fg); }
 .pill.retrying { background: var(--retry-bg); color: var(--retry-fg); }
-.pill.idle { background: var(--idle-bg); color: var(--idle-fg); }
 .pill.awaiting { background: var(--await-bg); color: var(--await-fg); }
-.pill.done { background: var(--done-bg); color: var(--done-fg); }
-
-/* ── attention zone ───────────────────────────────────────────────────── */
-/* Animated open/close: max-height transitions between 0 (empty) and a generous cap
-   (populated) so the section eases in and out rather than snapping the page up/down
-   when steering arrives or is resolved. */
-#attention {
+.row-meta { color: var(--muted); font-size: 0.82em; }
+.row-title {
   display: block;
-  overflow: hidden;
-  max-height: 0;
-  margin-bottom: 0;
-  transition: max-height 280ms cubic-bezier(.22, 1, .36, 1),
-              margin-bottom 280ms cubic-bezier(.22, 1, .36, 1);
+  color: var(--base); text-decoration: none;
+  font-size: 14px; line-height: 1.4;
+  overflow-wrap: anywhere;
 }
-#attention:not(:empty) {
-  max-height: 1500px;
-  margin-bottom: 0.4rem;
+.row-title:hover, .row-title:focus-visible { color: var(--strong); outline: none; }
+.row-peek {
+  font-size: 0.85em; line-height: 1.4;
+  overflow-wrap: anywhere;
+  max-height: 2.85em; overflow: hidden;
 }
-.attention-title { color: var(--await-fg); border-bottom-color: var(--await-bg); }
-.steering-error {
-  margin: 0.4rem 0; padding: 0.5rem 0.7rem;
-  background: var(--inset); border: 1px solid var(--rule-firm); border-radius: 4px;
-  color: var(--err); font-size: 0.9em; line-height: 1.4;
+.row-err {
+  font-size: 0.85em; line-height: 1.35; color: var(--err);
+  overflow-wrap: anywhere; word-break: break-word;
 }
-/* The steering panel: question-first layout. Selected via /impeccable live (variant 3,
-   question-scale=1.1, density=snug). The agent's prompt sits proud and unscaled, and the
-   original issue + agent context tuck into a disclosure so the panel reads small until
-   the operator wants depth. */
+.row-actions { display: flex; gap: 0.4rem; margin-top: 0.2rem; }
+.row-action { display: inline; margin: 0; padding: 0; }
+.ghost {
+  background: var(--chip); color: var(--base);
+  border: 1px solid var(--rule-firm); border-radius: 4px;
+  padding: 0.35rem 0.85rem; font: inherit; cursor: pointer;
+  transition: border-color 180ms cubic-bezier(.22,1,.36,1);
+}
+.ghost:hover { border-color: var(--muted); }
+.ghost:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ghost-sm {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--rule-firm); border-radius: 3px;
+  padding: 0.18rem 0.6rem; font: inherit; font-size: 0.82em; cursor: pointer;
+  transition: color 160ms cubic-bezier(.22,1,.36,1), border-color 160ms cubic-bezier(.22,1,.36,1);
+}
+.ghost-sm:hover { color: var(--strong); border-color: var(--muted); }
+.ghost-sm.danger:hover { color: var(--err); border-color: var(--err); }
+.ghost-sm:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ── inline steering on awaiting rows ────────────────────────────────── */
 .steering {
-  background: var(--raised); padding: 0.55rem 0.8rem; margin: 0.5rem 0;
-  border-radius: 6px;
+  margin-top: 0.45rem; padding-top: 0.45rem;
+  border-top: 1px dashed var(--rule-firm);
   display: grid; gap: 0.4rem;
 }
-.steering-head {
-  display: flex; align-items: center; gap: 0.6rem;
+.steering-q { color: var(--strong); font-size: 0.95em; line-height: 1.45; }
+.steering-q > :first-child { margin-top: 0; }
+.steering-q > :last-child { margin-bottom: 0; }
+.steering-q p { margin: 0.35em 0; }
+.steering-q h1, .steering-q h2, .steering-q h3,
+.steering-q h4, .steering-q h5, .steering-q h6 {
+  margin: 0.5em 0 0.25em; font-weight: 500; font-size: 1em;
 }
-.steering .ident { color: var(--strong); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.steering .turn { font-size: 0.88em; }
-.steering .question-primary {
-  margin: 0;
-  font-size: calc(14px * 1.1);
-  line-height: 1.4; color: var(--strong); font-weight: 400;
+.steering-q ul, .steering-q ol { margin: 0.3em 0; padding-left: 1.4em; }
+.steering-q li { margin: 0.15em 0; }
+.steering-q code {
+  background: var(--inset); padding: 0.05em 0.35em; border-radius: 3px; font-size: 0.92em;
 }
-/* Inner Markdown rendered from the steering question. Reset margins so the
-   first/last block hug the panel edge, but keep spacing between blocks. */
-.steering .question-primary > :first-child { margin-top: 0; }
-.steering .question-primary > :last-child { margin-bottom: 0; }
-.steering .question-primary p { margin: 0.4em 0; }
-.steering .question-primary h1,
-.steering .question-primary h2,
-.steering .question-primary h3,
-.steering .question-primary h4,
-.steering .question-primary h5,
-.steering .question-primary h6 {
-  margin: 0.6em 0 0.3em;
-  font-weight: 500;
-  border: 0; padding: 0;
-  font-size: 1em;
-}
-.steering .question-primary ul,
-.steering .question-primary ol { margin: 0.4em 0; padding-left: 1.4em; }
-.steering .question-primary li { margin: 0.15em 0; }
-.steering .question-primary code {
-  background: var(--inset); padding: 0.05em 0.35em; border-radius: 3px;
-  font-size: 0.92em;
-}
-.steering .question-primary pre {
+.steering-q pre {
   margin: 0.5em 0; padding: 0.5rem 0.65rem;
   background: var(--inset); border: 1px solid var(--rule-firm); border-radius: 4px;
   font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--muted); overflow: auto;
 }
-.steering .question-primary pre code { background: transparent; padding: 0; font-size: inherit; }
-.steering .question-primary blockquote {
-  margin: 0.4em 0; padding: 0.1em 0.7em;
+.steering-q pre code { background: transparent; padding: 0; font-size: inherit; }
+.steering-q blockquote {
+  margin: 0.35em 0; padding: 0.1em 0.7em;
   border-left: 2px solid var(--rule-firm); color: var(--muted);
 }
-.steering .question-primary a { color: var(--await-fg); }
-.steering details.steering-task { font-size: 0.92em; }
-.steering details.steering-task > summary {
+.steering-q a { color: var(--await-fg); }
+.steering-task { font-size: 0.88em; }
+.steering-task > summary {
   cursor: pointer; list-style: none;
-  color: var(--muted); padding: 0.3rem 0; user-select: none;
-  font-size: 0.88em;
+  color: var(--muted); padding: 0.2rem 0; user-select: none;
 }
-.steering details.steering-task > summary::-webkit-details-marker { display: none; }
-.steering details.steering-task > summary::before {
+.steering-task > summary::-webkit-details-marker { display: none; }
+.steering-task > summary::before {
   content: "▸"; padding-right: 0.4rem;
   transition: transform 180ms cubic-bezier(.22,1,.36,1);
   display: inline-block; color: var(--dim);
 }
-.steering details.steering-task[open] > summary::before { transform: rotate(90deg); }
-.steering .steering-task-body {
-  display: grid; gap: 0.45rem;
-  padding: 0.35rem 0 0 0.85rem;
-  border-left: 1px solid var(--rule-soft);
+.steering-task[open] > summary::before { transform: rotate(90deg); }
+.steering-task-body {
+  display: grid; gap: 0.35rem;
+  padding: 0.3rem 0 0 0.75rem;
 }
-.steering .steering-task-label {
-  font-size: 0.72em; color: var(--dim);
-  letter-spacing: 0.09em; text-transform: uppercase;
+.steering-task-label {
+  font-size: 0.7em; color: var(--dim);
+  letter-spacing: 0.08em; text-transform: uppercase;
 }
-.steering .steering-task-body .issue-title {
+.steering-task-body .issue-title {
   margin: 0; font-size: 0.95em; font-weight: 500; color: var(--base);
 }
-.steering .steering-task-body .issue-body {
+.steering-task-body .issue-body {
   margin: 0; color: var(--muted); font-size: 0.92em; line-height: 1.5;
 }
 .steering .context {
@@ -869,188 +1082,106 @@ h2:first-child { margin-top: 0.4rem; }
   color: var(--muted); white-space: pre-wrap; word-break: break-word;
   max-height: 12em; overflow: auto;
 }
-.steering form.reply { display: grid; gap: 0.45rem; }
-.steering textarea {
+form.reply { display: grid; gap: 0.4rem; margin: 0; }
+form.reply textarea {
   background: var(--inset); color: var(--strong);
   border: 1px solid var(--rule-firm); border-radius: 4px;
-  padding: 0.5rem 0.65rem;
+  padding: 0.45rem 0.6rem;
   font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
-  width: 100%; min-height: 64px; resize: vertical;
+  width: 100%; min-height: 60px; resize: vertical;
 }
-.steering textarea:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; border-color: var(--accent); }
-.steering .reply-row { display: flex; align-items: center; gap: 0.75rem; }
-.steering .hint { font-size: 0.82em; }
-.ghost {
-  background: var(--chip); color: var(--base);
-  border: 1px solid var(--rule-firm); border-radius: 4px;
-  padding: 0.35rem 0.85rem; font: inherit; cursor: pointer;
-  transition: border-color 180ms cubic-bezier(.22,1,.36,1);
-}
-.ghost:hover { border-color: var(--muted); }
-.ghost:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.ghost:disabled { color: var(--dim); cursor: not-allowed; }
-
-.retry-list { list-style: none; padding: 0; margin: 0.4rem 0 0; }
-.retry-list li {
-  display: grid;
-  grid-template-columns: max-content max-content max-content max-content;
-  gap: 0.55rem; align-items: center;
-  padding: 0.4rem 0; border-bottom: 1px solid var(--rule-soft);
-  font-variant-numeric: tabular-nums;
-}
-.retry-list li:last-child { border-bottom: 0; }
-.retry-list .ident { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.retry-list .retry-err {
-  grid-column: 1 / -1; color: var(--err); font-size: 0.88em;
-  padding-top: 0.15rem;
-  word-break: break-word;
-}
-
-/* ── sessions ─────────────────────────────────────────────────────────── */
-.sessions { list-style: none; padding: 0; margin: 0; }
-.sessions li.session {
-  padding: 0.5rem 0; border-bottom: 1px solid var(--rule-soft);
-}
-.sessions li.session:last-child { border-bottom: 0; }
-.session-row {
-  display: flex; align-items: baseline; gap: 0.65rem;
-  font-variant-numeric: tabular-nums;
-}
-.session-row .ident { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--strong); }
-.session-row .turn { font-size: 0.88em; color: var(--muted); }
-.session-row .tokens { font-size: 0.88em; }
-.session-msg {
-  margin-top: 0.2rem; padding-left: 0.05rem;
-  font-size: 0.9em; line-height: 1.45;
-  overflow-wrap: anywhere;
-  max-height: 2.9em; overflow: hidden;
-}
-
-/* ── on disk ──────────────────────────────────────────────────────────── */
-.disk { list-style: none; padding: 0; margin: 0; }
-.disk li {
-  display: grid;
-  grid-template-columns: 10rem 5.5rem 1fr;
-  gap: 0.5rem; align-items: baseline;
-  padding: 0.35rem 0; border-bottom: 1px solid var(--rule-soft);
-  font-variant-numeric: tabular-nums;
-}
-.disk li:last-child { border-bottom: 0; }
-.disk .ident { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--strong); }
-.disk .state { font-size: 0.85em; }
-.disk .title { color: var(--base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.count { font-weight: 400; font-size: 0.88em; margin-left: 0.4rem; }
-
-/* ── triage ──────────────────────────────────────────────────────────────
-   Agent-proposed issues awaiting operator approval. Visually adjacent to the
-   "disk" listing (a flat, dense list) — not to the "attention" zone, because
-   triage is not blocking the orchestrator; it's a queue the operator drains at
-   their own pace. The amber-ish "retry" palette is reused for the section
-   header to mark it as "needs your eyes" without escalating to the urgent
-   blue/attention treatment reserved for steering and retry failures. */
-#triage:empty { display: none; }
-.triage-title { color: var(--retry-fg); border-bottom-color: var(--retry-bg); }
-.triage { list-style: none; padding: 0; margin: 0; }
-.triage li.triage-row {
-  padding: 0.45rem 0;
-  border-bottom: 1px solid var(--rule-soft);
-  display: grid; gap: 0.1rem;
-}
-.triage li.triage-row:last-child { border-bottom: 0; }
-.triage .triage-line-1 {
-  display: flex; align-items: baseline; gap: 0.65rem;
-  font-variant-numeric: tabular-nums;
-}
-.triage .triage-line-1 .ident {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--strong);
-}
-.triage .triage-line-1 .title {
-  color: var(--base);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  flex: 1; min-width: 0;
-}
-.triage .triage-line-2 {
-  display: flex; align-items: center; gap: 0.5rem;
-  font-size: 0.88em;
-  padding-left: 0.05rem;
-}
-.triage .meta { font-variant-numeric: tabular-nums; }
-.triage form.triage-actions { display: inline; margin: 0; padding: 0; }
-.ghost-sm {
-  background: transparent; color: var(--muted);
-  border: 1px solid var(--rule-firm); border-radius: 3px;
-  padding: 0.15rem 0.55rem; font: inherit; font-size: 0.82em; cursor: pointer;
-  transition: color 180ms cubic-bezier(.22,1,.36,1),
-              border-color 180ms cubic-bezier(.22,1,.36,1);
-}
-.ghost-sm:hover { color: var(--strong); border-color: var(--muted); }
-.ghost-sm.danger:hover { color: var(--err); border-color: var(--err); }
-.ghost-sm:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-/* ── new issue (collapsed) ────────────────────────────────────────────── */
-details.new-issue {
-  margin-top: 1.4rem;
-}
-details.new-issue > summary {
-  cursor: pointer; list-style: none; padding: 0.55rem 0;
-  border-bottom: 1px solid var(--rule-firm);
-  font-size: 1rem; font-weight: 500;
-  display: flex; align-items: center; gap: 0.5rem;
-  user-select: none;
-}
-details.new-issue > summary::-webkit-details-marker { display: none; }
-details.new-issue > summary::before {
-  content: "▸"; color: var(--dim); font-size: 0.85em;
-  transition: transform 180ms cubic-bezier(.22,1,.36,1);
-  display: inline-block;
-}
-details.new-issue[open] > summary::before { transform: rotate(90deg); }
-details.new-issue[open] > summary { border-bottom-color: var(--rule-firm); }
-form.create {
-  display: grid; grid-template-columns: max-content 1fr; gap: 0.5rem 1rem;
-  align-items: center; padding: 1rem 0 0; margin-top: 0.4rem;
-}
-form.create label { color: var(--muted); }
-form.create input, form.create select, form.create textarea {
-  background: var(--inset); color: var(--strong);
-  border: 1px solid var(--rule-firm); border-radius: 4px;
-  padding: 0.4rem 0.6rem; font: inherit; width: 100%;
-}
-form.create input:focus-visible, form.create select:focus-visible, form.create textarea:focus-visible {
+form.reply textarea:focus-visible {
   outline: 1px solid var(--accent); outline-offset: 0; border-color: var(--accent);
 }
-form.create textarea { min-height: 80px; resize: vertical; }
-form.create .submit-row {
-  grid-column: 2; display: flex; align-items: center; gap: 0.85rem;
-}
-form.create button {
-  background: var(--accent); color: #f4f6fb; border: 0;
-  padding: 0.5rem 1rem; border-radius: 4px; font: inherit; cursor: pointer;
-  transition: filter 180ms cubic-bezier(.22,1,.36,1);
-  flex: 0 0 auto;
-}
-form.create button:hover { filter: brightness(1.08); }
-form.create button:focus-visible { outline: 2px solid var(--strong); outline-offset: 2px; }
-form.create .msg { min-height: 1.2em; color: var(--muted); font-size: 0.9em; line-height: 1.2; }
-form.create .msg.err { color: var(--err); }
-form.create .msg.ok { color: var(--run-fg); }
+form.reply .reply-row { display: flex; align-items: center; gap: 0.75rem; }
+form.reply .hint { font-size: 0.82em; }
 
-/* ── totals footer ────────────────────────────────────────────────────── */
+/* ── totals footer ───────────────────────────────────────────────────── */
 footer.totals {
-  margin-top: 2.5rem; padding-top: 0.85rem;
+  padding: 0.85rem 1.25rem;
   border-top: 1px solid var(--rule-soft);
-  color: var(--dim); font-size: 0.88em;
+  color: var(--dim); font-size: 0.85em;
   font-variant-numeric: tabular-nums;
   display: flex; gap: 0.65rem; flex-wrap: wrap;
 }
 footer.totals:empty { display: none; }
 
-.empty { padding: 0.5rem 0; }
+/* ── right-side new-issue panel (the One Card) ───────────────────────── */
+.new-panel {
+  position: fixed; top: 0; right: 0;
+  width: 400px; max-width: 90vw;
+  height: 100vh;
+  background: var(--raised);
+  border-left: 1px solid var(--rule-firm);
+  display: flex; flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 320ms cubic-bezier(.22, 1, .36, 1),
+              visibility 0s linear 320ms;
+  visibility: hidden;
+  z-index: 20;
+}
+.new-panel.open {
+  transform: translateX(0);
+  visibility: visible;
+  transition: transform 320ms cubic-bezier(.22, 1, .36, 1);
+}
+.np-head {
+  display: flex; align-items: center; gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.np-head h2 { margin: 0; font-size: 1rem; font-weight: 500; color: var(--strong); }
+.np-close {
+  margin-left: auto;
+  background: var(--chip); color: var(--muted);
+  border: 1px solid var(--rule-firm); border-radius: 4px;
+  width: 28px; height: 28px;
+  cursor: pointer; font: inherit; font-size: 16px; line-height: 1;
+  transition: color 160ms cubic-bezier(.22,1,.36,1), border-color 160ms cubic-bezier(.22,1,.36,1);
+}
+.np-close:hover { color: var(--strong); border-color: var(--muted); }
+.np-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.np-form {
+  display: flex; flex-direction: column; gap: 0.35rem;
+  padding: 1rem 1.25rem; flex: 1; overflow: auto;
+}
+.np-form label {
+  color: var(--muted); font-size: 14px; margin-top: 0.5rem;
+}
+.np-form label:first-of-type { margin-top: 0; }
+.np-form select, .np-form input, .np-form textarea {
+  background: var(--inset); color: var(--strong);
+  border: 1px solid var(--rule-firm); border-radius: 4px;
+  padding: 0.45rem 0.6rem; font: inherit; width: 100%;
+}
+.np-form textarea { resize: vertical; min-height: 120px; }
+.np-form select:focus-visible,
+.np-form input:focus-visible,
+.np-form textarea:focus-visible {
+  outline: 1px solid var(--accent); outline-offset: 0; border-color: var(--accent);
+}
+.np-actions {
+  display: flex; align-items: center; gap: 0.75rem;
+  margin-top: 0.9rem;
+}
+.np-msg {
+  flex: 1; color: var(--muted); font-size: 0.88em;
+  min-height: 1.2em; line-height: 1.2;
+}
+.np-msg.err { color: var(--err); }
+.np-msg.ok { color: var(--run-fg); }
+.np-submit {
+  background: var(--accent); color: #f4f6fb; border: 0;
+  padding: 0.55rem 1.1rem; border-radius: 4px;
+  font: inherit; cursor: pointer;
+  transition: filter 180ms cubic-bezier(.22,1,.36,1);
+}
+.np-submit:hover { filter: brightness(1.08); }
+.np-submit:focus-visible { outline: 2px solid var(--strong); outline-offset: 2px; }
 
 /* htmx ergonomics */
 .htmx-request .refresh { opacity: 0.6; }
-.htmx-settling .session-msg { opacity: 0.85; }
+.htmx-settling .row-peek { opacity: 0.85; }
 </style>
 <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
 <script src="https://unpkg.com/idiomorph@0.7.4/dist/idiomorph-ext.min.js"></script>
@@ -1069,88 +1200,102 @@ footer.totals:empty { display: none; }
           aria-label="refresh now" title="poll &amp; reconcile">⟳</button>
 </header>
 
-<main>
+<div id="ticker"
+     hx-get="/api/v1/partials/attention" hx-trigger="every 2s, refreshed from:body"
+     hx-swap="morph:innerHTML">${renderAttentionPartial(p)}</div>
 
-<section id="attention"
-         hx-get="/api/v1/partials/attention" hx-trigger="every 2s, refreshed from:body"
-         hx-swap="morph:innerHTML">${renderAttentionPartial(p)}</section>
+<main id="board"
+      hx-get="/api/v1/partials/board" hx-trigger="every 2s, refreshed from:body"
+      hx-swap="morph:innerHTML">${renderBoardPartial(p)}</main>
 
-<section id="sessions"
-         hx-get="/api/v1/partials/sessions" hx-trigger="every 2s, refreshed from:body"
-         hx-swap="morph:innerHTML">${renderSessionsPartial(p)}</section>
-
-<section id="triage"
-         hx-get="/api/v1/partials/triage" hx-trigger="every 2s, refreshed from:body"
-         hx-swap="morph:innerHTML">${renderTriagePartial(p)}</section>
-
-<section id="disk"
-         hx-get="/api/v1/partials/disk" hx-trigger="every 2s, refreshed from:body"
-         hx-swap="morph:innerHTML">${renderDiskPartial(p)}</section>
-
-<details class="new-issue"${formOpen ? ' open' : ''}>
-  <summary>new issue</summary>
-  <form class="create" id="create-form">
-    <label for="title">title</label>
-    <input id="title" name="title" required autocomplete="off" placeholder="what needs doing?" />
-    <label for="description">description</label>
-    <textarea id="description" name="description" placeholder="optional — extra context for the agent"></textarea>
-    <div class="submit-row">
-      <button type="submit">create issue</button>
-      <span class="msg" id="create-msg" role="status" aria-live="polite">drops into <code>${escapeHtml(defaultState)}/</code> with a slug derived from the title.</span>
-    </div>
-  </form>
-</details>
+${renderNewIssuePanel(p)}
 
 <footer class="totals"
         hx-get="/api/v1/partials/totals" hx-trigger="every 2s, refreshed from:body"
         hx-swap="morph:innerHTML">${renderTotalsPartial(p)}</footer>
 
-</main>
-
 <script>
-const $ = (id) => document.getElementById(id);
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const panel = $('new-panel');
+  const stateSelect = $('np-state');
+  const titleInput = $('np-title-input');
+  const descTextarea = $('np-description');
+  const npMsg = $('np-msg');
+  const form = $('np-form');
 
-// Enter-to-send on steering textareas. HTMX submits the form; shift+enter still inserts a newline.
-document.addEventListener('keydown', (ev) => {
-  const t = ev.target;
-  if (!(t instanceof HTMLTextAreaElement)) return;
-  if (!t.closest('form.reply')) return;
-  if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
-    ev.preventDefault();
-    t.form && t.form.requestSubmit();
-  }
-});
-
-// Create-issue form: stays on fetch+JSON. The dashboard only collects title +
-// description; the server derives a slug identifier and defaults state to the first
-// active state. Advanced fields (priority, labels, explicit identifier, explicit state)
-// are still accepted by the API for direct callers — they just no longer clutter the form.
-$('create-form').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const msg = $('create-msg');
-  msg.className = 'msg'; msg.textContent = 'creating…';
-  const body = {
-    title: $('title').value.trim(),
-    description: $('description').value,
+  const setMsg = (text, cls) => {
+    npMsg.className = 'np-msg' + (cls ? ' ' + cls : '');
+    npMsg.textContent = text;
   };
-  try {
-    const res = await fetch('/api/v1/issues', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
-    msg.className = 'msg ok';
-    msg.textContent = 'created ' + data.identifier;
-    $('create-form').reset();
-    fetch('/api/v1/refresh', { method: 'POST' }).catch(() => {});
-    document.body.dispatchEvent(new CustomEvent('refreshed', { bubbles: true }));
-  } catch (err) {
-    msg.className = 'msg err';
-    msg.textContent = err.message;
-  }
-});
+
+  const openPanel = (targetState) => {
+    if (targetState) {
+      for (const opt of stateSelect.options) {
+        if (opt.value === targetState) { stateSelect.value = targetState; break; }
+      }
+    }
+    setMsg('');
+    panel.classList.add('open');
+    panel.setAttribute('aria-hidden', 'false');
+    requestAnimationFrame(() => setTimeout(() => titleInput.focus(), 120));
+  };
+  const closePanel = () => {
+    panel.classList.remove('open');
+    panel.setAttribute('aria-hidden', 'true');
+  };
+
+  document.addEventListener('click', (ev) => {
+    const t = ev.target;
+    if (!(t instanceof Element)) return;
+    const addBtn = t.closest('.col-add');
+    if (addBtn) {
+      openPanel(addBtn.getAttribute('data-target-state') || '');
+      return;
+    }
+    if (t.closest('.np-close')) { closePanel(); return; }
+  });
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && panel.classList.contains('open')) {
+      ev.preventDefault(); closePanel(); return;
+    }
+    const t = ev.target;
+    if (!(t instanceof HTMLTextAreaElement)) return;
+    if (!t.closest('form.reply')) return;
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+      ev.preventDefault();
+      t.form && t.form.requestSubmit();
+    }
+  });
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    setMsg('creating…');
+    const body = {
+      state: stateSelect.value,
+      title: titleInput.value.trim(),
+      description: descTextarea.value,
+    };
+    try {
+      const res = await fetch('/api/v1/issues', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
+      setMsg('created ' + data.identifier, 'ok');
+      titleInput.value = '';
+      descTextarea.value = '';
+      fetch('/api/v1/refresh', { method: 'POST' }).catch(() => {});
+      document.body.dispatchEvent(new CustomEvent('refreshed', { bubbles: true }));
+      setTimeout(() => { closePanel(); setMsg(''); }, 900);
+    } catch (err) {
+      setMsg(err.message, 'err');
+    }
+  });
+})();
 </script>
 
 </body></html>`;
@@ -1691,9 +1836,7 @@ async function handleRequest(
     let body: string | null = null;
     if (slug === 'header') body = renderHeaderPartial(p);
     else if (slug === 'attention') body = renderAttentionPartial(p);
-    else if (slug === 'sessions') body = renderSessionsPartial(p);
-    else if (slug === 'triage') body = renderTriagePartial(p);
-    else if (slug === 'disk') body = renderDiskPartial(p);
+    else if (slug === 'board') body = renderBoardPartial(p);
     else if (slug === 'totals') body = renderTotalsPartial(p);
     if (body === null) return notFound(res, 'partial_not_found', `partial ${slug} does not exist`);
     res.statusCode = 200;
@@ -1748,14 +1891,16 @@ async function handleRequest(
       if (!state) {
         return badRequest(res, 'state is required (no active states declared to default to)');
       }
-      // Restrict `state` to one of the declared states with role in {active, terminal}.
-      // Holding states (Triage) are reachable through `propose_issue` and the on-disk
-      // file drop, not this dashboard form — keeping the form to dispatchable targets
-      // matches today's behaviour and stops a caller from bypassing the operator-
-      // approval queue. Values containing path separators / `..` are rejected by the
-      // set lookup so the request cannot escape the tracker root via `path.join`.
+      // Restrict `state` to one of the declared non-terminal states (active or holding).
+      // The kanban dashboard exposes a `+ new issue` affordance on every non-terminal
+      // column header — including Triage (holding) — so an operator can deliberately
+      // file proposals into the human-approval queue alongside agent-generated ones.
+      // Terminal states stay closed: creating an issue directly in Done/Cancelled would
+      // mean dispatching to an archive. Values containing path separators / `..` are
+      // rejected by the set lookup so the request cannot escape the tracker root via
+      // `path.join`.
       const allowedNames = view.states
-        .filter((s) => s.role === 'active' || s.role === 'terminal')
+        .filter((s) => s.role !== 'terminal')
         .map((s) => s.name);
       const allowedStates = new Set(allowedNames);
       if (!allowedStates.has(state)) {
@@ -2057,11 +2202,15 @@ async function handleRequest(
         }
       }
       if (isHtmx) {
+        // The triage buttons live on rows inside the Triage column of the board, and
+        // an approve move shuffles the row from Triage into the first active column.
+        // Re-rendering the whole board reflects the move in one swap (HTMX morph keeps
+        // unchanged columns stable; only the row that moved redraws).
         const p = await gatherPartialInputs(orch, view);
         res.statusCode = 200;
         res.setHeader('content-type', 'text/html; charset=utf-8');
         res.setHeader('cache-control', 'no-store');
-        res.end(renderTriagePartial(p));
+        res.end(renderBoardPartial(p));
         return;
       }
       return jsonResponse(res, 200, {
@@ -2074,15 +2223,15 @@ async function handleRequest(
       const code = (err as Error & { code?: string }).code ?? 'triage_failed';
       const status = code === 'local_issue_not_found' ? 404 : 409;
       if (isHtmx) {
-        // Re-render the section so the row that "failed" stays visible; the operator can
-        // retry or investigate. We don't have a banner widget for this section yet, so
-        // surface the failure via the log line + the section staying populated. A more
-        // verbose UI is a follow-up if operators report needing it.
+        // Re-render the board so the row that "failed" stays visible in its Triage column;
+        // the operator can retry or open the detail page. We don't surface a per-row banner
+        // for this case yet — the server log carries the error code. A more verbose UI is a
+        // follow-up if operators report needing it.
         const p = await gatherPartialInputs(orch, view);
         res.statusCode = 200;
         res.setHeader('content-type', 'text/html; charset=utf-8');
         res.setHeader('cache-control', 'no-store');
-        res.end(renderTriagePartial(p));
+        res.end(renderBoardPartial(p));
         return;
       }
       return jsonResponse(res, status, {
