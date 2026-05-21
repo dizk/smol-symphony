@@ -274,10 +274,21 @@ the per-issue branch, then hand off to the reviewer.
    symphony.transition({
      to_state: "Review",
      notes: "# <imperative-voice title, ≤72 chars>\n\n<one- to three-paragraph
-             summary of what you changed, why, files touched, tests added, and
-             any follow-ups you noticed but didn't do>"
+             summary of what you changed, why, files touched, and tests added>"
    })
    ```
+
+   The notes describe **this change**. Out-of-scope items you noticed —
+   unrelated bugs, refactors, follow-ups, a future ticket someone should
+   size — go through `symphony.propose_issue` (see the shared section below).
+   Do not park them in a "Follow-ups not done" section in the notes; that
+   surface dies in `Done/<id>.md` and no agent ever sees it again.
+
+   Don't include a verification section restating that
+   `npm run typecheck` / `npm test` / `npm run build` passed — that's an
+   AGENTS.md requirement and the reviewer re-runs them. Mention test count
+   or extra commands only when something is atypical (test count dropped,
+   you ran a smoke against a live service, etc.).
 
    The notes block is appended to the issue body **before** the file moves to
    `Review/`, so the reviewer sees it as part of `issue.description` on the
@@ -292,7 +303,10 @@ the issue description above. Your job: decide whether the work is correct and
 either approve (→ Done) or send it back (→ Todo) with specific findings.
 
 1. Read the implementer's notes in the issue description carefully — title,
-   summary, files claimed touched, follow-ups noted.
+   summary, files claimed touched. (Follow-ups belong in `propose_issue`,
+   not the notes; if you see a "Follow-ups not done" section in the notes,
+   reject and ask the implementer to file each item as a separate
+   `propose_issue` call instead.)
 2. Inspect the diff against the base branch:
 
    ```
@@ -396,6 +410,15 @@ dispatch; the operator approves or discards it from the dashboard. Your
 current issue is automatically recorded as the proposal's parent — do not
 paste it into the body. Use this instead of grafting unrelated changes onto
 your current task; keep your branch focused.
+
+File **one `propose_issue` call per follow-up**, not a batched call with
+multiple items in one body. Triage is per-item triage; the operator's
+approve/discard verb is per-issue, so a batched proposal forces an
+all-or-nothing decision and loses the individual sizing/priority each
+follow-up deserves. The "Follow-ups not done" pattern of writing a bulleted
+list in the handoff notes is the wrong surface — those notes ride into the
+PR and then die in `Done/<id>.md`; only `propose_issue` puts the items in
+front of the operator on the dashboard.
 
 {% if attempt -%}
 This is continuation/retry attempt {{ attempt }}. Inspect the workspace before
