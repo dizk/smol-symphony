@@ -153,17 +153,16 @@ logs:
 # hooks — shell scripts the orchestrator runs at workspace lifecycle points.
 #
 # All hooks run on the HOST (not inside the VM), with cwd set to the per-issue
-# workspace path. Each hook is a multi-line shell snippet. Available env vars:
+# workspace path. Each hook is a multi-line shell snippet. Available context:
 #
-#   PWD                  — the workspace directory (cwd at hook start).
-#   SYMPHONY_ISSUE_ID    — the issue identifier.
-#   SYMPHONY_ISSUE_STATE — the issue's current state.
-#   SYMPHONY_ATTEMPT     — 1-based attempt counter.
-#   SYMPHONY_WORKFLOW    — absolute path to the workflow file.
+#   PWD                  — the workspace directory (cwd at hook start). The
+#                          per-issue workspace path is `<workspace.root>/<id>`,
+#                          so `basename "$PWD"` gives the issue identifier.
 #
-# Plus any env var the operator exports before launching `symphony`. The
-# common pattern is to plumb tracker root / repo / base via env so the same
-# workflow file works against multiple repos. See WORKFLOW.md for an example.
+# Plus any env var the operator exports before launching `symphony` — the
+# orchestrator forwards the parent process env unchanged. The common pattern
+# is to plumb tracker root / repo / base via env so the same workflow file
+# works against multiple checkouts.
 #
 # Per-state overrides: any state can declare its own `hooks:` block under
 # `states.<name>.hooks` that overrides individual fields here for issues in
@@ -257,8 +256,9 @@ acp:
   # Leave unset / null for the adapter's own default. Default: null.
   # effort: xhigh
 
-  # NOTE: the launch shape is fixed (in-VM proxy dialing back over the bridge);
-  # fork `scripts/vm-agent.js` if you need to customize what the proxy spawns.
+  # NOTE: the launch shape is fixed (an in-VM proxy dials back over the bridge
+  # and spawns the chosen adapter). Customizing what the proxy spawns requires
+  # forking that proxy and rebuilding the VM image with the fork in place.
 
   # shell (string): shell used to run the ACP launch command. Default: 'bash'.
   shell: bash
@@ -312,10 +312,12 @@ acp:
 # smolvm — microVM execution environment.
 # ─────────────────────────────────────────────────────────────────────────────
 smolvm:
-  # from (path | null): path to a packed .smolmachine.smolmachine artifact.
-  # Built once with `scripts/build-vm.sh`. Mutually exclusive with `image`.
-  # Default: null.
-  from: ./.vm/symphony.smolmachine.smolmachine
+  # from (path | null): path to a packed .smolmachine.smolmachine artifact
+  # built with the `smolmachine` CLI. Mutually exclusive with `image`. The
+  # artifact must contain a Node.js runtime, the ACP adapters you intend to use
+  # (claude-agent-acp, codex-acp, etc.), and the symphony in-VM proxy at
+  # /opt/symphony/vm-agent.mjs. Default: null.
+  from: ./.vm/your-vm.smolmachine.smolmachine
 
   # image (string | null): container image to pull instead of a packed artifact.
   # Mutually exclusive with `from`. Default: null.

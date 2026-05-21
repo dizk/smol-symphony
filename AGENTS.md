@@ -41,21 +41,29 @@ Run all three before calling `symphony.transition` into a terminal state.
 
 ## Handoff: patch bundle vs. pull request
 
-`after_run` in `WORKFLOW.md` ships in two modes:
+The handoff lives on the **Done** state's per-state `after_run` hook in
+`WORKFLOW.md` (`states.Done.hooks.after_run`). Because the orchestrator only
+fires that hook on transition INTO Done, the script does not need to check
+whether the issue actually terminated — that's structurally guaranteed. The
+sibling Cancelled state has no `after_run`, so cancelled work is discarded
+with the workspace.
+
+The hook ships in two modes:
 
 - **Patch bundle (default).** Writes `git format-patch` to
-  `.symphony/patches/<branch>.patch` for human review. No remote needed.
-  This is what fires when no GitHub remote is wired up.
+  `.symphony/patches/<branch>.patch` for human review. This is what fires
+  when `SYMPHONY_REPO` is unset.
 - **Pull request.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is exported
-  before launch AND the working repo has an `origin` remote. The hook then
-  pushes the per-issue branch and runs `gh pr create`. `gh auth status` must
-  be clean on the host; the token never enters the VM.
+  before launch. The hook adds an `origin` remote pointing at GitHub if one
+  isn't already present (the `after_create` hook does the same on first
+  workspace creation), pushes the per-issue branch, then runs `gh pr create`.
+  `gh auth status` must be clean on the host; the token never enters the VM.
+  The patch bundle is always written first so the work survives even if the
+  push or `gh pr create` fails.
 
 To switch this project to PR mode:
 
 ```
-git remote add origin git@github.com:<owner>/smol-symphony.git
-git push -u origin main
 SYMPHONY_REPO=<owner>/smol-symphony npx symphony WORKFLOW.md
 ```
 
