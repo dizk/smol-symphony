@@ -170,7 +170,18 @@ logs:
 # top of the inherited process env for the hook invocation only (the host's
 # own process env is not mutated):
 #
-#   SYMPHONY_ISSUE_ID      — the dispatched issue's identifier (e.g. `42`).
+#   SYMPHONY_ISSUE_ID      — the dispatched issue's logical id (e.g. `42`). For
+#                            most issues this is also the filename key; an issue
+#                            whose front matter sets an explicit `id:` distinct
+#                            from its filename is the corner case where it
+#                            diverges (use SYMPHONY_ISSUE_IDENTIFIER for paths).
+#   SYMPHONY_ISSUE_IDENTIFIER — the issue's filename key under the tracker root
+#                            (i.e. the basename of `<state>/<identifier>.md`).
+#                            Equal to SYMPHONY_ISSUE_ID in the default case;
+#                            distinct when front matter pins `id:` and
+#                            `identifier:` to different values. Use this for any
+#                            hook that needs to locate the issue file (e.g. the
+#                            `Conflict/` reroute in multi-agent setups).
 #   SYMPHONY_BRANCH        — the per-issue working branch (`agent/<id>`), the
 #                            same name `after_create` checks out.
 #   SYMPHONY_BASE_BRANCH   — base branch the work targets. Mirrors

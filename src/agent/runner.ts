@@ -129,6 +129,11 @@ export async function buildAfterRunHookEnv(
   const baseBranch = process.env.SYMPHONY_BASE_BRANCH;
   const env: Record<string, string> = {
     SYMPHONY_ISSUE_ID: issue.id,
+    // Filename-key under the tracker root. `issue.id` can diverge from the tracker
+    // basename when an issue's front matter sets an explicit `id:` that differs
+    // from its filename; the after_run hook needs the filename form to locate
+    // (and re-route) `<state>/<identifier>.md`.
+    SYMPHONY_ISSUE_IDENTIFIER: ident,
     SYMPHONY_BRANCH: branch,
     SYMPHONY_BASE_BRANCH: baseBranch && baseBranch.length > 0 ? baseBranch : 'main',
     SYMPHONY_PR_TITLE: title.length > 0 ? `${issue.id}: ${title}` : issue.id,

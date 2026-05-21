@@ -235,6 +235,48 @@ describe('buildAfterRunHookEnv', () => {
     }
   });
 
+  it('stages SYMPHONY_ISSUE_IDENTIFIER from entry.identifier so the hook can locate the file when id and identifier diverge', async () => {
+    // The tracker stores issue files at <state>/<identifier>.md. SYMPHONY_ISSUE_ID is
+    // sourced from issue.id, which can differ from identifier when an issue's front
+    // matter pins an explicit `id:` distinct from its filename. The Conflict reroute
+    // path in the Done after_run hook uses identifier (via this env var), not id, to
+    // avoid an mv that silently misses an existing file and leaves the entry's
+    // cleanup_workspace_on_exit asserted (which would then delete agent/<id>).
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-hook-env-ident-'));
+    try {
+      const stateDir = path.join(trackerRoot, 'Done');
+      await mkdir(stateDir, { recursive: true });
+      // Note: the file is named after `identifier`, not `id`. This is the case the bug
+      // bites — a hook that uses $SYMPHONY_ISSUE_ID for the path would look for
+      // Done/ABC-1.md instead of Done/42.md and silently no-op.
+      await writeFile(path.join(stateDir, '42.md'), 'body for 42', 'utf8');
+      const entry = makeEntry({
+        issue: {
+          id: 'ABC-1',
+          identifier: '42',
+          title: 'Diverged id and identifier',
+          description: 'stale',
+          state: 'Done',
+        },
+        tracker_root_at_dispatch: trackerRoot,
+      });
+      const { env, cleanup } = await buildAfterRunHookEnv(entry);
+      try {
+        assert.equal(env.SYMPHONY_ISSUE_ID, 'ABC-1');
+        assert.equal(env.SYMPHONY_ISSUE_IDENTIFIER, '42');
+        // Branch is identifier-derived too — confirmed here so the hook's BRANCH
+        // and ISSUE_IDENTIFIER stay in agreement on the filename key.
+        assert.equal(env.SYMPHONY_BRANCH, 'agent/42');
+        const body = await readFile(env.SYMPHONY_PR_BODY_FILE!, 'utf8');
+        assert.equal(body, 'body for 42');
+      } finally {
+        await cleanup();
+      }
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
   it('omits SYMPHONY_TRACKER_ROOT when no snapshot is available', async () => {
     // When the dispatch path could not capture a tracker root (older path, propose
     // flow), leave the env var unset rather than staging an empty string the hook

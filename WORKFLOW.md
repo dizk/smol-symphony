@@ -63,6 +63,10 @@ states:
       after_run: |
         set -eu
         ISSUE_ID="$SYMPHONY_ISSUE_ID"
+        # Filename-key under SYMPHONY_TRACKER_ROOT. Differs from $SYMPHONY_ISSUE_ID
+        # when an issue's front matter pins an explicit `id:` distinct from its
+        # filename; the Conflict reroute below has to use this form to find the file.
+        ISSUE_IDENTIFIER="$SYMPHONY_ISSUE_IDENTIFIER"
         BRANCH="$SYMPHONY_BRANCH"
         BASE="$SYMPHONY_BASE_BRANCH"
         INTEGRATION="${SYMPHONY_INTEGRATION_BRANCH:-integration}"
@@ -163,8 +167,8 @@ states:
           exit 0
         fi
         mkdir -p "${SYMPHONY_TRACKER_ROOT}/Conflict"
-        SRC="${SYMPHONY_TRACKER_ROOT}/Done/${ISSUE_ID}.md"
-        DST="${SYMPHONY_TRACKER_ROOT}/Conflict/${ISSUE_ID}.md"
+        SRC="${SYMPHONY_TRACKER_ROOT}/Done/${ISSUE_IDENTIFIER}.md"
+        DST="${SYMPHONY_TRACKER_ROOT}/Conflict/${ISSUE_IDENTIFIER}.md"
         if [ -f "$SRC" ]; then
           mv "$SRC" "$DST"
         fi
