@@ -51,6 +51,13 @@ Run all three before calling `symphony.transition` into a terminal state.
   pushes the per-issue branch and runs `gh pr create`. `gh auth status` must
   be clean on the host; the token never enters the VM.
 
+Both modes also fast-forward the source repo's **agent integration branch**
+(default `agent-integration`) when an issue terminates in `Done`. The next
+dispatched issue clones from that branch's tip, so back-to-back issues that
+build on each other don't start from stale base-branch code. Set
+`SYMPHONY_INTEGRATION_BRANCH=<name>` to rename it or
+`SYMPHONY_INTEGRATION_BRANCH=""` to disable the indirection entirely.
+
 To switch this project to PR mode:
 
 ```

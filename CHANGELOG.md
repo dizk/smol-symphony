@@ -12,6 +12,14 @@ hand work off between them via a single MCP call.
 
 ### Added
 
+- The shipped `WORKFLOW.md` now stages an **agent integration branch** in the
+  source repo (default `agent-integration`, created lazily from
+  `SYMPHONY_BASE_BRANCH`). New issues clone from its tip instead of the bare
+  base branch, so issues dispatched after a prior one completes see the prior
+  agent's commits rather than stale code. The `after_run` hook
+  fast-forwards the integration branch when an issue lands in `Done`. Override
+  with `SYMPHONY_INTEGRATION_BRANCH=<name>` or disable
+  (`SYMPHONY_INTEGRATION_BRANCH=""`) to keep the legacy behavior.
 - Workflows now declare states under a top-level `states:` block. Each
   state has a `role` (`active`, `terminal`, or `holding`) and optional
   per-state `adapter`, `model`, `max_turns`, and `allowed_transitions`

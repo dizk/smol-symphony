@@ -242,6 +242,16 @@ operate on workspaces inside the credential file's ancestor repo.
   `.symphony/patches/<branch>.patch` via `git format-patch` so you can
   review and apply with `git am`. No remote required.
 
+Either way, when an issue lands in the `Done` terminal state the hook also
+fast-forwards an **agent integration branch** in the source repo (default:
+`agent-integration`, created lazily from `SYMPHONY_BASE_BRANCH` on first use).
+Subsequent issues clone from the integration branch's tip rather than the base
+branch, so an issue dispatched after another one completes sees the prior
+agent's commits instead of stale code. Override or disable with
+`SYMPHONY_INTEGRATION_BRANCH=<name>` (or `SYMPHONY_INTEGRATION_BRANCH=""` for
+the legacy "always branch from base" behavior). Non-fast-forward updates are a
+no-op with a warning; the patch bundle is the durable artifact in that case.
+
 The PR title and body come from the issue file itself: title from the
 front-matter `title:` (prefixed with the issue id), body from everything
 after the front-matter — which includes every `symphony.transition` notes

@@ -84,13 +84,21 @@ hooks:
 
   # Clone smol-symphony into the fresh per-issue workspace from a strictly local
   # source (no creds needed). The agent receives a working git repo with full
-  # history on the configured base branch, plus a per-issue branch checked out.
-  # All network remotes are stripped so any `git push`/`git fetch` from inside
-  # the VM fails closed.
+  # history on the integration branch, plus a per-issue branch checked out on
+  # top of it. All network remotes are stripped so any `git push`/`git fetch`
+  # from inside the VM fails closed.
+  #
+  # Integration branch: a shared mainline of in-flight agent work in the source
+  # repo. Issues clone from its tip — created lazily from BASE on first use —
+  # so an issue dispatched after another one completes sees the prior agent's
+  # commits, not stale BASE. The after_run hook fast-forwards the integration
+  # branch when an issue lands in Done. Export SYMPHONY_INTEGRATION_BRANCH=""
+  # to opt out and branch from BASE directly (legacy behavior).
   after_create: |
     set -eu
     SOURCE_REPO="${SYMPHONY_SOURCE_REPO:-${PWD}/../../..}"
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
+    INTEGRATION="${SYMPHONY_INTEGRATION_BRANCH-agent-integration}"
     ISSUE_ID="$(basename "$PWD")"
     BRANCH="agent/${ISSUE_ID}"
 
@@ -99,9 +107,33 @@ hooks:
       exit 1
     fi
 
+    # Ensure the integration branch exists in the source repo. Created from BASE
+    # on first use; subsequent issues see prior agents' work via its advancing
+    # tip. When INTEGRATION is empty the workspace branches from BASE directly.
+    if [ -n "${INTEGRATION}" ]; then
+      if ! git -C "${SOURCE_REPO}" rev-parse --verify "refs/heads/${INTEGRATION}" >/dev/null 2>&1; then
+        if ! git -C "${SOURCE_REPO}" rev-parse --verify "refs/heads/${BASE}" >/dev/null 2>&1; then
+          echo "after_create: source repo lacks ${BASE}; cannot bootstrap ${INTEGRATION}" >&2
+          exit 1
+        fi
+        git -C "${SOURCE_REPO}" branch "${INTEGRATION}" "${BASE}"
+        echo "after_create: created ${INTEGRATION} from ${BASE} in source repo"
+      fi
+      CLONE_BRANCH="${INTEGRATION}"
+    else
+      CLONE_BRANCH="${BASE}"
+    fi
+
     # `git clone --local` hardlinks .git/objects when possible; fast and disk-cheap.
-    # `--no-tags` keeps the local refspec minimal; `--branch` lands on the right base.
-    git clone --local --no-tags --branch "${BASE}" "${SOURCE_REPO}" .
+    # `--no-tags` keeps the local refspec minimal; `--branch` lands on the right tip.
+    git clone --local --no-tags --branch "${CLONE_BRANCH}" "${SOURCE_REPO}" .
+
+    # Stamp a local ${BASE} ref from the clone's remote-tracking origin/${BASE}
+    # before stripping remotes, so after_run can resolve the merge base for
+    # format-patch/PRs even when the clone landed on the integration branch.
+    if git rev-parse --verify "origin/${BASE}" >/dev/null 2>&1; then
+      git branch -f "${BASE}" "origin/${BASE}"
+    fi
 
     # Strip all remotes. The agent will see no network targets at all.
     for remote in $(git remote); do
@@ -123,7 +155,7 @@ hooks:
 
     git checkout -b "${BRANCH}"
 
-    echo "workspace ready: base=${BASE} branch=${BRANCH} source=${SOURCE_REPO}"
+    echo "workspace ready: base=${BASE} integration=${INTEGRATION:-<disabled>} branch=${BRANCH} source=${SOURCE_REPO}"
 
   # Runs after every attempt. Gated on the issue file landing in a TERMINAL
   # state directory (today: Done/ or Cancelled/) — i.e. the agent has called
@@ -139,6 +171,8 @@ hooks:
   after_run: |
     set -eu
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
+    INTEGRATION="${SYMPHONY_INTEGRATION_BRANCH-agent-integration}"
+    SOURCE_REPO="${SYMPHONY_SOURCE_REPO:-${PWD}/../../..}"
     ISSUE_ID="$(basename "$PWD")"
     BRANCH="agent/${ISSUE_ID}"
     TRACKER_ROOT="${SYMPHONY_TRACKER_ROOT:-$HOME/.symphony/trackers/smol-symphony}"
@@ -227,10 +261,12 @@ hooks:
     fi
 
     # Resolve the ref the agent diverged from. In remote mode origin/${BASE}
-    # exists (after_create's `git fetch`). In local-only mode we kept the local
-    # ${BASE} branch alive (`git clone --branch ${BASE}` creates it at the
-    # original tip; `git checkout -b ${BRANCH}` does not remove it). That tip
-    # is exactly where the agent diverged from.
+    # exists (after_create's `git fetch`). In local-only mode after_create
+    # stamps a local ${BASE} branch from the clone's remote-tracking
+    # origin/${BASE} before stripping the remote, so the ref is always
+    # available regardless of which branch the workspace cloned from. The
+    # patch is intentionally generated against ${BASE} (not the integration
+    # branch) so it can be replayed cleanly onto a base-branch checkout.
     if git rev-parse --verify "origin/${BASE}" >/dev/null 2>&1; then
       MERGE_BASE="origin/${BASE}"
     elif git rev-parse --verify "${BASE}" >/dev/null 2>&1; then
@@ -254,6 +290,20 @@ hooks:
     PATCH_OUT="${PATCHES_DIR}/$(echo "${BRANCH}" | tr '/' '_').patch"
     git format-patch --stdout "${MERGE_BASE}..${BRANCH}" > "${PATCH_OUT}"
     echo "wrote patch bundle: ${PATCH_OUT}"
+
+    # On a Done terminal, fast-forward the source repo's integration branch so the
+    # next dispatched issue clones from a tip that contains this issue's commits.
+    # Cancelled does NOT advance the integration branch — only approved work
+    # accumulates. Non-FF (concurrent agents touched overlapping history, or the
+    # operator advanced the branch by hand) is a no-op with a warning; the patch
+    # bundle is the durable artifact and operators can reconcile manually.
+    if [ -n "${INTEGRATION}" ] && [ -d "${SOURCE_REPO}/.git" ] && [ "${FOUND_TERMINAL}" = "Done" ]; then
+      if git push "${SOURCE_REPO}" "${BRANCH}:refs/heads/${INTEGRATION}" >/dev/null 2>&1; then
+        echo "fast-forwarded ${INTEGRATION} → ${BRANCH} in ${SOURCE_REPO}"
+      else
+        echo "warning: could not fast-forward ${INTEGRATION} in source repo (non-FF, branch checked out, or denyCurrentBranch); patch bundle preserved at ${PATCH_OUT}" >&2
+      fi
+    fi
 
     if [ -n "${SYMPHONY_REPO:-}" ]; then
       # Remote PR mode. Be defensive about origin: an earlier workspace creation may have
