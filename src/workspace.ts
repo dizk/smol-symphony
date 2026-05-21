@@ -86,18 +86,21 @@ function hookFailureReason(res: HookResult): string {
 
 // Execute a hook script (POSIX `sh -lc`). Returns result so callers can decide on failure
 // semantics (§9.4). Optional `capture` streams output in real time (used by per-issue JSONL
-// run logs) and reports the final result to the same callback.
+// run logs) and reports the final result to the same callback. Optional `extraEnv` is
+// merged on top of `process.env` so callers (e.g. the runner's after_run handoff) can
+// stage hook-specific values without polluting the host process environment.
 export async function runHookScript(
   script: string,
   cwd: string,
   timeoutMs: number,
   capture?: HookCapture,
+  extraEnv?: Record<string, string>,
 ): Promise<HookResult> {
   return new Promise((resolve) => {
     const child = spawn('sh', ['-lc', script], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     });
     let stdout = '';
     let stderr = '';
@@ -233,13 +236,17 @@ export class WorkspaceManager {
   }
 
   // Best-effort after_run hook (§9.4: failure logged and ignored — caller logs).
+  // `extraEnv` is merged into the hook process env; callers use this to stage
+  // values (e.g. SYMPHONY_PR_TITLE, SYMPHONY_PR_BODY_FILE) that the hook script
+  // would otherwise have to extract by hand.
   async runAfterRunBestEffort(
     workspacePath: string,
     hooks: HooksConfig,
     capture?: HookCapture,
+    extraEnv?: Record<string, string>,
   ): Promise<HookResult | null> {
     if (!hooks.after_run) return null;
-    return runHookScript(hooks.after_run, workspacePath, hooks.timeout_ms, capture);
+    return runHookScript(hooks.after_run, workspacePath, hooks.timeout_ms, capture, extraEnv);
   }
 
   // Best-effort before_remove + filesystem removal (§9.4).

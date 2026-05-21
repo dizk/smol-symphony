@@ -39,7 +39,7 @@ operators can write; an out-of-date template is a bug, not paperwork.
 
 Run all three before calling `symphony.transition` into a terminal state.
 
-## Handoff: patch bundle vs. pull request
+## Handoff: pull request (or branch-only in local mode)
 
 The handoff lives on the **Done** state's per-state `after_run` hook in
 `WORKFLOW.md` (`states.Done.hooks.after_run`). Because the orchestrator only
@@ -48,18 +48,21 @@ whether the issue actually terminated — that's structurally guaranteed. The
 sibling Cancelled state has no `after_run`, so cancelled work is discarded
 with the workspace.
 
-The hook ships in two modes:
+The orchestrator pre-stages `SYMPHONY_PR_TITLE` and `SYMPHONY_PR_BODY_FILE`
+(plus `SYMPHONY_BRANCH`) before invoking the hook, so the script itself is
+just `git push` + `gh pr create --body-file`. The body file holds the current
+tracker issue body, which carries every `symphony.transition` notes block
+accumulated across the run.
 
-- **Patch bundle (default).** Writes `git format-patch` to
-  `.symphony/patches/<branch>.patch` for human review. This is what fires
-  when `SYMPHONY_REPO` is unset.
 - **Pull request.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is exported
-  before launch. The hook adds an `origin` remote pointing at GitHub if one
-  isn't already present (the `after_create` hook does the same on first
-  workspace creation), pushes the per-issue branch, then runs `gh pr create`.
+  before launch. The `after_create` hook adds the `origin` remote pointing at
+  GitHub; `after_run` pushes the per-issue branch, then runs `gh pr create`.
   `gh auth status` must be clean on the host; the token never enters the VM.
-  The patch bundle is always written first so the work survives even if the
-  push or `gh pr create` fails.
+- **Local-only (default).** When `SYMPHONY_REPO` is unset the hook exits 0
+  immediately. The per-issue `agent/<id>` branch is left in the workspace
+  until the orchestrator removes the workspace; pick the commits up with
+  `git log` against your local clone, or run with `SYMPHONY_REPO` set to
+  open a PR.
 
 To switch this project to PR mode:
 
@@ -77,5 +80,5 @@ Skip these when staging commits unless the user asks:
 - `.agents/`, `.claude/`, `.impeccable/` — local tooling state.
 - `issues*/Done/`, `issues*/Cancelled/`, `issues*/In Progress/` — runtime
   tracker artifacts from prior symphony runs.
-- `.symphony/` — workspaces, patch bundles, runtime caches.
+- `.symphony/` — workspaces, runtime caches.
 - `skills-lock.json` — auto-generated.
