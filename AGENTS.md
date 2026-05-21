@@ -124,7 +124,10 @@ When an issue lands in `Conflict/`:
 3. The PR against `main` is independent and is still open for review.
 
 The orchestrator does not auto-dispatch from `Conflict/`; resolution is a
-human-in-the-loop step.
+human-in-the-loop step. The per-issue workspace (`.symphony/workspaces/<id>`)
+and the `agent/<id>` branch inside it are preserved across the reroute so
+the resolution above has something to rebase from — the runner detects the
+post-hook reroute and suppresses the terminal-state workspace cleanup.
 
 ## Don't write to generated state
 

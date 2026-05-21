@@ -4,7 +4,7 @@
 // the VM at the same absolute path so cwd values are consistent.
 
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type {
@@ -142,6 +142,55 @@ export async function buildAfterRunHookEnv(
     env.SYMPHONY_TRACKER_ROOT = entry.tracker_root_at_dispatch;
   }
   return { env, cleanup };
+}
+
+/**
+ * Re-resolve where the issue file lives under the snapshot tracker root after the
+ * after_run hook has fired. The Done state's hook can move the file sideways into a
+ * holding state (e.g. Conflict/) when the integration merge fails; the running entry's
+ * `issue.state` and `cleanup_workspace_on_exit` were committed earlier when the agent
+ * transitioned into Done, so without this reconciliation the orchestrator would delete
+ * the workspace (and the only copy of `agent/<id>` in local-only mode) even though the
+ * file is now in a non-terminal holding state needing operator triage.
+ *
+ * Mutates the entry in place: when the post-hook file location resolves to a declared
+ * non-terminal state, updates `entry.issue.state` to the new state and clears
+ * `cleanup_workspace_on_exit`. No-ops when the snapshot root is unset, the file is in
+ * the expected terminal state, or the file can't be located under any declared state.
+ */
+export async function reconcilePostHookEntryState(
+  entry: RunningEntry,
+  cfg: ServiceConfig,
+): Promise<{ relocated: boolean; from: string; to: string | null }> {
+  const before = entry.issue.state;
+  const root = entry.tracker_root_at_dispatch;
+  if (!root) return { relocated: false, from: before, to: null };
+  const filename = `${entry.identifier}.md`;
+  let foundState: string | null = null;
+  for (const stateName of Object.keys(cfg.states)) {
+    try {
+      await stat(path.join(root, stateName, filename));
+      foundState = stateName;
+      break;
+    } catch {
+      // Not in this state directory; keep scanning.
+    }
+  }
+  if (foundState === null) return { relocated: false, from: before, to: null };
+  if (foundState.toLowerCase() === before.toLowerCase()) {
+    return { relocated: false, from: before, to: foundState };
+  }
+  const role = cfg.states[foundState]!.role;
+  if (role === 'terminal') {
+    // File landed in a different terminal directory than dispatch expected — still
+    // legitimate cleanup, so leave the flag alone but record the new state so the
+    // before_remove hook resolves against the right state.
+    entry.issue.state = foundState;
+    return { relocated: false, from: before, to: foundState };
+  }
+  entry.issue.state = foundState;
+  entry.cleanup_workspace_on_exit = false;
+  return { relocated: true, from: before, to: foundState };
 }
 
 function buildSteeringReplyPrompt(question: string, context: string | null, reply: string): string {
@@ -602,6 +651,32 @@ export class AgentRunner {
         );
       } finally {
         if (extraEnvCleanup) await extraEnvCleanup();
+      }
+      // The after_run hook can re-route the issue file sideways into a holding state
+      // (e.g. Done's integration merge failure → Conflict/). The orchestrator's
+      // onWorkerExit reads `cleanup_workspace_on_exit` and `issue.state` to drive
+      // workspace removal and the before_remove hook; both were committed at the moment
+      // of the transition, before the after_run hook ran. Re-detect the file's location
+      // post-hook so the running entry reflects reality before onWorkerExit fires.
+      if (runningEntry) {
+        try {
+          const reconciliation = await reconcilePostHookEntryState(runningEntry, this.cfg);
+          if (reconciliation.relocated) {
+            logger.info('after_run rerouted issue to non-terminal state; preserving workspace', {
+              from: reconciliation.from,
+              to: reconciliation.to,
+            });
+            runLog?.system('post_hook_state_reroute', {
+              from: reconciliation.from,
+              to: reconciliation.to,
+              workspace_preserved: true,
+            });
+          }
+        } catch (err) {
+          logger.warn('post-hook state reconciliation failed', {
+            error: (err as Error).message,
+          });
+        }
       }
       // Per the agreed lifecycle, every attempt gets a fresh VM. Destroy is best-effort:
       // smolvm.destroy already swallows errors and logs at warn, so a stuck/lost VM here

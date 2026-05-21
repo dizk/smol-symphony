@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { buildAfterRunHookEnv } from '../src/agent/runner.js';
+import { buildAfterRunHookEnv, reconcilePostHookEntryState } from '../src/agent/runner.js';
+import { buildServiceConfig } from '../src/workflow.js';
 import type { Issue, RunningEntry } from '../src/types.js';
 
 // `buildAfterRunHookEnv` is the orchestrator-side staging helper that collapses the
@@ -248,6 +249,106 @@ describe('buildAfterRunHookEnv', () => {
     } finally {
       await cleanup();
     }
+  });
+
+  it('reconcilePostHookEntryState clears cleanup when after_run rerouted file to a holding state', async () => {
+    // Done's after_run hook can move the issue file from Done/ to Conflict/ when
+    // the integration merge fails. The transition into Done already set
+    // `cleanup_workspace_on_exit = true` on the entry; without the post-hook
+    // reconciliation the orchestrator would remove the workspace (and the only
+    // copy of agent/<id> in local-only mode) even though the file is now in a
+    // holding state needing operator triage.
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-posthook-reconcile-'));
+    try {
+      await mkdir(path.join(trackerRoot, 'Conflict'), { recursive: true });
+      // File now lives under Conflict/ — Done/ is intentionally empty to mirror
+      // what the after_run hook leaves behind on conflict.
+      await writeFile(path.join(trackerRoot, 'Conflict', '18.md'), 'body', 'utf8');
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root: trackerRoot },
+          acp: { adapter: 'claude' },
+          states: {
+            Todo: { role: 'active' },
+            Done: { role: 'terminal' },
+            Conflict: { role: 'holding' },
+          },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const entry = makeEntry({
+        issue: { id: '18', identifier: '18', title: 't', state: 'Done', description: 'body' },
+        tracker_root_at_dispatch: trackerRoot,
+      });
+      entry.cleanup_workspace_on_exit = true;
+      const result = await reconcilePostHookEntryState(entry, cfg);
+      assert.equal(result.relocated, true);
+      assert.equal(result.from, 'Done');
+      assert.equal(result.to, 'Conflict');
+      assert.equal(entry.issue.state, 'Conflict');
+      assert.equal(entry.cleanup_workspace_on_exit, false);
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reconcilePostHookEntryState leaves a still-terminal entry untouched', async () => {
+    // No reroute happened (file stayed in Done/), so the entry's transition
+    // decision still stands and the orchestrator should proceed with cleanup.
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-posthook-noreroute-'));
+    try {
+      await mkdir(path.join(trackerRoot, 'Done'), { recursive: true });
+      await writeFile(path.join(trackerRoot, 'Done', '19.md'), 'body', 'utf8');
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root: trackerRoot },
+          acp: { adapter: 'claude' },
+          states: {
+            Todo: { role: 'active' },
+            Done: { role: 'terminal' },
+            Conflict: { role: 'holding' },
+          },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const entry = makeEntry({
+        issue: { id: '19', identifier: '19', title: 't', state: 'Done', description: 'body' },
+        tracker_root_at_dispatch: trackerRoot,
+      });
+      entry.cleanup_workspace_on_exit = true;
+      const result = await reconcilePostHookEntryState(entry, cfg);
+      assert.equal(result.relocated, false);
+      assert.equal(entry.issue.state, 'Done');
+      assert.equal(entry.cleanup_workspace_on_exit, true);
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reconcilePostHookEntryState is a no-op without a tracker root snapshot', async () => {
+    // Older dispatch paths and the propose-flow can both produce entries with
+    // tracker_root_at_dispatch === null. The runner already tolerates that for
+    // env staging; reconciliation must do the same rather than throwing.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/x' },
+        acp: { adapter: 'claude' },
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+          Conflict: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    const entry = makeEntry({
+      issue: { id: '20', identifier: '20', title: 't', state: 'Done', description: 'body' },
+      tracker_root_at_dispatch: null,
+    });
+    entry.cleanup_workspace_on_exit = true;
+    const result = await reconcilePostHookEntryState(entry, cfg);
+    assert.equal(result.relocated, false);
+    assert.equal(entry.cleanup_workspace_on_exit, true);
   });
 
   it('extracts the body verbatim when the issue file has no front matter', async () => {

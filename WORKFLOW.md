@@ -281,12 +281,16 @@ hooks:
       gh auth setup-git 2>/dev/null || true
       git fetch --no-tags origin "${BASE}:refs/remotes/origin/${BASE}" || true
       # Sync local integration with origin's view if it exists; otherwise seed
-      # origin from the local copy we just cloned (push without --force; this
-      # only succeeds on a non-existent or already-ancestor remote ref).
+      # origin/integration from origin/${BASE} (the source of truth in remote mode).
+      # The source-repo integration branch we cloned from may have been seeded from a
+      # stale local ${BASE} above, so using it here would propagate stale state to
+      # everyone going forward — reset to origin/${BASE} before the first push.
       if git fetch --no-tags origin "${INTEGRATION}:refs/remotes/origin/${INTEGRATION}" 2>/dev/null; then
         git checkout "${INTEGRATION}"
         git reset --hard "refs/remotes/origin/${INTEGRATION}"
       else
+        git checkout "${INTEGRATION}"
+        git reset --hard "refs/remotes/origin/${BASE}"
         git push origin "refs/heads/${INTEGRATION}:refs/heads/${INTEGRATION}" || true
       fi
     fi
