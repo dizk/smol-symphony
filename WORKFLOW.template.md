@@ -164,6 +164,25 @@ logs:
 # Plus any env var the operator exports before launching `symphony`. The
 # common pattern is to plumb tracker root / repo / base via env so the same
 # workflow file works against multiple repos. See WORKFLOW.md for an example.
+# The shipped `WORKFLOW.md` reads these operator-exported env vars from its
+# hook scripts:
+#
+#   SYMPHONY_BASE_BRANCH         — branch issues diverge from and PRs target.
+#                                  Default: 'main'.
+#   SYMPHONY_REPO                — '<owner>/<repo>'. When set, after_run pushes
+#                                  the per-issue branch and opens a PR via gh;
+#                                  otherwise after_run only writes a patch
+#                                  bundle. Default: unset (patch-bundle mode).
+#   SYMPHONY_INTEGRATION_BRANCH  — shared agent-integration branch in the
+#                                  source repo. Workspaces clone from its tip
+#                                  (created lazily from SYMPHONY_BASE_BRANCH on
+#                                  first use); after_run fast-forwards it when
+#                                  an issue lands in Done so subsequent issues
+#                                  see prior agents' commits instead of stale
+#                                  base. Default: 'agent-integration'. Set to
+#                                  the empty string ('') to opt out and clone
+#                                  directly from SYMPHONY_BASE_BRANCH (legacy
+#                                  "branch from base" behavior).
 #
 # Per-state overrides: any state can declare its own `hooks:` block under
 # `states.<name>.hooks` that overrides individual fields here for issues in
