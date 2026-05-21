@@ -134,6 +134,13 @@ export async function buildAfterRunHookEnv(
     SYMPHONY_PR_TITLE: title.length > 0 ? `${issue.id}: ${title}` : issue.id,
     SYMPHONY_PR_BODY_FILE: bodyFile,
   };
+  // Stage the tracker root so the hook can reach the issue file directly — used by the
+  // shared-integration flow to re-route an issue to a Conflict/ holding state on merge
+  // failure (the orchestrator only owns the dispatch-time move; out-of-band post-hoc
+  // routing happens in the hook). Only present when the snapshot was captured.
+  if (entry.tracker_root_at_dispatch) {
+    env.SYMPHONY_TRACKER_ROOT = entry.tracker_root_at_dispatch;
+  }
   return { env, cleanup };
 }
 

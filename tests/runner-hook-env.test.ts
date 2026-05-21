@@ -13,6 +13,11 @@ import type { Issue, RunningEntry } from '../src/types.js';
 //   SYMPHONY_PR_TITLE                          — "<id>: <title>", already prefixed
 //   SYMPHONY_PR_BODY_FILE                      — absolute path to a temp file the host
 //                                                wrote with the up-to-date issue body
+//   SYMPHONY_TRACKER_ROOT                      — tracker root snapshot; only present
+//                                                when the dispatch captured it. Lets
+//                                                the hook re-route the issue file to
+//                                                a holding state (e.g. Conflict/) on
+//                                                merge failure.
 // We pin the contract end-to-end: env keys present, file written, fallback path
 // honored, cleanup wipes the temp dir.
 
@@ -209,6 +214,39 @@ describe('buildAfterRunHookEnv', () => {
     } finally {
       if (prior === undefined) delete process.env.SYMPHONY_BASE_BRANCH;
       else process.env.SYMPHONY_BASE_BRANCH = prior;
+    }
+  });
+
+  it('stages SYMPHONY_TRACKER_ROOT so the hook can reroute the issue file on merge conflict', async () => {
+    // The shared-integration flow (issue #18) has the Done after_run hook attempt
+    // `git merge --no-ff agent/<id>` into `integration` and, on conflict, move the
+    // tracker file into a `Conflict/` holding state. The hook needs the tracker root
+    // to write outside the workspace; expose it as SYMPHONY_TRACKER_ROOT.
+    const entry = makeEntry({
+      issue: { id: '11', identifier: '11', title: 't', state: 'Done', description: 'body' },
+      tracker_root_at_dispatch: '/var/symphony/tracker',
+    });
+    const { env, cleanup } = await buildAfterRunHookEnv(entry);
+    try {
+      assert.equal(env.SYMPHONY_TRACKER_ROOT, '/var/symphony/tracker');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('omits SYMPHONY_TRACKER_ROOT when no snapshot is available', async () => {
+    // When the dispatch path could not capture a tracker root (older path, propose
+    // flow), leave the env var unset rather than staging an empty string the hook
+    // would still treat as a valid root under `set -u`.
+    const entry = makeEntry({
+      issue: { id: '12', identifier: '12', title: 't', state: 'Done', description: 'body' },
+      tracker_root_at_dispatch: null,
+    });
+    const { env, cleanup } = await buildAfterRunHookEnv(entry);
+    try {
+      assert.equal(Object.prototype.hasOwnProperty.call(env, 'SYMPHONY_TRACKER_ROOT'), false);
+    } finally {
+      await cleanup();
     }
   });
 

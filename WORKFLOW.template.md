@@ -190,13 +190,21 @@ logs:
 #                            with large bodies on argv. The orchestrator
 #                            creates the file before the hook runs and
 #                            removes it after the hook returns.
+#   SYMPHONY_TRACKER_ROOT  — absolute path to the tracker root captured at
+#                            dispatch time. Lets the hook re-route the issue
+#                            file into a holding-role state directory (e.g.
+#                            `Conflict/` for integration-merge failures in
+#                            multi-agent setups) by `mv`'ing the file
+#                            directly. Unset when the dispatch path could
+#                            not snapshot a root (older code paths, propose
+#                            flow) — guard with `[ -n "${SYMPHONY_TRACKER_ROOT:-}" ]`.
 #
 # These keys are only staged for `after_run`. `after_create`, `before_run`, and
 # `before_remove` see only the inherited process env (plus PWD). If the
 # orchestrator cannot stage them (e.g. the tracker file became unreadable),
-# the hook still runs but the `SYMPHONY_PR_*` keys will be unset — write hook
-# scripts defensively (`set -u` + an `[ -n "${SYMPHONY_REPO:-}" ] || exit 0`
-# guard is the common pattern).
+# the hook still runs but the `SYMPHONY_PR_*` / `SYMPHONY_TRACKER_ROOT` keys
+# will be unset — write hook scripts defensively (`set -u` + an
+# `[ -n "${SYMPHONY_REPO:-}" ] || exit 0` guard is the common pattern).
 #
 # Per-state overrides: any state can declare its own `hooks:` block under
 # `states.<name>.hooks` that overrides individual fields here for issues in

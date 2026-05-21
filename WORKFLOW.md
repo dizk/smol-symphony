@@ -52,30 +52,156 @@ states:
   Done:
     role: terminal
     # Per-state after_run fires only on transition INTO this state. The host
-    # pre-stages SYMPHONY_PR_TITLE / SYMPHONY_PR_BODY_FILE / SYMPHONY_BRANCH for
-    # us (title is already issue-id prefixed; the body file carries the full
-    # multi-hop notes from the issue's tracker file), so the hook is just the
-    # push + PR-create. Local-only mode (no SYMPHONY_REPO) exits 0 and leaves
-    # the per-issue branch in the workspace; the orchestrator removes the
-    # workspace after this hook returns.
+    # pre-stages SYMPHONY_PR_TITLE / SYMPHONY_PR_BODY_FILE / SYMPHONY_BRANCH /
+    # SYMPHONY_TRACKER_ROOT for us (title is already issue-id prefixed; the body
+    # file carries the full multi-hop notes from the issue's tracker file), so
+    # the hook is just push + PR-create + integration merge. Local-only mode (no
+    # SYMPHONY_REPO) skips push/PR but still keeps the integration branch on the
+    # source repo in sync so concurrent agents see each other's work. The
+    # orchestrator removes the workspace after this hook returns.
     hooks:
       after_run: |
         set -eu
-        [ -n "${SYMPHONY_REPO:-}" ] || exit 0
-        git push -u origin "$SYMPHONY_BRANCH"
-        if gh pr view "$SYMPHONY_BRANCH" >/dev/null 2>&1; then
-          echo "PR already exists for $SYMPHONY_BRANCH; pushed updates"
+        ISSUE_ID="$SYMPHONY_ISSUE_ID"
+        BRANCH="$SYMPHONY_BRANCH"
+        BASE="$SYMPHONY_BASE_BRANCH"
+        INTEGRATION="${SYMPHONY_INTEGRATION_BRANCH:-integration}"
+        SOURCE_REPO="${SYMPHONY_SOURCE_REPO:-${PWD}/../../..}"
+
+        # 1) PR against `main` (remote mode only). Independent of the integration
+        # merge below — even if integration conflicts, the PR is still opened so
+        # the operator can handle it on the normal review cadence.
+        if [ -n "${SYMPHONY_REPO:-}" ]; then
+          git push -u origin "$BRANCH"
+          if gh pr view "$BRANCH" >/dev/null 2>&1; then
+            echo "PR already exists for $BRANCH; pushed updates"
+          else
+            gh pr create \
+              --base "$BASE" \
+              --head "$BRANCH" \
+              --title "$SYMPHONY_PR_TITLE" \
+              --body-file "$SYMPHONY_PR_BODY_FILE"
+          fi
+        fi
+
+        # 2) Merge agent/<id> into the shared integration branch. Done in the
+        # workspace (we already have the agent branch checked out), then pushed
+        # to whichever repo owns integration for this run: origin in remote mode,
+        # the source repo in local mode.
+        if [ -n "${SYMPHONY_REPO:-}" ]; then
+          INT_PUSH_TARGET="origin"
+          if ! git fetch --no-tags origin "${INTEGRATION}:refs/symphony/integ-base" 2>/dev/null; then
+            # Origin doesn't have integration yet (first run after switching to
+            # this flow). Seed it from BASE on origin and re-fetch.
+            git fetch --no-tags origin "${BASE}:refs/symphony/integ-base"
+            git push origin "refs/symphony/integ-base:refs/heads/${INTEGRATION}"
+          fi
+        else
+          INT_PUSH_TARGET="$SOURCE_REPO"
+          if ! git -C "$SOURCE_REPO" rev-parse --verify "refs/heads/${INTEGRATION}" >/dev/null 2>&1; then
+            git -C "$SOURCE_REPO" branch "$INTEGRATION" "$BASE"
+          fi
+          git fetch --no-tags "$SOURCE_REPO" "${INTEGRATION}:refs/symphony/integ-base"
+        fi
+
+        # Detach to the integration tip and squash-merge agent/<id>. Squash
+        # keeps integration history readable (one commit per issue) and makes
+        # future per-issue rebases trivial. The original per-commit history is
+        # preserved on agent/<id> for the PR against main.
+        git checkout --detach refs/symphony/integ-base >/dev/null
+        MERGE_OK=0
+        HAS_CHANGES=0
+        CONFLICT_FILES=""
+        DIFFSTAT=""
+        if git merge --squash "$BRANCH"; then
+          if git diff --cached --quiet; then
+            echo "no changes to integrate from ${BRANCH} (agent branch is identical to ${INTEGRATION})"
+            MERGE_OK=1
+          else
+            HAS_CHANGES=1
+            git commit -m "integrate ${BRANCH}" >/dev/null
+            MERGE_OK=1
+          fi
+        else
+          CONFLICT_FILES="$(git diff --name-only --diff-filter=U || true)"
+          DIFFSTAT="$(git diff --stat HEAD || true)"
+          # --squash doesn't track MERGE_HEAD, so `merge --abort` is a no-op
+          # here; reset hard to drop the conflicted working tree + index.
+          git reset --hard HEAD >/dev/null 2>&1 || true
+        fi
+
+        if [ "$MERGE_OK" = "1" ] && [ "$HAS_CHANGES" = "1" ]; then
+          if ! git push "$INT_PUSH_TARGET" "HEAD:refs/heads/${INTEGRATION}"; then
+            echo "warning: ${INTEGRATION} push to ${INT_PUSH_TARGET} failed" >&2
+            # Treat push failure (e.g. SOURCE_REPO currently has integration
+            # checked out → denyCurrentBranch, or origin/integration moved
+            # under us in a concurrent run) like a conflict so the operator is
+            # notified rather than silently losing the merge.
+            MERGE_OK=0
+            CONFLICT_FILES=""
+            DIFFSTAT="(push to ${INT_PUSH_TARGET}'s ${INTEGRATION} refused; the destination may currently have ${INTEGRATION} checked out, or it moved under us)"
+          fi
+        fi
+
+        # Restore the workspace HEAD on the agent branch so any later inspection
+        # (or before_remove hook) finds a sensible checkout.
+        git checkout "$BRANCH" >/dev/null 2>&1 || true
+
+        if [ "$MERGE_OK" = "1" ]; then
+          echo "integrated ${BRANCH} into ${INTEGRATION} on ${INT_PUSH_TARGET}"
           exit 0
         fi
-        gh pr create \
-          --base "$SYMPHONY_BASE_BRANCH" \
-          --head "$SYMPHONY_BRANCH" \
-          --title "$SYMPHONY_PR_TITLE" \
-          --body-file "$SYMPHONY_PR_BODY_FILE"
+
+        # 3) Conflict — re-route the issue file from Done/ to Conflict/ and
+        # append the diff context to the body so the operator can see what
+        # conflicted without re-running the merge by hand. The orchestrator
+        # already moved the file to Done/<id>.md as part of the terminal
+        # transition; we move it sideways here.
+        echo "integration merge failed for ${BRANCH}; routing issue to Conflict/" >&2
+        if [ -z "${SYMPHONY_TRACKER_ROOT:-}" ]; then
+          echo "warning: SYMPHONY_TRACKER_ROOT unset; leaving issue in Done/" >&2
+          exit 0
+        fi
+        mkdir -p "${SYMPHONY_TRACKER_ROOT}/Conflict"
+        SRC="${SYMPHONY_TRACKER_ROOT}/Done/${ISSUE_ID}.md"
+        DST="${SYMPHONY_TRACKER_ROOT}/Conflict/${ISSUE_ID}.md"
+        if [ -f "$SRC" ]; then
+          mv "$SRC" "$DST"
+        fi
+        if [ -f "$DST" ]; then
+          {
+            echo ""
+            echo "## Integration merge conflict"
+            echo ""
+            echo "Merging \`${BRANCH}\` into \`${INTEGRATION}\` failed on ${INT_PUSH_TARGET}."
+            if [ -n "$CONFLICT_FILES" ]; then
+              echo ""
+              echo "Conflicted files:"
+              echo '```'
+              echo "$CONFLICT_FILES"
+              echo '```'
+            fi
+            if [ -n "$DIFFSTAT" ]; then
+              echo ""
+              echo "Diff stat (${BRANCH} vs ${INTEGRATION}):"
+              echo '```'
+              echo "$DIFFSTAT"
+              echo '```'
+            fi
+          } >> "$DST"
+        fi
   Cancelled:
     role: terminal
     # Cancelled means the work was abandoned; no patch, no PR. The workspace is
     # cleaned up after the run unwinds and the commits are discarded with it.
+  Conflict:
+    # Holding state for issues whose Done-state integration merge failed. The
+    # orchestrator does NOT dispatch from here; the operator inspects the
+    # appended diff context in the issue body, resolves the conflict manually
+    # (rebasing the per-issue branch against integration, or dropping the
+    # integration merge if the PR was already closed), and routes the issue
+    # back into the active queue or to Cancelled from the dashboard.
+    role: holding
   Triage:
     # Landing directory for `symphony.propose_issue`. Never dispatched; the
     # operator approves or discards from the dashboard.
@@ -107,13 +233,20 @@ hooks:
 
   # Clone smol-symphony into the fresh per-issue workspace from a strictly local
   # source (no creds needed). The agent receives a working git repo with full
-  # history on the configured base branch, plus a per-issue branch checked out.
-  # All network remotes are stripped so any `git push`/`git fetch` from inside
-  # the VM fails closed.
+  # history on the shared integration branch, plus a per-issue branch checked
+  # out. All network remotes are stripped so any `git push`/`git fetch` from
+  # inside the VM fails closed.
+  #
+  # Branching off integration (not BASE) is the agent-throughput fix: in-flight
+  # agents see work from peers whose PRs against main are still open for review.
+  # On first run after switching to this flow, integration is seeded from BASE.
+  # See AGENTS.md for the `main → integration` reconciliation ritual that keeps
+  # integration from drifting too far from main.
   after_create: |
     set -eu
     SOURCE_REPO="${SYMPHONY_SOURCE_REPO:-${PWD}/../../..}"
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
+    INTEGRATION="${SYMPHONY_INTEGRATION_BRANCH:-integration}"
     ISSUE_ID="$(basename "$PWD")"
     BRANCH="agent/${ISSUE_ID}"
 
@@ -122,9 +255,17 @@ hooks:
       exit 1
     fi
 
+    # Ensure SOURCE_REPO has an integration branch. This is the authoritative
+    # integration in local-only mode, and the seed used by the remote-mode block
+    # below when origin doesn't carry integration yet.
+    if ! git -C "${SOURCE_REPO}" rev-parse --verify "refs/heads/${INTEGRATION}" >/dev/null 2>&1; then
+      echo "creating ${INTEGRATION} from ${BASE} on source repo (first run)"
+      git -C "${SOURCE_REPO}" branch "${INTEGRATION}" "${BASE}"
+    fi
+
     # `git clone --local` hardlinks .git/objects when possible; fast and disk-cheap.
-    # `--no-tags` keeps the local refspec minimal; `--branch` lands on the right base.
-    git clone --local --no-tags --branch "${BASE}" "${SOURCE_REPO}" .
+    # `--no-tags` keeps the local refspec minimal; `--branch` lands on integration.
+    git clone --local --no-tags --branch "${INTEGRATION}" "${SOURCE_REPO}" .
 
     # Strip all remotes. The agent will see no network targets at all.
     for remote in $(git remote); do
@@ -139,6 +280,15 @@ hooks:
       git remote add origin "https://github.com/${SYMPHONY_REPO}.git"
       gh auth setup-git 2>/dev/null || true
       git fetch --no-tags origin "${BASE}:refs/remotes/origin/${BASE}" || true
+      # Sync local integration with origin's view if it exists; otherwise seed
+      # origin from the local copy we just cloned (push without --force; this
+      # only succeeds on a non-existent or already-ancestor remote ref).
+      if git fetch --no-tags origin "${INTEGRATION}:refs/remotes/origin/${INTEGRATION}" 2>/dev/null; then
+        git checkout "${INTEGRATION}"
+        git reset --hard "refs/remotes/origin/${INTEGRATION}"
+      else
+        git push origin "refs/heads/${INTEGRATION}:refs/heads/${INTEGRATION}" || true
+      fi
     fi
 
     git config --local user.name  "symphony-agent"
@@ -146,7 +296,7 @@ hooks:
 
     git checkout -b "${BRANCH}"
 
-    echo "workspace ready: base=${BASE} branch=${BRANCH} source=${SOURCE_REPO}"
+    echo "workspace ready: base=${BASE} integration=${INTEGRATION} branch=${BRANCH} source=${SOURCE_REPO}"
 
   # No workflow-level after_run: the handoff (patch + optional PR) lives on
   # the Done state's per-state hook (see `states.Done.hooks.after_run` above).
