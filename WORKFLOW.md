@@ -7,8 +7,8 @@
 #
 # Defaults assume a fully local setup: the per-issue workspace clones from this
 # repo's `.git` directory, the agent has no network credentials, and when the
-# issue lands in a terminal state the host writes a `git format-patch` bundle
-# to `.symphony/patches/<branch>.patch` for human review.
+# issue lands in a terminal state the per-issue branch is left in the workspace
+# until cleanup. No patch bundle is written.
 #
 # To opt into the remote PR flow, export before launching:
 #
@@ -51,119 +51,27 @@ states:
     allowed_transitions: [Todo, Done]
   Done:
     role: terminal
-    # Per-state after_run fires only on transition INTO this state, so the
-    # script does not have to walk the tracker to check whether the issue
-    # actually landed in a terminal directory — the orchestrator's hook
-    # resolution already gates that. Two outputs:
-    #   - Always: write the agent's work as a git format-patch bundle into
-    #     ./.symphony/patches/<branch>.patch for human review.
-    #   - If SYMPHONY_REPO is set: push the per-issue branch + open (or update)
-    #     a PR via gh on top of the patch bundle.
+    # Per-state after_run fires only on transition INTO this state. The host
+    # pre-stages SYMPHONY_PR_TITLE / SYMPHONY_PR_BODY_FILE / SYMPHONY_BRANCH for
+    # us (title is already issue-id prefixed; the body file carries the full
+    # multi-hop notes from the issue's tracker file), so the hook is just the
+    # push + PR-create. Local-only mode (no SYMPHONY_REPO) exits 0 and leaves
+    # the per-issue branch in the workspace; the orchestrator removes the
+    # workspace after this hook returns.
     hooks:
       after_run: |
         set -eu
-        BASE="${SYMPHONY_BASE_BRANCH:-main}"
-        ISSUE_ID="$(basename "$PWD")"
-        BRANCH="agent/${ISSUE_ID}"
-        TRACKER_ROOT="${SYMPHONY_TRACKER_ROOT:-$HOME/.symphony/trackers/smol-symphony}"
-        PATCHES_DIR="${SYMPHONY_PATCHES_DIR:-$PWD/../../../.symphony/patches}"
-        # The hook is attached to the Done state, so the issue file is here.
-        ISSUE_FILE="${TRACKER_ROOT}/Done/${ISSUE_ID}.md"
-
-        # Pull PR title + body straight from the Done-state issue file. The
-        # `symphony.transition` tool appends every hop's notes (implementer →
-        # reviewer → approval) to the issue body before each move, so the file
-        # carries the full thread. We use:
-        #   - Title: front-matter `title:` field, prefixed with the issue id so
-        #     PR lists stay scannable. Falls back to the bare id when missing.
-        #   - Body:  everything after the closing `---` of front-matter.
-        # awk extracts `title:` without dragging in a YAML parser; the body-
-        # extracting awk walks state: 0 = before opening fence, 1 = in front
-        # matter, 2 = body. If the file has no opening fence, every line is body.
-        RAW_TITLE="$(awk '
-          BEGIN { in_fm = 0 }
-          NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; next }
-          in_fm && /^---[[:space:]]*$/ { exit }
-          in_fm && /^title:[[:space:]]*/ {
-            sub(/^title:[[:space:]]*/, "")
-            gsub(/^["'\'']|["'\'']$/, "")
-            print
-            exit
-          }
-        ' "${ISSUE_FILE}")"
-        TITLE="${RAW_TITLE}"
-        BODY="$(awk '
-          BEGIN { state = 0 }
-          NR == 1 {
-            if ($0 ~ /^---[[:space:]]*$/) { state = 1; next }
-            else { state = 2 }
-          }
-          state == 1 {
-            if ($0 ~ /^---[[:space:]]*$/) { state = 2; next }
-            next
-          }
-          state == 2 { print }
-        ' "${ISSUE_FILE}")"
-        if [ -z "${BODY}" ]; then
-          BODY="$(cat "${ISSUE_FILE}")"
-        fi
-
-        if ! git rev-parse --verify "${BRANCH}" >/dev/null 2>&1; then
-          echo "no branch ${BRANCH}; nothing to hand off"
+        [ -n "${SYMPHONY_REPO:-}" ] || exit 0
+        git push -u origin "$SYMPHONY_BRANCH"
+        if gh pr view "$SYMPHONY_BRANCH" >/dev/null 2>&1; then
+          echo "PR already exists for $SYMPHONY_BRANCH; pushed updates"
           exit 0
         fi
-
-        # Resolve the ref the agent diverged from. In remote mode origin/${BASE}
-        # exists (after_create's `git fetch`). In local-only mode the local
-        # ${BASE} branch is the tip the agent diverged from.
-        if git rev-parse --verify "origin/${BASE}" >/dev/null 2>&1; then
-          MERGE_BASE="origin/${BASE}"
-        elif git rev-parse --verify "${BASE}" >/dev/null 2>&1; then
-          MERGE_BASE="${BASE}"
-        else
-          echo "could not resolve merge base (no origin/${BASE} or local ${BASE})" >&2
-          exit 1
-        fi
-
-        if [ -z "$(git log --oneline "${MERGE_BASE}..${BRANCH}" 2>/dev/null)" ]; then
-          echo "no new commits on ${BRANCH}; nothing to hand off"
-          exit 0
-        fi
-
-        # Always materialize the patch bundle BEFORE attempting the remote push.
-        # If anything in the gh/origin chain fails the work survives at
-        # .symphony/patches/<branch>.patch and can be replayed with `git am`.
-        mkdir -p "${PATCHES_DIR}"
-        PATCH_OUT="${PATCHES_DIR}/$(echo "${BRANCH}" | tr '/' '_').patch"
-        git format-patch --stdout "${MERGE_BASE}..${BRANCH}" > "${PATCH_OUT}"
-        echo "wrote patch bundle: ${PATCH_OUT}"
-
-        if [ -n "${SYMPHONY_REPO:-}" ]; then
-          # Remote PR mode. Be defensive about origin: an earlier workspace creation
-          # may have happened with SYMPHONY_REPO unset (after_create's remote-add
-          # branch was skipped), leaving the workspace without an origin remote
-          # even though we are now in PR mode. Re-add it idempotently before pushing.
-          if ! git remote get-url origin >/dev/null 2>&1; then
-            echo "after_run: origin remote missing; re-adding"
-            git remote add origin "https://github.com/${SYMPHONY_REPO}.git"
-            gh auth setup-git 2>/dev/null || true
-          fi
-          if git push -u origin "${BRANCH}"; then
-            if gh pr view "${BRANCH}" >/dev/null 2>&1; then
-              echo "PR already exists for ${BRANCH}; pushed updates"
-            elif ! gh pr create \
-              --base "${BASE}" \
-              --head "${BRANCH}" \
-              --title "${ISSUE_ID}${TITLE:+: ${TITLE}}" \
-              --body "${BODY}"; then
-              echo "gh pr create failed; patch bundle preserved at ${PATCH_OUT}" >&2
-            fi
-          else
-            echo "git push failed; patch bundle preserved at ${PATCH_OUT}" >&2
-          fi
-        else
-          echo "  apply with:  git -C <target-repo> am ${PATCH_OUT}"
-        fi
+        gh pr create \
+          --base "$SYMPHONY_BASE_BRANCH" \
+          --head "$SYMPHONY_BRANCH" \
+          --title "$SYMPHONY_PR_TITLE" \
+          --body-file "$SYMPHONY_PR_BODY_FILE"
   Cancelled:
     role: terminal
     # Cancelled means the work was abandoned; no patch, no PR. The workspace is

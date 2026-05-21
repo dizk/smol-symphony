@@ -4,6 +4,9 @@
 // the VM at the same absolute path so cwd values are consistent.
 
 import { setTimeout as delay } from 'node:timers/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type {
   Issue,
   RunningEntry,
@@ -67,6 +70,71 @@ const CONTINUATION_PROMPT_NO_MCP =
 
 function continuationPrompt(mcpEnabled: boolean): string {
   return mcpEnabled ? CONTINUATION_PROMPT_WITH_MCP : CONTINUATION_PROMPT_NO_MCP;
+}
+
+// Extract the body (everything after the closing YAML front-matter fence) from a tracker
+// issue file. Tolerant of malformed/missing front matter — returns the whole file in that
+// case so a hand-edited issue still produces a sensible PR body. Mirrors the parser in
+// src/trackers/local.ts; kept local to avoid widening the tracker's public surface for a
+// single one-shot read.
+function extractIssueBody(text: string): string {
+  if (!text.startsWith('---')) return text.trim();
+  const lines = text.split(/\r?\n/);
+  const isFence = (l: string | undefined): boolean => /^---\s*$/.test(l ?? '');
+  if (!isFence(lines[0])) return text.trim();
+  for (let i = 1; i < lines.length; i++) {
+    if (isFence(lines[i])) return lines.slice(i + 1).join('\n').trim();
+  }
+  return text.trim();
+}
+
+// Stage the env vars + body file the Done state's after_run hook consumes (SYMPHONY_*).
+// Reads the current issue file from <tracker_root>/<state>/<identifier>.md so any
+// transition notes appended by `symphony.transition` ride through into the PR body;
+// falls back to the in-memory description if the file isn't reachable (no tracker root
+// pinned, or read failure). Returns the env map and a cleanup closure the caller MUST
+// run after the hook completes, so the temp file is removed promptly.
+export async function buildAfterRunHookEnv(
+  entry: RunningEntry,
+): Promise<{ env: Record<string, string>; cleanup: () => Promise<void> }> {
+  const issue = entry.issue;
+  const ident = entry.identifier;
+  const branch = `agent/${ident}`;
+  let body = issue.description ?? '';
+  if (entry.tracker_root_at_dispatch) {
+    const issuePath = path.join(entry.tracker_root_at_dispatch, issue.state, `${ident}.md`);
+    try {
+      const text = await readFile(issuePath, 'utf8');
+      body = extractIssueBody(text);
+    } catch {
+      // Fall back to the dispatch-time description; the hook still works, it just
+      // won't see notes the agent appended during the run.
+    }
+  }
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'symphony-pr-body-'));
+  const bodyFile = path.join(tmpDir, 'body.md');
+  await writeFile(bodyFile, body, 'utf8');
+  const cleanup = async (): Promise<void> => {
+    try {
+      await rm(tmpDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup; tmp dir is in $TMPDIR and the OS will reclaim it eventually.
+    }
+  };
+  const title = issue.title.trim();
+  // Mirror after_create's `${SYMPHONY_BASE_BRANCH:-main}` default so an operator who only
+  // exported SYMPHONY_REPO (the documented PR-mode setup in AGENTS.md) still gets a usable
+  // --base value. Staging here means the hook script can run under `set -u` and reference
+  // $SYMPHONY_BASE_BRANCH directly without an inline shell default.
+  const baseBranch = process.env.SYMPHONY_BASE_BRANCH;
+  const env: Record<string, string> = {
+    SYMPHONY_ISSUE_ID: issue.id,
+    SYMPHONY_BRANCH: branch,
+    SYMPHONY_BASE_BRANCH: baseBranch && baseBranch.length > 0 ? baseBranch : 'main',
+    SYMPHONY_PR_TITLE: title.length > 0 ? `${issue.id}: ${title}` : issue.id,
+    SYMPHONY_PR_BODY_FILE: bodyFile,
+  };
+  return { env, cleanup };
 }
 
 function buildSteeringReplyPrompt(question: string, context: string | null, reply: string): string {
@@ -502,11 +570,32 @@ export class AgentRunner {
       // state when no entry is wired or the transition never happened.
       const cleanupState = runningEntry?.issue.state ?? issue.state;
       const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        cleanupHooks,
-        hookCapture('after_run'),
-      );
+      // Stage SYMPHONY_* env vars + a temp body file for the hook (collapses the Done
+      // after_run from ~80 lines of awk/git plumbing to a few git/gh calls). The runner
+      // owns the temp body file's lifecycle; the post-hook cleanup always fires.
+      let extraEnv: Record<string, string> | undefined;
+      let extraEnvCleanup: (() => Promise<void>) | null = null;
+      if (runningEntry && cleanupHooks.after_run) {
+        try {
+          const staged = await buildAfterRunHookEnv(runningEntry);
+          extraEnv = staged.env;
+          extraEnvCleanup = staged.cleanup;
+        } catch (err) {
+          logger.warn('after_run env staging failed; running hook without SYMPHONY_PR_* vars', {
+            error: (err as Error).message,
+          });
+        }
+      }
+      try {
+        await this.workspaces.runAfterRunBestEffort(
+          workspace.path,
+          cleanupHooks,
+          hookCapture('after_run'),
+          extraEnv,
+        );
+      } finally {
+        if (extraEnvCleanup) await extraEnvCleanup();
+      }
       // Per the agreed lifecycle, every attempt gets a fresh VM. Destroy is best-effort:
       // smolvm.destroy already swallows errors and logs at warn, so a stuck/lost VM here
       // never aborts the attempt's return path. The next attempt's ensureRunning will

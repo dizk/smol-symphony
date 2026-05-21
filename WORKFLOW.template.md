@@ -74,8 +74,8 @@ tracker:
 #             `symphony.transition`, after_run and before_remove are resolved
 #             against the POST-transition state, so a terminal-state's hook can
 #             drive a state-specific handoff (e.g. Done opens a PR; Merge runs
-#             an auto-merge; Cancelled writes only a patch). The shared
-#             `timeout_ms` is not overridable per state.
+#             an auto-merge; Cancelled opts out entirely with `after_run: null`).
+#             The shared `timeout_ms` is not overridable per state.
 #
 # Declaration order matters: role-filtered listings (active states, terminal
 # states) follow it, and the dashboard renders state columns in the same order.
@@ -163,6 +163,40 @@ logs:
 # orchestrator forwards the parent process env unchanged. The common pattern
 # is to plumb tracker root / repo / base via env so the same workflow file
 # works against multiple checkouts.
+#
+# Additionally, the orchestrator pre-stages a small `SYMPHONY_*` env contract
+# for `after_run` hooks specifically, so the hook script doesn't have to parse
+# the issue file or recompute the branch name itself. These keys are merged on
+# top of the inherited process env for the hook invocation only (the host's
+# own process env is not mutated):
+#
+#   SYMPHONY_ISSUE_ID      — the dispatched issue's identifier (e.g. `42`).
+#   SYMPHONY_BRANCH        — the per-issue working branch (`agent/<id>`), the
+#                            same name `after_create` checks out.
+#   SYMPHONY_BASE_BRANCH   — base branch the work targets. Mirrors
+#                            `after_create`'s `${SYMPHONY_BASE_BRANCH:-main}`
+#                            default: if the operator did not export it, the
+#                            host stages `main`, so the hook can run under
+#                            `set -u` and reference it directly without an
+#                            inline shell default.
+#   SYMPHONY_PR_TITLE      — issue title already prefixed with the id (e.g.
+#                            `42: Fix the thing`). Falls back to the bare id
+#                            when the issue title is blank.
+#   SYMPHONY_PR_BODY_FILE  — absolute path to a temp file containing the
+#                            current issue body (read fresh from the tracker
+#                            after any `symphony.transition` notes have been
+#                            appended). Pass to `gh pr create --body-file` to
+#                            sidestep `E2BIG` and quoting headaches that come
+#                            with large bodies on argv. The orchestrator
+#                            creates the file before the hook runs and
+#                            removes it after the hook returns.
+#
+# These keys are only staged for `after_run`. `after_create`, `before_run`, and
+# `before_remove` see only the inherited process env (plus PWD). If the
+# orchestrator cannot stage them (e.g. the tracker file became unreadable),
+# the hook still runs but the `SYMPHONY_PR_*` keys will be unset — write hook
+# scripts defensively (`set -u` + an `[ -n "${SYMPHONY_REPO:-}" ] || exit 0`
+# guard is the common pattern).
 #
 # Per-state overrides: any state can declare its own `hooks:` block under
 # `states.<name>.hooks` that overrides individual fields here for issues in

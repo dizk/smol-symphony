@@ -7,8 +7,9 @@ OpenCode) inside isolated [smolvm](https://smolmachines.com/) microVMs over the
 
 The agent signals progress through an injected MCP server (`transition`,
 `request_human_steering`, `propose_issue`); the orchestrator handles state,
-retry, concurrency, and produces either a pull request or a `git format-patch`
-bundle per issue.
+retry, concurrency, and opens a pull request per issue when configured for
+a GitHub remote. In local-only mode the per-issue branch is left in the
+workspace for review.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -230,22 +231,22 @@ single credential file into a per-workspace location (under `.git/` when
 the workspace has its own clone, else `.symphony-runtime/`) and refuses to
 operate on workspaces inside the credential file's ancestor repo.
 
-## After-run handoff: PR or patch
+## After-run handoff: pull request
 
-`WORKFLOW.md`'s `after_run` hook ships in two modes:
+`WORKFLOW.md`'s Done-state `after_run` hook opens a PR when
+`SYMPHONY_REPO=<owner>/<repo>` is exported: it pushes the per-issue branch and
+runs `gh pr create --base $SYMPHONY_BASE_BRANCH ...`. Requires `gh auth status`
+to be clean on the host; the token never enters the VM.
 
-- **Pull request mode.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is
-  exported. The hook pushes the per-issue branch to GitHub and runs
-  `gh pr create --base $SYMPHONY_BASE_BRANCH ...`. Requires `gh auth status`
-  to be clean on the host. The token never enters the VM.
-- **Patch bundle mode** (default). Writes
-  `.symphony/patches/<branch>.patch` via `git format-patch` so you can
-  review and apply with `git am`. No remote required.
+In local-only mode (no `SYMPHONY_REPO`) the hook exits 0 and leaves the
+per-issue branch in the workspace until cleanup; pick the commits up with
+`git log agent/<id>` against your local clone.
 
-The PR title and body come from the issue file itself: title from the
-front-matter `title:` (prefixed with the issue id), body from everything
-after the front-matter — which includes every `symphony.transition` notes
-block accumulated across the run, giving reviewers the full handoff thread.
+The orchestrator stages `SYMPHONY_PR_TITLE` (already id-prefixed) and
+`SYMPHONY_PR_BODY_FILE` (a temp file holding the current issue body) before
+firing the hook, so the PR description carries every `symphony.transition`
+notes block accumulated across the run — the full handoff thread from
+implementer through reviewer to approval.
 
 See [AGENTS.md](./AGENTS.md) for the env-var contract and switch-over
 commands.
