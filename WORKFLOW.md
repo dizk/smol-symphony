@@ -131,7 +131,11 @@ hooks:
     # Stamp a local ${BASE} ref from the clone's remote-tracking origin/${BASE}
     # before stripping remotes, so after_run can resolve the merge base for
     # format-patch/PRs even when the clone landed on the integration branch.
-    if git rev-parse --verify "origin/${BASE}" >/dev/null 2>&1; then
+    # Skip when the clone is already on ${BASE} (the opt-out path,
+    # SYMPHONY_INTEGRATION_BRANCH=""): the local ${BASE} branch already exists
+    # at the right tip, and `git branch -f` against the checked-out branch
+    # would fail.
+    if [ "${CLONE_BRANCH}" != "${BASE}" ] && git rev-parse --verify "origin/${BASE}" >/dev/null 2>&1; then
       git branch -f "${BASE}" "origin/${BASE}"
     fi
 
