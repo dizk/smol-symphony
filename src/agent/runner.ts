@@ -122,9 +122,15 @@ export async function buildAfterRunHookEnv(
     }
   };
   const title = issue.title.trim();
+  // Mirror after_create's `${SYMPHONY_BASE_BRANCH:-main}` default so an operator who only
+  // exported SYMPHONY_REPO (the documented PR-mode setup in AGENTS.md) still gets a usable
+  // --base value. Staging here means the hook script can run under `set -u` and reference
+  // $SYMPHONY_BASE_BRANCH directly without an inline shell default.
+  const baseBranch = process.env.SYMPHONY_BASE_BRANCH;
   const env: Record<string, string> = {
     SYMPHONY_ISSUE_ID: issue.id,
     SYMPHONY_BRANCH: branch,
+    SYMPHONY_BASE_BRANCH: baseBranch && baseBranch.length > 0 ? baseBranch : 'main',
     SYMPHONY_PR_TITLE: title.length > 0 ? `${issue.id}: ${title}` : issue.id,
     SYMPHONY_PR_BODY_FILE: bodyFile,
   };

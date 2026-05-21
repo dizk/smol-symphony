@@ -167,6 +167,51 @@ describe('buildAfterRunHookEnv', () => {
     await assert.rejects(stat(bodyFile));
   });
 
+  it('stages SYMPHONY_BASE_BRANCH with a main default when the host env did not set it', async () => {
+    // The Done hook runs under `set -eu` and references $SYMPHONY_BASE_BRANCH directly. The
+    // documented PR-mode setup (AGENTS.md) only requires SYMPHONY_REPO to be exported, with
+    // SYMPHONY_BASE_BRANCH optional and defaulting to "main" — the same default after_create
+    // applies. Stage that default here so the hook is safe under `set -u`.
+    const prior = process.env.SYMPHONY_BASE_BRANCH;
+    delete process.env.SYMPHONY_BASE_BRANCH;
+    try {
+      const entry = makeEntry({
+        issue: { id: '5', identifier: '5', title: 't', state: 'Done', description: 'body' },
+        tracker_root_at_dispatch: null,
+      });
+      const { env, cleanup } = await buildAfterRunHookEnv(entry);
+      try {
+        assert.equal(env.SYMPHONY_BASE_BRANCH, 'main');
+      } finally {
+        await cleanup();
+      }
+    } finally {
+      if (prior !== undefined) process.env.SYMPHONY_BASE_BRANCH = prior;
+    }
+  });
+
+  it('forwards an explicit SYMPHONY_BASE_BRANCH from the host env', async () => {
+    // Operators on a non-default base (e.g. `develop`) export SYMPHONY_BASE_BRANCH at
+    // launch; the staged env must honour that rather than overriding with "main".
+    const prior = process.env.SYMPHONY_BASE_BRANCH;
+    process.env.SYMPHONY_BASE_BRANCH = 'develop';
+    try {
+      const entry = makeEntry({
+        issue: { id: '6', identifier: '6', title: 't', state: 'Done', description: 'body' },
+        tracker_root_at_dispatch: null,
+      });
+      const { env, cleanup } = await buildAfterRunHookEnv(entry);
+      try {
+        assert.equal(env.SYMPHONY_BASE_BRANCH, 'develop');
+      } finally {
+        await cleanup();
+      }
+    } finally {
+      if (prior === undefined) delete process.env.SYMPHONY_BASE_BRANCH;
+      else process.env.SYMPHONY_BASE_BRANCH = prior;
+    }
+  });
+
   it('extracts the body verbatim when the issue file has no front matter', async () => {
     // The local tracker writes front-matter unconditionally, but a hand-edited file or
     // a propose-issue payload without front-matter should still yield a usable PR body.
