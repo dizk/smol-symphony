@@ -1,16 +1,25 @@
 # AGENTS.md
 
-Standing instructions for any AI agent (Claude Code, Codex, OpenCode, etc.)
-working on this repo. Short list; keep it that way.
+Standing instructions and a small map for any AI agent (Claude Code, Codex,
+OpenCode, etc.) working on this repo. Keep it short.
+
+## Where things live
+
+- `src/orchestrator.ts` — top-level wiring; per-issue dispatch lifecycle entry.
+- `src/agent/runner.ts` — per-issue runner; owns the running-entry state the
+  hook env contract is built from.
+- `src/mcp.ts` — MCP tools exposed to in-VM agents (`symphony.transition`,
+  `symphony.request_human_steering`, `symphony.propose_issue`).
+- `src/workflow.ts` — workflow file parser; the contract `WORKFLOW.template.md`
+  documents.
+- `src/trackers/local.ts` — local markdown tracker (only kind today).
+- `src/acp-bridge.ts` + `scripts/vm-agent.js` — host↔VM ACP transport.
+- `src/http.ts` — HTTP dashboard + MCP endpoint listener.
+- `WORKFLOW.md` — canonical workflow this repo dispatches against itself.
+- `WORKFLOW.template.md` — annotated reference for workflow file syntax.
+- Handoff (push + PR) is documented in `README.md` § "After-run handoff".
 
 ## Workflow template stays in sync
-
-The repo ships two workflow files:
-
-- `WORKFLOW.md` — the canonical workflow used to dispatch agents against this
-  project.
-- `WORKFLOW.template.md` — the annotated reference covering every supported
-  option, its type, default, and example.
 
 **When you change anything that affects workflow file syntax or semantics,
 update `WORKFLOW.template.md` in the same commit.** Concretely:
@@ -19,17 +28,30 @@ update `WORKFLOW.template.md` in the same commit.** Concretely:
   `agent:`, `acp:`, `smolvm:`, `server:`, or `mcp:` → document it in the
   matching section of the template.
 - Renaming or removing a key → rename or remove it in the template too.
-- Changing a default value in `src/workflow.ts` (or whichever parser becomes
-  authoritative) → update the `Default:` annotation in the template.
-- Introducing a new top-level section → add a new section block to the
-  template.
+- Changing a default value in `src/workflow.ts` → update the `Default:`
+  annotation in the template.
 - Adding a new hook env var or Liquid context field → list it in the template
-  alongside the existing ones (under `hooks:` or under the prompt-body
-  comment).
+  alongside the existing ones.
 
 If you find the template already drifted from the parser at the start of your
-task, fix it as part of your change. The template is the contract for what
-operators can write; an out-of-date template is a bug, not paperwork.
+task, fix it as part of your change. An out-of-date template is a bug, not
+paperwork.
+
+## Hooks are glue, not state-machine extension points
+
+Hooks in `WORKFLOW.md` are repo-local glue that runs on the host with cwd in
+the per-issue workspace: cloning, `git push`, `gh pr create`, rescuing
+artifacts. They are not an extension point for behavior the orchestrator owns.
+
+Implement in the orchestrator (runner / MCP / `src/orchestrator.ts`) — not in
+a hook — when the change adds a new state transition, mutates tracker files
+the orchestrator wrote, needs the runner to re-detect what the hook did, or
+requires a new `SYMPHONY_*` env var so the hook can reach into
+orchestrator-owned state. A growing hook env contract is a signal the logic is
+on the wrong side of the seam; surface it as a typed call instead.
+
+Issue bodies sometimes sketch a shell-shaped solution under an `after_run:`
+heading. Treat that as one option, not a directive.
 
 ## Build, test, and check before declaring done
 
@@ -38,40 +60,6 @@ operators can write; an out-of-date template is a bug, not paperwork.
 - `npm run build` — must pass.
 
 Run all three before calling `symphony.transition` into a terminal state.
-
-## Handoff: pull request (or branch-only in local mode)
-
-The handoff lives on the **Done** state's per-state `after_run` hook in
-`WORKFLOW.md` (`states.Done.hooks.after_run`). Because the orchestrator only
-fires that hook on transition INTO Done, the script does not need to check
-whether the issue actually terminated — that's structurally guaranteed. The
-sibling Cancelled state has no `after_run`, so cancelled work is discarded
-with the workspace.
-
-The orchestrator pre-stages `SYMPHONY_PR_TITLE` and `SYMPHONY_PR_BODY_FILE`
-(plus `SYMPHONY_BRANCH`) before invoking the hook, so the script itself is
-just `git push` + `gh pr create --body-file`. The body file holds the current
-tracker issue body, which carries every `symphony.transition` notes block
-accumulated across the run.
-
-- **Pull request.** Triggered when `SYMPHONY_REPO=<owner>/<repo>` is exported
-  before launch. The `after_create` hook adds the `origin` remote pointing at
-  GitHub; `after_run` pushes the per-issue branch, then runs `gh pr create`.
-  `gh auth status` must be clean on the host; the token never enters the VM.
-- **Local-only (default).** When `SYMPHONY_REPO` is unset the hook exits 0
-  immediately. The per-issue `agent/<id>` branch is left in the workspace
-  until the orchestrator removes the workspace; pick the commits up with
-  `git log` against your local clone, or run with `SYMPHONY_REPO` set to
-  open a PR.
-
-To switch this project to PR mode:
-
-```
-SYMPHONY_REPO=<owner>/smol-symphony npx symphony WORKFLOW.md
-```
-
-`SYMPHONY_BASE_BRANCH` (default `main`) overrides the base the agent branches
-from and the PR opens against.
 
 ## Don't write to generated state
 

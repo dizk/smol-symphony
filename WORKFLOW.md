@@ -252,10 +252,23 @@ You are the **implementer**. Your job: turn the issue into a working change on
 the per-issue branch, then hand off to the reviewer.
 
 1. Read enough of the codebase to understand the change you need to make.
-2. Make the smallest correct change. Add or update tests where the change is
+2. Decide where the change belongs before writing it. The orchestrator
+   (`src/agent/runner.ts`, `src/mcp.ts`, `src/orchestrator.ts`) owns the
+   state machine and the tracker. Hooks in `WORKFLOW.md` are for repo-local
+   glue: cloning the workspace, `git push`, `gh pr create`, rescuing
+   artifacts. State-machine behavior (new transitions, conflict routing,
+   anything that mutates tracker files or runtime entry state) belongs in
+   the orchestrator with typed APIs and tests — not in a shell hook. If you
+   find yourself adding a `SYMPHONY_*` env var so a hook can reach into
+   orchestrator state, or writing a hook that the runner then has to
+   re-detect via a post-hook scan, that is the signal you are on the wrong
+   side of the seam: stop and put the logic in the runner/MCP layer
+   instead. The issue body may sketch a shell-shaped solution; treat that
+   as one option, not a directive.
+3. Make the smallest correct change. Add or update tests where the change is
    testable. Run `npm run typecheck` and `npm test`; both must pass.
-3. Commit your work to the per-issue branch with a short message.
-4. Hand off to the reviewer by calling:
+4. Commit your work to the per-issue branch with a short message.
+5. Hand off to the reviewer by calling:
 
    ```
    symphony.transition({
@@ -295,7 +308,30 @@ either approve (→ Done) or send it back (→ Todo) with specific findings.
    npm test
    ```
 
-3. Decide:
+3. Placement check — is the change on the right side of the seam?
+
+   The orchestrator (`src/agent/runner.ts`, `src/mcp.ts`, `src/orchestrator.ts`)
+   owns the state machine and tracker. Hooks in `WORKFLOW.md` are for
+   repo-local glue: cloning the workspace, `git push`, `gh pr create`,
+   rescuing artifacts. Reject when the diff crosses that line:
+
+   - A hook implements a new state transition, or mutates the tracker
+     filesystem the orchestrator owns (e.g. `mv issues/<state>/<id>.md
+     issues/<other-state>/<id>.md`).
+   - A hook mutates runtime state the orchestrator committed earlier (e.g.
+     undoing a cleanup flag) and the runner now has to re-detect what the
+     hook did via a post-hook scan.
+   - A new `SYMPHONY_*` env var is added so a hook can reach into
+     orchestrator-owned state. The contract is growing because the logic is
+     on the wrong side; surface it as a typed call in the runner/MCP layer
+     instead.
+
+   If any of the above fires, reject with a pointer to the right home
+   (runner, MCP tool, or orchestrator). Hook-only diffs that stay within
+   repo-local glue (push/PR/clone/format-patch) are fine — this check is
+   about state-machine logic leaking into shell.
+
+4. Decide:
 
    - **Approve**: the change is correct, tests pass, no blocking issues. Call
 
