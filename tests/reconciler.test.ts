@@ -266,7 +266,6 @@ describe('Reconciler bake resource', () => {
         tracker,
         workspaces,
         runner,
-        null,
         undefined,
         reconciler,
       );

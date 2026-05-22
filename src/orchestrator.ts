@@ -17,8 +17,6 @@ import { resolveHooksForState, validateDispatch, WorkflowError } from './workflo
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
 import { resolveDispatchConfig } from './agent/runner.js';
-import type { SmolvmClient } from './agent/smolvm.js';
-import { SYMPHONY_VM_PREFIX } from './agent/smolvm.js';
 import { activeStateNames, terminalStateNames } from './issues.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
@@ -28,7 +26,7 @@ import type { WorkspaceManager, HookCapture, HookResult } from './workspace.js';
 import { withIssue, log } from './logging.js';
 import { openRunLog, type RunLog } from './runlog.js';
 import { defaultMemProbe, computeMemoryAdmission, type MemProbe } from './memory.js';
-import type { Reconciler, ReconcilerSnapshot } from './reconciler/index.js';
+import type { Reconciler, ReconcilerSnapshot, IntendedVmProvider } from './reconciler/index.js';
 
 export interface Snapshot {
   generated_at: string;
@@ -98,7 +96,7 @@ interface RetrySchedule {
 const CONTINUATION_DELAY_MS = 1_000;
 const FAILURE_BASE_MS = 10_000;
 
-export class Orchestrator {
+export class Orchestrator implements IntendedVmProvider {
   private running = new Map<string, RunningEntry>();
   private claimed = new Set<string>();
   private retryAttempts = new Map<string, RetryEntry>();
@@ -143,20 +141,16 @@ export class Orchestrator {
     private tracker: IssueTracker,
     private workspaces: WorkspaceManager,
     private runner: AgentRunner,
-    // Optional so test stubs that don't exercise VM lifecycle don't have to mint a
-    // SmolvmClient. When absent, startup/shutdown VM reaping is skipped (logged once
-    // at startup so misconfiguration is visible). Production wiring in bin/symphony.ts
-    // always passes one in.
-    private smolvm: SmolvmClient | null = null,
     // Memory probe used by the admission cap (issue 27). Defaults to reading
     // /proc/meminfo synchronously; tests inject a stub that returns a controlled
     // mem_available_mib so the clamp behavior is deterministic.
     private memProbe: MemProbe = defaultMemProbe,
-    // Reconciler (issue 32) — owns managed external resources (today: the
-    // Smolfile-driven bake). Optional so tests that don't exercise reconciliation
-    // don't have to construct one; when absent, dispatch is never gated on a
-    // bake and `Snapshot.reconciler` is null. Production wiring in bin/symphony.ts
-    // always passes one in when `smolvm.smolfile` is configured.
+    // Reconciler (issue 32, 33) — owns managed external resources: the
+    // Smolfile-driven bake AND the symphony-VM lifecycle reaper. Optional so
+    // tests that don't exercise reconciliation don't have to construct one;
+    // when absent, dispatch is never gated on a bake, `Snapshot.reconciler`
+    // is null, and stray VM reaping is skipped. Production wiring in
+    // bin/symphony.ts always passes one in.
     private reconciler: Reconciler | null = null,
   ) {
     workflowSrc.onChange((next) => {
@@ -220,11 +214,15 @@ export class Orchestrator {
       }
     }
     await this.startupTerminalCleanup();
-    // Reap any leftover `symphony-*` VMs from a prior process. Without this, a
-    // SIGKILL/crash of a previous symphony instance leaves libkrun VMs alive that
-    // nothing tracks; over enough restarts they accumulate until the host runs out
-    // of RAM (issue 26). Best-effort: failures are logged inside cleanupOrphanVms.
-    await this.cleanupOrphanVms('startup');
+    // Initial VM reap (issue 33). The `running` map is empty at this point, so the
+    // intended set is ∅ — every `symphony-*` VM in the daemon registry AND every
+    // `_boot-vm` worker process from a symphony cache dir is treated as orphaned
+    // and torn down. Awaited so the next dispatch can't race a leftover VM that
+    // happens to share the same name. Best-effort: failures are logged inside
+    // the reaper and never abort startup.
+    if (this.reconciler) {
+      await this.reconciler.reapVms();
+    }
     // Trigger an initial reconcile pass before dispatching. The pass returns
     // quickly even if a bake is needed — the bake runs on a background task and
     // dispatch is gated until ready() is true. Backstop tick keeps the loop alive
@@ -266,10 +264,12 @@ export class Orchestrator {
     // the process, which kills the smolvm CLI children but NOT the libkrun VMs they
     // launched (those are owned by the smolvm daemon). Without this backstop, every
     // SIGTERM during an active run leaks one VM per running entry, and over enough
-    // operator restarts the host OOMs (issue 26). Enumerate by prefix so we also
-    // catch VMs that drifted out of `running` (e.g. a worker that already removed
-    // itself from `running` but hadn't reached the destroy call yet).
-    await this.cleanupOrphanVms('shutdown');
+    // operator restarts the host OOMs (issue 26). `running` is cleared above, so
+    // the reaper's intended set is ∅ and every `symphony-*` VM (registry + any
+    // surviving `_boot-vm` worker) gets torn down.
+    if (this.reconciler) {
+      await this.reconciler.reapVms();
+    }
   }
 
   /**
@@ -747,6 +747,18 @@ export class Orchestrator {
   /** §16.6 on_worker_exit */
   private onWorkerExit(issueId: string, normal: boolean, reason: string, entry: RunningEntry): void {
     this.running.delete(issueId);
+    // Issue 33: a non-clean exit may have skipped the runner's per-attempt VM
+    // destroy (e.g. JS throw before cleanup ran, smolvm CLI failure, the upstream
+    // smolvm bug that leaves the `_boot-vm` worker alive after `machine delete`).
+    // The `running` entry is gone now so the reaper's intended set excludes it
+    // and the VM / boot-worker — if either survives — is reaped. Clean exits get
+    // the same coverage via the backstop tick; we don't pay the enumeration cost
+    // on every well-behaved dispatch.
+    if (!normal && this.reconciler && !this.stopped) {
+      void this.reconciler.reapVms().catch((err) =>
+        log.debug('post-exit vm reap failed', { error: (err as Error).message }),
+      );
+    }
     const elapsedMs = Date.now() - Date.parse(entry.started_at);
     if (Number.isFinite(elapsedMs)) {
       this.sessionTotals.seconds_running += elapsedMs / 1000;
@@ -942,33 +954,21 @@ export class Orchestrator {
   }
 
   /**
-   * Destroy any VM in the smolvm daemon whose name starts with the symphony prefix.
-   * Called at start (to reap orphans from a prior process) and at stop (to backstop
-   * workers that didn't reach their per-attempt destroy in time).
-   *
-   * The `symphony-` namespace is owned by the orchestrator; matching VMs are
-   * unconditionally destroyed. Smolvm enumeration and per-VM destroy are both
-   * best-effort (the underlying client swallows and logs CLI failures); we never
-   * fail startup/shutdown on a stuck VM.
+   * Implements {@link IntendedVmProvider}. Returns the set of `symphony-*` VM
+   * names the orchestrator currently intends to keep alive — one per running
+   * dispatch. Used by the reconciler's vm resource to compute the orphan set
+   * to reap. `running.set` happens BEFORE the runner calls
+   * `smolvm.ensureRunning`, so a VM that exists in the daemon registry as
+   * part of an in-flight `machine create` is always already represented
+   * here. The reaper sees it as intended and leaves it alone, closing the
+   * "creating-but-not-yet-active" race the issue body calls out.
    */
-  private async cleanupOrphanVms(reason: 'startup' | 'shutdown'): Promise<void> {
-    if (!this.smolvm) return;
-    let all: string[];
-    try {
-      all = await this.smolvm.list();
-    } catch (err) {
-      log.warn('orphan vm enumeration failed', {
-        reason,
-        error: (err as Error).message,
-      });
-      return;
+  intendedVmNames(): Set<string> {
+    const out = new Set<string>();
+    for (const entry of this.running.values()) {
+      out.add(this.runner.vmNameFor(entry.issue));
     }
-    const orphans = all.filter((n) => n.startsWith(SYMPHONY_VM_PREFIX));
-    if (orphans.length === 0) return;
-    log.info('destroying orphan symphony VMs', { reason, count: orphans.length });
-    // Parallel destroy: each VM is independent, and smolvm.destroy already wraps the
-    // CLI call in a per-VM timeout so a single stuck VM can't hang the rest.
-    await Promise.all(orphans.map((name) => this.smolvm!.destroy(name)));
+    return out;
   }
 
   /** §8.6 startup terminal workspace cleanup. */

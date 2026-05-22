@@ -8,7 +8,7 @@
 // Action records carry a discriminant `kind`. v1 ships only `bake`; new kinds are added
 // as more resources land in later stages of the reconciler refactor.
 
-export type ReconcilerAction = BakeAction;
+export type ReconcilerAction = BakeAction | DestroyMachineAction | KillBootWorkerAction;
 
 // Bake the Smolfile-derived `.smolmachine` artifact and write it to the action cache.
 // The `input_hash` (sha256 of the Smolfile body) is the cache key: subsequent dispatches
@@ -20,6 +20,23 @@ export interface BakeAction {
   output_path: string;
   cpus: number;
   mem_mib: number;
+}
+
+// Destroy a daemon-registered `symphony-*` VM that the orchestrator no longer
+// intends to keep around (issue 33). Driven by `smolvm machine delete -f`.
+export interface DestroyMachineAction {
+  kind: 'destroy_machine';
+  vm_name: string;
+}
+
+// SIGTERM (with SIGKILL fallback after grace) a `_boot-vm` host worker whose
+// VM is `symphony-*`-prefixed but not in the orchestrator's intended set
+// (issue 33). Covers the upstream smolvm bug where `machine delete -f`
+// succeeds in the daemon but leaves the worker alive.
+export interface KillBootWorkerAction {
+  kind: 'kill_boot_worker';
+  pid: number;
+  vm_name: string;
 }
 
 // State of an individual action attempt. Reported on Snapshot.reconciler so the
