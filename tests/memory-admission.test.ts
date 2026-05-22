@@ -215,7 +215,6 @@ describe('Orchestrator memory admission integration', () => {
         tracker,
         workspaces,
         runner,
-        null,
         probe,
       );
       await orch.start();
@@ -274,7 +273,6 @@ describe('Orchestrator memory admission integration', () => {
         tracker,
         workspaces,
         runner,
-        null,
         probe,
       );
       await orch.start();

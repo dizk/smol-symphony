@@ -144,11 +144,14 @@ async function main() {
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
   // bind failure surfaces before we accept any dispatches.
   const acpBridge = new AcpBridge();
-  // Reconciler (issue 32). Owns the bake artifact lifecycle so the Smolfile's
-  // apt + npm install is paid once per Smolfile-content change instead of per
-  // dispatch. The orchestrator gates dispatch on `dispatchReady()` and the runner
-  // reads the resolved baked-artifact path via `setBakedArtifactProvider`.
-  const reconciler = new Reconciler(config);
+  // Reconciler (issues 32, 33). Owns the bake artifact lifecycle so the
+  // Smolfile's apt + npm install is paid once per Smolfile-content change
+  // instead of per dispatch (issue 32) AND reaps stray `symphony-*` VMs +
+  // `_boot-vm` workers that survive process restarts or per-attempt cleanup
+  // failures (issue 33). Smolvm client is passed at construction; the
+  // orchestrator wires itself in as the IntendedVmProvider after its own
+  // construction below.
+  const reconciler = new Reconciler(config, { smolvm });
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
@@ -181,10 +184,15 @@ async function main() {
     tracker,
     workspaces,
     runner,
-    smolvm,
     undefined,
     reconciler,
   );
+  // The Reconciler is constructed before the Orchestrator (the runner needs
+  // the reconciler at its own construction time for the bake-artifact path),
+  // so the vm reaper's IntendedVmProvider is plugged in here instead of at
+  // Reconciler construction. The vm resource is only built when both
+  // `smolvm` (passed above) and an intended provider are wired.
+  reconciler.setIntendedVmProvider(orch);
 
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved
   // tracker.root, changed active/terminal states) is reflected by both the propagation

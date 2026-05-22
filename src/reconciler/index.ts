@@ -20,7 +20,9 @@
 import { BakeResource, SmolvmBakeExecutor, type BakeExecutor } from './bake.js';
 import { defaultCacheRoot } from './cache.js';
 import type { ReconcilerSnapshot } from './types.js';
+import { VmResource, type BootWorker, type IntendedVmProvider } from './vm.js';
 import type { ServiceConfig, SmolvmConfig } from '../types.js';
+import type { SmolvmClient } from '../agent/smolvm.js';
 import { log } from '../logging.js';
 
 export interface ReconcilerOptions {
@@ -31,6 +33,15 @@ export interface ReconcilerOptions {
   // Backstop tick interval (ms). Default 5 minutes so a missed config-watcher
   // signal can't park the reconciler forever; tests override to a small value.
   backstopIntervalMs?: number;
+  // VM reaper inputs (issue 33). Optional so test harnesses that don't exercise
+  // VM lifecycle can omit them; when either `smolvm` or an intended provider is
+  // missing, the vm resource is not constructed and `reapVms()` is a no-op.
+  smolvm?: SmolvmClient;
+  vmIntendedProvider?: IntendedVmProvider;
+  // VmResource test hooks (mirror the same names on VmResourceOptions).
+  listBootWorkers?: () => Promise<BootWorker[]>;
+  killProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  killGraceMs?: number;
 }
 
 export class Reconciler {
@@ -38,6 +49,15 @@ export class Reconciler {
   private readonly bakeExecutor: BakeExecutor;
   private readonly backstopIntervalMs: number;
   private bake: BakeResource;
+  // VM reaper. Built at construction when smolvm + intended provider are
+  // already wired; otherwise lazily constructed via setIntendedVmProvider
+  // (the production path — bin/symphony.ts builds the Reconciler before the
+  // Orchestrator, then plugs the Orchestrator in as the intended-VM source).
+  private vm: VmResource | null = null;
+  private readonly smolvm: SmolvmClient | null;
+  private readonly vmListBootWorkers?: () => Promise<BootWorker[]>;
+  private readonly vmKillProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  private readonly vmKillGraceMs?: number;
   private backstopTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   // Single-flight: collapse concurrent reconcile() calls into one ongoing pass so
@@ -55,6 +75,61 @@ export class Reconciler {
       smolvm: cfg.smolvm,
       executor: this.bakeExecutor,
     });
+    this.smolvm = opts.smolvm ?? null;
+    this.vmListBootWorkers = opts.listBootWorkers;
+    this.vmKillProcess = opts.killProcess;
+    this.vmKillGraceMs = opts.killGraceMs;
+    if (this.smolvm && opts.vmIntendedProvider) {
+      this.vm = new VmResource({
+        smolvm: this.smolvm,
+        intended: opts.vmIntendedProvider,
+        listBootWorkers: this.vmListBootWorkers,
+        killProcess: this.vmKillProcess,
+        killGraceMs: this.vmKillGraceMs,
+      });
+    }
+  }
+
+  /**
+   * Wire the VM resource against an intended-VM source after construction.
+   * The orchestrator is the intended-VM provider in production (it owns the
+   * `running` map) but is constructed AFTER the Reconciler because the runner
+   * needs the Reconciler at construction time. Calling this is idempotent —
+   * the resource is replaced wholesale.
+   *
+   * No-op when no SmolvmClient was wired at Reconciler construction; without
+   * one, the reaper has nothing to enumerate the daemon side of the actual
+   * set with.
+   */
+  setIntendedVmProvider(provider: IntendedVmProvider): void {
+    if (!this.smolvm) return;
+    this.vm = new VmResource({
+      smolvm: this.smolvm,
+      intended: provider,
+      listBootWorkers: this.vmListBootWorkers,
+      killProcess: this.vmKillProcess,
+      killGraceMs: this.vmKillGraceMs,
+    });
+  }
+
+  /**
+   * Run the VM reaper outside the normal reconcile() walk. Used by the
+   * orchestrator at:
+   *   • startup (after `start()` — initial sweep of leftover symphony-* VMs).
+   *   • shutdown (`stop()` clears `running` first so desired = ∅).
+   *   • non-clean worker exit (the per-attempt destroy may not have fired).
+   *
+   * Decoupled from `reconcile()` so VM reaping doesn't have to wait on a
+   * mid-flight bake (and so a bake error doesn't suppress reaping). Returns
+   * immediately when the vm resource isn't wired.
+   */
+  async reapVms(): Promise<void> {
+    if (!this.vm) return;
+    try {
+      await this.vm.reconcile();
+    } catch (err) {
+      log.warn('vm reap pass threw', { error: (err as Error).message });
+    }
   }
 
   // Re-bind the bake resource against the freshly-reloaded smolvm config. The
@@ -143,10 +218,18 @@ export class Reconciler {
   private async runPass(opts: { force?: boolean }): Promise<void> {
     this.inFlight = (async () => {
       try {
-        // The DAG is trivial in v1 — one node — so we just run reconcile on the
-        // bake. As more resources land, walk in dependency order and propagate
-        // ready-state through dependsOn.
+        // DAG order: bake first (it's the dispatch-gating prereq), then vm
+        // (independent janitor). Both resources are idempotent / cheap when
+        // there's no work to do — bake short-circuits on cache hit, vm pass
+        // returns immediately when desired == actual.
         await this.bake.reconcile(opts);
+        if (this.vm) {
+          try {
+            await this.vm.reconcile();
+          } catch (err) {
+            log.warn('vm reconcile pass threw', { error: (err as Error).message });
+          }
+        }
       } catch (err) {
         log.warn('reconcile pass threw', { error: (err as Error).message });
       } finally {
@@ -182,9 +265,12 @@ export class Reconciler {
   }
 
   snapshot(): ReconcilerSnapshot {
-    return { resources: [this.bake.snapshot()] };
+    const resources = [this.bake.snapshot()];
+    if (this.vm) resources.push(this.vm.snapshot());
+    return { resources };
   }
 }
 
 export type { BakeExecutor } from './bake.js';
 export type { ReconcilerSnapshot, ResourceSnapshot, ActionStatus } from './types.js';
+export type { IntendedVmProvider, BootWorker } from './vm.js';

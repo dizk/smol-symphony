@@ -11,6 +11,7 @@ import type { IssueTracker, CandidateFetchResult } from '../src/trackers/types.j
 import type { WorkspaceManager } from '../src/workspace.js';
 import type { AgentRunner } from '../src/agent/runner.js';
 import type { SmolvmClient } from '../src/agent/smolvm.js';
+import { Reconciler } from '../src/reconciler/index.js';
 
 // Phase 2 contract for orchestrator startup: the credential check is no longer
 // just `cfg.acp.adapter`, it has to walk the union of the workflow-level adapter
@@ -182,13 +183,33 @@ describe('Orchestrator startup credential check', () => {
 // cleanup: each per-issue smolvm VM is owned by the orchestrator process, but the
 // libkrun VM itself outlives a SIGKILL or crash of that process because it is
 // daemon-managed. Without the reaping path, every restart leaves the prior
-// instance's VMs behind, and over enough restarts the host OOMs (issue 26). The
-// tests below pin both ends of the lifecycle: orphans are destroyed at start so
-// a fresh process recovers from a previous crash, and at stop so a graceful
-// shutdown does not leak the VMs whose worker cleanup it cancelled before they
-// reached destroy.
+// instance's VMs behind, and over enough restarts the host OOMs (issue 26).
+//
+// Issue 33 moved the reaping into the reconciler's `vm` resource. The
+// orchestrator just wires itself in as the IntendedVmProvider and triggers a
+// reap at three points: startup (sweep prior-process strays), shutdown
+// (backstop in-flight workers whose cleanup the SIGTERM cancelled), and after
+// any non-clean worker exit. These tests pin those orchestrator-level
+// integration points; the per-action details (SIGTERM→SIGKILL grace,
+// boot-worker enumeration via /proc) are covered in tests/reconciler-vm.test.ts.
 describe('Orchestrator VM lifecycle reaping', () => {
-  it('destroys orphan symphony-* VMs at startup', async () => {
+  // Helper: build a Reconciler with the supplied fake smolvm client and a
+  // hermetic boot-worker stub. The boot-worker default reads host /proc; tests
+  // must stub it so the suite doesn't pick up real `_boot-vm` workers on a
+  // busy developer box.
+  function makeReconcilerWith(cfg: ServiceConfig, fake: FakeSmolvm): Reconciler {
+    return new Reconciler(cfg, {
+      smolvm: fake.client,
+      listBootWorkers: async () => [],
+      killProcess: () => undefined,
+      killGraceMs: 0,
+      // Keep the backstop interval long so it never fires inside a test;
+      // we drive reapVms() manually via start/stop.
+      backstopIntervalMs: 60_000,
+    });
+  }
+
+  it('destroys orphan symphony-* VMs at startup via the reconciler', async () => {
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-start-home-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-start-tracker-'));
     const prevHome = process.env.HOME;
@@ -217,6 +238,7 @@ describe('Orchestrator VM lifecycle reaping', () => {
         'unrelated-vm',
         'SYMPHONY-uppercase-not-prefix', // case-sensitive prefix; this stays
       ]);
+      const reconciler = makeReconcilerWith(cfg, fake);
       const orch = new Orchestrator(
         cfg,
         def,
@@ -224,8 +246,10 @@ describe('Orchestrator VM lifecycle reaping', () => {
         tracker,
         workspaces,
         runner,
-        fake.client,
+        undefined,
+        reconciler,
       );
+      reconciler.setIntendedVmProvider(orch);
       await orch.start();
       assert.deepEqual(fake.destroyed.sort(), ['symphony-1', 'symphony-old-issue']);
       await orch.stop();
@@ -261,6 +285,7 @@ describe('Orchestrator VM lifecycle reaping', () => {
       // No orphans at startup; simulate a VM that the runner's per-attempt cleanup
       // didn't reach in time (e.g. SIGTERM mid-attempt) by injecting it before stop().
       const fake = makeFakeSmolvm([]);
+      const reconciler = makeReconcilerWith(cfg, fake);
       const orch = new Orchestrator(
         cfg,
         def,
@@ -268,8 +293,10 @@ describe('Orchestrator VM lifecycle reaping', () => {
         tracker,
         workspaces,
         runner,
-        fake.client,
+        undefined,
+        reconciler,
       );
+      reconciler.setIntendedVmProvider(orch);
       await orch.start();
       assert.deepEqual(fake.destroyed, []);
       // Inject a "leaked" VM into the smolvm view to mimic the SIGTERM-mid-run path.
@@ -284,8 +311,8 @@ describe('Orchestrator VM lifecycle reaping', () => {
     }
   });
 
-  it('skips reaping when no SmolvmClient is wired (test/stub harness)', async () => {
-    // The orchestrator's SmolvmClient parameter is optional so tests that don't
+  it('skips reaping when no Reconciler is wired (test/stub harness)', async () => {
+    // The orchestrator's Reconciler parameter is optional so tests that don't
     // care about VM lifecycle can omit it. Confirm that path stays silent and
     // does not throw at start/stop.
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-skip-home-'));
