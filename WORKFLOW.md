@@ -109,10 +109,13 @@ tracker:
 #     conflict_state: Conflict
 #     merge_on_states: [Done]
 #
-# and rewrite the `hooks.after_create` script below to clone from `integration`
-# (seeded from base on first run) instead of from base directly. The
-# orchestrator path that performs the host-side merge keys on a non-empty
-# `merge_on_states` list — leaving the block absent fully skips the feature.
+# and teach the orchestrator's built-in workspace setup (`setupWorkspaceDir`
+# in src/workspace.ts) to clone from the integration ref instead of the base
+# branch (seeded from base on first run). The orchestrator path that performs
+# the host-side merge keys on a non-empty `merge_on_states` list — leaving the
+# block absent fully skips the feature. There is no `hooks.after_create` to
+# rewrite: canonical workspace setup is now TypeScript-owned and runs before
+# any optional `after_create` hook (see SPEC §9.3 and WORKFLOW.template.md).
 
 polling:
   interval_ms: 5000

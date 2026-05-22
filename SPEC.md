@@ -2020,8 +2020,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Existing workspace directory is reused
 - Existing non-directory path at workspace location is handled safely (replace or fail per
   implementation policy)
-- OPTIONAL workspace population/synchronization errors are surfaced
-- `after_create` hook runs only on new workspace creation
+- Built-in canonical workspace setup runs on new workspace creation: hardlinked clone from the
+  source repo on the base branch, remotes stripped + `credential.helper` unset, conditional
+  `origin` restore when a remote is configured (no embedded credentials), pinned commit identity,
+  and per-issue branch cut (§9.3)
+- Built-in canonical workspace setup failure is fatal: the partially prepared directory is
+  removed so the next dispatch tick re-enters cleanly
+- Concurrent "ensure workspace" callers for the same identifier coalesce so canonical setup and
+  `after_create` each run exactly once per creation
+- The workspace's base ref is sourced from the source repo's local `<base>`; the implementation
+  does NOT implicitly fetch a different ref and reset the workspace base to it
+- `after_create` hook runs only on new workspace creation, AFTER the built-in canonical setup
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored

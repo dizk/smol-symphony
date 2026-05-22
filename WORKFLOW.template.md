@@ -126,11 +126,11 @@ states:
 # failure so a future resolver can finish the merge by hand.
 #
 # In PR mode (SYMPHONY_REPO set), the merge pushes to `origin` (which the
-# after_create hook restored as the GitHub remote). In local-only mode the
-# orchestrator stages a temp remote pointing at the source repo
-# (SYMPHONY_SOURCE_REPO, default `${PWD}/../../..` of the workspace), pushes
-# integration there, and removes the temp remote — the agent inside the VM
-# never sees this remote.
+# built-in workspace setup, `setupWorkspaceDir` in src/workspace.ts, restored
+# as the GitHub remote — see SPEC §9.3). In local-only mode the orchestrator
+# stages a temp remote pointing at the source repo (SYMPHONY_SOURCE_REPO,
+# default `${PWD}/../../..` of the workspace), pushes integration there, and
+# removes the temp remote — the agent inside the VM never sees this remote.
 #
 # Cancelled is intentionally absent from `merge_on_states`: an abandoned issue
 # does not contribute work to the shared branch.
@@ -215,9 +215,9 @@ logs:
 #
 #   SYMPHONY_ISSUE_ID      — the dispatched issue's identifier (e.g. `42`).
 #   SYMPHONY_BRANCH        — the per-issue working branch (`agent/<id>`), the
-#                            same name `after_create` checks out.
-#   SYMPHONY_BASE_BRANCH   — base branch the work targets. Mirrors
-#                            `after_create`'s `${SYMPHONY_BASE_BRANCH:-main}`
+#                            same name the built-in workspace setup checked out.
+#   SYMPHONY_BASE_BRANCH   — base branch the work targets. Mirrors the built-in
+#                            workspace setup's `${SYMPHONY_BASE_BRANCH:-main}`
 #                            default: if the operator did not export it, the
 #                            host stages `main`, so the hook can run under
 #                            `set -u` and reference it directly without an
