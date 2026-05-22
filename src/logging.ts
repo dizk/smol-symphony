@@ -1,5 +1,5 @@
-// Structured key=value logging to stderr per SPEC.md §13.1.
-// Sink failures do not crash the orchestrator (§13.2).
+// Structured key=value logging to stderr per SPEC.md §9.1.
+// Sink failures do not crash the orchestrator (§9.2).
 
 type Level = 'debug' | 'info' | 'warn' | 'error';
 
@@ -27,7 +27,7 @@ function emit(level: Level, msg: string, fields: Record<string, unknown> = {}) {
   try {
     process.stderr.write(format(level, msg, fields) + '\n');
   } catch {
-    // Spec §13.2: a failed sink must not crash the service.
+    // Spec §9.2: a failed sink must not crash the service.
   }
 }
 

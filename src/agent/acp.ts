@@ -273,9 +273,9 @@ export class AcpClient {
         return self.onPermissionRequest(params);
       },
       async readTextFile(_params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-        // §10.5 "high-trust" posture: the agent has direct workspace access inside the VM,
+        // §6.1 "high-trust" posture: the agent has direct workspace access inside the VM,
         // so client-mediated reads are unsupported. Returning an error keeps the session
-        // alive (per §10.5 "unsupported dynamic tool calls return failure without stall").
+        // alive (per §6.1 "unsupported dynamic tool calls return failure without stall").
         throw new AcpProtocolError('client_capability_not_implemented', 'client fs read not supported');
       },
       async writeTextFile(_params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
@@ -347,7 +347,7 @@ export class AcpClient {
   }
 
   private onPermissionRequest(params: RequestPermissionRequest): RequestPermissionResponse {
-    // §10.5 high-trust posture: auto-approve every prompt with "allow_always" so the
+    // §6.1 high-trust posture: auto-approve every prompt with "allow_always" so the
     // agent doesn't ask twice in the same session. Falls back to the first listed option
     // if no "allow_*" kind is present, which keeps the session alive in degraded mode.
     const preferred =

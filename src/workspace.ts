@@ -1,4 +1,4 @@
-// Workspace manager (SPEC §9). Per-issue workspace dirs under workspace.root.
+// Workspace manager (SPEC §5). Per-issue workspace dirs under workspace.root.
 //
 // Safety invariants enforced:
 // 1. Workspace path is rooted at workspace.root (containment check).
@@ -17,12 +17,12 @@ export class WorkspaceError extends Error {
   }
 }
 
-// §9.5 Invariant 3.
+// §5.5 Invariant 3.
 export function sanitizeWorkspaceKey(identifier: string): string {
   return identifier.replace(/[^A-Za-z0-9._-]/g, '_');
 }
 
-// §9.5 Invariant 2: workspace path MUST be contained within workspace root.
+// §5.5 Invariant 2: workspace path MUST be contained within workspace root.
 //
 // We deliberately check for a `..` path component rather than a `..` prefix on the
 // relative path: an identifier like `..fix` sanitizes to a perfectly contained child
@@ -85,7 +85,7 @@ function hookFailureReason(res: HookResult): string {
 }
 
 // Execute a hook script (POSIX `sh -lc`). Returns result so callers can decide on failure
-// semantics (§9.4). Optional `capture` streams output in real time (used by per-issue JSONL
+// semantics (§5.4). Optional `capture` streams output in real time (used by per-issue JSONL
 // run logs) and reports the final result to the same callback. Optional `extraEnv` is
 // merged on top of `process.env` so callers (e.g. the runner's after_run handoff) can
 // stage hook-specific values without polluting the host process environment.
@@ -442,7 +442,7 @@ export class WorkspaceManager {
     try {
       // Use lstat so symlinks at the workspace path are rejected: a symlink could redirect
       // hook execution and the returned cwd outside the workspace root, which violates the
-      // §9.5 containment invariant.
+      // §5.5 containment invariant.
       const st = await lstat(wsPath);
       if (st.isSymbolicLink()) {
         throw new WorkspaceError(
@@ -494,7 +494,7 @@ export class WorkspaceManager {
         captureAfterCreate,
       );
       if (hookFailed(res)) {
-        // §9.4: after_create failure is fatal — also unwind the partially prepared directory.
+        // §5.4: after_create failure is fatal — also unwind the partially prepared directory.
         try {
           await rm(wsPath, { recursive: true, force: true });
         } catch {
@@ -514,7 +514,7 @@ export class WorkspaceManager {
     };
   }
 
-  // Run before_run; throw on failure/timeout (§9.4).
+  // Run before_run; throw on failure/timeout (§5.4).
   async runBeforeRun(workspacePath: string, hooks: HooksConfig, capture?: HookCapture): Promise<void> {
     if (!hooks.before_run) return;
     const res = await runHookScript(hooks.before_run, workspacePath, hooks.timeout_ms, capture);
@@ -523,7 +523,7 @@ export class WorkspaceManager {
     }
   }
 
-  // Best-effort after_run hook (§9.4: failure logged and ignored — caller logs).
+  // Best-effort after_run hook (§5.4: failure logged and ignored — caller logs).
   // `extraEnv` is merged into the hook process env; callers use this to stage
   // values (e.g. SYMPHONY_PR_TITLE, SYMPHONY_PR_BODY_FILE) that the hook script
   // would otherwise have to extract by hand.
@@ -537,7 +537,7 @@ export class WorkspaceManager {
     return runHookScript(hooks.after_run, workspacePath, hooks.timeout_ms, capture, extraEnv);
   }
 
-  // Best-effort before_remove + filesystem removal (§9.4).
+  // Best-effort before_remove + filesystem removal (§5.4).
   async remove(
     identifier: string,
     hooks: HooksConfig,

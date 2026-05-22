@@ -39,7 +39,7 @@ describe('prompt', () => {
     await assert.rejects(
       () => renderPrompt({ template: '{{ issue.title | nonsense }}', issue, attempt: null }),
       // Liquid may surface unknown-filter errors at either parse or render time depending
-      // on version; both are valid §5.4 "strict filters" failures.
+      // on version; both are valid §4.4 "strict filters" failures.
       (err: unknown) =>
         err instanceof PromptError &&
         (err.code === 'template_render_error' || err.code === 'template_parse_error'),

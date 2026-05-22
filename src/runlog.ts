@@ -11,7 +11,7 @@
 //   { ts, issue_id, attempt, channel: "hook", hook, kind: "result", exit_code, signal, timed_out }
 //
 // Writes are best-effort: a write failure is swallowed so it can never crash the orchestrator
-// (consistent with logging.ts §13.2). Streams are opened in append mode so concurrent symphony
+// (consistent with logging.ts §9.2). Streams are opened in append mode so concurrent symphony
 // processes or restarts append safely to the same file.
 
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';

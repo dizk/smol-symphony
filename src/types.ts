@@ -1,4 +1,4 @@
-// Domain model per SPEC.md §4.
+// Domain model per SPEC.md §3.
 
 export interface BlockerRef {
   id: string | null;

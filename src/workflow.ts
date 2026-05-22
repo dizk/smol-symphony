@@ -1,4 +1,4 @@
-// WORKFLOW.md loader, watcher, and typed config view (SPEC §5, §6).
+// WORKFLOW.md loader, watcher, and typed config view (SPEC §4).
 
 import { readFile } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
@@ -39,7 +39,7 @@ export class WorkflowError extends Error {
   }
 }
 
-// §5.2: split YAML front matter from prompt body.
+// §4.2: split YAML front matter from prompt body.
 export function splitFrontMatter(text: string): { config: Record<string, unknown>; body: string } {
   if (!text.startsWith('---')) {
     return { config: {}, body: text.trim() };
@@ -88,7 +88,7 @@ export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefini
   return { config, prompt_template: body };
 }
 
-// $VAR / ~ expansion for path/command fields (§6.1).
+// $VAR / ~ expansion for path/command fields.
 export function expandVar(value: string): string {
   if (typeof value !== 'string') return value;
   let s = value;
@@ -136,7 +136,7 @@ function getObject(parent: Record<string, unknown>, key: string): Record<string,
   return {};
 }
 
-// Build a fully typed ServiceConfig from a parsed front matter map (§6.1).
+// Build a fully typed ServiceConfig from a parsed front matter map.
 export function buildServiceConfig(
   raw: Record<string, unknown>,
   workflowPath: string,
@@ -144,7 +144,7 @@ export function buildServiceConfig(
   const workflowAbs = path.resolve(workflowPath);
   const workflowDir = path.dirname(workflowAbs);
 
-  // tracker (§5.3.1)
+  // tracker (§4.3.1)
   const trackerRaw = getObject(raw, 'tracker');
   const trackerKind = (asString(trackerRaw['kind']) ?? '').trim();
   // local-tracker extension: optional `tracker.root` path.
@@ -170,13 +170,13 @@ export function buildServiceConfig(
     root: trackerRoot,
   };
 
-  // polling (§5.3.2)
+  // polling (§4.3.2)
   const pollingRaw = getObject(raw, 'polling');
   const polling: PollingConfig = {
     interval_ms: asInt(pollingRaw['interval_ms'], 30_000),
   };
 
-  // workspace (§5.3.3)
+  // workspace (§4.3.3)
   const workspaceRaw = getObject(raw, 'workspace');
   const wsRootInput = asString(workspaceRaw['root']);
   let workspaceRoot: string;
@@ -214,7 +214,7 @@ export function buildServiceConfig(
   }
   const logs: LogsConfig = { root: path.resolve(logsRoot) };
 
-  // hooks (§5.3.4)
+  // hooks (§4.3.4)
   const hooksRaw = getObject(raw, 'hooks');
   const hooks: HooksConfig = {
     after_create: asString(hooksRaw['after_create']),
@@ -227,7 +227,7 @@ export function buildServiceConfig(
     throw new WorkflowError('workflow_parse_error', 'hooks.timeout_ms must be positive');
   }
 
-  // agent (§5.3.5)
+  // agent (§4.3.5)
   const agentRaw = getObject(raw, 'agent');
   const maxTurns = asInt(agentRaw['max_turns'], 20);
   if (maxTurns <= 0) {
@@ -257,7 +257,7 @@ export function buildServiceConfig(
     host_memory_reserve_mib: hostMemoryReserveMib,
   };
 
-  // acp (Symphony extension; supersedes the §5.3.6 `codex` block). `adapter` selects
+  // acp (Symphony extension; see §4.3.6). `adapter` selects
   // one of symphony's known profiles (claude, codex); symphony auto-derives the launch
   // command from the adapter profile and stages the host credential file into the
   // workspace.
@@ -351,7 +351,7 @@ export function buildServiceConfig(
       `unix://${process.env.XDG_RUNTIME_DIR ?? '/run/user/1000'}/smolvm.sock`,
   };
 
-  // server extension (§13.7)
+  // server extension (§9.5)
   const serverRaw = getObject(raw, 'server');
   const server: ServerConfig = {
     port: typeof serverRaw['port'] === 'number' ? (serverRaw['port'] as number) : null,
@@ -574,7 +574,7 @@ export function resolveHooksForState(cfg: ServiceConfig, stateName: string): Hoo
   };
 }
 
-// §6.3 dispatch preflight validation.
+// Dispatch preflight validation.
 export function validateDispatch(cfg: ServiceConfig): string | null {
   if (cfg.tracker.kind !== 'local') {
     return `unsupported_tracker_kind: ${cfg.tracker.kind || '<missing>'}`;
@@ -756,7 +756,7 @@ export async function watchWorkflow(workflowPath: string): Promise<WorkflowSourc
 
   watcher.on('change', () => void reload());
   watcher.on('add', () => void reload());
-  // §5.5: workflow read errors must block dispatch. If the file is deleted or temporarily
+  // §4.5: workflow read errors must block dispatch. If the file is deleted or temporarily
   // renamed, surface a missing_workflow_file error so the orchestrator knows.
   watcher.on('unlink', () => void reload());
 
