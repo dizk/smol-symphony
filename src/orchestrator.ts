@@ -27,6 +27,7 @@ type JsonValue = unknown;
 import type { WorkspaceManager, HookCapture, HookResult } from './workspace.js';
 import { withIssue, log } from './logging.js';
 import { openRunLog, type RunLog } from './runlog.js';
+import { defaultMemProbe, computeMemoryAdmission, type MemProbe } from './memory.js';
 
 export interface Snapshot {
   generated_at: string;
@@ -58,6 +59,23 @@ export interface Snapshot {
   }>;
   session_totals: SessionTotals;
   rate_limits: JsonValue | null;
+  /**
+   * Memory-aware admission snapshot (issue 27). `effective_cap < static_cap` is the
+   * "why isn't this dispatching" signal — the dynamic clamp has kicked in. When the
+   * feature is disabled or the host doesn't expose `/proc/meminfo`, fields read
+   * `enabled: false` / `probe_supported: false` and `effective_cap === static_cap`.
+   */
+  memory_admission: {
+    enabled: boolean;
+    probe_supported: boolean;
+    mem_available_mib: number | null;
+    reserve_mib: number;
+    per_vm_mib: number;
+    static_cap: number;
+    effective_cap: number;
+    admission_room: number | null;
+    clamp_active: boolean;
+  };
 }
 
 interface RetrySchedule {
@@ -105,6 +123,11 @@ export class Orchestrator {
   // on the next dispatch — see §6.2).
   private onConfigReloaded?: (cfg: ServiceConfig, workflow: WorkflowDefinition) => void;
 
+  // Last clamp-active state observed by availableGlobalSlots. Used to log
+  // transitions (clamp_active true→false or false→true) at info level without
+  // spamming the log every tick while the cap stays clamped.
+  private memoryClampActive = false;
+
   constructor(
     private cfg: ServiceConfig,
     private workflowDef: WorkflowDefinition,
@@ -117,6 +140,10 @@ export class Orchestrator {
     // at startup so misconfiguration is visible). Production wiring in bin/symphony.ts
     // always passes one in.
     private smolvm: SmolvmClient | null = null,
+    // Memory probe used by the admission cap (issue 27). Defaults to reading
+    // /proc/meminfo synchronously; tests inject a stub that returns a controlled
+    // mem_available_mib so the clamp behavior is deterministic.
+    private memProbe: MemProbe = defaultMemProbe,
   ) {
     workflowSrc.onChange((next) => {
       if ('error' in next) {
@@ -402,10 +429,74 @@ export class Orchestrator {
     for (const r of this.retryAttempts.values()) {
       if (r.kind === 'continuation') pendingContinuations++;
     }
-    return Math.max(
-      0,
-      this.cfg.agent.max_concurrent_agents - this.running.size - pendingContinuations,
-    );
+    const admission = this.computeAdmission();
+    // Log a single line when the memory clamp transitions in or out of "active." This
+    // gives the operator the "why isn't this dispatching" signal in the log without
+    // spamming every tick while memory stays low.
+    if (admission.clamp_active !== this.memoryClampActive) {
+      this.memoryClampActive = admission.clamp_active;
+      if (admission.clamp_active) {
+        log.info('memory admission clamping concurrency', {
+          static_cap: admission.static_cap,
+          effective_cap: admission.effective_cap,
+          mem_available_mib: admission.mem_available_mib,
+          reserve_mib: admission.reserve_mib,
+          per_vm_mib: admission.per_vm_mib,
+        });
+      } else {
+        log.info('memory admission cleared; full static cap available', {
+          static_cap: admission.static_cap,
+          mem_available_mib: admission.mem_available_mib,
+        });
+      }
+    }
+    return Math.max(0, admission.effective_cap - this.running.size - pendingContinuations);
+  }
+
+  /**
+   * Compute the current memory-admission snapshot. Reads `/proc/meminfo` via the injected
+   * probe (default reads the real file; tests inject a stub). Pure with respect to the
+   * orchestrator state — just folds running count + config + probe reading into the
+   * dynamic cap. Snapshot endpoint and slot accounting both call through here so they
+   * never desync.
+   */
+  private computeAdmission(): {
+    enabled: boolean;
+    probe_supported: boolean;
+    mem_available_mib: number | null;
+    reserve_mib: number;
+    per_vm_mib: number;
+    static_cap: number;
+    effective_cap: number;
+    admission_room: number | null;
+    clamp_active: boolean;
+  } {
+    const staticCap = this.cfg.agent.max_concurrent_agents;
+    const reserveMib = this.cfg.agent.host_memory_reserve_mib;
+    const perVmMib = this.cfg.smolvm.mem_mib;
+    const enabled = this.cfg.agent.memory_admission_enabled;
+    const probe = enabled
+      ? this.memProbe()
+      : { mem_available_mib: null, supported: false };
+    const { effective_cap, admission_room, clamp_active } = computeMemoryAdmission({
+      enabled,
+      static_cap: staticCap,
+      running: this.running.size,
+      probe,
+      reserve_mib: reserveMib,
+      per_vm_mib: perVmMib,
+    });
+    return {
+      enabled,
+      probe_supported: probe.supported,
+      mem_available_mib: probe.mem_available_mib,
+      reserve_mib: reserveMib,
+      per_vm_mib: perVmMib,
+      static_cap: staticCap,
+      effective_cap,
+      admission_room,
+      clamp_active,
+    };
   }
 
   /** §8.3: per-state slot accounting using current running entries. */
@@ -935,6 +1026,7 @@ export class Orchestrator {
         seconds_running: this.sessionTotals.seconds_running + liveExtraSeconds,
       },
       rate_limits: this.rateLimits,
+      memory_admission: this.computeAdmission(),
     };
   }
 

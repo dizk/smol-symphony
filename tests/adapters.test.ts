@@ -42,6 +42,8 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
       max_turns: 1,
       max_retry_backoff_ms: 1000,
       max_concurrent_agents_by_state: {},
+      memory_admission_enabled: false,
+      host_memory_reserve_mib: 2048,
     },
     acp: {
       adapter: 'claude',

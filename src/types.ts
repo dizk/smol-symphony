@@ -102,6 +102,20 @@ export interface AgentConfig {
   max_turns: number;
   max_retry_backoff_ms: number;
   max_concurrent_agents_by_state: Record<string, number>;
+  /**
+   * When true, the orchestrator reads `/proc/meminfo` on every tick and clamps the
+   * effective concurrency cap to what currently fits in
+   * `MemAvailable - host_memory_reserve_mib` at `smolvm.mem_mib` per VM. Issue 27.
+   * When false (or on hosts without /proc/meminfo) the static `max_concurrent_agents`
+   * is used unchanged.
+   */
+  memory_admission_enabled: boolean;
+  /**
+   * Headroom (MiB) the memory admission cap keeps for the orchestrator process itself,
+   * hooks, the smolvm daemon, and the kernel's own working set. Only consulted when
+   * `memory_admission_enabled` is true.
+   */
+  host_memory_reserve_mib: number;
 }
 
 // ACP adapter configuration. `adapter` selects one of symphony's known adapter profiles
