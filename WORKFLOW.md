@@ -245,14 +245,12 @@ acp:
   stall_timeout_ms: 1800000
 
 smolvm:
-  # Declarative VM setup via Smolfile (https://github.com/smol-machines/smolvm).
-  # The Smolfile at the repo root carries the image, resources, [dev].init for
-  # apt + npm install, and a [dev].volumes line that bind-mounts scripts/ as
-  # /opt/symphony so the in-VM proxy lives at /opt/symphony/vm-agent.mjs. To
-  # skip the per-VM apt/npm install on every dispatch, pack the VM once with
-  # `smolvm pack create -s ./Smolfile -o ./.vm/symphony.smolmachine` and switch
-  # back to `from: ./.vm/symphony.smolmachine.smolmachine` here.
-  smolfile: ./Smolfile
+  # Prebaked .smolmachine artifact produced by scripts/build-vm.sh. Boots in ~250ms
+  # because apt + npm install are already in the snapshot — no per-dispatch init
+  # cost. Rebuild after dependency changes via `scripts/build-vm.sh`. A future
+  # reconciler subsystem (tracked separately) will own the bake lifecycle from a
+  # user-declared Smolfile; for now this path is operator-driven.
+  from: ./.vm/symphony.smolmachine.smolmachine
   cpus: 2
   mem_mib: 4096
   net: true
