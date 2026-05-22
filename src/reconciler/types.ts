@@ -8,7 +8,12 @@
 // Action records carry a discriminant `kind`. v1 ships only `bake`; new kinds are added
 // as more resources land in later stages of the reconciler refactor.
 
-export type ReconcilerAction = BakeAction | DestroyMachineAction | KillBootWorkerAction;
+export type ReconcilerAction =
+  | BakeAction
+  | DestroyMachineAction
+  | KillBootWorkerAction
+  | RemoveWorkspaceAction
+  | CreateWorkspaceAction;
 
 // Bake the Smolfile-derived `.smolmachine` artifact and write it to the action cache.
 // The `input_hash` (sha256 of the Smolfile body) is the cache key: subsequent dispatches
@@ -37,6 +42,30 @@ export interface KillBootWorkerAction {
   kind: 'kill_boot_worker';
   pid: number;
   vm_name: string;
+}
+
+// Remove a per-issue workspace directory under `workspace.root` whose owning
+// issue is no longer non-terminal (issue 34). Replaces the orchestrator's
+// startup-only terminal cleanup pass with a continuous-converge action. v1
+// has no destructive drift action; drift is surfaced as a `mark_stale` /
+// `mark_stuck` annotation in the workspace resource's snapshot, and re-clone
+// is operator-triggered (out of scope for this stage).
+export interface RemoveWorkspaceAction {
+  kind: 'remove_workspace';
+  identifier: string;
+}
+
+// Create the per-issue workspace directory for an active (non-terminal) issue
+// (issue 34). The desired set is the union of the tracker's non-terminal
+// identifiers and the dispatch in-flight set; any identifier in that set
+// without a dir under `workspace.root` triggers this action. The action body
+// (clone source repo, cut `agent/<id>`, optional origin restore, after_create
+// hook) lives in `WorkspaceManager.ensureFor` / `setupWorkspaceDir` — the
+// reconciler's create callback delegates there so dispatch-time creation and
+// reconciler-driven eager creation share one code path.
+export interface CreateWorkspaceAction {
+  kind: 'create_workspace';
+  identifier: string;
 }
 
 // State of an individual action attempt. Reported on Snapshot.reconciler so the

@@ -144,12 +144,14 @@ async function main() {
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
   // bind failure surfaces before we accept any dispatches.
   const acpBridge = new AcpBridge();
-  // Reconciler (issues 32, 33). Owns the bake artifact lifecycle so the
+  // Reconciler (issues 32, 33, 34). Owns the bake artifact lifecycle so the
   // Smolfile's apt + npm install is paid once per Smolfile-content change
-  // instead of per dispatch (issue 32) AND reaps stray `symphony-*` VMs +
+  // instead of per dispatch (issue 32), reaps stray `symphony-*` VMs +
   // `_boot-vm` workers that survive process restarts or per-attempt cleanup
-  // failures (issue 33). Smolvm client is passed at construction; the
-  // orchestrator wires itself in as the IntendedVmProvider after its own
+  // failures (issue 33), AND keeps per-issue workspace dirs converged to the
+  // tracker's non-terminal issue set (issue 34). Smolvm client is passed at
+  // construction; the orchestrator wires itself in as both the
+  // IntendedVmProvider and the WorkspaceIntendedProvider after its own
   // construction below.
   const reconciler = new Reconciler(config, { smolvm });
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
@@ -193,6 +195,27 @@ async function main() {
   // Reconciler construction. The vm resource is only built when both
   // `smolvm` (passed above) and an intended provider are wired.
   reconciler.setIntendedVmProvider(orch);
+  // Same ordering reason for the workspace resource (issue 34). The
+  // orchestrator owns the tracker read used to compute the intended set; we
+  // pass it in once it exists. Removal is delegated to WorkspaceManager so
+  // the workflow-level `before_remove` hook fires on janitor removals — the
+  // closure captures `workspaces` (whose config is kept live via
+  // updateConfig on reload), so a rotated `workspace.root` or hooks block
+  // takes effect without rebuilding the reconciler.
+  reconciler.setWorkspaceProviders(orch, {
+    baseRef: orch,
+    remove: (identifier) => orch.removeWorkspace(identifier),
+    // Create callback for the reconciler's eager-workspace pass (issue 34).
+    // Delegates to `WorkspaceManager.ensureFor` via the orchestrator so the
+    // canonical clone+branch+remote setup AND any per-state `after_create`
+    // hook fire on reconciler-driven creates the same way they do on
+    // dispatch. The intended-set provider supplies the issue's current state
+    // alongside the identifier so `resolveHooksForState` picks up a
+    // state-level override (e.g. `states.Todo.hooks.after_create`); the
+    // per-identifier ensureFor lock collapses any race with concurrent
+    // dispatch into one setup pass.
+    create: (identifier, state) => orch.createWorkspace(identifier, state),
+  });
 
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved
   // tracker.root, changed active/terminal states) is reflected by both the propagation

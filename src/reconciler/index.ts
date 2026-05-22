@@ -21,6 +21,12 @@ import { BakeResource, SmolvmBakeExecutor, type BakeExecutor } from './bake.js';
 import { defaultCacheRoot } from './cache.js';
 import type { ReconcilerSnapshot } from './types.js';
 import { VmResource, type BootWorker, type IntendedVmProvider } from './vm.js';
+import {
+  WorkspaceResource,
+  type BaseRefProvider,
+  type WorkspaceIntendedProvider,
+  type WorkspaceResourceOptions,
+} from './workspace.js';
 import type { ServiceConfig, SmolvmConfig } from '../types.js';
 import type { SmolvmClient } from '../agent/smolvm.js';
 import { log } from '../logging.js';
@@ -42,6 +48,16 @@ export interface ReconcilerOptions {
   listBootWorkers?: () => Promise<BootWorker[]>;
   killProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
   killGraceMs?: number;
+  // Workspace resource inputs (issue 34). Optional so test harnesses that
+  // don't exercise workspace reconciliation can omit them; when
+  // `workspaceIntendedProvider` is missing the workspace resource is not
+  // constructed and the reconciler's reconcile() pass skips it. Production
+  // wiring passes both at construction or later via `setWorkspaceProviders`.
+  workspaceIntendedProvider?: WorkspaceIntendedProvider;
+  workspaceBaseRef?: BaseRefProvider;
+  workspaceInspect?: WorkspaceResourceOptions['inspect'];
+  workspaceRemove?: WorkspaceResourceOptions['remove'];
+  workspaceCreate?: WorkspaceResourceOptions['create'];
 }
 
 export class Reconciler {
@@ -58,6 +74,15 @@ export class Reconciler {
   private readonly vmListBootWorkers?: () => Promise<BootWorker[]>;
   private readonly vmKillProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
   private readonly vmKillGraceMs?: number;
+  // Workspace janitor (issue 34). Constructed when an intended-set provider is
+  // wired; without one there's no desired set to compare against, so the
+  // resource is null and the reconcile pass skips it.
+  private workspace: WorkspaceResource | null = null;
+  private readonly workspaceInspect?: WorkspaceResourceOptions['inspect'];
+  private workspaceRemove?: WorkspaceResourceOptions['remove'];
+  private workspaceCreate?: WorkspaceResourceOptions['create'];
+  private workspaceBaseRef?: BaseRefProvider;
+  private workspaceIntended: WorkspaceIntendedProvider | null = null;
   private backstopTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   // Single-flight: collapse concurrent reconcile() calls into one ongoing pass so
@@ -88,6 +113,26 @@ export class Reconciler {
         killGraceMs: this.vmKillGraceMs,
       });
     }
+    this.workspaceInspect = opts.workspaceInspect;
+    this.workspaceRemove = opts.workspaceRemove;
+    this.workspaceCreate = opts.workspaceCreate;
+    this.workspaceBaseRef = opts.workspaceBaseRef;
+    if (opts.workspaceIntendedProvider) {
+      this.workspaceIntended = opts.workspaceIntendedProvider;
+      this.workspace = this.buildWorkspaceResource();
+    }
+  }
+
+  private buildWorkspaceResource(): WorkspaceResource | null {
+    if (!this.workspaceIntended) return null;
+    return new WorkspaceResource({
+      workspaceRoot: this.cfg.workspace.root,
+      intended: this.workspaceIntended,
+      baseRef: this.workspaceBaseRef,
+      inspect: this.workspaceInspect,
+      remove: this.workspaceRemove,
+      create: this.workspaceCreate,
+    });
   }
 
   /**
@@ -110,6 +155,56 @@ export class Reconciler {
       killProcess: this.vmKillProcess,
       killGraceMs: this.vmKillGraceMs,
     });
+  }
+
+  /**
+   * Wire the workspace janitor after construction. Same construction-ordering
+   * reason as `setIntendedVmProvider`: the orchestrator is the intended
+   * provider in production but is built after the Reconciler. Idempotent —
+   * the resource is replaced wholesale on each call.
+   */
+  setWorkspaceProviders(
+    intended: WorkspaceIntendedProvider,
+    opts: {
+      baseRef?: BaseRefProvider;
+      /**
+       * Override the remove callback used by the workspace reaper. Production
+       * passes a closure over `WorkspaceManager.remove` so the configured
+       * `before_remove` hook fires on janitor removals; tests omit it to use
+       * the default `rm -rf`.
+       */
+      remove?: WorkspaceResourceOptions['remove'];
+      /**
+       * Override the create callback. Production passes a closure over
+       * `WorkspaceManager.ensureFor` so the same canonical clone+branch+remote
+       * setup (and after_create hook) that dispatch uses also fires for
+       * reconciler-driven eager creation. Omitted ⇒ the reconciler only
+       * reaps; useful for tests that don't exercise creation.
+       */
+      create?: WorkspaceResourceOptions['create'];
+    } = {},
+  ): void {
+    this.workspaceIntended = intended;
+    if (opts.baseRef !== undefined) this.workspaceBaseRef = opts.baseRef;
+    if (opts.remove !== undefined) this.workspaceRemove = opts.remove;
+    if (opts.create !== undefined) this.workspaceCreate = opts.create;
+    this.workspace = this.buildWorkspaceResource();
+  }
+
+  /**
+   * Run the workspace reaper outside the normal reconcile() walk. Used by the
+   * orchestrator at startup to take over from the deleted `startupTerminalCleanup`
+   * sweep: a single awaited pass before the first dispatch tick removes
+   * leftover dirs from a prior run so a brand-new dispatch doesn't reuse
+   * stale state. No-op when the resource isn't wired.
+   */
+  async reapWorkspaces(): Promise<void> {
+    if (!this.workspace) return;
+    try {
+      await this.workspace.reconcile();
+    } catch (err) {
+      log.warn('workspace reap pass threw', { error: (err as Error).message });
+    }
   }
 
   /**
@@ -142,6 +237,14 @@ export class Reconciler {
       smolvm: cfg.smolvm,
       executor: this.bakeExecutor,
     });
+    // Workspace janitor reads `workspace.root` at construction; rebind so a
+    // workflow reload that moved the workspace root takes effect on the next
+    // pass. Preserves the held intended/integration providers — they're
+    // referenced indirectly via the orchestrator's identity, which doesn't
+    // change on reload.
+    if (this.workspace) {
+      this.workspace = this.buildWorkspaceResource();
+    }
     void this.reconcile().catch((err) =>
       log.warn('reconcile after config reload failed', { error: (err as Error).message }),
     );
@@ -219,15 +322,22 @@ export class Reconciler {
     this.inFlight = (async () => {
       try {
         // DAG order: bake first (it's the dispatch-gating prereq), then vm
-        // (independent janitor). Both resources are idempotent / cheap when
-        // there's no work to do — bake short-circuits on cache hit, vm pass
-        // returns immediately when desired == actual.
+        // and workspace (independent janitors). Each resource is idempotent /
+        // cheap when there's no work to do — bake short-circuits on cache
+        // hit, vm/workspace passes return immediately when desired == actual.
         await this.bake.reconcile(opts);
         if (this.vm) {
           try {
             await this.vm.reconcile();
           } catch (err) {
             log.warn('vm reconcile pass threw', { error: (err as Error).message });
+          }
+        }
+        if (this.workspace) {
+          try {
+            await this.workspace.reconcile();
+          } catch (err) {
+            log.warn('workspace reconcile pass threw', { error: (err as Error).message });
           }
         }
       } catch (err) {
@@ -267,6 +377,7 @@ export class Reconciler {
   snapshot(): ReconcilerSnapshot {
     const resources = [this.bake.snapshot()];
     if (this.vm) resources.push(this.vm.snapshot());
+    if (this.workspace) resources.push(this.workspace.snapshot());
     return { resources };
   }
 }
@@ -274,3 +385,9 @@ export class Reconciler {
 export type { BakeExecutor } from './bake.js';
 export type { ReconcilerSnapshot, ResourceSnapshot, ActionStatus } from './types.js';
 export type { IntendedVmProvider, BootWorker } from './vm.js';
+export type {
+  WorkspaceIntendedProvider,
+  BaseRefProvider,
+  WorkspaceInspection,
+  RemoveReason,
+} from './workspace.js';

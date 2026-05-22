@@ -5,7 +5,7 @@
 // 2. Workspace key is sanitized — only [A-Za-z0-9._-] allowed.
 // 3. Agent cwd MUST equal the workspace path (enforced by callers via runWithCwd).
 
-import { mkdir, rm, lstat } from 'node:fs/promises';
+import { mkdir, rm, lstat, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { Workspace, HooksConfig, ServiceConfig } from './types.js';
@@ -143,7 +143,241 @@ export async function runHookScript(
   });
 }
 
+// Inputs for the canonical per-issue clone+branch+remote setup (issue 34).
+// Previously lived as the `hooks.after_create` shell in WORKFLOW.md; lifted
+// into TypeScript so the canonical setup is unit-testable and the reconciler's
+// `workspace` resource owns it as a typed action instead of an opaque shell
+// blob. See `setupWorkspaceDir` below.
+export interface SetupWorkspaceDirOptions {
+  // Empty target directory (already created by the caller).
+  workspacePath: string;
+  // Absolute path to the local source repo to clone from. Hardlinks objects
+  // via `git clone --local` when possible.
+  sourceRepo: string;
+  // Base branch to land on (e.g. `main`).
+  baseBranch: string;
+  // Per-issue branch to cut from base (e.g. `agent/42`).
+  branch: string;
+  // GitHub `owner/repo` when the operator wants the after_run hook to push
+  // back. `null` leaves the workspace network-isolated (no origin remote).
+  originRepo: string | null;
+  // Pinned identity for commits the agent makes in the workspace.
+  gitIdentity: { name: string; email: string };
+}
+
+interface GitRunResult {
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+): Promise<GitRunResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (b) => {
+      stdout += b.toString('utf8');
+      if (stdout.length > 65_536) stdout = stdout.slice(0, 65_536);
+    });
+    child.stderr?.on('data', (b) => {
+      stderr += b.toString('utf8');
+      if (stderr.length > 65_536) stderr = stderr.slice(0, 65_536);
+    });
+    child.on('error', (err) => reject(err));
+    child.on('close', (code) => resolve({ exit_code: code ?? -1, stdout, stderr }));
+  });
+}
+
+async function runGit(args: string[], cwd: string): Promise<GitRunResult> {
+  return runCommand('git', args, cwd);
+}
+
+async function runGitExpect(args: string[], cwd: string): Promise<GitRunResult> {
+  const r = await runGit(args, cwd);
+  if (r.exit_code !== 0) {
+    throw new WorkspaceError(
+      'workspace_setup_git_failed',
+      `git ${args.join(' ')} exited ${r.exit_code}: ${r.stderr.trim() || r.stdout.trim()}`,
+    );
+  }
+  return r;
+}
+
+/**
+ * Canonical per-issue clone+branch+remote setup (issue 34). Performs the work
+ * the old `hooks.after_create` shell did, but in TypeScript so:
+ *
+ *   1. The setup is unit-testable independent of a workflow-defined shell hook.
+ *   2. The reconciler's `workspace` resource owns it as a typed `create_workspace`
+ *      action instead of an opaque shell blob.
+ *   3. State-machine behavior (origin restoration, identity pinning) stays on
+ *      the orchestrator side of the runner/hook seam.
+ *
+ * Behavior (mirroring the shell version's invariants minus the origin-fetch
+ * reset — see "Base ref source-of-truth" below):
+ *
+ *   - `git clone --local --no-tags --branch <base> <source> .` into `workspacePath`,
+ *     hardlinking objects when possible (fast + disk-cheap).
+ *   - Strip every remote the clone left behind so any in-VM `git push`/`git fetch`
+ *     fails closed (no network targets reachable from inside the dispatched agent).
+ *   - Unset any inherited `credential.helper` for the same reason.
+ *   - When `originRepo` is set, restore an `origin` pointing at the canonical
+ *     HTTPS URL (no token; auth comes from the host's `gh` and never enters the
+ *     VM). `gh auth setup-git` runs best-effort so a later host-side `git push`
+ *     from the Done hook can authenticate.
+ *   - Pin `user.name`/`user.email` to the symphony-agent identity.
+ *   - `git checkout -b <branch>` to cut the per-issue branch.
+ *
+ * Base ref source-of-truth: the source repo's local `<base>` is the canonical
+ * reference. The previous shell version also fetched `origin/<base>` when
+ * `originRepo` was set and reset the workspace's base to that live remote tip,
+ * but that created two divergent sources of truth — `Orchestrator.currentBaseRef`
+ * resolves `<base>` in the source repo, and a fetch-and-reset workspace would
+ * be based on a ref the reconciler can't see. The drift detector caught the
+ * resulting "freshly cloned workspace is already stale" false positives, so
+ * the fetch+reset step is gone. To pick up a new base, the operator updates
+ * the source repo (`git pull` / `git fetch`) and the next workspace clones
+ * from the updated source.
+ *
+ * `workspacePath` must exist and be empty. Caller is responsible for the mkdir
+ * and for unwinding the directory on failure.
+ */
+export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise<void> {
+  const { workspacePath, sourceRepo, baseBranch, branch, originRepo, gitIdentity } = opts;
+  // 1. Source repo must look like a git repo. Same check the shell ran, lifted
+  //    into TypeScript so the error surfaces as a typed WorkspaceError rather
+  //    than a shell exit code the runner has to decode.
+  try {
+    const gitDir = path.join(sourceRepo, '.git');
+    const st = await stat(gitDir);
+    if (!st.isDirectory() && !st.isFile()) {
+      throw new WorkspaceError(
+        'workspace_setup_no_source_repo',
+        `source repo ${sourceRepo} is not a git repository`,
+      );
+    }
+  } catch (err) {
+    if (err instanceof WorkspaceError) throw err;
+    throw new WorkspaceError(
+      'workspace_setup_no_source_repo',
+      `source repo ${sourceRepo} is not a git repository: ${(err as Error).message}`,
+    );
+  }
+
+  // 2. Clone hardlinked, narrow refspec, land on base. `.` is the cwd so the
+  //    objects/refs go directly into `workspacePath`.
+  await runGitExpect(
+    ['clone', '--local', '--no-tags', '--branch', baseBranch, sourceRepo, '.'],
+    workspacePath,
+  );
+
+  // 3. Strip all remotes the clone copied over (typically just `origin`
+  //    pointing at SOURCE_REPO). Network targets stay zero by default.
+  const remotes = await runGitExpect(['remote'], workspacePath);
+  for (const remote of remotes.stdout.split(/\r?\n/).map((r) => r.trim()).filter((r) => r.length > 0)) {
+    await runGitExpect(['remote', 'remove', remote], workspacePath);
+  }
+  // Unset credential.helper if the clone inherited one. Best-effort: an empty
+  // local config returns exit 5 which is fine.
+  await runGit(['config', '--local', '--unset', 'credential.helper'], workspacePath);
+
+  // 4. Conditional origin restore. SYMPHONY_REPO is the documented "I want
+  //    the after_run hook to push" opt-in; without it the workspace stays
+  //    purely local and no origin is configured. The remote URL is the
+  //    canonical HTTPS form (no token); auth comes from the host's `gh`,
+  //    which never enters the VM. Unlike the prior shell version, we do
+  //    NOT fetch `origin/<base>` and reset — see the function comment for
+  //    why; the source repo's local `<base>` is the canonical base ref.
+  if (originRepo && originRepo.length > 0) {
+    await runGitExpect(
+      ['remote', 'add', 'origin', `https://github.com/${originRepo}.git`],
+      workspacePath,
+    );
+    // `gh auth setup-git` is best-effort: a host without gh installed should
+    // still get a working workspace with an origin pointing at the HTTPS URL,
+    // even if a later push fails for lack of credentials.
+    await runCommand('gh', ['auth', 'setup-git'], workspacePath).catch(() => undefined);
+  }
+
+  // 5. Pin commit identity. Local-only so this never leaks into ~/.gitconfig.
+  await runGitExpect(
+    ['config', '--local', 'user.name', gitIdentity.name],
+    workspacePath,
+  );
+  await runGitExpect(
+    ['config', '--local', 'user.email', gitIdentity.email],
+    workspacePath,
+  );
+
+  // 6. Cut the per-issue branch off base. After this HEAD is `branch`, ready
+  //    for the dispatched agent to commit against.
+  await runGitExpect(['checkout', '-b', branch], workspacePath);
+}
+
+/**
+ * Inputs the WorkspaceManager passes to its `createWorkspace` action so the
+ * canonical setup can run before the optional repo-local `after_create` shell.
+ * Falls back to env-derived defaults (SYMPHONY_*) when fields are omitted.
+ */
+export interface ResolveSetupOptionsArgs {
+  identifier: string;
+  workspacePath: string;
+  workflowDir: string;
+}
+
+/**
+ * Resolve the env-driven SetupWorkspaceDirOptions for an issue at dispatch
+ * time. Centralized so the runner/manager and tests can share the same
+ * mapping. Mirrors the shell heuristic the old after_create used:
+ *
+ *   - SYMPHONY_SOURCE_REPO override else fall back to `workflowDir`
+ *     (the directory containing WORKFLOW.md, which in the canonical
+ *     project layout is the repo root).
+ *   - SYMPHONY_BASE_BRANCH override else 'main'.
+ *   - SYMPHONY_REPO selects PR mode (origin restored) vs local-only.
+ */
+export function resolveSetupOptions(args: ResolveSetupOptionsArgs): SetupWorkspaceDirOptions {
+  const sourceRepo =
+    process.env.SYMPHONY_SOURCE_REPO && process.env.SYMPHONY_SOURCE_REPO.length > 0
+      ? process.env.SYMPHONY_SOURCE_REPO
+      : args.workflowDir;
+  const baseBranch =
+    process.env.SYMPHONY_BASE_BRANCH && process.env.SYMPHONY_BASE_BRANCH.length > 0
+      ? process.env.SYMPHONY_BASE_BRANCH
+      : 'main';
+  const originRepo =
+    process.env.SYMPHONY_REPO && process.env.SYMPHONY_REPO.length > 0
+      ? process.env.SYMPHONY_REPO
+      : null;
+  return {
+    workspacePath: args.workspacePath,
+    sourceRepo,
+    baseBranch,
+    branch: `agent/${args.identifier}`,
+    originRepo,
+    gitIdentity: { name: 'symphony-agent', email: 'agent@symphony.local' },
+  };
+}
+
 export class WorkspaceManager {
+  // Per-identifier in-flight promise map. Coalesces concurrent ensureFor
+  // calls for the same identifier into a single setup pass so the dispatch
+  // path (runner.ts) and the reconciler's create_workspace pass don't race
+  // on `git clone --local` into the same dir. The promise is removed in a
+  // finally block so the next pass (e.g. a re-dispatch after the workspace
+  // was removed) re-enters cleanly. Keyed by sanitized workspace key for
+  // identity with `workspacePathFor`.
+  private ensureInFlight = new Map<string, Promise<Workspace>>();
+
   constructor(private cfg: ServiceConfig) {}
 
   updateConfig(cfg: ServiceConfig): void {
@@ -158,10 +392,43 @@ export class WorkspaceManager {
     return path.join(this.cfg.workspace.root, key);
   }
 
-  // Ensure the per-issue workspace directory exists. Runs after_create when created_now.
-  // `hooks` is resolved per the issue's current state by the caller (so a state-level
-  // hooks override applies); pass the workflow-level hooks for state-agnostic callers.
+  // Ensure the per-issue workspace directory exists. On first creation, runs
+  // the canonical TypeScript `create_workspace` action (clone + branch +
+  // optional origin/identity setup) BEFORE the optional repo-local
+  // `after_create` shell. The shell is now a thin glue surface for workflow
+  // authors who need to add additional setup — the canonical clone+branch+remote
+  // work is owned by `setupWorkspaceDir` and unit-tested independently.
+  //
+  // `hooks` is resolved per the issue's current state by the caller (so a
+  // state-level hooks override applies); pass the workflow-level hooks for
+  // state-agnostic callers.
+  //
+  // Concurrent callers for the same identifier (dispatch runner + reconciler
+  // eager-create) coalesce via `ensureInFlight`: the second caller awaits
+  // the first's result and observes `created_now: false` from the cached
+  // workspace shape (since the first's promise already resolved with the
+  // created-now=true outcome). Callers must NOT rely on `created_now`
+  // distinguishing "I created it" from "someone else did, just before me" —
+  // the bool exists only to gate the `after_create` hook on first-mkdir,
+  // and the lock guarantees it fires exactly once.
   async ensureFor(
+    identifier: string,
+    hooks: HooksConfig,
+    captureAfterCreate?: HookCapture,
+  ): Promise<Workspace> {
+    const key = sanitizeWorkspaceKey(identifier);
+    const existing = this.ensureInFlight.get(key);
+    if (existing) return existing;
+    const p = this.doEnsureFor(identifier, hooks, captureAfterCreate);
+    this.ensureInFlight.set(key, p);
+    try {
+      return await p;
+    } finally {
+      this.ensureInFlight.delete(key);
+    }
+  }
+
+  private async doEnsureFor(
     identifier: string,
     hooks: HooksConfig,
     captureAfterCreate?: HookCapture,
@@ -194,6 +461,27 @@ export class WorkspaceManager {
         await mkdir(wsPath, { recursive: true });
         createdNow = true;
       } else {
+        throw err;
+      }
+    }
+
+    if (createdNow) {
+      // Canonical clone+branch+remote setup. Fatal failure unwinds the dir
+      // so the next dispatch tick can retry cleanly.
+      try {
+        await setupWorkspaceDir(
+          resolveSetupOptions({
+            identifier,
+            workspacePath: wsPath,
+            workflowDir: this.cfg.workflow_dir,
+          }),
+        );
+      } catch (err) {
+        try {
+          await rm(wsPath, { recursive: true, force: true });
+        } catch {
+          // Best-effort cleanup.
+        }
         throw err;
       }
     }

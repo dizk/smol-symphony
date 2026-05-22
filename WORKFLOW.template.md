@@ -126,11 +126,11 @@ states:
 # failure so a future resolver can finish the merge by hand.
 #
 # In PR mode (SYMPHONY_REPO set), the merge pushes to `origin` (which the
-# after_create hook restored as the GitHub remote). In local-only mode the
-# orchestrator stages a temp remote pointing at the source repo
-# (SYMPHONY_SOURCE_REPO, default `${PWD}/../../..` of the workspace), pushes
-# integration there, and removes the temp remote — the agent inside the VM
-# never sees this remote.
+# built-in workspace setup, `setupWorkspaceDir` in src/workspace.ts, restored
+# as the GitHub remote — see SPEC §9.3). In local-only mode the orchestrator
+# stages a temp remote pointing at the source repo (SYMPHONY_SOURCE_REPO,
+# default `${PWD}/../../..` of the workspace), pushes integration there, and
+# removes the temp remote — the agent inside the VM never sees this remote.
 #
 # Cancelled is intentionally absent from `merge_on_states`: an abandoned issue
 # does not contribute work to the shared branch.
@@ -215,9 +215,9 @@ logs:
 #
 #   SYMPHONY_ISSUE_ID      — the dispatched issue's identifier (e.g. `42`).
 #   SYMPHONY_BRANCH        — the per-issue working branch (`agent/<id>`), the
-#                            same name `after_create` checks out.
-#   SYMPHONY_BASE_BRANCH   — base branch the work targets. Mirrors
-#                            `after_create`'s `${SYMPHONY_BASE_BRANCH:-main}`
+#                            same name the built-in workspace setup checked out.
+#   SYMPHONY_BASE_BRANCH   — base branch the work targets. Mirrors the built-in
+#                            workspace setup's `${SYMPHONY_BASE_BRANCH:-main}`
 #                            default: if the operator did not export it, the
 #                            host stages `main`, so the hook can run under
 #                            `set -u` and reference it directly without an
@@ -252,16 +252,37 @@ hooks:
   # Default: 60000
   timeout_ms: 120000
 
-  # after_create (string | null): runs right after the workspace directory is
-  # created, before the first dispatch. Use for git clone, dependency install,
-  # etc. Default: null.
+  # after_create (string | null): additional repo-local glue run AFTER the
+  # built-in canonical workspace setup, before the first dispatch. Default: null.
+  #
+  # The orchestrator now performs the canonical clone + branch + remote setup
+  # in TypeScript (`setupWorkspaceDir`) on first creation, BEFORE this hook
+  # runs. The workspace cwd already has:
+  #
+  #   • a hardlinked `git clone --local --no-tags` of the source repo (selected
+  #     via `SYMPHONY_SOURCE_REPO`, default: the directory containing
+  #     WORKFLOW.md) on the base branch (`SYMPHONY_BASE_BRANCH`, default `main`)
+  #   • all network remotes stripped (in-VM `git push`/`git fetch` fail closed)
+  #   • when `SYMPHONY_REPO` is set: `origin` restored to the canonical HTTPS
+  #     URL `https://github.com/<owner>/<repo>.git` so a host-side terminal
+  #     hook can push; `gh auth setup-git` runs best-effort on the host so the
+  #     push has credentials (the token never enters the VM). Without
+  #     `SYMPHONY_REPO` the workspace stays local-only with no remotes
+  #   • `user.name = symphony-agent` / `user.email = agent@symphony.local`
+  #     pinned in `--local` config
+  #   • `agent/<id>` checked out off the base SHA
+  #
+  # Use `after_create` only for additional setup on top of that — dependency
+  # bootstrap, code generation, etc. The canonical clone/branch/remote work
+  # is owned by the orchestrator and SHOULD NOT be re-implemented here. Leave
+  # this block unset if no additional glue is needed.
   after_create: |
     set -eu
-    # ... your setup ...
+    # ... your additional repo-local setup, if any ...
 
   # before_run (string | null): runs before each turn. Default: null. Use for
-  # cheap "make sure the workspace is sane" checks; expensive setup belongs in
-  # after_create.
+  # cheap "make sure the workspace is sane" checks; one-time expensive setup
+  # belongs in after_create (which fires only on first workspace creation).
   before_run: |
     set -eu
     # ... pre-turn checks ...

@@ -109,10 +109,13 @@ tracker:
 #     conflict_state: Conflict
 #     merge_on_states: [Done]
 #
-# and rewrite the `hooks.after_create` script below to clone from `integration`
-# (seeded from base on first run) instead of from base directly. The
-# orchestrator path that performs the host-side merge keys on a non-empty
-# `merge_on_states` list — leaving the block absent fully skips the feature.
+# and teach the orchestrator's built-in workspace setup (`setupWorkspaceDir`
+# in src/workspace.ts) to clone from the integration ref instead of the base
+# branch (seeded from base on first run). The orchestrator path that performs
+# the host-side merge keys on a non-empty `merge_on_states` list — leaving the
+# block absent fully skips the feature. There is no `hooks.after_create` to
+# rewrite: canonical workspace setup is now TypeScript-owned and runs before
+# any optional `after_create` hook (see SPEC §9.3 and WORKFLOW.template.md).
 
 polling:
   interval_ms: 5000
@@ -131,54 +134,31 @@ logs:
 hooks:
   timeout_ms: 120000
 
-  # Clone smol-symphony into the fresh per-issue workspace from a strictly local
-  # source (no creds needed). The agent receives a working git repo with full
-  # history on the base branch plus a per-issue branch checked out from it.
-  # All network remotes are stripped so any `git push`/`git fetch` from inside
-  # the VM fails closed.
-  after_create: |
-    set -eu
-    SOURCE_REPO="${SYMPHONY_SOURCE_REPO:-${PWD}/../../..}"
-    BASE="${SYMPHONY_BASE_BRANCH:-main}"
-    ISSUE_ID="$(basename "$PWD")"
-    BRANCH="agent/${ISSUE_ID}"
-
-    if [ ! -d "${SOURCE_REPO}/.git" ]; then
-      echo "after_create: SOURCE_REPO=${SOURCE_REPO} is not a git repo" >&2
-      exit 1
-    fi
-
-    # `git clone --local` hardlinks .git/objects when possible; fast and disk-cheap.
-    # `--no-tags` keeps the local refspec minimal; `--branch` lands on the base.
-    git clone --local --no-tags --branch "${BASE}" "${SOURCE_REPO}" .
-
-    # Strip all remotes. The agent will see no network targets at all.
-    for remote in $(git remote); do
-      git remote remove "${remote}"
-    done
-    git config --local --unset credential.helper 2>/dev/null || true
-
-    # If SYMPHONY_REPO is set, restore an `origin` pointing at the GitHub remote
-    # so the after_run hook can push. The URL is the canonical HTTPS form (no
-    # token); auth comes from the host's `gh`, which never enters the VM. After
-    # fetching origin/${BASE} we reset the local base branch to it, ensuring
-    # the `agent/<id>` branch we cut next is based on the live remote tip
-    # rather than a possibly-stale source-repo copy.
-    if [ -n "${SYMPHONY_REPO:-}" ]; then
-      git remote add origin "https://github.com/${SYMPHONY_REPO}.git"
-      gh auth setup-git 2>/dev/null || true
-      if git fetch --no-tags origin "${BASE}:refs/remotes/origin/${BASE}"; then
-        git checkout -B "${BASE}" "refs/remotes/origin/${BASE}"
-      fi
-    fi
-
-    git config --local user.name  "symphony-agent"
-    git config --local user.email "agent@symphony.local"
-
-    git checkout -b "${BRANCH}"
-
-    echo "workspace ready: base=${BASE} branch=${BRANCH} source=${SOURCE_REPO}"
-
+  # The canonical clone + base-branch checkout + `agent/<id>` branch cut +
+  # origin/identity setup moved into the orchestrator's TypeScript
+  # `setupWorkspaceDir` action (issue 34 / reconciler stage 3). The per-issue
+  # workspace arrives at the dispatched agent with:
+  #
+  #   • a hardlinked `git clone --local` of the source repo on the base branch
+  #     (SYMPHONY_BASE_BRANCH or `main`) at the source repo's current local
+  #     base SHA
+  #   • all network remotes stripped (in-VM `git push`/`git fetch` fail closed)
+  #   • when SYMPHONY_REPO is set: `origin` restored to the canonical HTTPS URL
+  #     so the host's Done hook can push (`gh auth setup-git` runs best-effort
+  #     on the host so the push has credentials; the token never enters the VM)
+  #   • `user.name = symphony-agent` / `user.email = agent@symphony.local`
+  #   • `agent/<id>` checked out
+  #
+  # The source repo's local `<base>` is the single source of truth for the
+  # workspace's base ref. To pick up a new base, update the source repo
+  # (`git pull` / `git fetch && git checkout <base>`) before the next dispatch;
+  # symphony does not implicitly fetch from `origin/<base>` at setup time.
+  #
+  # No `after_create:` block is declared because no repo-local glue is needed
+  # on top of that. Add an `after_create:` here if you need additional
+  # workspace setup — it fires AFTER the canonical setup against the prepared
+  # workspace cwd.
+  #
   # No workflow-level after_run: the handoff (patch + optional PR) lives on
   # the Done state's per-state hook (see `states.Done.hooks.after_run` above).
   # It only fires on transition into Done, so we no longer need a script-level

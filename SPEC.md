@@ -846,15 +846,45 @@ Part B: Tracker state refresh
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
-### 8.6 Startup Terminal Workspace Cleanup
+### 8.6 Workspace Lifecycle Reconciliation
 
-When the service starts:
+An implementation MUST converge the set of per-issue workspace directories
+under `workspace.root` toward the set of issues currently in non-terminal
+states. The convergence loop:
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
+1. Query the tracker for issues in non-terminal states; union with the set of
+   identifiers currently in-flight (claimed for dispatch but not yet
+   reflected in the tracker).
+2. List directory entries under `workspace.root`.
+3. Remove any workspace directory whose sanitized identifier is not in the
+   desired set.
+4. Create a workspace directory for each desired identifier that has no
+   matching dir on disk. The create action runs the same canonical
+   clone+branch+remote setup the dispatch path uses; concurrent callers for
+   the same identifier coalesce (e.g. dispatch and reconciler firing within
+   the same tick) so the setup runs exactly once.
+5. Optional drift detection: when the implementation tracks a base ref (the
+   tip of the configured base branch in the source repo), it SHOULD compare
+   each active workspace's recorded view of that branch against the source's
+   current tip. Disagreement is drift and SHOULD be surfaced in the
+   reconciler snapshot as `stale` (no uncommitted changes, no commits ahead
+   of base — re-clone would be safe but is deferred to operator action) or
+   `stuck` (re-clone would discard agent work). Drift handling is
+   non-destructive: the workspace stays on disk in both cases. Comparing
+   recorded SHAs against the source rather than running cross-repo
+   reachability checks inside the workspace avoids the object-store boundary
+   that `git clone --local` creates (the workspace cannot see commits added
+   to the source repo after clone time).
 
-This prevents stale terminal workspaces from accumulating after restarts.
+The canonical clone+branch+remote setup MUST use the source repo's local
+`<base>` SHA at clone time as the workspace's base ref. Implementations
+MUST NOT fetch from a different ref (e.g. `origin/<base>`) and reset the
+workspace base to it; doing so creates a divergent source of truth that
+the drift detector cannot reconcile against the source repo.
+
+This runs at startup and continuously thereafter, so stale terminal
+workspaces never accumulate even on long-lived processes, and a fresh
+workspace appears for any new non-terminal issue.
 
 ## 9. Workspace Management and Safety
 
@@ -884,28 +914,59 @@ Algorithm summary:
 3. Ensure the workspace path exists as a directory.
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
-5. If `created_now=true`, run `after_create` hook if configured.
+5. If `created_now=true`, run the built-in canonical workspace setup (§9.3).
+6. If `created_now=true`, run `after_create` hook if configured (after the canonical setup).
 
-Notes:
+Concurrent callers for the same identifier MUST coalesce so the canonical setup and `after_create`
+hook each run exactly once per workspace creation. This is what allows the workspace lifecycle
+reconciler (§8.6) and a dispatch-path caller to both invoke "ensure workspace exists" against the
+same identifier within a single tick without racing on `git clone --local`.
 
-- This section does not assume any specific repository/VCS workflow.
-- Workspace preparation beyond directory creation (for example dependency bootstrap, checkout/sync,
-  code generation) is implementation-defined and is typically handled via hooks.
+### 9.3 Built-in Workspace Population
 
-### 9.3 OPTIONAL Workspace Population (Implementation-Defined)
+The workspace lifecycle is owned by the orchestrator, not the workflow. On first creation of a
+workspace, an implementation MUST clone the source repository into the workspace path, check out
+the configured base branch, and cut a per-issue branch off the base, before running any optional
+`after_create` hook glue.
 
-The spec does not require any built-in VCS or repository bootstrap behavior.
+The canonical setup performs the following steps in order against the empty workspace directory:
 
-Implementations MAY populate or synchronize the workspace using implementation-defined logic and/or
-hooks (for example `after_create` and/or `before_run`).
+1. Validate the source repository looks like a git repository.
+2. `git clone --local --no-tags --branch <base>` from the source repo into the workspace path.
+   The clone is hardlinked so the workspace's object store is a cheap delta over the source's
+   at clone time.
+3. Strip every remote the clone copied over and unset any inherited `credential.helper`, so
+   any subsequent `git push`/`git fetch` from inside the workspace (including from within a
+   dispatched VM) fails closed by default.
+4. When the implementation is configured for a remote repository (e.g. an `origin` URL is
+   known via env), restore `origin` pointing at the canonical HTTPS URL of that repo. The
+   restore MUST NOT embed credentials; auth is provided host-side (e.g. by `gh auth setup-git`,
+   run best-effort) so that a host-side terminal hook can push without the token ever entering
+   the workspace or any VM derived from it.
+5. Pin commit identity in `--local` git config so commits made by the dispatched agent
+   carry a stable author/committer that never leaks into the operator's global git config.
+6. `git checkout -b <branch>` for the per-issue branch (typically `agent/<id>`) off the
+   base SHA.
+
+The source repository's local `<base>` is the single source of truth for the workspace's base
+ref. Implementations MUST NOT implicitly fetch from a different ref (e.g. `origin/<base>`) and
+reset the workspace base to it: the workspace lifecycle reconciler (§8.6) compares the
+workspace's recorded base SHA against the source's `<base>` SHA, and a divergent source of
+truth here would produce false-positive drift on a freshly created workspace. Operators pick up
+a new base by updating the source repo (`git pull` / `git fetch && git checkout <base>`)
+before the next dispatch.
 
 Failure handling:
 
-- Workspace population/synchronization failures return an error for the current attempt.
-- If failure happens while creating a brand-new workspace, implementations MAY remove the partially
-  prepared directory.
-- Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
-  explicitly chosen and documented.
+- Failure of any canonical setup step is fatal to workspace creation. The partially prepared
+  directory MUST be removed so the next dispatch tick re-enters cleanly.
+- `after_create` hook failure is also fatal (§9.4); the partially prepared directory is removed.
+- Reused workspaces are NOT destructively reset on subsequent dispatches; canonical setup runs
+  only when the directory was created during the current ensure call.
+
+Workflow-level `after_create` hooks remain available for additional repo-local glue (dependency
+bootstrap, code generation, etc.) but MUST NOT be required to perform the canonical
+clone+branch+remote work, which is owned by the implementation.
 
 ### 9.4 Workspace Hooks
 
@@ -1154,7 +1215,7 @@ An implementation MUST support these tracker adapter operations:
    - Return issues in configured active states.
 
 2. `fetch_issues_by_states(state_names)`
-   - Used for startup terminal cleanup.
+   - Used for workspace lifecycle reconciliation (§8.6).
 
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
@@ -1582,7 +1643,7 @@ After restart:
 - No retry timers are restored from prior process memory.
 - No running sessions are assumed recoverable.
 - Service recovers by:
-  - startup terminal workspace cleanup
+  - workspace lifecycle reconciliation (§8.6) — removes terminal/orphan dirs
   - fresh polling of active issues
   - re-dispatching eligible work
 
@@ -1959,8 +2020,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Existing workspace directory is reused
 - Existing non-directory path at workspace location is handled safely (replace or fail per
   implementation policy)
-- OPTIONAL workspace population/synchronization errors are surfaced
-- `after_create` hook runs only on new workspace creation
+- Built-in canonical workspace setup runs on new workspace creation: hardlinked clone from the
+  source repo on the base branch, remotes stripped + `credential.helper` unset, conditional
+  `origin` restore when a remote is configured (no embedded credentials), pinned commit identity,
+  and per-issue branch cut (§9.3)
+- Built-in canonical workspace setup failure is fatal: the partially prepared directory is
+  removed so the next dispatch tick re-enters cleanly
+- Concurrent "ensure workspace" callers for the same identifier coalesce so canonical setup and
+  `after_create` each run exactly once per creation
+- The workspace's base ref is sourced from the source repo's local `<base>`; the implementation
+  does NOT implicitly fetch a different ref and reset the workspace base to it
+- `after_create` hook runs only on new workspace creation, AFTER the built-in canonical setup
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
