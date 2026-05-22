@@ -300,6 +300,24 @@ agent:
     Todo: 1
     In Progress: 1
 
+  # memory_admission_enabled (bool): when true, before each dispatch the
+  # orchestrator reads `/proc/meminfo` (MemAvailable) and clamps the effective
+  # concurrency cap to what currently fits at `smolvm.mem_mib` per VM after
+  # subtracting `host_memory_reserve_mib`. This is a defense-in-depth backstop
+  # for hosts where the static `max_concurrent_agents` is set generously: when
+  # MemAvailable drops, new dispatches are gated so a misconfigured cap can't
+  # walk the host into OOM (issue 27). On hosts without `/proc/meminfo`
+  # (macOS, BSD) the probe degrades gracefully and the static cap is used
+  # unchanged. Default: true.
+  memory_admission_enabled: true
+
+  # host_memory_reserve_mib (int): headroom (MiB) the memory admission cap
+  # keeps for the orchestrator process itself, hooks, the smolvm daemon, and
+  # the kernel's own working set. Only consulted when
+  # `memory_admission_enabled` is true. Raise on hosts with heavy non-symphony
+  # workloads; lower on dedicated worker hosts. Default: 2048.
+  host_memory_reserve_mib: 2048
+
 # ─────────────────────────────────────────────────────────────────────────────
 # acp — Agent Client Protocol adapter selection.
 # ─────────────────────────────────────────────────────────────────────────────

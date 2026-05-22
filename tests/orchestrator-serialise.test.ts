@@ -166,7 +166,10 @@ describe('Orchestrator serialises runs across active states (issue 25)', () => {
       const { cfg, def } = await buildCfg(
         {
           acp: { adapter: 'claude' },
-          agent: { max_concurrent_agents: 1 },
+          // Disable memory admission so the test isn't sensitive to the CI runner's
+          // free memory — the continuation-slot behavior under test has nothing to
+          // do with issue 27's clamp.
+          agent: { max_concurrent_agents: 1, memory_admission_enabled: false },
           polling: { interval_ms: 50 },
           states: {
             Todo: { role: 'active', adapter: 'claude' },
@@ -272,7 +275,7 @@ describe('Orchestrator serialises runs across active states (issue 25)', () => {
       const { cfg, def } = await buildCfg(
         {
           acp: { adapter: 'claude' },
-          agent: { max_concurrent_agents: 1 },
+          agent: { max_concurrent_agents: 1, memory_admission_enabled: false },
           polling: { interval_ms: 30 },
           states: {
             Todo: { role: 'active', adapter: 'claude' },

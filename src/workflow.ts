@@ -233,11 +233,28 @@ export function buildServiceConfig(
   if (maxTurns <= 0) {
     throw new WorkflowError('workflow_parse_error', 'agent.max_turns must be positive');
   }
+  // Memory-aware admission cap (issue 27). Default-on with a 2 GiB host reserve — that's
+  // enough headroom for the orchestrator process, hooks, the smolvm daemon, and the
+  // kernel's working set on a typical workstation. Operators can disable the cap (set
+  // `memory_admission_enabled: false`) on hosts that don't expose /proc/meminfo or where
+  // the static cap is already the binding constraint.
+  const memAdmissionEnabledRaw = agentRaw['memory_admission_enabled'];
+  const memoryAdmissionEnabled =
+    memAdmissionEnabledRaw === undefined ? true : memAdmissionEnabledRaw !== false;
+  const hostMemoryReserveMib = asInt(agentRaw['host_memory_reserve_mib'], 2048);
+  if (hostMemoryReserveMib < 0) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      'agent.host_memory_reserve_mib must be a non-negative integer',
+    );
+  }
   const agent: AgentConfig = {
     max_concurrent_agents: asInt(agentRaw['max_concurrent_agents'], 10),
     max_turns: maxTurns,
     max_retry_backoff_ms: asInt(agentRaw['max_retry_backoff_ms'], 300_000),
     max_concurrent_agents_by_state: asMapStrPosInt(agentRaw['max_concurrent_agents_by_state']),
+    memory_admission_enabled: memoryAdmissionEnabled,
+    host_memory_reserve_mib: hostMemoryReserveMib,
   };
 
   // acp (Symphony extension; supersedes the §5.3.6 `codex` block). `adapter` selects
