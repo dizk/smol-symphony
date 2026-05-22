@@ -46,9 +46,16 @@ Prerequisites:
 - Node.js ≥ 20.
 - A `smolvm` binary on `$PATH` with the server reachable on the configured
   endpoint (e.g. `smolvm serve start --listen unix:///run/user/$UID/smolvm.sock`).
-- A packed VM image (one-time): `bash scripts/build-vm.sh` produces
-  `.vm/symphony.smolmachine.smolmachine` (~1.1 GB; ships `claude-agent-acp`,
-  `codex-acp`, and `opencode` on the guest `$PATH`).
+- A `Smolfile` describing the per-issue VM. The repo ships one at the root that
+  starts from `node:24-bookworm-slim`, installs base CLI tooling, npm-installs
+  every ACP-capable coding agent (`claude-agent-acp`, `codex-acp`, `opencode`),
+  and bind-mounts `scripts/` as `/opt/symphony` so the in-VM stdio proxy lives
+  at `/opt/symphony/vm-agent.mjs` without a per-VM copy step. `WORKFLOW.md`'s
+  `smolvm.smolfile` points at it; symphony hands the file to
+  `smolvm machine create --smolfile` on every dispatch. To skip the per-VM
+  apt/npm install pay, pre-pack once with
+  `smolvm pack create -s ./Smolfile -o ./.vm/symphony.smolmachine` and switch
+  `smolvm.smolfile` → `smolvm.from` in `WORKFLOW.md`.
 - For the default `acp.adapter: claude`: a credentials file at
   `~/.claude/.credentials.json` on the host (symphony reads and stages it; the
   host directory is **not** bind-mounted into the VM).

@@ -35,8 +35,8 @@
     "SPEC.md",
     "PRODUCT.md",
     "DESIGN.md",
-    "scripts/build-vm.sh",
-    "scripts/vm-agent.js",
+    "Smolfile",
+    "scripts/vm-agent.mjs",
     "README.md",
     "LICENSE"
   ],

@@ -13,7 +13,10 @@ OpenCode, etc.) working on this repo. Keep it short.
 - `src/workflow.ts` — workflow file parser; the contract `WORKFLOW.template.md`
   documents.
 - `src/trackers/local.ts` — local markdown tracker (only kind today).
-- `src/acp-bridge.ts` + `scripts/vm-agent.js` — host↔VM ACP transport.
+- `src/acp-bridge.ts` + `scripts/vm-agent.mjs` — host↔VM ACP transport.
+- `Smolfile` — declarative per-issue VM (image, resources, apt/npm install,
+  scripts/ → /opt/symphony bind mount). Referenced by `WORKFLOW.md`'s
+  `smolvm.smolfile`.
 - `src/http.ts` — HTTP dashboard + MCP endpoint listener.
 - `WORKFLOW.md` — canonical workflow this repo dispatches against itself.
 - `WORKFLOW.template.md` — annotated reference for workflow file syntax.

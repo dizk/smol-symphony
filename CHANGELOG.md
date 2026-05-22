@@ -12,6 +12,13 @@ hand work off between them via a single MCP call.
 
 ### Added
 
+- `smolvm.smolfile` workflow key. Point it at a TOML
+  [Smolfile](https://github.com/smol-machines/smolvm) and symphony hands it
+  to `smolvm machine create --smolfile` for every per-issue VM. The repo
+  ships a canonical `Smolfile` at the root that boots `node:24-bookworm-slim`,
+  installs base CLI tooling + every ACP-capable coding agent, and
+  bind-mounts `scripts/` as `/opt/symphony` so the in-VM stdio proxy at
+  `/opt/symphony/vm-agent.mjs` is the same file the host pins.
 - Workflows now declare states under a top-level `states:` block. Each
   state has a `role` (`active`, `terminal`, or `holding`) and optional
   per-state `adapter`, `model`, `max_turns`, and `allowed_transitions`
@@ -64,6 +71,11 @@ hand work off between them via a single MCP call.
 
 ### Removed
 
+- `scripts/build-vm.sh`. The Smolfile (with `smolvm.smolfile` in
+  `WORKFLOW.md`) drives the per-issue VM declaratively; the imperative
+  pre-pack script is no longer needed. To keep the old packed flow,
+  run `smolvm pack create -s ./Smolfile -o ./.vm/symphony.smolmachine`
+  once and set `smolvm.from` in `WORKFLOW.md` instead.
 - `mark_done` MCP tool. Use `transition({ to_state: "<terminal>",
   notes })` instead. The `notes` block becomes the PR description,
   the same way the old `mark_done({ title, summary })` payload did.

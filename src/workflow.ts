@@ -285,6 +285,18 @@ export function buildServiceConfig(
     }
     from = path.isAbsolute(expanded) ? expanded : path.resolve(workflowDir, expanded);
   }
+  const smolfileRaw = asString(smolvmRaw['smolfile']);
+  let smolfile: string | null = null;
+  if (smolfileRaw) {
+    const expanded = expandVar(smolfileRaw);
+    if (expanded === '') {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `smolvm.smolfile references an unset variable: ${smolfileRaw}`,
+      );
+    }
+    smolfile = path.isAbsolute(expanded) ? expanded : path.resolve(workflowDir, expanded);
+  }
   const volumesRaw = smolvmRaw['volumes'];
   const volumes = Array.isArray(volumesRaw)
     ? volumesRaw.flatMap((v) => {
@@ -305,6 +317,7 @@ export function buildServiceConfig(
   const smolvm: SmolvmConfig = {
     image: asString(smolvmRaw['image']),
     from,
+    smolfile,
     cpus: asInt(smolvmRaw['cpus'], 2),
     mem_mib: asInt(smolvmRaw['mem_mib'], 2048),
     net: smolvmRaw['net'] !== false,
@@ -559,6 +572,20 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   if (statesError) return statesError;
   if (!isKnownAdapter(cfg.acp.adapter)) {
     return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex`;
+  }
+  // smolvm artifact source is one of image / from / smolfile. The smolvm CLI itself
+  // would also reject conflicting flags, but failing here gives the operator a clear
+  // pointer at the workflow key instead of a deep CLI error.
+  const sources = [cfg.smolvm.image, cfg.smolvm.from, cfg.smolvm.smolfile].filter(
+    (v): v is string => v !== null,
+  );
+  if (sources.length > 1) {
+    return 'smolvm: set at most one of image / from / smolfile (mutually exclusive)';
+  }
+  // smolfile is the path the runner hands smolvm via `--smolfile`. Verify it exists at
+  // parse time so a typo / wrong cwd fails fast rather than at the first dispatch.
+  if (cfg.smolvm.smolfile && !existsSync(cfg.smolvm.smolfile)) {
+    return `smolvm.smolfile not found: ${cfg.smolvm.smolfile}`;
   }
   // The bridge transport requires the VM to dial the host. Without networking the proxy
   // can never reach `SYMPHONY_ACP_URL`, every attempt fails after connect_timeout_ms,
