@@ -231,11 +231,16 @@ smolvm:
   cpus: 2
   mem_mib: 4096
   net: true
-  # No volume mounts. Workspace is auto-mounted by the runner. Credentials are
-  # staged into the workspace by symphony and copied into ~/.claude by the
-  # auto-derived ACP launch command. The tracker is reached only through the
-  # symphony MCP server.
-  volumes: []
+  # Bind-mount scripts/ at /opt/symphony on every dispatch so the in-VM
+  # stdio proxy at /opt/symphony/vm-agent.mjs is reachable. The Smolfile's
+  # [dev].volumes carries the same mount for direct `smolvm machine create
+  # --smolfile` dev runs, but that directive does NOT persist into a packed
+  # artifact — bind-mounts are runtime-only and the reconciler dispatches
+  # via `--from <pack>`, so the mount has to be re-applied here. Workspace
+  # is auto-mounted by the runner; credentials are staged into the workspace
+  # by symphony; the tracker is reached only through the symphony MCP server.
+  volumes:
+    - { host: ./scripts, guest: /opt/symphony, readonly: true }
   forward_env:
     - OPENAI_API_KEY
     - ANTHROPIC_API_KEY
