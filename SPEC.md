@@ -846,15 +846,25 @@ Part B: Tracker state refresh
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
-### 8.6 Startup Terminal Workspace Cleanup
+### 8.6 Workspace Lifecycle Reconciliation
 
-When the service starts:
+An implementation MUST converge the set of per-issue workspace directories
+under `workspace.root` toward the set of issues currently in non-terminal
+states. The convergence loop:
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
+1. List directory entries under `workspace.root`.
+2. Query the tracker for issues in non-terminal states.
+3. Remove any workspace directory whose sanitized identifier is not in the
+   non-terminal set (after also accounting for any in-flight dispatches whose
+   tracker file may not yet reflect their state).
+4. Optional drift detection: when the implementation tracks an integration
+   ref, a workspace whose HEAD does not contain the current integration tip
+   MAY be re-cloned (i.e. removed and recreated by the next dispatch) iff
+   there are no uncommitted changes and no commits ahead of integration.
+   Otherwise the workspace is left untouched and surfaced as stuck.
 
-This prevents stale terminal workspaces from accumulating after restarts.
+This runs at startup and continuously thereafter, so stale terminal
+workspaces never accumulate even on long-lived processes.
 
 ## 9. Workspace Management and Safety
 
@@ -1154,7 +1164,7 @@ An implementation MUST support these tracker adapter operations:
    - Return issues in configured active states.
 
 2. `fetch_issues_by_states(state_names)`
-   - Used for startup terminal cleanup.
+   - Used for workspace lifecycle reconciliation (§8.6).
 
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
@@ -1582,7 +1592,7 @@ After restart:
 - No retry timers are restored from prior process memory.
 - No running sessions are assumed recoverable.
 - Service recovers by:
-  - startup terminal workspace cleanup
+  - workspace lifecycle reconciliation (§8.6) — removes terminal/orphan dirs
   - fresh polling of active issues
   - re-dispatching eligible work
 

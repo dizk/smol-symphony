@@ -26,7 +26,14 @@ import type { WorkspaceManager, HookCapture, HookResult } from './workspace.js';
 import { withIssue, log } from './logging.js';
 import { openRunLog, type RunLog } from './runlog.js';
 import { defaultMemProbe, computeMemoryAdmission, type MemProbe } from './memory.js';
-import type { Reconciler, ReconcilerSnapshot, IntendedVmProvider } from './reconciler/index.js';
+import type {
+  Reconciler,
+  ReconcilerSnapshot,
+  IntendedVmProvider,
+  WorkspaceIntendedProvider,
+  IntegrationRefProvider,
+} from './reconciler/index.js';
+import { spawn } from 'node:child_process';
 
 export interface Snapshot {
   generated_at: string;
@@ -96,7 +103,7 @@ interface RetrySchedule {
 const CONTINUATION_DELAY_MS = 1_000;
 const FAILURE_BASE_MS = 10_000;
 
-export class Orchestrator implements IntendedVmProvider {
+export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvider, IntegrationRefProvider {
   private running = new Map<string, RunningEntry>();
   private claimed = new Set<string>();
   private retryAttempts = new Map<string, RetryEntry>();
@@ -213,14 +220,16 @@ export class Orchestrator implements IntendedVmProvider {
         throw new WorkflowError('missing_host_credential', (err as Error).message);
       }
     }
-    await this.startupTerminalCleanup();
-    // Initial VM reap (issue 33). The `running` map is empty at this point, so the
-    // intended set is ∅ — every `symphony-*` VM in the daemon registry AND every
-    // `_boot-vm` worker process from a symphony cache dir is treated as orphaned
-    // and torn down. Awaited so the next dispatch can't race a leftover VM that
-    // happens to share the same name. Best-effort: failures are logged inside
-    // the reaper and never abort startup.
+    // Initial workspace + VM reap (issues 33, 34). The `running` map is empty
+    // at this point and the tracker has been read for terminal/active state,
+    // so the reconciler's two janitors converge to "remove anything orphaned
+    // by the previous process." Awaited so the next dispatch can't race a
+    // leftover workspace whose old HEAD doesn't match the current integration
+    // ref, or a leftover VM whose name collides with a fresh allocation.
+    // Best-effort: failures are logged inside each reaper and never abort
+    // startup.
     if (this.reconciler) {
+      await this.reconciler.reapWorkspaces();
       await this.reconciler.reapVms();
     }
     // Trigger an initial reconcile pass before dispatching. The pass returns
@@ -971,26 +980,94 @@ export class Orchestrator implements IntendedVmProvider {
     return out;
   }
 
-  /** §8.6 startup terminal workspace cleanup. */
-  private async startupTerminalCleanup(): Promise<void> {
-    try {
-      const terminals = await this.tracker.fetchIssuesByStates(terminalStateNames(this.cfg.states));
-      for (const issue of terminals) {
-        try {
-          // Each terminal state can declare its own before_remove (e.g. push a PR vs.
-          // write a patch). Resolve per issue.state so the right one fires.
-          const removalHooks = resolveHooksForState(this.cfg, issue.state);
-          await this.workspaces.remove(issue.identifier, removalHooks);
-        } catch (err) {
-          log.warn('terminal cleanup failed for issue', {
-            issue_identifier: issue.identifier,
-            error: (err as Error).message,
-          });
-        }
-      }
-    } catch (err) {
-      log.warn('startup terminal cleanup fetch failed', { error: (err as Error).message });
+  /**
+   * Implements {@link WorkspaceIntendedProvider}. Returns the set of
+   * identifiers whose workspace dirs the reconciler should preserve. Two
+   * sources are unioned:
+   *
+   *   • Tracker view: every issue file in a non-terminal state. Anything
+   *     terminal (Done, Cancelled) is fair game for removal — this replaces
+   *     the old `startupTerminalCleanup` sweep with a continuous pass.
+   *   • In-flight allocations: running entries plus claimed/pending retries.
+   *     The window between dispatch claiming an issue and the tracker
+   *     reflecting it is brief but real; without this, a fresh dispatch's
+   *     workspace could be reaped seconds after creation.
+   *
+   * Mirrors `intendedVmNames()` in shape so the reconciler's race-condition
+   * reasoning is the same across both janitors.
+   */
+  async activeIdentifiers(): Promise<Set<string>> {
+    const out = new Set<string>();
+    const nonTerminal: string[] = [];
+    for (const [name, cfg] of Object.entries(this.cfg.states)) {
+      if (cfg.role !== 'terminal') nonTerminal.push(name);
     }
+    try {
+      const issues = await this.tracker.fetchIssuesByStates(nonTerminal);
+      for (const i of issues) out.add(i.identifier);
+    } catch (err) {
+      log.debug('activeIdentifiers fetch failed', { error: (err as Error).message });
+    }
+    return out;
+  }
+
+  /**
+   * Identifiers the orchestrator has claimed for dispatch but the tracker may
+   * not yet reflect as active. Includes running entries plus pending retry
+   * timers (continuations and failure backoffs both hold their identifier).
+   * Every claimed issue id is also in one of those two maps — the `claimed`
+   * set itself only stores issue ids, not identifiers.
+   */
+  inFlightIdentifiers(): Set<string> {
+    const out = new Set<string>();
+    for (const e of this.running.values()) out.add(e.identifier);
+    for (const r of this.retryAttempts.values()) out.add(r.identifier);
+    return out;
+  }
+
+  /**
+   * Workspace removal callback the reconciler invokes for stale dirs (issue
+   * 34). Defers to `WorkspaceManager.remove`, resolved against the live
+   * workflow-level hooks so a reload that changed `before_remove` takes
+   * effect on subsequent reaper passes. Orphan dirs have no matching issue
+   * file and therefore no per-state hook to resolve — workflow-level is the
+   * only meaningful choice. Failures are logged at warn (the reconciler's
+   * action ledger also records them).
+   */
+  async removeWorkspace(identifier: string): Promise<void> {
+    await this.workspaces.remove(identifier, this.cfg.hooks);
+  }
+
+  /**
+   * Implements {@link IntegrationRefProvider}. Returns the SHA the workspace
+   * resource should compare HEAD against, or null when there's no
+   * integration ref to track. Today this resolves to null whenever the
+   * `integration:` block isn't opted in via `merge_on_states` — the drift
+   * detector then stays dormant and only stale-workspace removal fires.
+   * Stage 4 ([[issue-35]]) will replace this with a real integration_branch
+   * resource that publishes the SHA the rest of the reconciler can read.
+   */
+  async currentIntegrationSha(): Promise<string | null> {
+    if (this.cfg.integration.merge_on_states.length === 0) return null;
+    const branch = this.cfg.integration.branch;
+    const sourceRepo = this.cfg.workflow_dir;
+    return new Promise((resolve) => {
+      const child = spawn('git', ['rev-parse', branch], {
+        cwd: sourceRepo,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+      });
+      let stdout = '';
+      child.stdout?.on('data', (b) => {
+        stdout += b.toString('utf8');
+      });
+      child.on('error', () => resolve(null));
+      child.on('close', (code) => {
+        if (code !== 0) return resolve(null);
+        const sha = stdout.trim();
+        resolve(sha.length > 0 ? sha : null);
+      });
+    });
   }
 
   // Public hooks the runner uses to feed events back.

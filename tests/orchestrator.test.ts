@@ -141,8 +141,8 @@ describe('Orchestrator startup credential check', () => {
 
   it('starts cleanly when credentials for every referenced adapter are present', async () => {
     // Same workflow as above but with both credentials staged. Orchestrator
-    // should reach the post-credential-check `startupTerminalCleanup` path
-    // and resolve without throwing.
+    // should reach the post-credential-check workspace + VM reap path and
+    // resolve without throwing.
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-ok-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-ok-'));
     const prevHome = process.env.HOME;

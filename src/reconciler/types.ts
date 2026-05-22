@@ -8,7 +8,12 @@
 // Action records carry a discriminant `kind`. v1 ships only `bake`; new kinds are added
 // as more resources land in later stages of the reconciler refactor.
 
-export type ReconcilerAction = BakeAction | DestroyMachineAction | KillBootWorkerAction;
+export type ReconcilerAction =
+  | BakeAction
+  | DestroyMachineAction
+  | KillBootWorkerAction
+  | RemoveWorkspaceAction
+  | ReCloneWorkspaceAction;
 
 // Bake the Smolfile-derived `.smolmachine` artifact and write it to the action cache.
 // The `input_hash` (sha256 of the Smolfile body) is the cache key: subsequent dispatches
@@ -37,6 +42,23 @@ export interface KillBootWorkerAction {
   kind: 'kill_boot_worker';
   pid: number;
   vm_name: string;
+}
+
+// Remove a per-issue workspace directory under `workspace.root` whose owning
+// issue is no longer non-terminal (issue 34). Replaces the orchestrator's
+// startup-only terminal cleanup pass with a continuous-converge action.
+export interface RemoveWorkspaceAction {
+  kind: 'remove_workspace';
+  identifier: string;
+}
+
+// Drop a workspace whose HEAD has drifted behind the current integration ref
+// AND has no agent commits / uncommitted changes that a re-clone would lose
+// (issue 34). Implemented as removal — the next dispatch's `ensureFor` re-runs
+// after_create against the fresher integration tip.
+export interface ReCloneWorkspaceAction {
+  kind: 're_clone_workspace';
+  identifier: string;
 }
 
 // State of an individual action attempt. Reported on Snapshot.reconciler so the
