@@ -1,5 +1,9 @@
 # smol-symphony
 
+> **Disclaimer:** this project is written using AI — the orchestrator
+> dispatches AI coding agents at itself, and the bulk of the code in this
+> repository was authored by those agents under human review.
+
 A small TypeScript orchestrator that reads issues off a local Markdown tracker,
 prepares per-issue workspaces, and runs coding agents (Claude Code, Codex,
 OpenCode) inside isolated [smolvm](https://smolmachines.com/) microVMs over the
