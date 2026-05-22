@@ -857,11 +857,13 @@ states. The convergence loop:
 3. Remove any workspace directory whose sanitized identifier is not in the
    non-terminal set (after also accounting for any in-flight dispatches whose
    tracker file may not yet reflect their state).
-4. Optional drift detection: when the implementation tracks an integration
-   ref, a workspace whose HEAD does not contain the current integration tip
-   MAY be re-cloned (i.e. removed and recreated by the next dispatch) iff
-   there are no uncommitted changes and no commits ahead of integration.
-   Otherwise the workspace is left untouched and surfaced as stuck.
+4. Optional drift detection: when the implementation tracks a base ref (the
+   tip of the configured base branch), a workspace whose HEAD does not
+   contain that base tip SHOULD be surfaced in the reconciler snapshot as
+   `stale` (no uncommitted changes, no commits ahead of base — re-clone
+   would be safe but is deferred to operator action) or `stuck` (re-clone
+   would discard agent work). Drift handling is non-destructive: the
+   workspace stays on disk in both cases.
 
 This runs at startup and continuously thereafter, so stale terminal
 workspaces never accumulate even on long-lived processes.

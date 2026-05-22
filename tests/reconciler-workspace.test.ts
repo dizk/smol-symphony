@@ -3,17 +3,17 @@
 //
 //   (a) stale workspace for an issue now in Cancelled → removed.
 //   (b) stale workspace for an issue that no longer has a file at all → removed.
-//   (c) active workspace whose HEAD matches integration → untouched.
-//   (d) active workspace whose HEAD is behind integration AND has no agent
-//       work to lose → re-cloned (i.e. removed; dispatch recreates on next
-//       tick via the existing `WorkspaceManager.ensureFor` path).
-//   (e) active workspace whose HEAD is behind integration BUT carries
-//       uncommitted changes or commits ahead of integration → left alone
-//       and surfaced as `stuck` so the operator can intervene.
+//   (c) active workspace whose HEAD matches base → untouched, no marks.
+//   (d) active workspace whose HEAD is behind base AND has no agent work to
+//       lose → marked `stale` in the snapshot; the workspace stays on disk
+//       (re-clone is operator-triggered in v1).
+//   (e) active workspace whose HEAD is behind base BUT carries uncommitted
+//       changes or commits ahead of base → marked `stuck` in the snapshot;
+//       the workspace stays on disk so the operator can rescue work.
 //
-// In-flight protection (the dispatch-just-starting race that `inFlightIdentifiers`
-// covers) is also pinned: an active identifier missing from the tracker but
-// present in the in-flight set must NOT be reaped.
+// In-flight protection (the dispatch-just-starting race that
+// `inFlightIdentifiers` covers) is also pinned: an active identifier missing
+// from the tracker but present in the in-flight set must NOT be reaped.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,7 +22,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {
   WorkspaceResource,
-  type IntegrationRefProvider,
+  type BaseRefProvider,
   type WorkspaceInspection,
   type WorkspaceIntendedProvider,
 } from '../src/reconciler/workspace.js';
@@ -107,16 +107,15 @@ describe('WorkspaceResource — stale removal', () => {
     }
   });
 
-  it('leaves an active workspace alone when integration ref is unavailable', async () => {
-    // The drift detector is dormant when no integration provider is wired
-    // (current production state — the workflow has no integration block).
-    // Even with no inspector, the active dir must survive.
+  it('leaves an active workspace alone when base ref is unavailable', async () => {
+    // Drift detection is skipped when no base provider is wired or it
+    // returns null. The active dir must survive regardless.
     const root = await makeWorkspaceRoot('alive');
     try {
       const res = new WorkspaceResource({
         workspaceRoot: root,
         intended: intended(['alive']),
-        // No integrationRef, no inspect.
+        // No baseRef, no inspect.
       });
       await res.reconcile();
       assert.equal(await dirExists(path.join(root, 'alive')), true);
@@ -149,25 +148,25 @@ describe('WorkspaceResource — stale removal', () => {
   });
 });
 
-describe('WorkspaceResource — drift detection', () => {
-  function fakeIntegration(sha: string | null): IntegrationRefProvider {
-    return { currentIntegrationSha: async () => sha };
+describe('WorkspaceResource — drift detection (non-destructive)', () => {
+  function fakeBase(sha: string | null): BaseRefProvider {
+    return { currentBaseSha: async () => sha };
   }
 
-  it('leaves an active workspace alone when its HEAD already incorporates the integration tip', async () => {
+  it('leaves an active workspace alone when its HEAD already incorporates the base tip', async () => {
     const root = await makeWorkspaceRoot('up-to-date');
     try {
       const inspect = async (): Promise<WorkspaceInspection> => ({
         head: 'abc123',
         hasUncommitted: false,
-        integrationAncestor: true,
-        commitsAheadOfIntegration: 0,
+        baseAncestor: true,
+        commitsAheadOfBase: 0,
       });
       const removed: string[] = [];
       const res = new WorkspaceResource({
         workspaceRoot: root,
         intended: intended(['up-to-date']),
-        integrationRef: fakeIntegration('deadbeef'),
+        baseRef: fakeBase('deadbeef'),
         inspect,
         remove: async (id) => {
           removed.push(id);
@@ -175,62 +174,68 @@ describe('WorkspaceResource — drift detection', () => {
       });
       await res.reconcile();
       assert.deepEqual(removed, [], 'up-to-date workspace untouched');
+      assert.equal(res.staleOnLastPass(), 0);
       assert.equal(res.stuckOnLastPass(), 0);
+      const snap = res.snapshot();
+      assert.equal(snap.last_error, null);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('re-clones an active workspace when HEAD is behind integration AND nothing would be lost', async () => {
-    // Drift but no uncommitted changes and no agent work ahead of integration
-    // → safe to drop. Removal is implemented as `rm`; the next dispatch's
-    // `ensureFor` rebuilds the dir via the existing after_create hook.
+  it('marks a drifted clean workspace stale WITHOUT removing it (re-clone is opt-in)', async () => {
+    // Drift but no uncommitted changes and no agent work ahead of base.
+    // v1 surfaces this as a `stale` annotation in the snapshot; the dir
+    // stays on disk so an operator (or future opt-in re-clone path) can
+    // decide what to do.
     const root = await makeWorkspaceRoot('drifted');
     try {
-      const removed: Array<{ id: string; reason: string }> = [];
+      const removed: string[] = [];
       const res = new WorkspaceResource({
         workspaceRoot: root,
         intended: intended(['drifted']),
-        integrationRef: fakeIntegration('newer-integration-sha'),
+        baseRef: fakeBase('newer-base-sha'),
         inspect: async () => ({
           head: 'older-sha',
           hasUncommitted: false,
-          integrationAncestor: false,
-          commitsAheadOfIntegration: 0,
+          baseAncestor: false,
+          commitsAheadOfBase: 0,
         }),
-        remove: async (id, reason) => {
-          removed.push({ id, reason });
-          await rm(path.join(root, id), { recursive: true, force: true });
+        remove: async (id) => {
+          removed.push(id);
         },
       });
       await res.reconcile();
-      assert.deepEqual(removed, [{ id: 'drifted', reason: 'drift_reclone' }]);
-      assert.equal(await dirExists(path.join(root, 'drifted')), false);
+      assert.deepEqual(removed, [], 'no removal on drift in v1');
+      assert.equal(await dirExists(path.join(root, 'drifted')), true);
+      assert.equal(res.staleOnLastPass(), 1);
+      assert.equal(res.stuckOnLastPass(), 0);
       const snap = res.snapshot();
-      const action = snap.actions.find((a) => a.action === 're_clone_workspace:drifted');
-      assert.ok(action, 'ledger records re_clone action');
-      assert.equal(action!.state, 'done');
+      assert.match(snap.last_error ?? '', /stale|base advanced/);
+      const markAction = snap.actions.find((a) => a.action === 'mark_stale:drifted');
+      assert.ok(markAction, 'ledger records mark_stale annotation');
+      assert.equal(markAction!.state, 'done');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('marks the workspace stuck (not re-cloned) when agent has uncommitted changes', async () => {
-    // Safety: re-clone would destroy uncommitted edits. Refuse and surface
-    // it via `last_error` so the operator notices on the dashboard. The
-    // workspace stays on disk untouched.
+  it('marks the workspace stuck (not removed) when agent has uncommitted changes', async () => {
+    // Safety: a hypothetical re-clone would destroy uncommitted edits.
+    // Surface the situation via `last_error` so the operator notices on the
+    // dashboard. The workspace stays on disk untouched.
     const root = await makeWorkspaceRoot('dirty');
     try {
       const removed: string[] = [];
       const res = new WorkspaceResource({
         workspaceRoot: root,
         intended: intended(['dirty']),
-        integrationRef: fakeIntegration('newer-sha'),
+        baseRef: fakeBase('newer-sha'),
         inspect: async () => ({
           head: 'older-sha',
           hasUncommitted: true,
-          integrationAncestor: false,
-          commitsAheadOfIntegration: 0,
+          baseAncestor: false,
+          commitsAheadOfBase: 0,
         }),
         remove: async (id) => {
           removed.push(id);
@@ -242,26 +247,28 @@ describe('WorkspaceResource — drift detection', () => {
       assert.equal(res.stuckOnLastPass(), 1);
       const snap = res.snapshot();
       assert.match(snap.last_error ?? '', /uncommitted/);
+      const markAction = snap.actions.find((a) => a.action === 'mark_stuck:dirty');
+      assert.ok(markAction, 'ledger records mark_stuck annotation');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('marks the workspace stuck when agent/<id> has commits ahead of integration', async () => {
-    // Safety: re-clone would discard the agent's work. Same surfacing as the
-    // uncommitted-changes case.
+  it('marks the workspace stuck when agent/<id> has commits ahead of base', async () => {
+    // Safety: a hypothetical re-clone would discard the agent's work. Same
+    // surfacing as the uncommitted-changes case; same non-destructive policy.
     const root = await makeWorkspaceRoot('ahead');
     try {
       const removed: string[] = [];
       const res = new WorkspaceResource({
         workspaceRoot: root,
         intended: intended(['ahead']),
-        integrationRef: fakeIntegration('newer-sha'),
+        baseRef: fakeBase('newer-sha'),
         inspect: async () => ({
           head: 'agent-head-sha',
           hasUncommitted: false,
-          integrationAncestor: false,
-          commitsAheadOfIntegration: 3,
+          baseAncestor: false,
+          commitsAheadOfBase: 3,
         }),
         remove: async (id) => {
           removed.push(id);
@@ -269,6 +276,7 @@ describe('WorkspaceResource — drift detection', () => {
       });
       await res.reconcile();
       assert.deepEqual(removed, [], 'no removal when agent has commits ahead');
+      assert.equal(await dirExists(path.join(root, 'ahead')), true);
       assert.equal(res.stuckOnLastPass(), 1);
       const snap = res.snapshot();
       assert.match(snap.last_error ?? '', /3 commit/);

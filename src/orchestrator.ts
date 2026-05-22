@@ -31,7 +31,7 @@ import type {
   ReconcilerSnapshot,
   IntendedVmProvider,
   WorkspaceIntendedProvider,
-  IntegrationRefProvider,
+  BaseRefProvider,
 } from './reconciler/index.js';
 import { spawn } from 'node:child_process';
 
@@ -103,7 +103,7 @@ interface RetrySchedule {
 const CONTINUATION_DELAY_MS = 1_000;
 const FAILURE_BASE_MS = 10_000;
 
-export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvider, IntegrationRefProvider {
+export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvider, BaseRefProvider {
   private running = new Map<string, RunningEntry>();
   private claimed = new Set<string>();
   private retryAttempts = new Map<string, RetryEntry>();
@@ -1039,18 +1039,30 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
   }
 
   /**
-   * Implements {@link IntegrationRefProvider}. Returns the SHA the workspace
-   * resource should compare HEAD against, or null when there's no
-   * integration ref to track. Today this resolves to null whenever the
-   * `integration:` block isn't opted in via `merge_on_states` — the drift
-   * detector then stays dormant and only stale-workspace removal fires.
-   * Stage 4 ([[issue-35]]) will replace this with a real integration_branch
-   * resource that publishes the SHA the rest of the reconciler can read.
+   * Implements {@link BaseRefProvider}. Returns the current tip of the
+   * configured base branch in the source repo (workflow_dir by default), or
+   * null when the SHA cannot be resolved (no `.git`, base branch missing,
+   * etc.). The workspace resource compares this SHA against each active
+   * workspace's HEAD to detect drift — i.e. "base advanced while this issue
+   * was paused" — and reports `stale` / `stuck` annotations accordingly.
+   *
+   * The base branch is read from `SYMPHONY_BASE_BRANCH` (default `main`), the
+   * same env var the dispatch-time clone uses, so the reconciler's drift
+   * check is comparing against the same ref the workspace was originally
+   * cloned from.
+   *
+   * Returning a SHA does NOT make the janitor destructive — drift handling
+   * is a snapshot annotation only in v1.
    */
-  async currentIntegrationSha(): Promise<string | null> {
-    if (this.cfg.integration.merge_on_states.length === 0) return null;
-    const branch = this.cfg.integration.branch;
-    const sourceRepo = this.cfg.workflow_dir;
+  async currentBaseSha(): Promise<string | null> {
+    const branch =
+      process.env.SYMPHONY_BASE_BRANCH && process.env.SYMPHONY_BASE_BRANCH.length > 0
+        ? process.env.SYMPHONY_BASE_BRANCH
+        : 'main';
+    const sourceRepo =
+      process.env.SYMPHONY_SOURCE_REPO && process.env.SYMPHONY_SOURCE_REPO.length > 0
+        ? process.env.SYMPHONY_SOURCE_REPO
+        : this.cfg.workflow_dir;
     return new Promise((resolve) => {
       const child = spawn('git', ['rev-parse', branch], {
         cwd: sourceRepo,

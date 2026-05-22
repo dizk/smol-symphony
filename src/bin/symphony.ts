@@ -203,7 +203,7 @@ async function main() {
   // updateConfig on reload), so a rotated `workspace.root` or hooks block
   // takes effect without rebuilding the reconciler.
   reconciler.setWorkspaceProviders(orch, {
-    integrationRef: orch,
+    baseRef: orch,
     remove: (identifier) => orch.removeWorkspace(identifier),
   });
 

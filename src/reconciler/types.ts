@@ -12,8 +12,7 @@ export type ReconcilerAction =
   | BakeAction
   | DestroyMachineAction
   | KillBootWorkerAction
-  | RemoveWorkspaceAction
-  | ReCloneWorkspaceAction;
+  | RemoveWorkspaceAction;
 
 // Bake the Smolfile-derived `.smolmachine` artifact and write it to the action cache.
 // The `input_hash` (sha256 of the Smolfile body) is the cache key: subsequent dispatches
@@ -46,18 +45,12 @@ export interface KillBootWorkerAction {
 
 // Remove a per-issue workspace directory under `workspace.root` whose owning
 // issue is no longer non-terminal (issue 34). Replaces the orchestrator's
-// startup-only terminal cleanup pass with a continuous-converge action.
+// startup-only terminal cleanup pass with a continuous-converge action. v1
+// has no destructive drift action; drift is surfaced as a `mark_stale` /
+// `mark_stuck` annotation in the workspace resource's snapshot, and re-clone
+// is operator-triggered (out of scope for this stage).
 export interface RemoveWorkspaceAction {
   kind: 'remove_workspace';
-  identifier: string;
-}
-
-// Drop a workspace whose HEAD has drifted behind the current integration ref
-// AND has no agent commits / uncommitted changes that a re-clone would lose
-// (issue 34). Implemented as removal — the next dispatch's `ensureFor` re-runs
-// after_create against the fresher integration tip.
-export interface ReCloneWorkspaceAction {
-  kind: 're_clone_workspace';
   identifier: string;
 }
 

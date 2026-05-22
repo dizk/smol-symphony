@@ -1,28 +1,26 @@
 // Workspace resource (issue 34 / reconciler stage 3). Owns the lifecycle of
 // per-issue workspace directories under `workspace.root`. Replaces the
 // orchestrator's old `startupTerminalCleanup` sweep with a continuous-converge
-// resource that also catches drift between an active workspace's HEAD and the
-// current integration ref.
+// resource that also surfaces drift between an active workspace's HEAD and the
+// current base branch tip.
 //
 // What this resource owns:
 //   • Removing workspace dirs that no longer correspond to any non-terminal
 //     issue file. The old startup sweep only fired once on boot; here it runs
 //     on every reconcile tick.
-//   • Detecting that an active workspace's HEAD has fallen behind the current
-//     integration ref (e.g. integration advanced while the issue was paused)
-//     and re-cloning if it is safe to do so. "Safe" today means: no
-//     uncommitted changes and no agent/<id> commits ahead of integration.
-//     When unsafe, the workspace is marked `stuck` in the snapshot so the
-//     operator notices instead of the resource silently destroying agent work.
+//   • Reporting drift between an active workspace's HEAD and the current
+//     base-branch tip (e.g. base advanced while the issue was paused). v1 is
+//     non-destructive: drift is surfaced as a `stale` / `stuck` annotation in
+//     the snapshot and the workspace is left on disk. Re-clone (or any other
+//     destructive recovery) is explicitly opt-in via an operator action or
+//     per-issue label and is out of scope for this stage.
 //
 // What stays with WorkspaceManager:
 //   • Per-dispatch allocation. The runner's dispatch path still calls
-//     `WorkspaceManager.ensureFor` which creates the dir and runs after_create
-//     the first time it sees an issue. The reconciler is purely a janitor
-//     here; "re_clone_workspace" is implemented as "remove the dir and let
-//     the next dispatch recreate it." That keeps the after_create hook (which
-//     is workflow-defined and may need staging like SYMPHONY_REPO) on the
-//     dispatch path where the runner already wires its env.
+//     `WorkspaceManager.ensureFor` which creates the dir and runs the canonical
+//     `setupWorkspaceDir` action on first creation. The reconciler is purely a
+//     janitor here for v1; create-workspace runs at dispatch time because it
+//     is tightly coupled to dispatch readiness signaling.
 //
 // Race-condition rule (same shape as VmResource): the intended set comes
 // from a provider the orchestrator implements. It returns both the active
@@ -32,7 +30,7 @@
 // it, a brand-new issue's workspace could be reaped seconds after creation
 // because the reconciler raced ahead of the tracker read.
 
-import { readdir, rm, stat } from 'node:fs/promises';
+import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { sanitizeWorkspaceKey } from '../workspace.js';
@@ -55,15 +53,17 @@ export interface WorkspaceIntendedProvider {
 }
 
 /**
- * Source of the "what HEAD should be" SHA for the drift check. Returns null
- * when there is no integration ref to compare against — in that case the
- * drift detector is dormant and the resource only removes stale workspaces.
- * Stage 4 ([[issue-35]]) will plug in a real integration_branch resource
- * here; until then production returns null when the workflow has no
- * `integration:` block.
+ * Source of the "what HEAD should be" SHA for the drift check — i.e. the
+ * current tip of the configured base branch in the source repo. The
+ * orchestrator implements this against `cfg.workflow_dir` (which in the
+ * canonical layout is the source repo) and `SYMPHONY_BASE_BRANCH` (default
+ * `main`). Returns null when the SHA cannot be resolved (e.g. the source
+ * repo isn't a git repo, or the base branch doesn't exist) — in that case
+ * the drift detector is skipped this pass and only stale-workspace removal
+ * fires.
  */
-export interface IntegrationRefProvider {
-  currentIntegrationSha(): Promise<string | null>;
+export interface BaseRefProvider {
+  currentBaseSha(): Promise<string | null>;
 }
 
 export interface WorkspaceInspection {
@@ -72,36 +72,36 @@ export interface WorkspaceInspection {
   /** True iff `git status --porcelain` is non-empty. */
   hasUncommitted: boolean;
   /**
-   * True iff `integrationSha` is an ancestor of HEAD. When the caller passes
-   * `integrationSha === null`, the inspector returns true here (no drift
-   * check possible). Equivalent to `git merge-base --is-ancestor <sha> HEAD`.
+   * True iff `baseSha` is an ancestor of HEAD. When the caller passes
+   * `baseSha === null`, the inspector returns true here (no drift check
+   * possible). Equivalent to `git merge-base --is-ancestor <sha> HEAD`.
    */
-  integrationAncestor: boolean;
+  baseAncestor: boolean;
   /**
-   * Number of commits reachable from HEAD that are NOT in the integration
-   * history. Only meaningful when `integrationSha` is non-null. Used as the
-   * "would re-clone discard agent work?" safety check.
+   * Number of commits reachable from HEAD that are NOT in the base history.
+   * Only meaningful when `baseSha` is non-null. Used as the "would a re-clone
+   * discard agent work?" safety signal — non-zero means the workspace gets
+   * marked `stuck` instead of `stale`.
    */
-  commitsAheadOfIntegration: number;
+  commitsAheadOfBase: number;
 }
 
 export interface WorkspaceResourceOptions {
   workspaceRoot: string;
   intended: WorkspaceIntendedProvider;
   /**
-   * Optional integration-ref source. When omitted (or it returns null), the
-   * drift detector is dormant and only stale-workspace removal fires. Stage 4
-   * provides a real implementation; stage 3 falls back to a stub that always
-   * returns null when no integration block is declared.
+   * Optional base-branch source. When omitted (or it returns null), the drift
+   * detector is skipped for that pass and only stale-workspace removal fires.
+   * Production wires the orchestrator as the implementation; tests pass a stub.
    */
-  integrationRef?: IntegrationRefProvider;
+  baseRef?: BaseRefProvider;
   /**
-   * Override for filesystem + git inspection (tests pass a stub). Receives
-   * the integration SHA so the implementation can run the comparison in a
-   * single subprocess pass instead of forcing the resource to make two trips
-   * across the boundary.
+   * Override for filesystem + git inspection (tests pass a stub). Receives the
+   * base SHA so the implementation can run the comparison in a single
+   * subprocess pass instead of forcing the resource to make two trips across
+   * the boundary.
    */
-  inspect?: (workspacePath: string, integrationSha: string | null) => Promise<WorkspaceInspection>;
+  inspect?: (workspacePath: string, baseSha: string | null) => Promise<WorkspaceInspection>;
   /**
    * Override for the remove action (tests pass a stub). Receives the
    * sanitized dir name (which is what `WorkspaceManager.workspacePathFor`
@@ -111,56 +111,62 @@ export interface WorkspaceResourceOptions {
   remove?: (identifier: string, reason: RemoveReason) => Promise<void>;
 }
 
-export type RemoveReason = 'stale_issue' | 'drift_reclone';
+/**
+ * Why the janitor is removing a workspace. v1 has exactly one reason — the
+ * owning issue is no longer non-terminal (the old `startupTerminalCleanup`
+ * sweep's job). Drift-driven re-clone is NOT a v1 remove reason; drift is
+ * surfaced as a snapshot annotation only.
+ */
+export type RemoveReason = 'stale_issue';
 
 const MAX_ACTION_HISTORY = 32;
 
 /**
  * Stat-based default inspector. Spawns three git invocations against the
  * workspace path: `rev-parse HEAD`, `status --porcelain`, and (only when
- * `integrationSha` is non-null) `merge-base --is-ancestor` + `rev-list --count`.
+ * `baseSha` is non-null) `merge-base --is-ancestor` + `rev-list --count`.
  * Returns `head: null` for anything that doesn't look like a git repo — the
  * caller treats that as "can't reason about this dir, don't touch it."
  */
 export async function defaultInspectWorkspace(
   workspacePath: string,
-  integrationSha: string | null,
+  baseSha: string | null,
 ): Promise<WorkspaceInspection> {
   const head = await runGitCapture(workspacePath, ['rev-parse', 'HEAD']);
   if (head.exit !== 0 || head.stdout.trim().length === 0) {
     return {
       head: null,
       hasUncommitted: false,
-      integrationAncestor: true,
-      commitsAheadOfIntegration: 0,
+      baseAncestor: true,
+      commitsAheadOfBase: 0,
     };
   }
   const headSha = head.stdout.trim();
   const status = await runGitCapture(workspacePath, ['status', '--porcelain']);
   const hasUncommitted = status.exit === 0 && status.stdout.length > 0;
-  if (integrationSha === null) {
-    return { head: headSha, hasUncommitted, integrationAncestor: true, commitsAheadOfIntegration: 0 };
+  if (baseSha === null) {
+    return { head: headSha, hasUncommitted, baseAncestor: true, commitsAheadOfBase: 0 };
   }
   // is-ancestor exits 0 iff the first arg is an ancestor of the second; 1 otherwise.
   // Any other exit (e.g. unknown SHA) we treat as "ancestor unknown → no drift"
-  // so a transient missing-object error doesn't trigger a destructive re-clone.
+  // so a transient missing-object error doesn't trigger a spurious stale flag.
   const isAncestor = await runGitCapture(workspacePath, [
     'merge-base',
     '--is-ancestor',
-    integrationSha,
+    baseSha,
     headSha,
   ]);
-  let integrationAncestor: boolean;
-  if (isAncestor.exit === 0) integrationAncestor = true;
-  else if (isAncestor.exit === 1) integrationAncestor = false;
-  else integrationAncestor = true;
+  let baseAncestor: boolean;
+  if (isAncestor.exit === 0) baseAncestor = true;
+  else if (isAncestor.exit === 1) baseAncestor = false;
+  else baseAncestor = true;
   const ahead = await runGitCapture(workspacePath, [
     'rev-list',
     '--count',
-    `${integrationSha}..${headSha}`,
+    `${baseSha}..${headSha}`,
   ]);
   const aheadCount = ahead.exit === 0 ? Number(ahead.stdout.trim()) || 0 : 0;
-  return { head: headSha, hasUncommitted, integrationAncestor, commitsAheadOfIntegration: aheadCount };
+  return { head: headSha, hasUncommitted, baseAncestor, commitsAheadOfBase: aheadCount };
 }
 
 interface GitCaptureResult {
@@ -193,6 +199,7 @@ function runGitCapture(cwd: string, args: string[]): Promise<GitCaptureResult> {
  * fires. The two-callback design lets tests skip the hook plumbing entirely.
  */
 async function defaultRemoveWorkspace(workspaceRoot: string, identifier: string): Promise<void> {
+  const { rm } = await import('node:fs/promises');
   const dir = path.join(workspaceRoot, identifier);
   await rm(dir, { recursive: true, force: true });
 }
@@ -200,30 +207,36 @@ async function defaultRemoveWorkspace(workspaceRoot: string, identifier: string)
 /**
  * Workspace resource. Desired = active issue workspaces (set of sanitized
  * identifiers from the tracker plus in-flight allocations). Actual = dirs
- * under `workspace.root`. Diff → two action shapes:
+ * under `workspace.root`. Diff → one destructive action plus two snapshot
+ * annotations:
+ *
  *   • remove_workspace — dir has no matching non-terminal issue.
- *   • re_clone_workspace — dir matches but HEAD has fallen behind integration
- *                          and the workspace has no agent work to lose.
+ *   • mark_stale       — dir matches but HEAD is behind base and the
+ *                        workspace has no uncommitted / ahead work. Non-
+ *                        destructive: re-clone is operator-triggered in v1.
+ *   • mark_stuck       — dir matches but HEAD is behind base AND has
+ *                        uncommitted changes or commits ahead of base. Non-
+ *                        destructive; surfaced so the operator can intervene
+ *                        before any rebuild attempt.
  *
- * Stuck case (drift + uncommitted/ahead) records a `last_error` and is left
- * on disk so the operator can inspect or intervene.
- *
- * Declares `dependsOn: ['integration_branch']` for the stage-4 wiring even
- * though that resource does not exist yet; the reconciler walker tolerates
- * unknown dependencies (they're informational metadata), and the explicit
- * declaration makes the ordering intent visible.
+ * `dependsOn: ['base_ref']` is informational. v1 doesn't ship a base_ref
+ * resource; the BaseRefProvider is a direct dependency call. The metadata is
+ * carried forward for the stage-4 `integration_branch` resource that
+ * [[issue-31]] sketched (now slated for [[issue-36]] follow-up if shared-
+ * integration is ever re-enabled).
  */
 export class WorkspaceResource {
   readonly id = 'workspace';
-  readonly dependsOn: string[] = ['integration_branch'];
+  readonly dependsOn: string[] = [];
 
   private readonly inspect: (
     workspacePath: string,
-    integrationSha: string | null,
+    baseSha: string | null,
   ) => Promise<WorkspaceInspection>;
   private readonly remove: (identifier: string, reason: RemoveReason) => Promise<void>;
   private actions: ActionStatus[] = [];
   private lastError: string | null = null;
+  private staleCount = 0;
   private stuckCount = 0;
 
   constructor(private readonly opts: WorkspaceResourceOptions) {
@@ -267,19 +280,24 @@ export class WorkspaceResource {
     for (const id of active) wanted.add(sanitizeWorkspaceKey(id));
     for (const id of inFlight) wanted.add(sanitizeWorkspaceKey(id));
 
-    let integrationSha: string | null = null;
-    if (this.opts.integrationRef) {
+    let baseSha: string | null = null;
+    if (this.opts.baseRef) {
       try {
-        integrationSha = await this.opts.integrationRef.currentIntegrationSha();
+        baseSha = await this.opts.baseRef.currentBaseSha();
       } catch (err) {
-        log.debug('workspace reconcile: integration ref lookup failed', {
+        log.debug('workspace reconcile: base ref lookup failed', {
           error: (err as Error).message,
         });
-        integrationSha = null;
+        baseSha = null;
       }
     }
 
+    this.staleCount = 0;
     this.stuckCount = 0;
+    // Reset lastError at the start of every pass so a transient stale/stuck
+    // condition that has since resolved doesn't keep haunting the snapshot.
+    // Errors raised during this pass below will repopulate it.
+    this.lastError = null;
     for (const entry of entries) {
       const dirPath = path.join(this.opts.workspaceRoot, entry);
       let st;
@@ -295,11 +313,11 @@ export class WorkspaceResource {
         continue;
       }
 
-      // In the desired set. Check for drift.
-      if (integrationSha === null) continue;
+      // In the desired set. Check for drift (non-destructive).
+      if (baseSha === null) continue;
       let inspection: WorkspaceInspection;
       try {
-        inspection = await this.inspect(dirPath, integrationSha);
+        inspection = await this.inspect(dirPath, baseSha);
       } catch (err) {
         log.debug('workspace reconcile: inspect failed', {
           identifier: entry,
@@ -308,21 +326,31 @@ export class WorkspaceResource {
         continue;
       }
       if (inspection.head === null) continue;
-      if (inspection.integrationAncestor) continue;
-      if (inspection.hasUncommitted || inspection.commitsAheadOfIntegration > 0) {
+      if (inspection.baseAncestor) continue;
+      // Drift detected. v1 never auto-removes for drift; we annotate and move
+      // on so the operator can decide whether to relaunch the workspace.
+      if (inspection.hasUncommitted || inspection.commitsAheadOfBase > 0) {
         this.stuckCount += 1;
         const reason = inspection.hasUncommitted
           ? 'uncommitted changes present'
-          : `${inspection.commitsAheadOfIntegration} commit(s) ahead of integration`;
-        const msg = `workspace ${entry} stale vs integration but refusing re-clone: ${reason}`;
+          : `${inspection.commitsAheadOfBase} commit(s) ahead of base`;
+        const msg = `workspace ${entry} stuck: base advanced and ${reason}`;
         this.lastError = msg;
-        log.warn('workspace reconcile: stuck (drift unsafe to re-clone)', {
+        this.recordMark(entry, 'stuck', reason);
+        log.warn('workspace reconcile: stuck (drift, agent work present)', {
           identifier: entry,
           reason,
         });
         continue;
       }
-      await this.runRemove(entry, 'drift_reclone');
+      this.staleCount += 1;
+      const staleReason = 'base advanced past workspace HEAD; re-clone is opt-in';
+      this.lastError = `workspace ${entry} stale: ${staleReason}`;
+      this.recordMark(entry, 'stale', staleReason);
+      log.info('workspace reconcile: stale (drift, no agent work to lose)', {
+        identifier: entry,
+        reason: staleReason,
+      });
     }
   }
 
@@ -336,16 +364,18 @@ export class WorkspaceResource {
     };
   }
 
-  /** Test helper: number of workspaces left stuck on the last reconcile pass. */
+  /** Test helper: number of workspaces marked stale on the last reconcile pass. */
+  staleOnLastPass(): number {
+    return this.staleCount;
+  }
+
+  /** Test helper: number of workspaces marked stuck on the last reconcile pass. */
   stuckOnLastPass(): number {
     return this.stuckCount;
   }
 
   private async runRemove(identifier: string, reason: RemoveReason): Promise<void> {
-    const actionKey =
-      reason === 'stale_issue'
-        ? `remove_workspace:${identifier}`
-        : `re_clone_workspace:${identifier}`;
+    const actionKey = `remove_workspace:${identifier}`;
     const startedAt = new Date().toISOString();
     this.pushAction({
       resource: this.id,
@@ -365,6 +395,27 @@ export class WorkspaceResource {
       this.markActionError(actionKey, msg);
       log.warn('workspace reconcile: remove failed', { identifier, reason, error: msg });
     }
+  }
+
+  /**
+   * Record a non-destructive drift annotation in the action ledger so the
+   * dashboard can render "stale" / "stuck" badges per workspace without the
+   * janitor touching disk. `mark_stale:<id>` and `mark_stuck:<id>` are the
+   * v1 surfaces; the reason rides on the action's `error` field for parity
+   * with the existing snapshot-error shape, even though it isn't a hard
+   * failure.
+   */
+  private recordMark(identifier: string, status: 'stale' | 'stuck', reason: string): void {
+    const actionKey = `mark_${status}:${identifier}`;
+    const now = new Date().toISOString();
+    this.pushAction({
+      resource: this.id,
+      action: actionKey,
+      state: 'done',
+      started_at: now,
+      finished_at: now,
+      error: reason,
+    });
   }
 
   private pushAction(status: ActionStatus): void {

@@ -23,7 +23,7 @@ import type { ReconcilerSnapshot } from './types.js';
 import { VmResource, type BootWorker, type IntendedVmProvider } from './vm.js';
 import {
   WorkspaceResource,
-  type IntegrationRefProvider,
+  type BaseRefProvider,
   type WorkspaceIntendedProvider,
   type WorkspaceResourceOptions,
 } from './workspace.js';
@@ -54,7 +54,7 @@ export interface ReconcilerOptions {
   // constructed and the reconciler's reconcile() pass skips it. Production
   // wiring passes both at construction or later via `setWorkspaceProviders`.
   workspaceIntendedProvider?: WorkspaceIntendedProvider;
-  workspaceIntegrationRef?: IntegrationRefProvider;
+  workspaceBaseRef?: BaseRefProvider;
   workspaceInspect?: WorkspaceResourceOptions['inspect'];
   workspaceRemove?: WorkspaceResourceOptions['remove'];
 }
@@ -79,7 +79,7 @@ export class Reconciler {
   private workspace: WorkspaceResource | null = null;
   private readonly workspaceInspect?: WorkspaceResourceOptions['inspect'];
   private workspaceRemove?: WorkspaceResourceOptions['remove'];
-  private workspaceIntegrationRef?: IntegrationRefProvider;
+  private workspaceBaseRef?: BaseRefProvider;
   private workspaceIntended: WorkspaceIntendedProvider | null = null;
   private backstopTimer: NodeJS.Timeout | null = null;
   private stopped = false;
@@ -113,7 +113,7 @@ export class Reconciler {
     }
     this.workspaceInspect = opts.workspaceInspect;
     this.workspaceRemove = opts.workspaceRemove;
-    this.workspaceIntegrationRef = opts.workspaceIntegrationRef;
+    this.workspaceBaseRef = opts.workspaceBaseRef;
     if (opts.workspaceIntendedProvider) {
       this.workspaceIntended = opts.workspaceIntendedProvider;
       this.workspace = this.buildWorkspaceResource();
@@ -125,7 +125,7 @@ export class Reconciler {
     return new WorkspaceResource({
       workspaceRoot: this.cfg.workspace.root,
       intended: this.workspaceIntended,
-      integrationRef: this.workspaceIntegrationRef,
+      baseRef: this.workspaceBaseRef,
       inspect: this.workspaceInspect,
       remove: this.workspaceRemove,
     });
@@ -162,7 +162,7 @@ export class Reconciler {
   setWorkspaceProviders(
     intended: WorkspaceIntendedProvider,
     opts: {
-      integrationRef?: IntegrationRefProvider;
+      baseRef?: BaseRefProvider;
       /**
        * Override the remove callback used by the workspace reaper. Production
        * passes a closure over `WorkspaceManager.remove` so the configured
@@ -173,7 +173,7 @@ export class Reconciler {
     } = {},
   ): void {
     this.workspaceIntended = intended;
-    if (opts.integrationRef !== undefined) this.workspaceIntegrationRef = opts.integrationRef;
+    if (opts.baseRef !== undefined) this.workspaceBaseRef = opts.baseRef;
     if (opts.remove !== undefined) this.workspaceRemove = opts.remove;
     this.workspace = this.buildWorkspaceResource();
   }
@@ -374,7 +374,7 @@ export type { ReconcilerSnapshot, ResourceSnapshot, ActionStatus } from './types
 export type { IntendedVmProvider, BootWorker } from './vm.js';
 export type {
   WorkspaceIntendedProvider,
-  IntegrationRefProvider,
+  BaseRefProvider,
   WorkspaceInspection,
   RemoveReason,
 } from './workspace.js';
