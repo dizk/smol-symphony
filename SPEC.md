@@ -914,28 +914,59 @@ Algorithm summary:
 3. Ensure the workspace path exists as a directory.
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
-5. If `created_now=true`, run `after_create` hook if configured.
+5. If `created_now=true`, run the built-in canonical workspace setup (§9.3).
+6. If `created_now=true`, run `after_create` hook if configured (after the canonical setup).
 
-Notes:
+Concurrent callers for the same identifier MUST coalesce so the canonical setup and `after_create`
+hook each run exactly once per workspace creation. This is what allows the workspace lifecycle
+reconciler (§8.6) and a dispatch-path caller to both invoke "ensure workspace exists" against the
+same identifier within a single tick without racing on `git clone --local`.
 
-- This section does not assume any specific repository/VCS workflow.
-- Workspace preparation beyond directory creation (for example dependency bootstrap, checkout/sync,
-  code generation) is implementation-defined and is typically handled via hooks.
+### 9.3 Built-in Workspace Population
 
-### 9.3 OPTIONAL Workspace Population (Implementation-Defined)
+The workspace lifecycle is owned by the orchestrator, not the workflow. On first creation of a
+workspace, an implementation MUST clone the source repository into the workspace path, check out
+the configured base branch, and cut a per-issue branch off the base, before running any optional
+`after_create` hook glue.
 
-The spec does not require any built-in VCS or repository bootstrap behavior.
+The canonical setup performs the following steps in order against the empty workspace directory:
 
-Implementations MAY populate or synchronize the workspace using implementation-defined logic and/or
-hooks (for example `after_create` and/or `before_run`).
+1. Validate the source repository looks like a git repository.
+2. `git clone --local --no-tags --branch <base>` from the source repo into the workspace path.
+   The clone is hardlinked so the workspace's object store is a cheap delta over the source's
+   at clone time.
+3. Strip every remote the clone copied over and unset any inherited `credential.helper`, so
+   any subsequent `git push`/`git fetch` from inside the workspace (including from within a
+   dispatched VM) fails closed by default.
+4. When the implementation is configured for a remote repository (e.g. an `origin` URL is
+   known via env), restore `origin` pointing at the canonical HTTPS URL of that repo. The
+   restore MUST NOT embed credentials; auth is provided host-side (e.g. by `gh auth setup-git`,
+   run best-effort) so that a host-side terminal hook can push without the token ever entering
+   the workspace or any VM derived from it.
+5. Pin commit identity in `--local` git config so commits made by the dispatched agent
+   carry a stable author/committer that never leaks into the operator's global git config.
+6. `git checkout -b <branch>` for the per-issue branch (typically `agent/<id>`) off the
+   base SHA.
+
+The source repository's local `<base>` is the single source of truth for the workspace's base
+ref. Implementations MUST NOT implicitly fetch from a different ref (e.g. `origin/<base>`) and
+reset the workspace base to it: the workspace lifecycle reconciler (§8.6) compares the
+workspace's recorded base SHA against the source's `<base>` SHA, and a divergent source of
+truth here would produce false-positive drift on a freshly created workspace. Operators pick up
+a new base by updating the source repo (`git pull` / `git fetch && git checkout <base>`)
+before the next dispatch.
 
 Failure handling:
 
-- Workspace population/synchronization failures return an error for the current attempt.
-- If failure happens while creating a brand-new workspace, implementations MAY remove the partially
-  prepared directory.
-- Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
-  explicitly chosen and documented.
+- Failure of any canonical setup step is fatal to workspace creation. The partially prepared
+  directory MUST be removed so the next dispatch tick re-enters cleanly.
+- `after_create` hook failure is also fatal (§9.4); the partially prepared directory is removed.
+- Reused workspaces are NOT destructively reset on subsequent dispatches; canonical setup runs
+  only when the directory was created during the current ensure call.
+
+Workflow-level `after_create` hooks remain available for additional repo-local glue (dependency
+bootstrap, code generation, etc.) but MUST NOT be required to perform the canonical
+clone+branch+remote work, which is owned by the implementation.
 
 ### 9.4 Workspace Hooks
 

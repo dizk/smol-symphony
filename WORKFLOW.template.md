@@ -252,16 +252,37 @@ hooks:
   # Default: 60000
   timeout_ms: 120000
 
-  # after_create (string | null): runs right after the workspace directory is
-  # created, before the first dispatch. Use for git clone, dependency install,
-  # etc. Default: null.
+  # after_create (string | null): additional repo-local glue run AFTER the
+  # built-in canonical workspace setup, before the first dispatch. Default: null.
+  #
+  # The orchestrator now performs the canonical clone + branch + remote setup
+  # in TypeScript (`setupWorkspaceDir`) on first creation, BEFORE this hook
+  # runs. The workspace cwd already has:
+  #
+  #   • a hardlinked `git clone --local --no-tags` of the source repo (selected
+  #     via `SYMPHONY_SOURCE_REPO`, default: the directory containing
+  #     WORKFLOW.md) on the base branch (`SYMPHONY_BASE_BRANCH`, default `main`)
+  #   • all network remotes stripped (in-VM `git push`/`git fetch` fail closed)
+  #   • when `SYMPHONY_REPO` is set: `origin` restored to the canonical HTTPS
+  #     URL `https://github.com/<owner>/<repo>.git` so a host-side terminal
+  #     hook can push; `gh auth setup-git` runs best-effort on the host so the
+  #     push has credentials (the token never enters the VM). Without
+  #     `SYMPHONY_REPO` the workspace stays local-only with no remotes
+  #   • `user.name = symphony-agent` / `user.email = agent@symphony.local`
+  #     pinned in `--local` config
+  #   • `agent/<id>` checked out off the base SHA
+  #
+  # Use `after_create` only for additional setup on top of that — dependency
+  # bootstrap, code generation, etc. The canonical clone/branch/remote work
+  # is owned by the orchestrator and SHOULD NOT be re-implemented here. Leave
+  # this block unset if no additional glue is needed.
   after_create: |
     set -eu
-    # ... your setup ...
+    # ... your additional repo-local setup, if any ...
 
   # before_run (string | null): runs before each turn. Default: null. Use for
-  # cheap "make sure the workspace is sane" checks; expensive setup belongs in
-  # after_create.
+  # cheap "make sure the workspace is sane" checks; one-time expensive setup
+  # belongs in after_create (which fires only on first workspace creation).
   before_run: |
     set -eu
     # ... pre-turn checks ...
