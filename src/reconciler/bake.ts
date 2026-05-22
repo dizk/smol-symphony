@@ -46,9 +46,18 @@ export interface BakeExecutor {
 // drives the Smolfile path: `machine create --smolfile` runs the Smolfile's
 // [dev].init at start, `pack create --from-vm` snapshots the populated VM, and the
 // temporary VM is deleted in a finally block so a partial bake doesn't leak.
+//
+// `smolvm pack create -o <X>` produces TWO files: a runnable stub at `<X>` and the
+// actual SMOLPACK assets at `<X>.smolmachine`. `machine create --from` requires the
+// SMOLPACK file, not the stub (which is just an ELF binary). So we strip the
+// trailing `.smolmachine` from `output_path` before passing it as `-o`, then verify
+// the SMOLPACK lands at `output_path`. The stub is unlinked — we don't use it.
 export class SmolvmBakeExecutor implements BakeExecutor {
   async bake(input: BakeInput): Promise<void> {
     const vmName = `symphony-bake-${input.output_path.split(path.sep).pop()!.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40)}`;
+    const stubBase = input.output_path.endsWith('.smolmachine')
+      ? input.output_path.slice(0, -'.smolmachine'.length)
+      : input.output_path;
     try {
       await execFileAsync(
         'smolvm',
@@ -82,7 +91,7 @@ export class SmolvmBakeExecutor implements BakeExecutor {
           '--from-vm',
           vmName,
           '-o',
-          input.output_path,
+          stubBase,
           '--cpus',
           String(input.cpus),
           '--mem',
@@ -90,6 +99,24 @@ export class SmolvmBakeExecutor implements BakeExecutor {
         ],
         { timeout: BAKE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
       );
+      // Verify the SMOLPACK assets file actually exists at the expected path. If
+      // smolvm's output convention ever changes, fail loudly here rather than handing
+      // the runner a stub that smolvm will reject with "invalid magic".
+      try {
+        await stat(input.output_path);
+      } catch (err) {
+        throw new Error(
+          `bake produced no SMOLPACK at ${input.output_path}: ${(err as Error).message}`,
+        );
+      }
+      // Drop the stub side-output (~25 MB ELF, unused by `machine create --from`).
+      if (stubBase !== input.output_path) {
+        try {
+          await unlink(stubBase);
+        } catch {
+          // Best-effort: stub may not exist on a future smolvm that drops it.
+        }
+      }
     } finally {
       try {
         await execFileAsync('smolvm', ['machine', 'delete', vmName, '-f'], {
