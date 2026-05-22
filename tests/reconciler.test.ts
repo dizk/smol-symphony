@@ -8,7 +8,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -389,6 +389,83 @@ describe('Reconciler bake resource', () => {
       const afterMtime = (await stat(baked!)).mtimeMs;
       assert.ok(afterMtime >= beforeMtime, 'artifact was rewritten');
       assert.equal(reconciler.dispatchReady(), true);
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  it('force coalesces with an in-flight non-force pass and still rebakes (no warm-cache dispatch slip)', async () => {
+    // Reviewer scenario: orch.start() kicks an initial reconcile asynchronously, then
+    // the CLI force path calls reconcile({ force: true }) without awaiting it. With
+    // a warm cache, the initial pass would set readyHash=hash and dispatchReady would
+    // flip true between the in-flight pass completing and the rerun firing — which,
+    // pre-fix, was a non-forced rerun and dropped the rebuild on the floor.
+    const env = await makeTmpEnv('image = "alpine:3.20"\n');
+    try {
+      const { createHash } = await import('node:crypto');
+      const body = await readFile(env.smolfilePath);
+      const hash = createHash('sha256').update(body).digest('hex');
+      const cacheDir = actionCacheDir(env.cacheRoot, 'bake');
+      await mkdir(cacheDir, { recursive: true });
+      // Pre-warm so the initial non-force pass would short-circuit to "ready" via the
+      // cache hit. The force path must still rebuild.
+      await writeFile(path.join(cacheDir, `${hash}.smolmachine`), 'pre-existing');
+
+      const cfg = makeCfg(env);
+      const { exec, calls } = makeRecordingExecutor();
+      const reconciler = new Reconciler(cfg, { cacheRoot: env.cacheRoot, bakeExecutor: exec });
+
+      // Mirror the CLI ordering: kick the initial reconcile (no force), then immediately
+      // call force without awaiting the first. The force MUST close the gate before any
+      // event-loop turn can let a dispatch tick observe readyHash from the warm cache.
+      const initial = reconciler.reconcile();
+      const forced = reconciler.reconcile({ force: true });
+      // Synchronous post-condition: gate closed immediately after the force enqueues.
+      // Pre-fix this would have been `true` (the in-flight pass had nothing to mark it
+      // stale, and the rerun wasn't force).
+      assert.equal(reconciler.dispatchReady(), false, 'gate closes synchronously on force');
+      await Promise.all([initial, forced]);
+      await reconciler.awaitInFlight();
+
+      assert.equal(calls.length, 1, 'a fresh bake actually ran despite the coalescing');
+      assert.equal(reconciler.dispatchReady(), true, 'gate reopens after the fresh bake');
+      const action = reconciler.snapshot().resources[0]!.actions[0]!;
+      assert.equal(action.state, 'done');
+      assert.match(action.action, /^bake:[0-9a-f]{64}$/);
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  it('Smolfile read failure clears readiness so dispatch stays gated', async () => {
+    // Reviewer scenario: a previously-successful bake leaves readyHash=desiredHash.
+    // If the Smolfile then becomes unreadable (deleted, perms revoked), the read-error
+    // path must NOT leave the gate open — otherwise dispatch fires against a stale
+    // artifact even though prerequisites no longer converge.
+    const env = await makeTmpEnv('image = "alpine:3.20"\n');
+    try {
+      const cfg = makeCfg(env);
+      const { exec } = makeRecordingExecutor();
+      const reconciler = new Reconciler(cfg, { cacheRoot: env.cacheRoot, bakeExecutor: exec });
+
+      // First, get to a steady-ready state.
+      await reconciler.reconcile();
+      await reconciler.awaitInFlight();
+      assert.equal(reconciler.dispatchReady(), true, 'baseline: ready after a clean bake');
+
+      // Now make the Smolfile unreadable and reconcile.
+      await unlink(env.smolfilePath);
+      await reconciler.reconcile();
+      await reconciler.awaitInFlight();
+
+      assert.equal(reconciler.dispatchReady(), false, 'gate closes when Smolfile is unreadable');
+      assert.equal(reconciler.bakedArtifactPath(), null, 'no artifact path while unreadable');
+      const snap = reconciler.snapshot();
+      assert.equal(snap.resources[0]!.desired_hash, null);
+      assert.match(snap.resources[0]!.last_error!, /read Smolfile failed/);
+      const errAction = snap.resources[0]!.actions[0]!;
+      assert.equal(errAction.state, 'error');
+      assert.equal(errAction.action, 'bake:read-smolfile');
     } finally {
       await env.cleanup();
     }

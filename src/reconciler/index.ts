@@ -101,18 +101,34 @@ export class Reconciler {
   // Trigger a reconcile pass. Idempotent across overlapping callers (single-flight);
   // if a pass is in progress when called, a re-run is scheduled to fire once it
   // completes so the latest config is always observed.
+  //
+  // Force semantics: when called with `{ force: true }`, the bake's sticky
+  // `forcePending` flag is set synchronously via `markStale()` BEFORE any await
+  // can yield to the event loop. That closes the dispatch gate immediately
+  // (`bake.ready()` returns false while forcePending is true) and propagates the
+  // "I want a fresh artifact" intent into both the in-flight pass and any
+  // subsequent rerun via the merge inside `BakeResource.reconcile()`. The flag
+  // is cleared only when a successful `runBake()` lands a fresh artifact, so
+  // there is no path where a coalesced force call gets absorbed into a non-force
+  // rerun and silently drops the rebuild.
   async reconcile(opts: { force?: boolean } = {}): Promise<void> {
     if (this.stopped) return;
+    if (opts.force === true) {
+      // Synchronous. Must run before the first await of this function so that any
+      // dispatch tick or in-flight pass observing the bake's state from this same
+      // microtask sees the gate closed and forcePending set.
+      this.bake.markStale();
+    }
     if (this.inFlight) {
       this.rerunRequested = true;
       await this.inFlight;
       if (this.rerunRequested) {
-        // The most recent call may have set force=true; we can't reliably merge
-        // that flag with an in-flight pass, so a follow-up always runs as a
-        // non-forced pass. A user who wants force semantics on a coalesced call
-        // can simply re-invoke `symphony reconcile --force` once the in-flight
-        // pass finishes.
         this.rerunRequested = false;
+        // The rerun does not need to re-pass force=true: the in-flight pass
+        // either (a) observed forcePending via the bake's internal merge and
+        // already ran force semantics, or (b) restored readyHash on a cache hit
+        // — in which case forcePending is still set, and this rerun's
+        // `bake.reconcile()` will pick it up and run a force pass itself.
         await this.runPass({});
       }
       return;

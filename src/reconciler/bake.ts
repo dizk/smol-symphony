@@ -118,6 +118,17 @@ interface BakeState {
   // Snapshot payloads small.
   actions: ActionStatus[];
   lastError: string | null;
+  // Sticky "operator wants a fresh bake" flag. Set by `markStale()` (called from
+  // `Reconciler.reconcile({ force: true })` synchronously, before any await can
+  // yield to the event loop) and cleared only when a `runBake()` completes
+  // successfully. While set, `ready()` returns false so dispatch stays gated, and
+  // the next `reconcile()` pass treats itself as force regardless of how the
+  // caller invoked it. This is what closes the warm-cache race: a force coming in
+  // during an in-flight non-force pass cannot get "absorbed" into a no-op rerun,
+  // because the in-flight pass either (a) observes forcePending and runs force
+  // semantics itself, or (b) restores readyHash on cache hit while
+  // forcePending=true still keeps the gate closed for the rerun.
+  forcePending: boolean;
 }
 
 const MAX_ACTION_HISTORY = 8;
@@ -143,6 +154,7 @@ export class BakeResource {
     inFlightHash: null,
     actions: [],
     lastError: null,
+    forcePending: false,
   };
 
   constructor(private readonly opts: BakeResourceOptions) {}
@@ -156,11 +168,22 @@ export class BakeResource {
 
   ready(): boolean {
     if (!this.opts.smolvm.smolfile) return true; // no Smolfile → no bake needed
+    if (this.state.forcePending) return false;
     return this.state.readyHash !== null && this.state.readyHash === this.state.desiredHash;
   }
 
   desiredHash(): string | null {
     return this.state.desiredHash;
+  }
+
+  // Synchronous gate-close used by `Reconciler.reconcile({ force: true })`. Sets
+  // `forcePending` so `ready()` returns false until the next successful runBake
+  // clears it, and drops `readyHash` so any concurrent dispatchReady check that
+  // bypasses the forcePending guard (none today, but defensive) also sees the
+  // stale artifact as not-ready.
+  markStale(): void {
+    this.state.forcePending = true;
+    this.state.readyHash = null;
   }
 
   // Run one reconcile pass: re-read the Smolfile, refresh desired/actual, and start
@@ -174,6 +197,7 @@ export class BakeResource {
     if (!this.opts.smolvm.smolfile) {
       this.state.desiredHash = null;
       this.state.readyHash = null;
+      this.state.forcePending = false;
       return;
     }
     let desiredHash: string;
@@ -183,6 +207,23 @@ export class BakeResource {
     } catch (err) {
       const msg = `read Smolfile failed: ${(err as Error).message}`;
       this.state.lastError = msg;
+      // Clear desired/ready so a Smolfile that becomes unreadable after a
+      // successful bake (deletion, permission change) drops the dispatch gate
+      // instead of leaving stale `readyHash === desiredHash` from the prior
+      // pass. Without this, `dispatchReady()` would stay true and the runner
+      // would dispatch against the previous artifact even though the
+      // prerequisite (a readable Smolfile) no longer converges.
+      this.state.desiredHash = null;
+      this.state.readyHash = null;
+      const now = new Date().toISOString();
+      this.pushAction({
+        resource: this.id,
+        action: 'bake:read-smolfile',
+        state: 'error',
+        started_at: now,
+        finished_at: now,
+        error: msg,
+      });
       log.warn('bake reconcile: smolfile read failed', {
         smolfile: this.opts.smolvm.smolfile,
         error: msg,
@@ -191,7 +232,15 @@ export class BakeResource {
     }
     this.state.desiredHash = desiredHash;
 
-    if (opts.force) {
+    // Fold the sticky `forcePending` flag into the per-call force decision. This is
+    // what closes the warm-cache race when force is called during an in-flight
+    // non-force pass: `Reconciler.reconcile({ force: true })` synchronously calls
+    // `markStale()` (sets forcePending=true), then awaits the in-flight pass. When
+    // the in-flight pass's `bake.reconcile` resumes past its first await, it
+    // observes forcePending=true here and runs force semantics (unlink + rebake)
+    // instead of the cache-hit branch.
+    const force = opts.force === true || this.state.forcePending;
+    if (force) {
       try {
         await unlink(this.cachePath(desiredHash));
       } catch {
@@ -200,10 +249,14 @@ export class BakeResource {
       this.state.readyHash = null;
     }
 
-    // Cache hit? Update ready flag and we're done.
+    // Cache hit? Update ready flag and we're done. (Unreachable under force in the
+    // common case because we just unlinked; but a concurrent writer could land an
+    // artifact between the unlink and the stat, in which case we accept it as fresh
+    // and clear forcePending.)
     const cached = await this.cachedArtifactExists(desiredHash);
     if (cached) {
       this.state.readyHash = desiredHash;
+      if (this.state.forcePending) this.state.forcePending = false;
       // Best-effort GC every reconcile pass; cheap when the cache is small.
       await this.gcCache(desiredHash).catch((err) =>
         log.debug('bake gc failed', { error: (err as Error).message }),
@@ -211,7 +264,9 @@ export class BakeResource {
       return;
     }
 
-    // Already baking the right hash? Don't kick off a duplicate.
+    // Already baking the right hash? Don't kick off a duplicate. forcePending will
+    // be cleared when that bake completes (any successful bake against the current
+    // desiredHash is by definition "fresh" enough to satisfy the operator's force).
     if (this.state.inFlight && this.state.inFlightHash === desiredHash) {
       return;
     }
@@ -321,6 +376,10 @@ export class BakeResource {
       this.markActionDone(hash);
       this.state.readyHash = hash;
       this.state.lastError = null;
+      // Any successful bake against the current desiredHash satisfies a pending
+      // force request: a fresh artifact exists on disk. Clear forcePending so
+      // ready() flips true and dispatch can proceed.
+      this.state.forcePending = false;
       log.info('bake ready', { hash, output: outputPath });
       await this.gcCache(hash).catch((err) =>
         log.debug('bake gc failed', { error: (err as Error).message }),

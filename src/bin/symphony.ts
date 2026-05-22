@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 // CLI entry (SPEC §17.7). Usage:
 //   symphony [path-to-WORKFLOW.md] [--port <port>]
+//   symphony reconcile [path-to-WORKFLOW.md] [--force] [--port <port>]
 //
 // Default workflow path is ./WORKFLOW.md.
+//
+// The `reconcile` subcommand boots symphony exactly the same way as the bare
+// form; `--force` additionally invalidates any cached bake artifact for the
+// current Smolfile hash before dispatch so the next bake is guaranteed to
+// rebuild. `--reconcile-force` is kept as a top-level alias for ergonomics.
 
 import path from 'node:path';
 import process from 'node:process';
@@ -26,13 +32,23 @@ interface Cli {
 }
 
 function parseCli(argv: string[]): Cli {
+  // Detect the `reconcile` subcommand. When the first positional is `reconcile`,
+  // the rest of the args are parsed in subcommand mode (so `--force` is
+  // recognized and the issue's documented `symphony reconcile --force` shape
+  // works). Otherwise we parse in the legacy single-command shape.
+  let subcommand: 'reconcile' | null = null;
+  let rest = argv;
+  if (argv[0] === 'reconcile') {
+    subcommand = 'reconcile';
+    rest = argv.slice(1);
+  }
   let workflow: string | null = null;
   let port: number | null = null;
   let reconcileForce = false;
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
     if (a === '--port' || a === '-p') {
-      const v = argv[++i];
+      const v = rest[++i];
       if (!v) {
         process.stderr.write(`error: --port requires a value\n`);
         process.exit(2);
@@ -50,18 +66,20 @@ function parseCli(argv: string[]): Cli {
         process.exit(2);
       }
       port = n;
+    } else if (subcommand === 'reconcile' && a === '--force') {
+      reconcileForce = true;
     } else if (a === '--reconcile-force') {
-      // Drop the cached bake artifact for the current Smolfile hash and rebuild it
-      // at startup. The reconciler still runs its normal pass; force just removes
-      // the on-disk artifact first so `actual()` returns "absent" and a fresh bake
-      // is enqueued.
+      // Top-level alias for `reconcile --force`. Kept so existing invocations and
+      // process-manager unit files don't need rewriting; the new canonical shape is
+      // `symphony reconcile --force [path]`.
       reconcileForce = true;
     } else if (a === '-h' || a === '--help') {
       process.stdout.write(
-        `symphony [path-to-WORKFLOW.md] [--port PORT] [--reconcile-force]\n\n` +
+        `symphony [path-to-WORKFLOW.md] [--port PORT] [--reconcile-force]\n` +
+          `symphony reconcile [path-to-WORKFLOW.md] [--force] [--port PORT]\n\n` +
           `If path is omitted, ./WORKFLOW.md is used.\n` +
-          `--reconcile-force invalidates the cached bake artifact and rebakes\n` +
-          `before dispatching.\n`,
+          `\`reconcile --force\` (or the alias \`--reconcile-force\`) invalidates the\n` +
+          `cached bake artifact and rebakes before dispatching.\n`,
       );
       process.exit(0);
     } else if (!workflow) {
