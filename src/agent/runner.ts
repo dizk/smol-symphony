@@ -17,7 +17,7 @@ import type {
 import type { IssueTracker } from '../trackers/types.js';
 import { WorkspaceManager, sanitizeWorkspaceKey } from '../workspace.js';
 import { renderPrompt } from '../prompt.js';
-import { SmolvmClient } from './smolvm.js';
+import { SmolvmClient, SYMPHONY_VM_PREFIX } from './smolvm.js';
 import { AcpClient } from './acp.js';
 import {
   ADAPTERS,
@@ -254,7 +254,7 @@ export class AgentRunner {
   }
 
   vmNameFor(issue: Issue): string {
-    return `symphony-${sanitizeWorkspaceKey(issue.identifier)}`.toLowerCase();
+    return `${SYMPHONY_VM_PREFIX}${sanitizeWorkspaceKey(issue.identifier)}`.toLowerCase();
   }
 
   async runAttempt(
