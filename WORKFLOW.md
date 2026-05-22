@@ -78,7 +78,17 @@ states:
     # cleaned up after the run unwinds and the commits are discarded with it.
   Triage:
     # Landing directory for `symphony.propose_issue`. Never dispatched; the
-    # operator approves or discards from the dashboard.
+    # operator approves or discards from the dashboard. Must precede `Conflict`
+    # below so propose_issue (which lands in the first holding state) still
+    # targets Triage rather than the integration-conflict bucket.
+    role: holding
+  Conflict:
+    # Issues land here when the orchestrator's post-Done merge into the shared
+    # `integration` branch fails (merge conflict, or push refusal because
+    # integration moved on the remote). The workspace and `agent/<id>` branch
+    # are preserved; the operator (or a future agent) resolves the conflict and
+    # re-routes the issue from the dashboard. See the top-level `integration:`
+    # block below.
     role: holding
 
 tracker:
@@ -87,6 +97,22 @@ tracker:
   # propose_issue writes don't dirty the codebase's git status. Symphony
   # auto-mkdirs every declared state directory under this root on startup.
   root: ~/.symphony/trackers/smol-symphony
+
+# Shared-integration-branch flow (issue 19). All per-issue workspaces clone
+# from `integration` (seeded from the base branch on first run by the
+# after_create hook). On a successful transition into one of the terminal
+# states listed in `merge_on_states`, the orchestrator host-side merges
+# `agent/<id>` into `integration` and pushes — concurrent agents see each
+# other's work without waiting for human PR review against `main`. On merge
+# conflict or push refusal the orchestrator routes the issue to
+# `conflict_state` (a declared holding state), appends a diagnostic notes
+# block, and preserves the workspace + `agent/<id>` branch so an operator can
+# resolve. Cancelled is intentionally absent from `merge_on_states`: an
+# abandoned issue does not contribute work to the shared branch.
+integration:
+  branch: integration
+  conflict_state: Conflict
+  merge_on_states: [Done]
 
 polling:
   interval_ms: 5000
@@ -107,13 +133,20 @@ hooks:
 
   # Clone smol-symphony into the fresh per-issue workspace from a strictly local
   # source (no creds needed). The agent receives a working git repo with full
-  # history on the configured base branch, plus a per-issue branch checked out.
-  # All network remotes are stripped so any `git push`/`git fetch` from inside
-  # the VM fails closed.
+  # history on the shared `integration` branch (seeded from base on first run
+  # by ensuring it exists in the source repo before clone), plus a per-issue
+  # branch checked out from integration. All network remotes are stripped so
+  # any `git push`/`git fetch` from inside the VM fails closed.
+  #
+  # Choosing WHICH branch to clone from (integration vs base) is a workflow
+  # decision; PERFORMING the clone is repo-local glue and lives here. The
+  # orchestrator's post-Done merge owns putting work back onto integration; see
+  # the `integration:` block above.
   after_create: |
     set -eu
     SOURCE_REPO="${SYMPHONY_SOURCE_REPO:-${PWD}/../../..}"
     BASE="${SYMPHONY_BASE_BRANCH:-main}"
+    INTEGRATION="${SYMPHONY_INTEGRATION_BRANCH:-integration}"
     ISSUE_ID="$(basename "$PWD")"
     BRANCH="agent/${ISSUE_ID}"
 
@@ -122,9 +155,18 @@ hooks:
       exit 1
     fi
 
+    # Seed `integration` from base in the SOURCE repo on first run so the clone
+    # below has something to land on. `--quiet` keeps the success path silent;
+    # the existence check is a `show-ref` so we don't accidentally rewind an
+    # existing integration branch with `git branch -f`.
+    if ! git -C "${SOURCE_REPO}" show-ref --verify --quiet "refs/heads/${INTEGRATION}"; then
+      echo "after_create: seeding ${INTEGRATION} from ${BASE} in ${SOURCE_REPO}"
+      git -C "${SOURCE_REPO}" branch "${INTEGRATION}" "${BASE}"
+    fi
+
     # `git clone --local` hardlinks .git/objects when possible; fast and disk-cheap.
-    # `--no-tags` keeps the local refspec minimal; `--branch` lands on the right base.
-    git clone --local --no-tags --branch "${BASE}" "${SOURCE_REPO}" .
+    # `--no-tags` keeps the local refspec minimal; `--branch` lands on integration.
+    git clone --local --no-tags --branch "${INTEGRATION}" "${SOURCE_REPO}" .
 
     # Strip all remotes. The agent will see no network targets at all.
     for remote in $(git remote); do
@@ -135,10 +177,22 @@ hooks:
     # If SYMPHONY_REPO is set, restore an `origin` pointing at the GitHub remote
     # so the after_run hook can push. The URL is the canonical HTTPS form (no
     # token); auth comes from the host's `gh`, which never enters the VM.
+    #
+    # In PR mode the canonical integration ref lives on `origin` — that is
+    # where the orchestrator's post-Done merge pushes — NOT the source-repo
+    # copy we cloned from. So after fetching origin/${INTEGRATION} we reset
+    # the local integration branch to it, ensuring the `agent/<id>` branch we
+    # cut next is based on the live remote tip rather than a possibly-stale
+    # source-repo branch. If origin has no integration ref yet (very first
+    # run after opting into the flow) we fall through and keep the local seed
+    # that the SOURCE_REPO step above produced from base.
     if [ -n "${SYMPHONY_REPO:-}" ]; then
       git remote add origin "https://github.com/${SYMPHONY_REPO}.git"
       gh auth setup-git 2>/dev/null || true
       git fetch --no-tags origin "${BASE}:refs/remotes/origin/${BASE}" || true
+      if git fetch --no-tags origin "${INTEGRATION}:refs/remotes/origin/${INTEGRATION}"; then
+        git checkout -B "${INTEGRATION}" "refs/remotes/origin/${INTEGRATION}"
+      fi
     fi
 
     git config --local user.name  "symphony-agent"
@@ -146,7 +200,7 @@ hooks:
 
     git checkout -b "${BRANCH}"
 
-    echo "workspace ready: base=${BASE} branch=${BRANCH} source=${SOURCE_REPO}"
+    echo "workspace ready: base=${BASE} integration=${INTEGRATION} branch=${BRANCH} source=${SOURCE_REPO}"
 
   # No workflow-level after_run: the handoff (patch + optional PR) lives on
   # the Done state's per-state hook (see `states.Done.hooks.after_run` above).

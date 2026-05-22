@@ -33,6 +33,12 @@ import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
 import { resolveHooksForState } from '../workflow.js';
+import {
+  performIntegrationMerge,
+  resolveIntegrationRemote,
+  routeIntegrationFailureToConflict,
+  shouldMergeForState,
+} from './integration.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { RunLog } from '../runlog.js';
 import type { HookCapture, HookResult } from '../workspace.js';
@@ -568,14 +574,77 @@ export class AgentRunner {
       // runningEntry.issue.state to the new state, so terminal-state hooks (e.g. Done's
       // PR-create hook) fire instead of the initial state's. Falls back to the initial
       // state when no entry is wired or the transition never happened.
-      const cleanupState = runningEntry?.issue.state ?? issue.state;
+      let cleanupState = runningEntry?.issue.state ?? issue.state;
+      // Shared-integration-branch handoff (issue 19). When the agent has just
+      // transitioned into a terminal state that the operator opted in to
+      // `integration.merge_on_states`, attempt a host-side merge of
+      // `agent/<identifier>` into the shared integration branch BEFORE the
+      // terminal state's after_run hook fires. The merge owns the state-machine
+      // call: on success we proceed into the same after_run path the Done hook
+      // expects (push + gh pr create); on conflict / push-refusal we reroute the
+      // issue to the configured holding state (Conflict), append a diagnostic
+      // notes block, preserve the workspace and `agent/<id>` branch, and skip
+      // after_run so no orphan PR opens. The post-reroute cleanupState picks up
+      // the holding state's hooks (typically none), so the after_run path below
+      // becomes a no-op in that branch.
+      let integrationFailed = false;
+      const integrationCfg = this.cfg.integration;
+      if (
+        runningEntry &&
+        runningEntry.transitioned &&
+        integrationCfg.merge_on_states.length > 0 &&
+        shouldMergeForState(cleanupState, integrationCfg.merge_on_states)
+      ) {
+        const remote = resolveIntegrationRemote(workspace.path);
+        runLog?.system('integration_merge_started', {
+          identifier: runningEntry.identifier,
+          integration_branch: integrationCfg.branch,
+          terminal_state: cleanupState,
+          remote: remote.kind,
+        });
+        const result = await performIntegrationMerge({
+          workspacePath: workspace.path,
+          identifier: runningEntry.identifier,
+          integrationBranch: integrationCfg.branch,
+          baseBranch: process.env.SYMPHONY_BASE_BRANCH || 'main',
+          remote,
+          timeoutMs: this.cfg.hooks.timeout_ms,
+          capture: hookCapture('integration_merge'),
+        });
+        if (result.ok) {
+          runLog?.system('integration_merge_succeeded', {
+            integration_branch: result.integrationBranch,
+            remote: result.remote,
+            merged_at: result.merged_at,
+          });
+        } else {
+          runLog?.system('integration_merge_failed', {
+            reason: result.reason,
+            integration_branch: result.integrationBranch,
+            remote: result.remote,
+            diagnostic: result.diagnostic.slice(0, 2000),
+          });
+          await routeIntegrationFailureToConflict(
+            this.tracker,
+            runningEntry,
+            integrationCfg.conflict_state,
+            result,
+          );
+          integrationFailed = true;
+          // The reroute mutates runningEntry.issue.state to the conflict state.
+          // Refresh the local copy so after_run resolution below picks up the
+          // conflict state's hooks (typically none) and so vm_destroy logging
+          // shows the post-reroute state.
+          cleanupState = runningEntry.issue.state;
+        }
+      }
       const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
       // Stage SYMPHONY_* env vars + a temp body file for the hook (collapses the Done
       // after_run from ~80 lines of awk/git plumbing to a few git/gh calls). The runner
       // owns the temp body file's lifecycle; the post-hook cleanup always fires.
       let extraEnv: Record<string, string> | undefined;
       let extraEnvCleanup: (() => Promise<void>) | null = null;
-      if (runningEntry && cleanupHooks.after_run) {
+      if (!integrationFailed && runningEntry && cleanupHooks.after_run) {
         try {
           const staged = await buildAfterRunHookEnv(runningEntry);
           extraEnv = staged.env;
@@ -587,12 +656,14 @@ export class AgentRunner {
         }
       }
       try {
-        await this.workspaces.runAfterRunBestEffort(
-          workspace.path,
-          cleanupHooks,
-          hookCapture('after_run'),
-          extraEnv,
-        );
+        if (!integrationFailed) {
+          await this.workspaces.runAfterRunBestEffort(
+            workspace.path,
+            cleanupHooks,
+            hookCapture('after_run'),
+            extraEnv,
+          );
+        }
       } finally {
         if (extraEnvCleanup) await extraEnvCleanup();
       }

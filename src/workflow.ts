@@ -21,6 +21,7 @@ import type {
   SmolvmConfig,
   ServerConfig,
   McpConfig,
+  IntegrationConfig,
 } from './types.js';
 import { log } from './logging.js';
 import {
@@ -345,6 +346,25 @@ export function buildServiceConfig(
     explicit_host_url: asString(mcpRaw['host_url']),
   };
 
+  // integration (shared-branch flow). Optional block. When merge_on_states is
+  // empty, the orchestrator skips integration handling entirely and behaves as
+  // if no integration block were declared. Operators opt in per terminal state
+  // by listing the state(s) that should fire the merge — typically just Done.
+  // `branch` defaults to "integration", `conflict_state` to "Conflict".
+  // Validation (declared-state references, role checks) lives in
+  // `validateDispatch` so the parser stays decoupled from the live states map.
+  const integrationRaw = getObject(raw, 'integration');
+  const integrationBranch = asString(integrationRaw['branch'])?.trim();
+  const integrationConflictState = asString(integrationRaw['conflict_state'])?.trim();
+  const integration: IntegrationConfig = {
+    branch: integrationBranch && integrationBranch.length > 0 ? integrationBranch : 'integration',
+    conflict_state:
+      integrationConflictState && integrationConflictState.length > 0
+        ? integrationConflictState
+        : 'Conflict',
+    merge_on_states: asStringList(integrationRaw['merge_on_states'], []),
+  };
+
   return {
     workflow_path: workflowAbs,
     workflow_dir: workflowDir,
@@ -358,6 +378,7 @@ export function buildServiceConfig(
     smolvm,
     server,
     mcp,
+    integration,
     states,
   };
 }
@@ -548,6 +569,42 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
       'reach the host listener; set smolvm.net: true (the default) or override the ' +
       'reachability of the bridge via acp.bridge.reach_url.'
     );
+  }
+  if (cfg.integration.merge_on_states.length > 0) {
+    const integrationError = validateIntegration(cfg.integration, cfg.states);
+    if (integrationError) return integrationError;
+  }
+  return null;
+}
+
+// integration.merge_on_states cross-references the declared states map and
+// must hit terminal states; conflict_state must hit a holding state. Off
+// (merge_on_states: []) skips this check entirely so an operator who hasn't
+// opted in isn't gated on a Conflict directory existing.
+function validateIntegration(
+  integration: IntegrationConfig,
+  states: Record<string, StateConfig>,
+): string | null {
+  const byLower = new Map<string, string>();
+  for (const name of Object.keys(states)) byLower.set(name.toLowerCase(), name);
+  for (const target of integration.merge_on_states) {
+    const canonical = byLower.get(target.toLowerCase());
+    if (!canonical) {
+      return `integration.merge_on_states references undeclared state "${target}"`;
+    }
+    if (states[canonical]!.role !== 'terminal') {
+      return `integration.merge_on_states["${target}"] must reference a terminal state (got role: ${states[canonical]!.role})`;
+    }
+  }
+  const conflictCanonical = byLower.get(integration.conflict_state.toLowerCase());
+  if (!conflictCanonical) {
+    return `integration.conflict_state references undeclared state "${integration.conflict_state}"`;
+  }
+  if (states[conflictCanonical]!.role !== 'holding') {
+    return `integration.conflict_state "${integration.conflict_state}" must be a holding state (got role: ${states[conflictCanonical]!.role})`;
+  }
+  if (integration.branch.length === 0) {
+    return 'integration.branch must be a non-empty string';
   }
   return null;
 }

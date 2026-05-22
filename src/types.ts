@@ -205,6 +205,20 @@ export interface McpConfig {
   explicit_host_url: string | null;
 }
 
+// Shared-integration-branch configuration. When `merge_on_states` is non-empty, a
+// successful terminal transition into one of those states triggers a host-side
+// merge of `agent/<id>` into `branch` (followed by a push if a network remote is
+// configured). On conflict or push refusal the orchestrator routes the issue
+// into `conflict_state` (a holding state) and preserves the workspace + branch
+// so an operator or future agent can resolve it. When `merge_on_states` is
+// empty the feature is off and the orchestrator behaves as if no integration
+// block were declared.
+export interface IntegrationConfig {
+  branch: string;
+  conflict_state: string;
+  merge_on_states: string[];
+}
+
 export interface ServiceConfig {
   workflow_path: string;
   workflow_dir: string;
@@ -218,6 +232,7 @@ export interface ServiceConfig {
   smolvm: SmolvmConfig;
   server: ServerConfig;
   mcp: McpConfig;
+  integration: IntegrationConfig;
   // Canonical per-state configuration map. The same map is mirrored onto
   // `tracker.states` so the tracker (which only sees its slice of config)
   // keeps the state set without reaching back into the full ServiceConfig.
