@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { Orchestrator } from '../src/orchestrator.js';
@@ -308,6 +309,139 @@ describe('Orchestrator VM lifecycle reaping', () => {
       else process.env.HOME = prevHome;
       await rm(fakeHome, { recursive: true, force: true });
       await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('createWorkspace resolves per-state hooks for the reconciler-driven path', async () => {
+    // Regression test: the reconciler invokes createWorkspace(identifier, state)
+    // when it eagerly creates a missing workspace. The orchestrator must
+    // resolve hooks against `state` via `resolveHooksForState`, not just pass
+    // the workflow-level block — otherwise a state-level `after_create`
+    // override (e.g. `states.Todo.hooks.after_create`) silently fails to fire
+    // when creation is reconciler-driven. The fix carries enough state through
+    // the intended provider for hook resolution to work.
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-create-hooks-tracker-'));
+    try {
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          hooks: { after_create: 'workflow-level-after-create' },
+          states: {
+            Todo: {
+              role: 'active',
+              adapter: 'claude',
+              hooks: { after_create: 'todo-state-after-create' },
+            },
+            Review: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+          },
+        },
+        trackerRoot,
+      );
+      // Capture every (identifier, hooks) tuple the orchestrator hands to
+      // WorkspaceManager.ensureFor so we can pin which after_create script the
+      // resolver picked. The fake also counts invocations so the test can
+      // assert exactly-once behavior when the lock coalesces two callers.
+      const ensureCalls: Array<{
+        identifier: string;
+        after_create: string | null;
+      }> = [];
+      const fakeWorkspaces = {
+        ensureFor: async (identifier: string, hooks: { after_create: string | null }) => {
+          ensureCalls.push({ identifier, after_create: hooks.after_create });
+          return { path: '/tmp/ignored', workspace_key: identifier, created_now: true };
+        },
+      } as unknown as WorkspaceManager;
+      const { workflowSrc, tracker, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, fakeWorkspaces, runner);
+      // State-level override wins for Todo.
+      await orch.createWorkspace('issue-42', 'Todo');
+      // No state override on Review → workflow-level after_create fires.
+      await orch.createWorkspace('issue-43', 'Review');
+      // Defensive null state → falls back to workflow-level hooks.
+      await orch.createWorkspace('issue-44', null);
+      assert.deepEqual(ensureCalls, [
+        { identifier: 'issue-42', after_create: 'todo-state-after-create' },
+        { identifier: 'issue-43', after_create: 'workflow-level-after-create' },
+        { identifier: 'issue-44', after_create: 'workflow-level-after-create' },
+      ]);
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reconciler-driven create fires a state-level after_create exactly once', async () => {
+    // End-to-end pin on the per-identifier ensureFor lock: when both the
+    // reconciler and a dispatch caller race on the same identifier with the
+    // same per-state hooks, after_create must fire exactly once. Drives the
+    // real WorkspaceManager + setupWorkspaceDir against a real source repo so
+    // the lock + after_create interaction is the live one (not a stub).
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-create-once-tracker-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-create-once-ws-'));
+    const sourceRepo = await mkdtemp(path.join(os.tmpdir(), 'symphony-create-once-src-'));
+    const markerFile = path.join(
+      await mkdtemp(path.join(os.tmpdir(), 'symphony-create-once-marker-')),
+      'count.txt',
+    );
+    // Build a real source repo on main so setupWorkspaceDir can clone it.
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn('sh', ['-lc', [
+        'git init -b main',
+        'git config user.name test',
+        'git config user.email test@example.com',
+        'echo initial > README.md',
+        'git add .',
+        'git commit -m initial',
+      ].join(' && ')], { cwd: sourceRepo, stdio: 'ignore' });
+      child.on('error', reject);
+      child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`git init exit ${code}`))));
+    });
+    try {
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          workspace: { root: wsRoot },
+          acp: { adapter: 'claude' },
+          // Per-state override picks up an `after_create` that appends to a
+          // marker file. If it fires twice the file ends up with 2 lines.
+          states: {
+            Todo: {
+              role: 'active',
+              adapter: 'claude',
+              hooks: { after_create: `echo fired >> ${markerFile}` },
+            },
+            Done: { role: 'terminal' },
+          },
+        },
+        trackerRoot,
+      );
+      const realWorkspaces = new (await import('../src/workspace.js')).WorkspaceManager(cfg);
+      // Force the canonical setup to clone from the test source repo regardless
+      // of cfg.workflow_dir.
+      const prevSource = process.env.SYMPHONY_SOURCE_REPO;
+      process.env.SYMPHONY_SOURCE_REPO = sourceRepo;
+      try {
+        const { workflowSrc, tracker, runner } = makeStubs();
+        const orch = new Orchestrator(cfg, def, workflowSrc, tracker, realWorkspaces, runner);
+        // Two concurrent callers for the same identifier (reconciler eager-create
+        // + dispatch runner). The per-identifier lock must coalesce them and the
+        // per-state after_create must fire exactly once.
+        await Promise.all([
+          orch.createWorkspace('issue-100', 'Todo'),
+          orch.createWorkspace('issue-100', 'Todo'),
+        ]);
+        const { readFile } = await import('node:fs/promises');
+        const body = await readFile(markerFile, 'utf8');
+        const lines = body.split('\n').filter((l) => l.length > 0);
+        assert.equal(lines.length, 1, `after_create fired ${lines.length} times, expected 1`);
+      } finally {
+        if (prevSource === undefined) delete process.env.SYMPHONY_SOURCE_REPO;
+        else process.env.SYMPHONY_SOURCE_REPO = prevSource;
+      }
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+      await rm(sourceRepo, { recursive: true, force: true });
+      await rm(path.dirname(markerFile), { recursive: true, force: true });
     }
   });
 

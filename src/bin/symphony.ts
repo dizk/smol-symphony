@@ -207,11 +207,14 @@ async function main() {
     remove: (identifier) => orch.removeWorkspace(identifier),
     // Create callback for the reconciler's eager-workspace pass (issue 34).
     // Delegates to `WorkspaceManager.ensureFor` via the orchestrator so the
-    // canonical clone+branch+remote setup AND the workflow-level
-    // `after_create` hook fire on reconciler-driven creates the same way
-    // they do on dispatch. The per-identifier ensureFor lock collapses any
-    // race with concurrent dispatch into one setup pass.
-    create: (identifier) => orch.createWorkspace(identifier),
+    // canonical clone+branch+remote setup AND any per-state `after_create`
+    // hook fire on reconciler-driven creates the same way they do on
+    // dispatch. The intended-set provider supplies the issue's current state
+    // alongside the identifier so `resolveHooksForState` picks up a
+    // state-level override (e.g. `states.Todo.hooks.after_create`); the
+    // per-identifier ensureFor lock collapses any race with concurrent
+    // dispatch into one setup pass.
+    create: (identifier, state) => orch.createWorkspace(identifier, state),
   });
 
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved

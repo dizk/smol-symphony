@@ -45,10 +45,23 @@ async function makeWorkspaceRoot(...identifiers: string[]): Promise<string> {
   return root;
 }
 
+// Build a WorkspaceIntendedProvider whose active/in-flight maps share a
+// caller-controlled default state ('Todo'). Tests that need to assert
+// per-state hook resolution use `intendedWithStates` instead.
 function intended(active: string[], inFlight: string[] = []): WorkspaceIntendedProvider {
+  return intendedWithStates(
+    new Map(active.map((id) => [id, 'Todo'])),
+    new Map(inFlight.map((id) => [id, 'Todo'])),
+  );
+}
+
+function intendedWithStates(
+  active: Map<string, string>,
+  inFlight: Map<string, string> = new Map(),
+): WorkspaceIntendedProvider {
   return {
-    activeIdentifiers: async () => new Set(active),
-    inFlightIdentifiers: () => new Set(inFlight),
+    activeIdentifiers: async () => active,
+    inFlightIdentifiers: () => inFlight,
   };
 }
 
@@ -487,6 +500,79 @@ describe('WorkspaceResource — create_workspace', () => {
       await res.reconcile();
       assert.deepEqual(created, ['fresh']);
       assert.equal(await dirExists(path.join(root, 'fresh')), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('passes the issue state to the create callback so per-state hooks can resolve', async () => {
+    // Regression test for the per-state hook resolution path. The orchestrator's
+    // production wiring uses the state to call `resolveHooksForState`; the
+    // resource must forward the value the provider declares so a state-level
+    // `after_create` override fires for reconciler-driven creation the same way
+    // it does for runner-driven creation.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-state-'));
+    try {
+      const received: Array<{ identifier: string; state: string | null }> = [];
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intendedWithStates(
+          new Map([
+            ['active-issue', 'Review'],
+            ['inflight-issue', 'Todo'],
+          ]),
+          // Active set takes precedence over in-flight when both name the
+          // same identifier — pin that with a deliberate disagreement.
+          new Map([
+            ['inflight-issue', 'Todo'],
+            ['active-issue', 'STALE-TARGET'],
+          ]),
+        ),
+        create: async (identifier, state) => {
+          received.push({ identifier, state });
+        },
+      });
+      await res.reconcile();
+      received.sort((a, b) => a.identifier.localeCompare(b.identifier));
+      assert.deepEqual(received, [
+        { identifier: 'active-issue', state: 'Review' },
+        { identifier: 'inflight-issue', state: 'Todo' },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('WorkspaceResource — fail-closed on tracker error', () => {
+  it('leaves existing workspaces untouched when activeIdentifiers throws', async () => {
+    // Regression test: if the tracker read fails (bad YAML, ENOENT on a state
+    // dir, transient FS error), the resource must NOT treat the empty set as
+    // the desired state. The original v0 of the orchestrator's provider
+    // swallowed the error and returned {} — every dir on disk would then be
+    // reaped as stale on the next pass. Surface as last_error and bail.
+    const root = await makeWorkspaceRoot('keepme-1', 'keepme-2');
+    try {
+      const removed: string[] = [];
+      const provider: WorkspaceIntendedProvider = {
+        activeIdentifiers: async () => {
+          throw new Error('tracker scan exploded');
+        },
+        inFlightIdentifiers: () => new Map(),
+      };
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: provider,
+        remove: async (id) => {
+          removed.push(id);
+        },
+      });
+      await res.reconcile();
+      assert.deepEqual(removed, [], 'no workspaces removed when tracker fetch fails');
+      assert.equal(await dirExists(path.join(root, 'keepme-1')), true);
+      assert.equal(await dirExists(path.join(root, 'keepme-2')), true);
+      const snap = res.snapshot();
+      assert.match(snap.last_error ?? '', /active_fetch_failed.*tracker scan exploded/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

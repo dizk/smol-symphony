@@ -981,8 +981,8 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
   }
 
   /**
-   * Implements {@link WorkspaceIntendedProvider}. Returns the set of
-   * identifiers whose workspace dirs the reconciler should preserve. Two
+   * Implements {@link WorkspaceIntendedProvider}. Returns the map of
+   * identifier → state the reconciler should preserve workspaces for. Two
    * sources are unioned:
    *
    *   • Tracker view: every issue file in a non-terminal state. Anything
@@ -993,35 +993,43 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
    *     reflecting it is brief but real; without this, a fresh dispatch's
    *     workspace could be reaped seconds after creation.
    *
+   * The state value is carried so the reconciler's `create` callback can
+   * resolve per-state hook overrides (a state-level `after_create` block
+   * must fire for reconciler-driven eager creation, matching the runner's
+   * resolution at dispatch time).
+   *
+   * Tracker errors propagate. Catching them here would cause an empty set
+   * to be returned, which the reconciler would treat as authoritative and
+   * reap every workspace — the regression this contract closes. The
+   * resource's `reconcile()` catches the throw and leaves on-disk state
+   * untouched until the next pass.
+   *
    * Mirrors `intendedVmNames()` in shape so the reconciler's race-condition
    * reasoning is the same across both janitors.
    */
-  async activeIdentifiers(): Promise<Set<string>> {
-    const out = new Set<string>();
+  async activeIdentifiers(): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
     const nonTerminal: string[] = [];
     for (const [name, cfg] of Object.entries(this.cfg.states)) {
       if (cfg.role !== 'terminal') nonTerminal.push(name);
     }
-    try {
-      const issues = await this.tracker.fetchIssuesByStates(nonTerminal);
-      for (const i of issues) out.add(i.identifier);
-    } catch (err) {
-      log.debug('activeIdentifiers fetch failed', { error: (err as Error).message });
-    }
+    const issues = await this.tracker.fetchIssuesByStates(nonTerminal);
+    for (const i of issues) out.set(i.identifier, i.state);
     return out;
   }
 
   /**
    * Identifiers the orchestrator has claimed for dispatch but the tracker may
-   * not yet reflect as active. Includes running entries plus pending retry
-   * timers (continuations and failure backoffs both hold their identifier).
-   * Every claimed issue id is also in one of those two maps — the `claimed`
-   * set itself only stores issue ids, not identifiers.
+   * not yet reflect as active, with the state used to resolve per-state hooks
+   * for an eager workspace create. Running entries carry the state the
+   * dispatch was claimed from (`issue.state`); pending retries carry their
+   * `target_state` (where the next attempt will run). Both match what the
+   * runner would resolve hooks against if it created the workspace itself.
    */
-  inFlightIdentifiers(): Set<string> {
-    const out = new Set<string>();
-    for (const e of this.running.values()) out.add(e.identifier);
-    for (const r of this.retryAttempts.values()) out.add(r.identifier);
+  inFlightIdentifiers(): Map<string, string> {
+    const out = new Map<string, string>();
+    for (const e of this.running.values()) out.set(e.identifier, e.issue.state);
+    for (const r of this.retryAttempts.values()) out.set(r.identifier, r.target_state);
     return out;
   }
 
@@ -1042,20 +1050,22 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
    * Workspace create callback the reconciler invokes for non-terminal issues
    * whose dirs are not yet on disk (issue 34). Delegates to
    * `WorkspaceManager.ensureFor` so the same canonical clone+branch+remote
-   * setup the dispatch path runs also fires here. Resolved against the live
-   * workflow-level hooks: the reconciler doesn't know which state the
-   * identifier is in (it eagerly creates for any non-terminal issue), so
-   * per-state hook overrides are not consulted — only workflow-level
-   * `after_create` applies. The dispatch path still resolves per-state
-   * hooks at attempt time for `before_run` / `after_run`; only `after_create`
-   * is created-once, and its workflow-level form is the documented base.
+   * setup the dispatch path runs also fires here.
+   *
+   * Hooks are resolved against the issue's current state via
+   * `resolveHooksForState`, so a state-level `after_create` override fires
+   * the same way it would if the runner created the workspace itself. The
+   * intended-set provider supplies the state alongside the identifier; the
+   * `null` fallback is defensive — production callers always pass a state.
    *
    * Race with the runner's dispatch-time `ensureFor` is handled inside
    * `WorkspaceManager` via a per-identifier in-flight promise lock: both
-   * callers coalesce into one setup pass.
+   * callers coalesce into one setup pass, so `after_create` fires exactly
+   * once whether the reconciler or the runner wins the race.
    */
-  async createWorkspace(identifier: string): Promise<void> {
-    await this.workspaces.ensureFor(identifier, this.cfg.hooks);
+  async createWorkspace(identifier: string, state: string | null): Promise<void> {
+    const hooks = state !== null ? resolveHooksForState(this.cfg, state) : this.cfg.hooks;
+    await this.workspaces.ensureFor(identifier, hooks);
   }
 
   /**

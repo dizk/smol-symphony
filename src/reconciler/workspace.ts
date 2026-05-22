@@ -41,14 +41,26 @@ import type { ActionStatus, ResourceSnapshot } from './types.js';
  * reconcile pass so the reaper sees the latest tracker view and the latest
  * in-flight allocations.
  *
+ * Each map is keyed by raw issue identifier and carries the current state
+ * name so the create callback can resolve per-state hook overrides the same
+ * way the dispatch runner does (a state-level `after_create` block must fire
+ * for reconciler-driven eager creation, not just for runner-driven creation).
+ *
  * `activeIdentifiers` is the long-lived desired set (non-terminal issues with
- * a file on disk). `inFlightIdentifiers` covers the window between dispatch
- * claiming an issue and the tracker reflecting it, mirroring VmResource's
- * intended-set rule.
+ * a file on disk). It MUST throw on tracker errors rather than fail open —
+ * the reconciler's reconcile loop catches the throw and leaves existing
+ * workspaces untouched. Swallowing the error and returning the empty set
+ * would cause a transient tracker failure to reap every workspace.
+ *
+ * `inFlightIdentifiers` covers the window between dispatch claiming an issue
+ * and the tracker reflecting it, mirroring VmResource's intended-set rule.
+ * The state value is the dispatched-from state (for running entries) or
+ * target state (for pending retries) — whichever is the resolution context
+ * the runner would use for its own `after_create` resolution.
  */
 export interface WorkspaceIntendedProvider {
-  activeIdentifiers(): Promise<Set<string>>;
-  inFlightIdentifiers(): Set<string>;
+  activeIdentifiers(): Promise<Map<string, string>>;
+  inFlightIdentifiers(): Map<string, string>;
 }
 
 /**
@@ -124,13 +136,17 @@ export interface WorkspaceResourceOptions {
   /**
    * Override for the create action (tests pass a stub). Receives the raw
    * identifier (not the sanitized dir name — `WorkspaceManager.ensureFor`
-   * does its own sanitization). Production defers to
+   * does its own sanitization) plus the issue's current state name so the
+   * orchestrator can resolve per-state hook overrides for `after_create`.
+   * `state` is null only on the defensive path where the provider failed to
+   * supply one (e.g. an in-flight retry whose target state has been pruned);
+   * production callers always pass a string. Production defers to
    * `WorkspaceManager.ensureFor` so the same canonical setup + per-identifier
    * lock that dispatch uses applies here. Omitted ⇒ the resource only reaps,
    * matching the v0 janitor-only behavior for harnesses that don't exercise
    * creation.
    */
-  create?: (identifier: string) => Promise<void>;
+  create?: (identifier: string, state: string | null) => Promise<void>;
 }
 
 /**
@@ -258,7 +274,9 @@ export class WorkspaceResource {
     baseBranch: string,
   ) => Promise<WorkspaceInspection>;
   private readonly remove: (identifier: string, reason: RemoveReason) => Promise<void>;
-  private readonly create: ((identifier: string) => Promise<void>) | null;
+  private readonly create:
+    | ((identifier: string, state: string | null) => Promise<void>)
+    | null;
   private actions: ActionStatus[] = [];
   private lastError: string | null = null;
   private staleCount = 0;
@@ -284,21 +302,36 @@ export class WorkspaceResource {
     // every active identifier — the create path will mkdir the root via
     // `ensureFor`. Pulling this before the readdir collapses the two
     // branches into one flow.
-    const active = await this.opts.intended.activeIdentifiers().catch((err) => {
-      this.lastError = `active_fetch_failed: ${(err as Error).message}`;
-      log.warn('workspace reconcile: active fetch failed', { error: (err as Error).message });
-      return null as Set<string> | null;
-    });
-    if (active === null) return;
+    //
+    // Fail closed when the tracker read throws: we must NOT treat the empty
+    // set as the desired state. Reaping every workspace on a transient
+    // tracker hiccup is the regression this contract closes. Catch here,
+    // surface as last_error, and bail — the next pass retries.
+    let active: Map<string, string>;
+    try {
+      active = await this.opts.intended.activeIdentifiers();
+    } catch (err) {
+      const msg = (err as Error).message;
+      this.lastError = `active_fetch_failed: ${msg}`;
+      log.warn('workspace reconcile: active fetch failed', { error: msg });
+      return;
+    }
     const inFlight = this.opts.intended.inFlightIdentifiers();
-    // Map sanitized key → raw identifier so the create callback gets the
-    // operator-visible identifier (WorkspaceManager.ensureFor re-sanitizes
-    // internally; sanitization is idempotent so a pre-sanitized identifier
-    // is also fine). Sanitize-then-set so the dir-name comparison matches
-    // `workspacePathFor`'s post-sanitize layout.
-    const wanted = new Map<string, string>();
-    for (const id of active) wanted.set(sanitizeWorkspaceKey(id), id);
-    for (const id of inFlight) wanted.set(sanitizeWorkspaceKey(id), id);
+    // Map sanitized key → { identifier, state } so the create callback gets
+    // the operator-visible identifier AND the current state name (used to
+    // resolve per-state `after_create` hook overrides). Sanitize-then-set so
+    // the dir-name comparison matches `workspacePathFor`'s post-sanitize
+    // layout. Active issues take precedence over in-flight in case of
+    // overlap so the tracker's authoritative state wins over an in-flight
+    // entry that may carry a target_state (where the issue is going, not
+    // where it currently lives).
+    const wanted = new Map<string, { identifier: string; state: string | null }>();
+    for (const [id, state] of inFlight) {
+      wanted.set(sanitizeWorkspaceKey(id), { identifier: id, state });
+    }
+    for (const [id, state] of active) {
+      wanted.set(sanitizeWorkspaceKey(id), { identifier: id, state });
+    }
 
     let entries: string[];
     try {
@@ -411,9 +444,9 @@ export class WorkspaceResource {
     // idempotent (per-identifier lock + dir-exists check) so a concurrent
     // dispatch call coalesces into the same setup pass.
     if (this.create !== null) {
-      for (const [key, identifier] of wanted) {
+      for (const [key, { identifier, state }] of wanted) {
         if (present.has(key)) continue;
-        await this.runCreate(identifier, key);
+        await this.runCreate(identifier, key, state);
       }
     }
   }
@@ -443,7 +476,11 @@ export class WorkspaceResource {
     return this.createdCount;
   }
 
-  private async runCreate(identifier: string, sanitizedKey: string): Promise<void> {
+  private async runCreate(
+    identifier: string,
+    sanitizedKey: string,
+    state: string | null,
+  ): Promise<void> {
     if (!this.create) return;
     // Action key uses the sanitized identifier (matches what
     // remove_workspace uses) so dashboards can correlate the two
@@ -459,15 +496,15 @@ export class WorkspaceResource {
       error: null,
     });
     try {
-      await this.create(identifier);
+      await this.create(identifier, state);
       this.createdCount += 1;
       this.markActionDone(actionKey);
-      log.info('workspace reconcile: created', { identifier });
+      log.info('workspace reconcile: created', { identifier, state });
     } catch (err) {
       const msg = (err as Error).message;
       this.lastError = msg;
       this.markActionError(actionKey, msg);
-      log.warn('workspace reconcile: create failed', { identifier, error: msg });
+      log.warn('workspace reconcile: create failed', { identifier, state, error: msg });
     }
   }
 
