@@ -16,16 +16,19 @@ import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
+import { Reconciler } from '../reconciler/index.js';
 import { log } from '../logging.js';
 
 interface Cli {
   workflow: string;
   port: number | null;
+  reconcileForce: boolean;
 }
 
 function parseCli(argv: string[]): Cli {
   let workflow: string | null = null;
   let port: number | null = null;
+  let reconcileForce = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === '--port' || a === '-p') {
@@ -47,10 +50,18 @@ function parseCli(argv: string[]): Cli {
         process.exit(2);
       }
       port = n;
+    } else if (a === '--reconcile-force') {
+      // Drop the cached bake artifact for the current Smolfile hash and rebuild it
+      // at startup. The reconciler still runs its normal pass; force just removes
+      // the on-disk artifact first so `actual()` returns "absent" and a fresh bake
+      // is enqueued.
+      reconcileForce = true;
     } else if (a === '-h' || a === '--help') {
       process.stdout.write(
-        `symphony [path-to-WORKFLOW.md] [--port PORT]\n\n` +
-          `If path is omitted, ./WORKFLOW.md is used.\n`,
+        `symphony [path-to-WORKFLOW.md] [--port PORT] [--reconcile-force]\n\n` +
+          `If path is omitted, ./WORKFLOW.md is used.\n` +
+          `--reconcile-force invalidates the cached bake artifact and rebakes\n` +
+          `before dispatching.\n`,
       );
       process.exit(0);
     } else if (!workflow) {
@@ -60,7 +71,11 @@ function parseCli(argv: string[]): Cli {
       process.exit(2);
     }
   }
-  return { workflow: workflow ?? path.resolve(process.cwd(), 'WORKFLOW.md'), port };
+  return {
+    workflow: workflow ?? path.resolve(process.cwd(), 'WORKFLOW.md'),
+    port,
+    reconcileForce,
+  };
 }
 
 async function main() {
@@ -111,6 +126,11 @@ async function main() {
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
   // bind failure surfaces before we accept any dispatches.
   const acpBridge = new AcpBridge();
+  // Reconciler (issue 32). Owns the bake artifact lifecycle so the Smolfile's
+  // apt + npm install is paid once per Smolfile-content change instead of per
+  // dispatch. The orchestrator gates dispatch on `dispatchReady()` and the runner
+  // reads the resolved baked-artifact path via `setBakedArtifactProvider`.
+  const reconciler = new Reconciler(config);
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
@@ -134,8 +154,19 @@ async function main() {
     },
     mcp,
     acpBridge,
+    reconciler,
   );
-  orch = new Orchestrator(config, definition, src, tracker, workspaces, runner, smolvm);
+  orch = new Orchestrator(
+    config,
+    definition,
+    src,
+    tracker,
+    workspaces,
+    runner,
+    smolvm,
+    undefined,
+    reconciler,
+  );
 
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved
   // tracker.root, changed active/terminal states) is reflected by both the propagation
@@ -146,6 +177,9 @@ async function main() {
     workspaces.updateConfig(cfg);
     runner.updateConfig(cfg, def);
     mcp.updateStates(cfg.states);
+    // The orchestrator's onChange handler already forwards the new config to
+    // the reconciler (so a Smolfile-path change kicks off a new bake); we do
+    // not re-forward here. liveCfg drives the HTTP dashboard's tracker view.
     liveCfg = cfg;
     // Materialize any state directory the reload introduced. Best-effort: a
     // mkdir failure here would normally come from a tracker.root rotation that
@@ -251,6 +285,16 @@ async function main() {
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
     process.exit(1);
+  }
+  if (cli.reconcileForce) {
+    // `--reconcile-force`: drop any cached bake artifact and rebuild before
+    // dispatching. The orchestrator's reconciler gate keeps dispatch off until
+    // the rebuild lands, so callers that pass --force after a dependency change
+    // get a guaranteed fresh artifact on the next dispatch.
+    log.info('reconcile --force requested');
+    void orch.triggerReconcile({ force: true }).catch((err) =>
+      log.warn('reconcile --force failed', { error: (err as Error).message }),
+    );
   }
   log.info('symphony started', {
     workflow: workflowPath,

@@ -51,11 +51,12 @@ Prerequisites:
   every ACP-capable coding agent (`claude-agent-acp`, `codex-acp`, `opencode`),
   and bind-mounts `scripts/` as `/opt/symphony` so the in-VM stdio proxy lives
   at `/opt/symphony/vm-agent.mjs` without a per-VM copy step. `WORKFLOW.md`'s
-  `smolvm.smolfile` points at it; symphony hands the file to
-  `smolvm machine create --smolfile` on every dispatch. To skip the per-VM
-  apt/npm install pay, pre-pack once with
-  `smolvm pack create -s ./Smolfile -o ./.vm/symphony.smolmachine` and switch
-  `smolvm.smolfile` → `smolvm.from` in `WORKFLOW.md`.
+  `smolvm.smolfile` points at it; symphony's reconciler bakes the Smolfile into
+  a cached `.smolmachine` artifact under `~/.cache/symphony/actions/bake/<sha256>`
+  on first run, then hands `--from <cache>` to `smolvm machine create` on every
+  subsequent dispatch — the per-start `[dev].init` (apt + npm install) only runs
+  once per Smolfile-content change. Pass `--reconcile-force` to drop the cached
+  artifact and rebake.
 - For the default `acp.adapter: claude`: a credentials file at
   `~/.claude/.credentials.json` on the host (symphony reads and stages it; the
   host directory is **not** bind-mounted into the VM).
