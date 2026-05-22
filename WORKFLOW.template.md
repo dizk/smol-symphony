@@ -404,7 +404,7 @@ smolvm:
   # `smolfile`. The artifact must contain a Node.js runtime, the ACP adapters
   # you intend to use (claude-agent-acp, codex-acp, etc.), and the symphony
   # in-VM proxy at /opt/symphony/vm-agent.mjs. Default: null.
-  from: ./.vm/your-vm.smolmachine.smolmachine
+  from: null
 
   # image (string | null): container image to pull instead of a packed artifact
   # or Smolfile. Mutually exclusive with `from` and `smolfile`. Default: null.
