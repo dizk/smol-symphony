@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// CLI entry (SPEC §17.7). Usage:
+// CLI entry. Usage:
 //   symphony [path-to-WORKFLOW.md] [--port <port>]
 //   symphony reconcile [path-to-WORKFLOW.md] [--force] [--port <port>]
 //

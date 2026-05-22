@@ -115,7 +115,7 @@ tracker:
 # the host-side merge keys on a non-empty `merge_on_states` list — leaving the
 # block absent fully skips the feature. There is no `hooks.after_create` to
 # rewrite: canonical workspace setup is now TypeScript-owned and runs before
-# any optional `after_create` hook (see SPEC §9.3 and WORKFLOW.template.md).
+# any optional `after_create` hook (see SPEC §5.3 and WORKFLOW.template.md).
 
 polling:
   interval_ms: 5000

@@ -1,4 +1,4 @@
-// Tracker adapter contract (SPEC §11.1).
+// Tracker adapter contract (SPEC §7.1).
 
 import type { Issue } from '../types.js';
 
@@ -17,11 +17,11 @@ export interface CandidateFetchResult {
 }
 
 export interface IssueTracker {
-  /** SPEC §11.1.1: fetch issues whose state is in the configured active set. */
+  /** SPEC §7.1: fetch issues whose state is in the configured active set. */
   fetchCandidateIssues(): Promise<CandidateFetchResult>;
-  /** SPEC §11.1.2: used for startup terminal-workspace cleanup. */
+  /** SPEC §7.1: used for workspace lifecycle reconciliation. */
   fetchIssuesByStates(stateNames: string[]): Promise<Issue[]>;
-  /** SPEC §11.1.3: refresh tracker state for the given issue ids. Missing ids omitted. */
+  /** SPEC §7.1: refresh tracker state for the given issue ids. Missing ids omitted. */
   fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]>;
   /**
    * Optional capability: transition an issue to a new state. Used by the MCP `transition`

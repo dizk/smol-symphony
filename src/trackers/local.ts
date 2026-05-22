@@ -17,7 +17,7 @@
 //   <description body>
 //
 // The state of an issue is taken verbatim from the parent directory name.
-// State comparison is case-insensitive (SPEC §4.2 "Normalized Issue State").
+// State comparison is case-insensitive (SPEC §3.2 "Normalized Issue State").
 
 import { mkdir, open, readdir, readFile, rename, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -141,7 +141,7 @@ export class LocalMarkdownTracker implements IssueTracker {
   }
 
   async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
-    // §17.3: empty input returns empty without an API call.
+    // Empty input returns empty without an API call.
     if (stateNames.length === 0) return [];
     const want = new Set(stateNames.map((s) => s.toLowerCase()));
     const all = await this.scanAll();

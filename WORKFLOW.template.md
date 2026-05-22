@@ -127,7 +127,7 @@ states:
 #
 # In PR mode (SYMPHONY_REPO set), the merge pushes to `origin` (which the
 # built-in workspace setup, `setupWorkspaceDir` in src/workspace.ts, restored
-# as the GitHub remote — see SPEC §9.3). In local-only mode the orchestrator
+# as the GitHub remote — see SPEC §5.3). In local-only mode the orchestrator
 # stages a temp remote pointing at the source repo (SYMPHONY_SOURCE_REPO,
 # default `${PWD}/../../..` of the workspace), pushes integration there, and
 # removes the temp remote — the agent inside the VM never sees this remote.

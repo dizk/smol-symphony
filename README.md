@@ -39,6 +39,10 @@ workspace for review.
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
+`SPEC.md` documents the contracts this repo's code references; for the
+original architectural narrative, see
+[openai/symphony/SPEC.md](https://github.com/openai/symphony/blob/main/SPEC.md).
+
 ## Quick start
 
 Prerequisites:
@@ -271,7 +275,7 @@ via `smolvm.forward_env`), no tracker filesystem access (the tracker is
 reached only through the MCP server), and stripped git remotes (set by
 `after_create`).
 
-Within the ACP session, the orchestrator follows SPEC §10.5's "high-trust"
+Within the ACP session, the orchestrator follows SPEC §6.1's "high-trust"
 posture:
 
 - Command execution and file change approvals: auto-approve.

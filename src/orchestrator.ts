@@ -1,5 +1,5 @@
-// Orchestrator (SPEC §7, §8, §14, §16). Owns the single-authority runtime state and
-// drives the poll-and-dispatch tick, retries, reconciliation, and worker exit handling.
+// Orchestrator. Owns the single-authority runtime state and drives the
+// poll-and-dispatch tick, retries, reconciliation, and worker exit handling.
 
 import type {
   Issue,
@@ -133,7 +133,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
 
   // Optional callback used to propagate reloaded config to components that hold their own
   // tracker/runner/workspace state (so prompt body, hooks, smolvm config, etc., take effect
-  // on the next dispatch — see §6.2).
+  // on the next dispatch).
   private onConfigReloaded?: (cfg: ServiceConfig, workflow: WorkflowDefinition) => void;
 
   // Last clamp-active state observed by availableGlobalSlots. Used to log
@@ -292,7 +292,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     await this.reconciler.reconcile(opts);
   }
 
-  /** Operator trigger for an immediate poll cycle (§13.7 /refresh). */
+  /** Operator trigger for an immediate poll cycle (§9.5 /refresh). */
   triggerRefresh(): { queued: boolean; coalesced: boolean } {
     if (this.refreshRequested) return { queued: true, coalesced: true };
     this.refreshRequested = true;
@@ -365,7 +365,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     this.scheduleTick(this.cfg.polling.interval_ms);
   }
 
-  /** §8.5: stall detection + tracker state refresh for running issues. */
+  /** Stall detection + tracker state refresh for running issues. */
   private async reconcile(): Promise<void> {
     // Part A: stall detection.
     if (this.cfg.acp.stall_timeout_ms > 0) {
@@ -417,7 +417,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     for (const id of ids) {
       const fresh = byId.get(id);
       if (!fresh) {
-        // Missing from tracker — non-active, no cleanup (§8.5 part B "neither" branch).
+        // Missing from tracker — non-active, no cleanup.
         this.terminateRunning(id, false, 'tracker_state_missing');
         continue;
       }
@@ -450,7 +450,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     });
   }
 
-  /** §8.2 candidate eligibility. */
+  /** Candidate eligibility. */
   private isEligible(issue: Issue): boolean {
     return this.eligibilityReason(issue, /*ignoreOwnClaim*/ false) === null;
   }
@@ -565,7 +565,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     };
   }
 
-  /** §8.3: per-state slot accounting using current running entries. */
+  /** Per-state slot accounting using current running entries. */
   private hasPerStateSlot(stateName: string): boolean {
     const cap = this.cfg.agent.max_concurrent_agents_by_state[stateName.toLowerCase()];
     if (!cap) return this.availableGlobalSlots() > 0;
@@ -584,7 +584,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     return inState < cap && this.availableGlobalSlots() > 0;
   }
 
-  /** §8.2 sort: priority ASC (null last), then created_at ASC, then identifier. */
+  /** Sort: priority ASC (null last), then created_at ASC, then identifier. */
   private sortForDispatch(issues: Issue[]): Issue[] {
     return [...issues].sort((a, b) => {
       const pa = a.priority ?? Number.POSITIVE_INFINITY;
@@ -597,7 +597,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     });
   }
 
-  /** §16.4 dispatch_issue */
+  /** Dispatch one issue. */
   private async dispatchIssue(
     issue: Issue,
     attempt: number | null,
@@ -753,7 +753,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     this.onWorkerExit(issue.id, ok, reason, entry);
   }
 
-  /** §16.6 on_worker_exit */
+  /** on_worker_exit */
   private onWorkerExit(issueId: string, normal: boolean, reason: string, entry: RunningEntry): void {
     this.running.delete(issueId);
     // Issue 33: a non-clean exit may have skipped the runner's per-attempt VM
@@ -816,7 +816,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
         });
     }
 
-    // §14.2: if the service was stopped while this worker was unwinding, do not schedule
+    // If the service was stopped while this worker was unwinding, do not schedule
     // a new retry — that would leave a live timer behind even though stop() was called.
     if (this.stopped) {
       this.claimed.delete(issueId);
@@ -859,7 +859,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     }
   }
 
-  /** §8.4 retry queue. */
+  /** Retry queue. */
   private scheduleRetry(issueId: string, sched: RetrySchedule): void {
     if (this.stopped) return;
     const existing = this.retryAttempts.get(issueId);
@@ -879,7 +879,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     this.claimed.add(issueId);
   }
 
-  /** §16.6 on_retry_timer */
+  /** on_retry_timer */
   private async onRetryTimer(issueId: string): Promise<void> {
     if (this.stopped) return;
     const entry = this.retryAttempts.get(issueId);
@@ -1115,7 +1115,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
   reportTokenUsage(issueId: string, usage: { input_tokens: number; output_tokens: number; total_tokens: number }) {
     const e = this.running.get(issueId);
     if (!e) return;
-    // §13.5: prefer absolute totals; track deltas to avoid double-counting.
+    // §9.4: prefer absolute totals; track deltas to avoid double-counting.
     const dIn = Math.max(0, usage.input_tokens - e.last_reported_input_tokens);
     const dOut = Math.max(0, usage.output_tokens - e.last_reported_output_tokens);
     const dTot = Math.max(0, usage.total_tokens - e.last_reported_total_tokens);
@@ -1158,7 +1158,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
     e.turn_count = turnNumber;
   }
 
-  /** §13.3 snapshot. */
+  /** §9.3 snapshot. */
   snapshot(): Snapshot {
     const generatedAt = new Date().toISOString();
     const liveExtraSeconds = [...this.running.values()]

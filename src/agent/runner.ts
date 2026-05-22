@@ -1,4 +1,4 @@
-// Agent Runner (SPEC §10.7): workspace + prompt + ACP session, with continuation turns up
+// Agent Runner (SPEC §6.2): workspace + prompt + ACP session, with continuation turns up
 // to agent.max_turns. The ACP adapter (claude-agent-acp / codex-acp / opencode acp) runs
 // inside a per-issue smolvm machine. The host workspace directory is volume-mounted into
 // the VM at the same absolute path so cwd values are consistent.
