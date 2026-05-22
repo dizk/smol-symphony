@@ -4,6 +4,7 @@
 import type {
   Issue,
   RetryEntry,
+  RetryKind,
   RunningEntry,
   RuntimeEvent,
   ServiceConfig,
@@ -62,6 +63,8 @@ interface RetrySchedule {
   attempt: number;
   delayMs: number;
   error: string | null;
+  kind: RetryKind;
+  target_state: string;
 }
 
 const CONTINUATION_DELAY_MS = 1_000;
@@ -366,7 +369,22 @@ export class Orchestrator {
   }
 
   private availableGlobalSlots(): number {
-    return Math.max(0, this.cfg.agent.max_concurrent_agents - this.running.size);
+    // Pending continuations hold their slot. The continuation is the
+    // post-transition resume of an issue that just normal-exited (e.g.
+    // Todo→Review handoff); without this, a tick firing inside the 1s
+    // continuation window can dispatch a brand-new Todo and steal the slot
+    // the just-transitioned issue is about to reclaim, leaving it requeued
+    // with "no available orchestrator slots" until something else finishes.
+    // Failure-backoff retries do NOT hold slots: the orchestrator is free
+    // to run other work during the exponential-backoff window.
+    let pendingContinuations = 0;
+    for (const r of this.retryAttempts.values()) {
+      if (r.kind === 'continuation') pendingContinuations++;
+    }
+    return Math.max(
+      0,
+      this.cfg.agent.max_concurrent_agents - this.running.size - pendingContinuations,
+    );
   }
 
   /** §8.3: per-state slot accounting using current running entries. */
@@ -376,6 +394,14 @@ export class Orchestrator {
     let inState = 0;
     for (const e of this.running.values()) {
       if (e.issue.state.toLowerCase() === stateName.toLowerCase()) inState++;
+    }
+    // Mirror the global rule for per-state caps: a pending continuation whose
+    // target state matches counts against the state's cap, so the resuming
+    // worker is guaranteed a slot when its timer fires.
+    for (const r of this.retryAttempts.values()) {
+      if (r.kind === 'continuation' && r.target_state.toLowerCase() === stateName.toLowerCase()) {
+        inState++;
+      }
     }
     return inState < cap && this.availableGlobalSlots() > 0;
   }
@@ -611,11 +637,18 @@ export class Orchestrator {
     if (normal) {
       this.completed.add(issueId);
       logger.info('worker exited (normal)', { reason });
+      // entry.issue.state has been updated to the post-transition state by
+      // McpRegistry.performTransition (if the agent transitioned) and is the
+      // state the continuation will dispatch into; if the worker exited
+      // without transitioning, the state is unchanged and the continuation
+      // is a no-op poll that lands back here on the next tick.
       this.scheduleRetry(issueId, {
         identifier,
         attempt: 1,
         delayMs: CONTINUATION_DELAY_MS,
         error: null,
+        kind: 'continuation',
+        target_state: entry.issue.state,
       });
     } else {
       const nextAttempt =
@@ -630,6 +663,8 @@ export class Orchestrator {
         attempt: nextAttempt,
         delayMs,
         error: reason,
+        kind: 'failure',
+        target_state: entry.issue.state,
       });
     }
   }
@@ -648,6 +683,8 @@ export class Orchestrator {
       due_at_ms: dueAt,
       timer_handle: handle,
       error: sched.error,
+      kind: sched.kind,
+      target_state: sched.target_state,
     });
     this.claimed.add(issueId);
   }
@@ -678,6 +715,8 @@ export class Orchestrator {
           this.cfg.agent.max_retry_backoff_ms,
         ),
         error: 'retry poll failed',
+        kind: 'failure',
+        target_state: entry.target_state,
       });
       return;
     }
@@ -697,6 +736,13 @@ export class Orchestrator {
     const reason = this.eligibilityReason(issue, true);
     if (reason !== null) {
       if (reason === 'no per-state slot') {
+        // Reaching this branch means some other claim has the slot we
+        // expected. With the continuation-holds-slot rule above, that
+        // happens only when genuine contention is in play (e.g. max=2
+        // with two unrelated issues running) — never as a side effect of
+        // a tick stealing this issue's own continuation. Re-queue as a
+        // failure-shaped backoff; the orchestrator can dispatch other
+        // work during the wait.
         this.scheduleRetry(issueId, {
           identifier: issue.identifier,
           attempt: entry.attempt + 1,
@@ -705,6 +751,8 @@ export class Orchestrator {
             this.cfg.agent.max_retry_backoff_ms,
           ),
           error: 'no available orchestrator slots',
+          kind: 'failure',
+          target_state: issue.state,
         });
         return;
       }
