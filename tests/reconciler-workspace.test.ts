@@ -323,6 +323,176 @@ describe('WorkspaceResource — drift detection (non-destructive)', () => {
   });
 });
 
+describe('WorkspaceResource — create_workspace', () => {
+  it('calls create for an active identifier with no dir on disk', async () => {
+    // Eager-create path: an issue is in the desired set but its workspace dir
+    // doesn't exist yet. The reconciler must call the create callback. The
+    // stub records the identifier and materializes the dir so the next pass
+    // observes idempotency.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-'));
+    try {
+      const created: string[] = [];
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intended(['new-issue']),
+        create: async (id) => {
+          created.push(id);
+          await mkdir(path.join(root, id), { recursive: true });
+        },
+      });
+      await res.reconcile();
+      assert.deepEqual(created, ['new-issue']);
+      assert.equal(res.createdOnLastPass(), 1);
+      assert.equal(await dirExists(path.join(root, 'new-issue')), true);
+      const snap = res.snapshot();
+      const action = snap.actions.find((a) => a.action === 'create_workspace:new-issue');
+      assert.ok(action, 'ledger records create_workspace');
+      assert.equal(action!.state, 'done');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips create when the workspace dir already exists', async () => {
+    // Idempotent path: the dispatch runner already created the dir; the
+    // reconciler should observe it as `present` and not invoke create.
+    const root = await makeWorkspaceRoot('existing');
+    try {
+      const created: string[] = [];
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intended(['existing']),
+        create: async (id) => {
+          created.push(id);
+        },
+      });
+      await res.reconcile();
+      assert.deepEqual(created, [], 'no create when dir already on disk');
+      assert.equal(res.createdOnLastPass(), 0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the sanitized key for both ledger correlation and present-set lookup', async () => {
+    // Identifier `foo/bar` sanitizes to `foo_bar` on disk. The create
+    // callback receives the RAW identifier (WorkspaceManager.ensureFor will
+    // re-sanitize; sanitization is idempotent), but the action key in the
+    // ledger uses the sanitized form so it correlates with any future
+    // remove_workspace entry for the same dir.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-sanitize-'));
+    try {
+      const created: string[] = [];
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intended(['foo/bar']),
+        create: async (id) => {
+          created.push(id);
+        },
+      });
+      await res.reconcile();
+      assert.deepEqual(created, ['foo/bar'], 'create receives raw identifier');
+      const snap = res.snapshot();
+      const action = snap.actions.find((a) => a.action === 'create_workspace:foo_bar');
+      assert.ok(action, 'action key uses sanitized name');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('eagerly creates a workspace for an in-flight identifier even without a tracker file', async () => {
+    // The in-flight set covers the dispatch-claiming window before the
+    // tracker reflects the issue. A reconciler tick during that window
+    // should also produce a workspace — the runner's own ensureFor will
+    // see the dir present (or coalesce with this one via the per-id lock)
+    // and proceed without a second clone.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-inflight-'));
+    try {
+      const created: string[] = [];
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intended([], ['claimed']),
+        create: async (id) => {
+          created.push(id);
+        },
+      });
+      await res.reconcile();
+      assert.deepEqual(created, ['claimed']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('records errors when create fails', async () => {
+    // A create failure must land in the action ledger AND in last_error so
+    // the dashboard can surface it. The reconciler does NOT throw — other
+    // identifiers in the same pass should still get processed.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-err-'));
+    try {
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intended(['boom']),
+        create: async () => {
+          throw new Error('synthetic create failure');
+        },
+      });
+      await res.reconcile();
+      const snap = res.snapshot();
+      const action = snap.actions.find((a) => a.action === 'create_workspace:boom');
+      assert.ok(action);
+      assert.equal(action!.state, 'error');
+      assert.match(action!.error ?? '', /synthetic create failure/);
+      assert.match(snap.last_error ?? '', /synthetic create failure/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not call create when no create callback is wired', async () => {
+    // Janitor-only mode: harnesses without an intended create provider still
+    // run the reaper; missing-create-callback is a no-op for that side of
+    // the diff. Belt-and-suspenders on the resource's optionality.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-no-create-'));
+    try {
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intended(['missing']),
+        // no create callback
+      });
+      await res.reconcile();
+      assert.equal(res.createdOnLastPass(), 0);
+      assert.equal(await dirExists(path.join(root, 'missing')), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('first run on a missing workspace root still creates dirs for active issues', async () => {
+    // Cold-start scenario: workspace.root does not yet exist. The reconciler
+    // must NOT bail early on the ENOENT readdir — it should treat actual
+    // entries as empty and still drive create_workspace for each active
+    // identifier. The create callback handles the root mkdir (production's
+    // WorkspaceManager.ensureFor does `mkdir(root, {recursive: true})`).
+    const root = path.join(os.tmpdir(), `symphony-ws-cold-${Date.now()}`);
+    try {
+      const created: string[] = [];
+      const res = new WorkspaceResource({
+        workspaceRoot: root,
+        intended: intended(['fresh']),
+        create: async (id) => {
+          created.push(id);
+          await mkdir(path.join(root, id), { recursive: true });
+        },
+      });
+      await res.reconcile();
+      assert.deepEqual(created, ['fresh']);
+      assert.equal(await dirExists(path.join(root, 'fresh')), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('WorkspaceResource — snapshot shape', () => {
   it('reports id, ready, and a per-action ledger', async () => {
     const root = await makeWorkspaceRoot('stale1', 'stale2');
@@ -576,6 +746,59 @@ describe('WorkspaceResource — real git drift detection', () => {
       assert.equal(res.staleOnLastPass(), 0);
       const snap = res.snapshot();
       assert.match(snap.last_error ?? '', /\d+ commit/);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reconciler-driven create produces a workspace whose base matches the source repo', async () => {
+    // End-to-end: a non-terminal issue identifier flows through the
+    // reconciler's create path against a real `setupWorkspaceDir`, and the
+    // resulting workspace base SHA agrees with the source repo's base SHA
+    // (the very invariant the drift check relies on). Pins finding #2 from
+    // the prior review iteration: setup and drift must share a source of
+    // truth.
+    const source = await makeRealSourceRepo();
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-create-e2e-'));
+    try {
+      const res = new WorkspaceResource({
+        workspaceRoot: wsRoot,
+        intended: intended(['new-issue']),
+        baseRef: {
+          currentBaseRef: async () => ({
+            branch: 'main',
+            sha: await runShell('git', ['rev-parse', 'main'], source),
+          }),
+        },
+        create: async (identifier) => {
+          const wsPath = path.join(wsRoot, identifier);
+          await mkdir(wsPath, { recursive: true });
+          await setupWorkspaceDir({
+            workspacePath: wsPath,
+            sourceRepo: source,
+            baseBranch: 'main',
+            branch: `agent/${identifier}`,
+            originRepo: null,
+            gitIdentity: { name: 'symphony-agent', email: 'agent@symphony.local' },
+          });
+        },
+      });
+      await res.reconcile();
+
+      const wsPath = path.join(wsRoot, 'new-issue');
+      assert.equal(await dirExists(wsPath), true);
+      const wsBase = await runShell('git', ['rev-parse', 'main'], wsPath);
+      const srcBase = await runShell('git', ['rev-parse', 'main'], source);
+      assert.equal(wsBase, srcBase, 'workspace base SHA matches source repo');
+      const head = await runShell('git', ['symbolic-ref', '--short', 'HEAD'], wsPath);
+      assert.equal(head, 'agent/new-issue', 'agent branch checked out');
+
+      // Second pass with no source-side advance: no drift, no double-create.
+      await res.reconcile();
+      assert.equal(res.staleOnLastPass(), 0);
+      assert.equal(res.stuckOnLastPass(), 0);
+      assert.equal(res.createdOnLastPass(), 0, 'idempotent on second pass');
     } finally {
       await rm(source, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });

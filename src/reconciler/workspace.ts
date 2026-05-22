@@ -8,19 +8,18 @@
 //   • Removing workspace dirs that no longer correspond to any non-terminal
 //     issue file. The old startup sweep only fired once on boot; here it runs
 //     on every reconcile tick.
+//   • Creating workspace dirs for non-terminal issues that don't yet have one
+//     on disk. The action body (clone source repo, cut `agent/<id>`, optional
+//     origin restore, after_create hook) is delegated to
+//     `WorkspaceManager.ensureFor` so dispatch-time and reconciler-driven
+//     eager creation share a single code path. Idempotency / race safety is
+//     enforced inside `ensureFor` via a per-identifier in-flight promise lock.
 //   • Reporting drift between an active workspace's HEAD and the current
 //     base-branch tip (e.g. base advanced while the issue was paused). v1 is
 //     non-destructive: drift is surfaced as a `stale` / `stuck` annotation in
 //     the snapshot and the workspace is left on disk. Re-clone (or any other
 //     destructive recovery) is explicitly opt-in via an operator action or
 //     per-issue label and is out of scope for this stage.
-//
-// What stays with WorkspaceManager:
-//   • Per-dispatch allocation. The runner's dispatch path still calls
-//     `WorkspaceManager.ensureFor` which creates the dir and runs the canonical
-//     `setupWorkspaceDir` action on first creation. The reconciler is purely a
-//     janitor here for v1; create-workspace runs at dispatch time because it
-//     is tightly coupled to dispatch readiness signaling.
 //
 // Race-condition rule (same shape as VmResource): the intended set comes
 // from a provider the orchestrator implements. It returns both the active
@@ -122,6 +121,16 @@ export interface WorkspaceResourceOptions {
    * defers to `WorkspaceManager.remove` so before_remove fires.
    */
   remove?: (identifier: string, reason: RemoveReason) => Promise<void>;
+  /**
+   * Override for the create action (tests pass a stub). Receives the raw
+   * identifier (not the sanitized dir name — `WorkspaceManager.ensureFor`
+   * does its own sanitization). Production defers to
+   * `WorkspaceManager.ensureFor` so the same canonical setup + per-identifier
+   * lock that dispatch uses applies here. Omitted ⇒ the resource only reaps,
+   * matching the v0 janitor-only behavior for harnesses that don't exercise
+   * creation.
+   */
+  create?: (identifier: string) => Promise<void>;
 }
 
 /**
@@ -218,9 +227,13 @@ async function defaultRemoveWorkspace(workspaceRoot: string, identifier: string)
 /**
  * Workspace resource. Desired = active issue workspaces (set of sanitized
  * identifiers from the tracker plus in-flight allocations). Actual = dirs
- * under `workspace.root`. Diff → one destructive action plus two snapshot
- * annotations:
+ * under `workspace.root`. Diff drives two converging actions plus two
+ * snapshot annotations:
  *
+ *   • create_workspace — identifier in the desired set with no matching dir
+ *                        on disk. Delegates to `WorkspaceManager.ensureFor`,
+ *                        which runs the canonical clone+branch+remote setup
+ *                        and the optional `after_create` hook.
  *   • remove_workspace — dir has no matching non-terminal issue.
  *   • mark_stale       — dir matches but HEAD is behind base and the
  *                        workspace has no uncommitted / ahead work. Non-
@@ -245,16 +258,19 @@ export class WorkspaceResource {
     baseBranch: string,
   ) => Promise<WorkspaceInspection>;
   private readonly remove: (identifier: string, reason: RemoveReason) => Promise<void>;
+  private readonly create: ((identifier: string) => Promise<void>) | null;
   private actions: ActionStatus[] = [];
   private lastError: string | null = null;
   private staleCount = 0;
   private stuckCount = 0;
+  private createdCount = 0;
 
   constructor(private readonly opts: WorkspaceResourceOptions) {
     this.inspect = opts.inspect ?? defaultInspectWorkspace;
     this.remove =
       opts.remove ??
       ((identifier) => defaultRemoveWorkspace(this.opts.workspaceRoot, identifier));
+    this.create = opts.create ?? null;
   }
 
   ready(): boolean {
@@ -263,23 +279,11 @@ export class WorkspaceResource {
   }
 
   async reconcile(): Promise<void> {
-    let entries: string[];
-    try {
-      entries = await readdir(this.opts.workspaceRoot);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') return;
-      this.lastError = `workspace_root_read_failed: ${(err as Error).message}`;
-      log.warn('workspace reconcile: readdir failed', {
-        workspace_root: this.opts.workspaceRoot,
-        error: (err as Error).message,
-      });
-      return;
-    }
-
-    // Sanitize-then-set so dir-name comparisons match `workspacePathFor`'s
-    // post-sanitize layout. `sanitizeWorkspaceKey` is idempotent, so passing
-    // dir names back into WorkspaceManager.remove(...) re-sanitizes safely.
+    // Read the desired set up front. Even if `readdir` returns ENOENT
+    // (workspace.root not yet created), we still want to create dirs for
+    // every active identifier — the create path will mkdir the root via
+    // `ensureFor`. Pulling this before the readdir collapses the two
+    // branches into one flow.
     const active = await this.opts.intended.activeIdentifiers().catch((err) => {
       this.lastError = `active_fetch_failed: ${(err as Error).message}`;
       log.warn('workspace reconcile: active fetch failed', { error: (err as Error).message });
@@ -287,9 +291,31 @@ export class WorkspaceResource {
     });
     if (active === null) return;
     const inFlight = this.opts.intended.inFlightIdentifiers();
-    const wanted = new Set<string>();
-    for (const id of active) wanted.add(sanitizeWorkspaceKey(id));
-    for (const id of inFlight) wanted.add(sanitizeWorkspaceKey(id));
+    // Map sanitized key → raw identifier so the create callback gets the
+    // operator-visible identifier (WorkspaceManager.ensureFor re-sanitizes
+    // internally; sanitization is idempotent so a pre-sanitized identifier
+    // is also fine). Sanitize-then-set so the dir-name comparison matches
+    // `workspacePathFor`'s post-sanitize layout.
+    const wanted = new Map<string, string>();
+    for (const id of active) wanted.set(sanitizeWorkspaceKey(id), id);
+    for (const id of inFlight) wanted.set(sanitizeWorkspaceKey(id), id);
+
+    let entries: string[];
+    try {
+      entries = await readdir(this.opts.workspaceRoot);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        entries = [];
+      } else {
+        this.lastError = `workspace_root_read_failed: ${(err as Error).message}`;
+        log.warn('workspace reconcile: readdir failed', {
+          workspace_root: this.opts.workspaceRoot,
+          error: (err as Error).message,
+        });
+        return;
+      }
+    }
 
     let baseRef: { branch: string; sha: string } | null = null;
     if (this.opts.baseRef) {
@@ -305,10 +331,16 @@ export class WorkspaceResource {
 
     this.staleCount = 0;
     this.stuckCount = 0;
+    this.createdCount = 0;
     // Reset lastError at the start of every pass so a transient stale/stuck
     // condition that has since resolved doesn't keep haunting the snapshot.
     // Errors raised during this pass below will repopulate it.
     this.lastError = null;
+
+    // Track which desired identifiers already exist on disk so the
+    // create-loop below only fires for the missing ones.
+    const present = new Set<string>();
+
     for (const entry of entries) {
       const dirPath = path.join(this.opts.workspaceRoot, entry);
       let st;
@@ -323,6 +355,7 @@ export class WorkspaceResource {
         await this.runRemove(entry, 'stale_issue');
         continue;
       }
+      present.add(entry);
 
       // In the desired set. Check for drift (non-destructive). No baseRef
       // means we can't compare; just skip and treat the workspace as ok.
@@ -371,6 +404,18 @@ export class WorkspaceResource {
         reason: staleReason,
       });
     }
+
+    // Create any desired identifier that has no dir on disk. The create
+    // callback is optional so test harnesses that exercise only the reaper
+    // can skip it; production wires `WorkspaceManager.ensureFor`, which is
+    // idempotent (per-identifier lock + dir-exists check) so a concurrent
+    // dispatch call coalesces into the same setup pass.
+    if (this.create !== null) {
+      for (const [key, identifier] of wanted) {
+        if (present.has(key)) continue;
+        await this.runCreate(identifier, key);
+      }
+    }
   }
 
   snapshot(): ResourceSnapshot {
@@ -391,6 +436,39 @@ export class WorkspaceResource {
   /** Test helper: number of workspaces marked stuck on the last reconcile pass. */
   stuckOnLastPass(): number {
     return this.stuckCount;
+  }
+
+  /** Test helper: number of workspaces created on the last reconcile pass. */
+  createdOnLastPass(): number {
+    return this.createdCount;
+  }
+
+  private async runCreate(identifier: string, sanitizedKey: string): Promise<void> {
+    if (!this.create) return;
+    // Action key uses the sanitized identifier (matches what
+    // remove_workspace uses) so dashboards can correlate the two
+    // operations on the same workspace dir.
+    const actionKey = `create_workspace:${sanitizedKey}`;
+    const startedAt = new Date().toISOString();
+    this.pushAction({
+      resource: this.id,
+      action: actionKey,
+      state: 'in_progress',
+      started_at: startedAt,
+      finished_at: null,
+      error: null,
+    });
+    try {
+      await this.create(identifier);
+      this.createdCount += 1;
+      this.markActionDone(actionKey);
+      log.info('workspace reconcile: created', { identifier });
+    } catch (err) {
+      const msg = (err as Error).message;
+      this.lastError = msg;
+      this.markActionError(actionKey, msg);
+      log.warn('workspace reconcile: create failed', { identifier, error: msg });
+    }
   }
 
   private async runRemove(identifier: string, reason: RemoveReason): Promise<void> {

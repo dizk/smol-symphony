@@ -852,12 +852,18 @@ An implementation MUST converge the set of per-issue workspace directories
 under `workspace.root` toward the set of issues currently in non-terminal
 states. The convergence loop:
 
-1. List directory entries under `workspace.root`.
-2. Query the tracker for issues in non-terminal states.
+1. Query the tracker for issues in non-terminal states; union with the set of
+   identifiers currently in-flight (claimed for dispatch but not yet
+   reflected in the tracker).
+2. List directory entries under `workspace.root`.
 3. Remove any workspace directory whose sanitized identifier is not in the
-   non-terminal set (after also accounting for any in-flight dispatches whose
-   tracker file may not yet reflect their state).
-4. Optional drift detection: when the implementation tracks a base ref (the
+   desired set.
+4. Create a workspace directory for each desired identifier that has no
+   matching dir on disk. The create action runs the same canonical
+   clone+branch+remote setup the dispatch path uses; concurrent callers for
+   the same identifier coalesce (e.g. dispatch and reconciler firing within
+   the same tick) so the setup runs exactly once.
+5. Optional drift detection: when the implementation tracks a base ref (the
    tip of the configured base branch in the source repo), it SHOULD compare
    each active workspace's recorded view of that branch against the source's
    current tip. Disagreement is drift and SHOULD be surfaced in the
@@ -870,8 +876,15 @@ states. The convergence loop:
    that `git clone --local` creates (the workspace cannot see commits added
    to the source repo after clone time).
 
+The canonical clone+branch+remote setup MUST use the source repo's local
+`<base>` SHA at clone time as the workspace's base ref. Implementations
+MUST NOT fetch from a different ref (e.g. `origin/<base>`) and reset the
+workspace base to it; doing so creates a divergent source of truth that
+the drift detector cannot reconcile against the source repo.
+
 This runs at startup and continuously thereafter, so stale terminal
-workspaces never accumulate even on long-lived processes.
+workspaces never accumulate even on long-lived processes, and a fresh
+workspace appears for any new non-terminal issue.
 
 ## 9. Workspace Management and Safety
 

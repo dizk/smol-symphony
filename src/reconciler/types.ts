@@ -12,7 +12,8 @@ export type ReconcilerAction =
   | BakeAction
   | DestroyMachineAction
   | KillBootWorkerAction
-  | RemoveWorkspaceAction;
+  | RemoveWorkspaceAction
+  | CreateWorkspaceAction;
 
 // Bake the Smolfile-derived `.smolmachine` artifact and write it to the action cache.
 // The `input_hash` (sha256 of the Smolfile body) is the cache key: subsequent dispatches
@@ -51,6 +52,19 @@ export interface KillBootWorkerAction {
 // is operator-triggered (out of scope for this stage).
 export interface RemoveWorkspaceAction {
   kind: 'remove_workspace';
+  identifier: string;
+}
+
+// Create the per-issue workspace directory for an active (non-terminal) issue
+// (issue 34). The desired set is the union of the tracker's non-terminal
+// identifiers and the dispatch in-flight set; any identifier in that set
+// without a dir under `workspace.root` triggers this action. The action body
+// (clone source repo, cut `agent/<id>`, optional origin restore, after_create
+// hook) lives in `WorkspaceManager.ensureFor` / `setupWorkspaceDir` — the
+// reconciler's create callback delegates there so dispatch-time creation and
+// reconciler-driven eager creation share one code path.
+export interface CreateWorkspaceAction {
+  kind: 'create_workspace';
   identifier: string;
 }
 

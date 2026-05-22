@@ -1039,6 +1039,26 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
   }
 
   /**
+   * Workspace create callback the reconciler invokes for non-terminal issues
+   * whose dirs are not yet on disk (issue 34). Delegates to
+   * `WorkspaceManager.ensureFor` so the same canonical clone+branch+remote
+   * setup the dispatch path runs also fires here. Resolved against the live
+   * workflow-level hooks: the reconciler doesn't know which state the
+   * identifier is in (it eagerly creates for any non-terminal issue), so
+   * per-state hook overrides are not consulted — only workflow-level
+   * `after_create` applies. The dispatch path still resolves per-state
+   * hooks at attempt time for `before_run` / `after_run`; only `after_create`
+   * is created-once, and its workflow-level form is the documented base.
+   *
+   * Race with the runner's dispatch-time `ensureFor` is handled inside
+   * `WorkspaceManager` via a per-identifier in-flight promise lock: both
+   * callers coalesce into one setup pass.
+   */
+  async createWorkspace(identifier: string): Promise<void> {
+    await this.workspaces.ensureFor(identifier, this.cfg.hooks);
+  }
+
+  /**
    * Implements {@link BaseRefProvider}. Returns the configured base branch
    * name AND its current SHA in the source repo (workflow_dir by default).
    * Returns null when the SHA can't be resolved (no `.git`, base branch

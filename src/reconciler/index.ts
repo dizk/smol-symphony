@@ -57,6 +57,7 @@ export interface ReconcilerOptions {
   workspaceBaseRef?: BaseRefProvider;
   workspaceInspect?: WorkspaceResourceOptions['inspect'];
   workspaceRemove?: WorkspaceResourceOptions['remove'];
+  workspaceCreate?: WorkspaceResourceOptions['create'];
 }
 
 export class Reconciler {
@@ -79,6 +80,7 @@ export class Reconciler {
   private workspace: WorkspaceResource | null = null;
   private readonly workspaceInspect?: WorkspaceResourceOptions['inspect'];
   private workspaceRemove?: WorkspaceResourceOptions['remove'];
+  private workspaceCreate?: WorkspaceResourceOptions['create'];
   private workspaceBaseRef?: BaseRefProvider;
   private workspaceIntended: WorkspaceIntendedProvider | null = null;
   private backstopTimer: NodeJS.Timeout | null = null;
@@ -113,6 +115,7 @@ export class Reconciler {
     }
     this.workspaceInspect = opts.workspaceInspect;
     this.workspaceRemove = opts.workspaceRemove;
+    this.workspaceCreate = opts.workspaceCreate;
     this.workspaceBaseRef = opts.workspaceBaseRef;
     if (opts.workspaceIntendedProvider) {
       this.workspaceIntended = opts.workspaceIntendedProvider;
@@ -128,6 +131,7 @@ export class Reconciler {
       baseRef: this.workspaceBaseRef,
       inspect: this.workspaceInspect,
       remove: this.workspaceRemove,
+      create: this.workspaceCreate,
     });
   }
 
@@ -170,11 +174,20 @@ export class Reconciler {
        * the default `rm -rf`.
        */
       remove?: WorkspaceResourceOptions['remove'];
+      /**
+       * Override the create callback. Production passes a closure over
+       * `WorkspaceManager.ensureFor` so the same canonical clone+branch+remote
+       * setup (and after_create hook) that dispatch uses also fires for
+       * reconciler-driven eager creation. Omitted ⇒ the reconciler only
+       * reaps; useful for tests that don't exercise creation.
+       */
+      create?: WorkspaceResourceOptions['create'];
     } = {},
   ): void {
     this.workspaceIntended = intended;
     if (opts.baseRef !== undefined) this.workspaceBaseRef = opts.baseRef;
     if (opts.remove !== undefined) this.workspaceRemove = opts.remove;
+    if (opts.create !== undefined) this.workspaceCreate = opts.create;
     this.workspace = this.buildWorkspaceResource();
   }
 

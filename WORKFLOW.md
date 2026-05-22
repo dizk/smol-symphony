@@ -137,12 +137,19 @@ hooks:
   # workspace arrives at the dispatched agent with:
   #
   #   • a hardlinked `git clone --local` of the source repo on the base branch
-  #     (SYMPHONY_BASE_BRANCH or `main`)
+  #     (SYMPHONY_BASE_BRANCH or `main`) at the source repo's current local
+  #     base SHA
   #   • all network remotes stripped (in-VM `git push`/`git fetch` fail closed)
   #   • when SYMPHONY_REPO is set: `origin` restored to the canonical HTTPS URL
-  #     and the local base branch reset to `origin/<base>`
+  #     so the host's Done hook can push (`gh auth setup-git` runs best-effort
+  #     on the host so the push has credentials; the token never enters the VM)
   #   • `user.name = symphony-agent` / `user.email = agent@symphony.local`
   #   • `agent/<id>` checked out
+  #
+  # The source repo's local `<base>` is the single source of truth for the
+  # workspace's base ref. To pick up a new base, update the source repo
+  # (`git pull` / `git fetch && git checkout <base>`) before the next dispatch;
+  # symphony does not implicitly fetch from `origin/<base>` at setup time.
   #
   # No `after_create:` block is declared because no repo-local glue is needed
   # on top of that. Add an `after_create:` here if you need additional
