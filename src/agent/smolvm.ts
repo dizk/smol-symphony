@@ -22,11 +22,20 @@ export interface VmMount {
 }
 
 export interface CreateOptions {
-  // Either an OCI image reference (`--image`) or a path to a packed .smolmachine artifact
-  // (`--from`). When both are set, `from` wins because that's what smolvm itself would do
-  // — `--from` skips the registry pull and boots from pre-extracted layers (~250ms).
+  // Source for the VM. At most one of:
+  //   - `image`    : OCI image reference (`--image`).
+  //   - `from`     : path to a packed .smolmachine artifact (`--from`). Boots from
+  //                  pre-extracted layers (~250ms).
+  //   - `smolfile` : path to a TOML Smolfile (`--smolfile`). The Smolfile declares
+  //                  image + resources + `[dev].init` + `[dev].volumes`; symphony's
+  //                  CLI flags merge with the Smolfile per smolvm's precedence rules
+  //                  (CLI > Smolfile > defaults).
+  // Mutual exclusion is enforced upstream in `validateDispatch`. When two are
+  // somehow still set, `from` > `smolfile` > `image` so the highest-fidelity source
+  // wins.
   image: string | null;
   from: string | null;
+  smolfile: string | null;
   cpus: number;
   memMib: number;
   net: boolean;
@@ -121,6 +130,8 @@ export class SmolvmClient {
     const args = ['machine', 'create', name];
     if (opts.from) {
       args.push('--from', opts.from);
+    } else if (opts.smolfile) {
+      args.push('--smolfile', opts.smolfile);
     } else if (opts.image) {
       args.push('--image', opts.image);
     }

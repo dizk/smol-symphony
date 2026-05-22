@@ -160,7 +160,7 @@ export function hostCredentialAbsPath(profile: AdapterProfile): string {
  *     cannot place the credential where the in-VM agent can see it without
  *     re-introducing the working-tree-leak risk. Linked worktrees are
  *     unsupported under the TCP bridge transport; use a non-linked workspace
- *     clone or fork scripts/vm-agent.js.
+ *     clone or fork scripts/vm-agent.mjs.
  *
  * Returned path is relative to `workspacePath` and slash-joined (POSIX) so it
  * works as-is in the in-VM acp launch command, regardless of host OS path
@@ -378,12 +378,12 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
     // is inside the working tree, where `.gitignore` negation or a tracked file
     // could still expose the secret to `git add -A`. Linked worktrees are
     // currently unsupported — use a non-linked workspace clone (e.g.
-    // `git clone --local`) or fork scripts/vm-agent.js to stage credentials in
+    // `git clone --local`) or fork scripts/vm-agent.mjs to stage credentials in
     // whatever shape your worktree layout needs.
     throw new Error(
       `cannot auto-stage credentials in a linked worktree (.git at ${gitPath} is a file). ` +
         `Linked worktrees are unsupported under the ACP TCP bridge transport; use a ` +
-        `non-linked workspace clone or fork scripts/vm-agent.js.`,
+        `non-linked workspace clone or fork scripts/vm-agent.mjs.`,
     );
   }
   throw new Error(

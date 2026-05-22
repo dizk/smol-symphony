@@ -443,6 +443,7 @@ export class AgentRunner {
       await this.smolvm.ensureRunning(vmName, {
         image: this.cfg.smolvm.image,
         from: this.cfg.smolvm.from,
+        smolfile: this.cfg.smolvm.smolfile,
         cpus: this.cfg.smolvm.cpus,
         memMib: this.cfg.smolvm.mem_mib,
         net: this.cfg.smolvm.net,

@@ -108,7 +108,7 @@ export interface AgentConfig {
 // (currently `claude` and `codex`); the profile encodes the binary symphony launches
 // inside the VM and the credential file it copies in from the host. Symphony always
 // auto-derives the launch command (scrub guest cred dir + stage credential + exec the
-// in-VM proxy); operators who need a custom shape fork scripts/vm-agent.js.
+// in-VM proxy); operators who need a custom shape fork scripts/vm-agent.mjs.
 export interface AcpConfig {
   adapter: string;
   /**
@@ -167,11 +167,21 @@ export interface SmolvmVolume {
 }
 
 export interface SmolvmConfig {
-  // Container image to pull. Mutually exclusive with `from`.
+  // Container image to pull. Mutually exclusive with `from` and `smolfile`.
   image: string | null;
   // Path to a packed .smolmachine artifact (smolvm pack create --from-vm). When set, takes
   // precedence over `image`; the agent runner passes it to `smolvm machine create --from`.
   from: string | null;
+  // Path to a TOML Smolfile (https://github.com/smol-machines/smolvm) describing the
+  // per-issue VM declaratively. When set, the runner passes `--smolfile <path>` to
+  // `smolvm machine create`; the Smolfile's `image`, `cpus`, `memory`, `net`, and
+  // `[dev].init` / `[dev].volumes` provide the source-of-truth setup, replacing the
+  // old hand-built .smolmachine pre-pack flow. CLI flags symphony still emits (cpus,
+  // memory, net, --volume for the workspace mount, --env for forwarded credentials)
+  // override or merge with the Smolfile per smolvm's precedence rules. When both
+  // `smolfile` and one of `image`/`from` are set the workflow parser rejects the
+  // config (mutually exclusive).
+  smolfile: string | null;
   cpus: number;
   mem_mib: number;
   net: boolean;

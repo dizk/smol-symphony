@@ -389,15 +389,25 @@ acp:
 # smolvm — microVM execution environment.
 # ─────────────────────────────────────────────────────────────────────────────
 smolvm:
+  # smolfile (path | null): path to a TOML Smolfile (https://github.com/smol-machines/smolvm)
+  # describing the per-issue VM declaratively. When set, the runner passes
+  # `--smolfile <path>` to `smolvm machine create`; the Smolfile's `image`, resources,
+  # and `[dev].init` / `[dev].volumes` carry the per-VM setup. The repo ships a
+  # canonical `Smolfile` at the root that installs node tooling + every ACP-capable
+  # coding agent and bind-mounts scripts/ → /opt/symphony so the in-VM proxy at
+  # /opt/symphony/vm-agent.mjs is the same file the host pins. Mutually exclusive
+  # with `image` and `from`. Default: null.
+  smolfile: ./Smolfile
+
   # from (path | null): path to a packed .smolmachine.smolmachine artifact
-  # built with the `smolmachine` CLI. Mutually exclusive with `image`. The
-  # artifact must contain a Node.js runtime, the ACP adapters you intend to use
-  # (claude-agent-acp, codex-acp, etc.), and the symphony in-VM proxy at
-  # /opt/symphony/vm-agent.mjs. Default: null.
+  # built with `smolvm pack create`. Mutually exclusive with `image` and
+  # `smolfile`. The artifact must contain a Node.js runtime, the ACP adapters
+  # you intend to use (claude-agent-acp, codex-acp, etc.), and the symphony
+  # in-VM proxy at /opt/symphony/vm-agent.mjs. Default: null.
   from: ./.vm/your-vm.smolmachine.smolmachine
 
-  # image (string | null): container image to pull instead of a packed artifact.
-  # Mutually exclusive with `from`. Default: null.
+  # image (string | null): container image to pull instead of a packed artifact
+  # or Smolfile. Mutually exclusive with `from` and `smolfile`. Default: null.
   image: null
 
   # cpus (int): vCPU count per VM. Default: 2.

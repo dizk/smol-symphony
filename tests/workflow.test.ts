@@ -100,6 +100,21 @@ describe('workflow', () => {
     assert.equal(cfg.acp.model, null);
   });
 
+  it('parses smolvm.smolfile and resolves it relative to the workflow directory', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        smolvm: { smolfile: './Smolfile' },
+      },
+      '/tmp/symphony/WORKFLOW.md',
+    );
+    assert.equal(cfg.smolvm.smolfile, '/tmp/symphony/Smolfile');
+    // image/from default to null when smolfile is the chosen source.
+    assert.equal(cfg.smolvm.image, null);
+    assert.equal(cfg.smolvm.from, null);
+  });
+
   it('rejects a workflow YAML with no states block', () => {
     assert.throws(
       () =>

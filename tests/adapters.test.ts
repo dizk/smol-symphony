@@ -63,6 +63,7 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     smolvm: {
       image: null,
       from: null,
+      smolfile: null,
       cpus: 1,
       mem_mib: 256,
       // The TCP bridge needs the VM to reach the host listener; validateDispatch refuses
@@ -604,6 +605,49 @@ describe('validateDispatch', () => {
       const err = validateDispatch(cfg);
       assert.ok(err, 'expected validation error');
       assert.match(err!, /smolvm\.net=false is incompatible/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects setting both smolvm.image and smolvm.smolfile (mutually exclusive)', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
+    try {
+      const cfg = bareCfg({ adapter: 'claude' });
+      cfg.tracker.root = root;
+      cfg.smolvm.image = 'node:24-bookworm-slim';
+      cfg.smolvm.smolfile = '/nonexistent/Smolfile';
+      const err = validateDispatch(cfg);
+      assert.ok(err, 'expected validation error');
+      assert.match(err!, /set at most one of image \/ from \/ smolfile/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects smolvm.smolfile pointing at a missing file', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
+    try {
+      const cfg = bareCfg({ adapter: 'claude' });
+      cfg.tracker.root = root;
+      cfg.smolvm.smolfile = path.join(root, 'no-such-Smolfile');
+      const err = validateDispatch(cfg);
+      assert.ok(err, 'expected validation error');
+      assert.match(err!, /smolvm\.smolfile not found/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts smolvm.smolfile when the file exists', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
+    try {
+      const cfg = bareCfg({ adapter: 'claude' });
+      cfg.tracker.root = root;
+      const smolfilePath = path.join(root, 'Smolfile');
+      await writeFile(smolfilePath, 'image = "node:24-bookworm-slim"\n');
+      cfg.smolvm.smolfile = smolfilePath;
+      assert.equal(validateDispatch(cfg), null);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

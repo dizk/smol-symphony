@@ -218,7 +218,7 @@ acp:
   # a launch command that places the file at the adapter's expected path inside
   # the VM before exec'ing the in-VM proxy. There is no `command` escape hatch
   # under the TCP bridge transport — the launch shape is fixed; fork
-  # scripts/vm-agent.js if you need to customize what the proxy spawns.
+  # scripts/vm-agent.mjs if you need to customize what the proxy spawns.
   adapter: claude
   # Reasoning effort forwarded to claude-agent-acp via a staged settings.json
   # (`{"effortLevel": "xhigh"}`) copied into /root/.claude/settings.json before the
@@ -245,7 +245,14 @@ acp:
   stall_timeout_ms: 1800000
 
 smolvm:
-  from: ./.vm/symphony.smolmachine.smolmachine
+  # Declarative VM setup via Smolfile (https://github.com/smol-machines/smolvm).
+  # The Smolfile at the repo root carries the image, resources, [dev].init for
+  # apt + npm install, and a [dev].volumes line that bind-mounts scripts/ as
+  # /opt/symphony so the in-VM proxy lives at /opt/symphony/vm-agent.mjs. To
+  # skip the per-VM apt/npm install on every dispatch, pack the VM once with
+  # `smolvm pack create -s ./Smolfile -o ./.vm/symphony.smolmachine` and switch
+  # back to `from: ./.vm/symphony.smolmachine.smolmachine` here.
+  smolfile: ./Smolfile
   cpus: 2
   mem_mib: 4096
   net: true
