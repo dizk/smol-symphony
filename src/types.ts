@@ -321,6 +321,16 @@ export interface RunningEntry {
   steering_context: string | null;
 }
 
+// Discriminates the two retry shapes in the queue. A `continuation` is the
+// short follow-up scheduled after a clean worker exit so the same issue can
+// resume in its (post-transition) state without other Todo work stealing the
+// slot mid-handoff. A `failure` is the exponential-backoff retry after an
+// abnormal exit (or a re-queue when no slots were available); during its
+// backoff the orchestrator is free to dispatch other work. Continuations
+// hold a slot for the duration of their delay; failures do not. See
+// Orchestrator.availableGlobalSlots / hasPerStateSlot.
+export type RetryKind = 'continuation' | 'failure';
+
 export interface RetryEntry {
   issue_id: string;
   identifier: string;
@@ -328,6 +338,13 @@ export interface RetryEntry {
   due_at_ms: number;
   timer_handle: ReturnType<typeof setTimeout>;
   error: string | null;
+  kind: RetryKind;
+  // State the next attempt will dispatch into. For continuations this is the
+  // post-transition state recorded on the running entry at exit time; for
+  // failures it is the same state the worker last ran under. Used by
+  // per-state slot accounting so a pending continuation counts against the
+  // target state's cap.
+  target_state: string;
 }
 
 export interface RuntimeEvent {

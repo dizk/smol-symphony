@@ -257,6 +257,10 @@ Fields:
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
+- `kind` (`continuation` after a normal exit, `failure` after an abnormal exit / requeue)
+- `target_state` (state the next attempt dispatches into; for continuations this is the
+  post-transition state recorded on the running entry at exit time, for failures it is the
+  state the worker last ran under)
 
 #### 4.1.8 Orchestrator Runtime State
 
@@ -771,21 +775,32 @@ Sorting order (stable intent):
 
 Global limit:
 
-- `available_slots = max(max_concurrent_agents - running_count, 0)`
+- `available_slots = max(max_concurrent_agents - running_count - pending_continuation_count, 0)`
+- `pending_continuation_count` is the number of `RetryEntry` records with `kind=continuation`.
+  A continuation is the short follow-up scheduled after a normal worker exit (issue handed off
+  to its next active state, or finished a turn and is about to re-poll); the slot it just
+  vacated is held for it so a tick firing inside the continuation window cannot dispatch a
+  brand-new candidate and force the resuming issue to requeue with `no available orchestrator
+  slots`. Failure-shaped retries do NOT hold slots — the orchestrator is free to dispatch
+  other work during their exponential-backoff window.
 
 Per-state limit:
 
 - `max_concurrent_agents_by_state[state]` if present (state key normalized)
 - otherwise fallback to global limit
+- Pending continuations whose `target_state` matches also count against the per-state cap, so
+  a continuation resuming into state `S` reserves a slot in `S`'s cap as well.
 
-The runtime counts issues by their current tracked state in the `running` map.
+The runtime counts issues by their current tracked state in the `running` map (plus the
+continuation reservations above).
 
 ### 8.4 Retry and Backoff
 
 Retry entry creation:
 
 - Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, and new timer handle.
+- Store `attempt`, `identifier`, `error`, `kind`, `target_state`, `due_at_ms`, and new timer
+  handle.
 
 Backoff formula:
 
