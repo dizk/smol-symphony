@@ -1,0 +1,34 @@
+# Smolfile — declarative per-issue microVM for smol-symphony.
+#
+# Used by smolvm when symphony's runner does `machine create -s Smolfile` (driven by
+# the `smolvm.smolfile` workflow key in WORKFLOW.md). Single source of truth for the
+# image, resource budget, and in-VM setup.
+#
+# [dev].init runs on every machine start, so a fresh per-issue VM pays the apt + npm
+# install on each dispatch. For a single-developer setup that's fine; to amortise the
+# cost, pre-build a custom OCI image with these layers baked in and switch `image`
+# below to point at it (or run `smolvm pack create --from-vm <name> -o symphony.smolmachine`
+# once and set `smolvm.from` in WORKFLOW.md instead of `smolvm.smolfile`).
+
+image = "node:24-bookworm-slim"
+
+cpus = 2
+memory = 4096
+net = true
+
+[dev]
+# Mount the host scripts/ dir as /opt/symphony in the guest read-only so the in-VM
+# stdio proxy at /opt/symphony/vm-agent.mjs (referenced by deriveAcpCommand) is
+# always the same file the host has on disk — no separate copy step, no drift.
+# Path is resolved relative to this Smolfile.
+volumes = ["./scripts:/opt/symphony:ro"]
+
+# Install base CLI tooling + every ACP-capable coding agent symphony's adapter
+# registry knows how to launch (claude-agent-acp, codex-acp, opencode). The
+# `--no-install-recommends` keeps the apt layer slim; `--no-audit --no-fund`
+# strips npm output the orchestrator would otherwise log per dispatch.
+init = [
+    "apt-get update -q",
+    "apt-get install -y --no-install-recommends git ripgrep ca-certificates curl",
+    "npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp opencode-ai",
+]

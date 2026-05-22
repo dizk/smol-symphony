@@ -245,12 +245,12 @@ acp:
   stall_timeout_ms: 1800000
 
 smolvm:
-  # Prebaked .smolmachine artifact produced by scripts/build-vm.sh. Boots in ~250ms
-  # because apt + npm install are already in the snapshot — no per-dispatch init
-  # cost. Rebuild after dependency changes via `scripts/build-vm.sh`. A future
-  # reconciler subsystem (tracked separately) will own the bake lifecycle from a
-  # user-declared Smolfile; for now this path is operator-driven.
-  from: ./.vm/symphony.smolmachine.smolmachine
+  # Declarative VM setup via Smolfile. The reconciler (issue 32) hashes the Smolfile
+  # on startup and on change, builds a .smolmachine artifact under
+  # ~/.cache/symphony/actions/bake/<sha256>.smolmachine, and gates dispatch on
+  # bake-ready. Dispatch then uses `smolvm machine create --from <cache>` so the
+  # Smolfile's apt + npm install are paid once at bake time, not per dispatch.
+  smolfile: ./Smolfile
   cpus: 2
   mem_mib: 4096
   net: true
