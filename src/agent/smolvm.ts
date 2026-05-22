@@ -15,6 +15,12 @@ import { log } from '../logging.js';
 
 const execFile = promisify(execFileCb);
 
+// Prefix used by every VM the orchestrator creates. The runner mints VM names as
+// `${SYMPHONY_VM_PREFIX}<sanitized-identifier>`; the orchestrator owns this namespace
+// so any matching VM that survives across symphony process restarts (e.g. a SIGKILL'd
+// previous instance) is treated as orphaned and destroyed at start/stop.
+export const SYMPHONY_VM_PREFIX = 'symphony-';
+
 export interface VmMount {
   host: string;
   guest: string;
@@ -115,15 +121,25 @@ export class SmolvmClient {
     }
   }
 
-  async exists(name: string): Promise<boolean> {
+  // List all VM names known to the smolvm daemon. Failures (daemon down, malformed
+  // JSON) return [] — callers treat that as "nothing to enumerate" rather than fatal,
+  // which is right both for `exists` and for orphan cleanup.
+  async list(): Promise<string[]> {
     try {
       const { stdout } = await this.run(['machine', 'ls', '--json'], { timeoutMs: 10_000 });
       const parsed = JSON.parse(stdout) as { machines?: Array<{ name?: string }> } | Array<{ name?: string }>;
       const list = Array.isArray(parsed) ? parsed : parsed.machines ?? [];
-      return list.some((m) => m.name === name);
+      return list
+        .map((m) => m.name)
+        .filter((n): n is string => typeof n === 'string' && n.length > 0);
     } catch {
-      return false;
+      return [];
     }
+  }
+
+  async exists(name: string): Promise<boolean> {
+    const all = await this.list();
+    return all.includes(name);
   }
 
   async create(name: string, opts: CreateOptions): Promise<void> {

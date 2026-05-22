@@ -135,7 +135,7 @@ async function main() {
     mcp,
     acpBridge,
   );
-  orch = new Orchestrator(config, definition, src, tracker, workspaces, runner);
+  orch = new Orchestrator(config, definition, src, tracker, workspaces, runner, smolvm);
 
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved
   // tracker.root, changed active/terminal states) is reflected by both the propagation

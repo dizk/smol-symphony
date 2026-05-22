@@ -17,6 +17,8 @@ import { resolveHooksForState, validateDispatch, WorkflowError } from './workflo
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
 import { resolveDispatchConfig } from './agent/runner.js';
+import type { SmolvmClient } from './agent/smolvm.js';
+import { SYMPHONY_VM_PREFIX } from './agent/smolvm.js';
 import { activeStateNames, terminalStateNames } from './issues.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
@@ -110,6 +112,11 @@ export class Orchestrator {
     private tracker: IssueTracker,
     private workspaces: WorkspaceManager,
     private runner: AgentRunner,
+    // Optional so test stubs that don't exercise VM lifecycle don't have to mint a
+    // SmolvmClient. When absent, startup/shutdown VM reaping is skipped (logged once
+    // at startup so misconfiguration is visible). Production wiring in bin/symphony.ts
+    // always passes one in.
+    private smolvm: SmolvmClient | null = null,
   ) {
     workflowSrc.onChange((next) => {
       if ('error' in next) {
@@ -168,6 +175,11 @@ export class Orchestrator {
       }
     }
     await this.startupTerminalCleanup();
+    // Reap any leftover `symphony-*` VMs from a prior process. Without this, a
+    // SIGKILL/crash of a previous symphony instance leaves libkrun VMs alive that
+    // nothing tracks; over enough restarts they accumulate until the host runs out
+    // of RAM (issue 26). Best-effort: failures are logged inside cleanupOrphanVms.
+    await this.cleanupOrphanVms('startup');
     this.scheduleTick(0);
   }
 
@@ -191,6 +203,15 @@ export class Orchestrator {
       this.runLogs.delete(issueId);
     }
     await Promise.all(closures);
+    // The runner's per-attempt cleanup destroys its own VM, but stop() does NOT wait
+    // for in-flight workers to unwind before returning — the bin script then exits
+    // the process, which kills the smolvm CLI children but NOT the libkrun VMs they
+    // launched (those are owned by the smolvm daemon). Without this backstop, every
+    // SIGTERM during an active run leaks one VM per running entry, and over enough
+    // operator restarts the host OOMs (issue 26). Enumerate by prefix so we also
+    // catch VMs that drifted out of `running` (e.g. a worker that already removed
+    // itself from `running` but hadn't reached the destroy call yet).
+    await this.cleanupOrphanVms('shutdown');
   }
 
   /** Operator trigger for an immediate poll cycle (§13.7 /refresh). */
@@ -770,6 +791,36 @@ export class Orchestrator {
     void this.dispatchIssue(issue, entry.attempt, {
       trackerRoot: snapshotTrackerRoot,
     });
+  }
+
+  /**
+   * Destroy any VM in the smolvm daemon whose name starts with the symphony prefix.
+   * Called at start (to reap orphans from a prior process) and at stop (to backstop
+   * workers that didn't reach their per-attempt destroy in time).
+   *
+   * The `symphony-` namespace is owned by the orchestrator; matching VMs are
+   * unconditionally destroyed. Smolvm enumeration and per-VM destroy are both
+   * best-effort (the underlying client swallows and logs CLI failures); we never
+   * fail startup/shutdown on a stuck VM.
+   */
+  private async cleanupOrphanVms(reason: 'startup' | 'shutdown'): Promise<void> {
+    if (!this.smolvm) return;
+    let all: string[];
+    try {
+      all = await this.smolvm.list();
+    } catch (err) {
+      log.warn('orphan vm enumeration failed', {
+        reason,
+        error: (err as Error).message,
+      });
+      return;
+    }
+    const orphans = all.filter((n) => n.startsWith(SYMPHONY_VM_PREFIX));
+    if (orphans.length === 0) return;
+    log.info('destroying orphan symphony VMs', { reason, count: orphans.length });
+    // Parallel destroy: each VM is independent, and smolvm.destroy already wraps the
+    // CLI call in a per-VM timeout so a single stuck VM can't hang the rest.
+    await Promise.all(orphans.map((name) => this.smolvm!.destroy(name)));
   }
 
   /** §8.6 startup terminal workspace cleanup. */

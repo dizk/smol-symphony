@@ -10,6 +10,7 @@ import type { WorkflowSource } from '../src/workflow.js';
 import type { IssueTracker, CandidateFetchResult } from '../src/trackers/types.js';
 import type { WorkspaceManager } from '../src/workspace.js';
 import type { AgentRunner } from '../src/agent/runner.js';
+import type { SmolvmClient } from '../src/agent/smolvm.js';
 
 // Phase 2 contract for orchestrator startup: the credential check is no longer
 // just `cfg.acp.adapter`, it has to walk the union of the workflow-level adapter
@@ -43,6 +44,38 @@ function makeStubs(): {
     tracker: makeTracker(),
     workspaces: {} as unknown as WorkspaceManager,
     runner: {} as unknown as AgentRunner,
+  };
+}
+
+// Recording fake of SmolvmClient — captures `list()` and `destroy()` calls so the
+// orphan-cleanup tests can assert which VMs were enumerated and which were torn down,
+// without touching the real smolvm CLI.
+interface FakeSmolvm {
+  client: SmolvmClient;
+  destroyed: string[];
+  listCalls: number;
+}
+
+function makeFakeSmolvm(initialVms: string[]): FakeSmolvm {
+  const state = { vms: [...initialVms], destroyed: [] as string[], listCalls: 0 };
+  const client: Partial<SmolvmClient> = {
+    list: async () => {
+      state.listCalls++;
+      return [...state.vms];
+    },
+    destroy: async (name: string) => {
+      state.destroyed.push(name);
+      state.vms = state.vms.filter((v) => v !== name);
+    },
+  };
+  return {
+    client: client as SmolvmClient,
+    get destroyed() {
+      return state.destroyed;
+    },
+    get listCalls() {
+      return state.listCalls;
+    },
   };
 }
 
@@ -143,4 +176,145 @@ describe('Orchestrator startup credential check', () => {
     }
   });
 
+});
+
+// Orphan-VM reaping is the lifecycle counterpart to startup terminal workspace
+// cleanup: each per-issue smolvm VM is owned by the orchestrator process, but the
+// libkrun VM itself outlives a SIGKILL or crash of that process because it is
+// daemon-managed. Without the reaping path, every restart leaves the prior
+// instance's VMs behind, and over enough restarts the host OOMs (issue 26). The
+// tests below pin both ends of the lifecycle: orphans are destroyed at start so
+// a fresh process recovers from a previous crash, and at stop so a graceful
+// shutdown does not leak the VMs whose worker cleanup it cancelled before they
+// reached destroy.
+describe('Orchestrator VM lifecycle reaping', () => {
+  it('destroys orphan symphony-* VMs at startup', async () => {
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-start-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-start-tracker-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      const { workflowSrc, tracker, workspaces, runner } = makeStubs();
+      // Mix orphan symphony VMs with an unrelated VM the operator may have running.
+      // Only the symphony-prefixed ones should be reaped.
+      const fake = makeFakeSmolvm([
+        'symphony-1',
+        'symphony-old-issue',
+        'unrelated-vm',
+        'SYMPHONY-uppercase-not-prefix', // case-sensitive prefix; this stays
+      ]);
+      const orch = new Orchestrator(
+        cfg,
+        def,
+        workflowSrc,
+        tracker,
+        workspaces,
+        runner,
+        fake.client,
+      );
+      await orch.start();
+      assert.deepEqual(fake.destroyed.sort(), ['symphony-1', 'symphony-old-issue']);
+      await orch.stop();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('destroys remaining symphony-* VMs at shutdown so SIGTERM does not leak them', async () => {
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-stop-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-stop-tracker-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      const { workflowSrc, tracker, workspaces, runner } = makeStubs();
+      // No orphans at startup; simulate a VM that the runner's per-attempt cleanup
+      // didn't reach in time (e.g. SIGTERM mid-attempt) by injecting it before stop().
+      const fake = makeFakeSmolvm([]);
+      const orch = new Orchestrator(
+        cfg,
+        def,
+        workflowSrc,
+        tracker,
+        workspaces,
+        runner,
+        fake.client,
+      );
+      await orch.start();
+      assert.deepEqual(fake.destroyed, []);
+      // Inject a "leaked" VM into the smolvm view to mimic the SIGTERM-mid-run path.
+      (fake.client.list as () => Promise<string[]>) = async () => ['symphony-leaked-7'];
+      await orch.stop();
+      assert.deepEqual(fake.destroyed, ['symphony-leaked-7']);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('skips reaping when no SmolvmClient is wired (test/stub harness)', async () => {
+    // The orchestrator's SmolvmClient parameter is optional so tests that don't
+    // care about VM lifecycle can omit it. Confirm that path stays silent and
+    // does not throw at start/stop.
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-skip-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-skip-tracker-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      const { workflowSrc, tracker, workspaces, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, workspaces, runner);
+      await orch.start();
+      await orch.stop();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
 });
