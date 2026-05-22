@@ -53,35 +53,47 @@ export interface WorkspaceIntendedProvider {
 }
 
 /**
- * Source of the "what HEAD should be" SHA for the drift check — i.e. the
- * current tip of the configured base branch in the source repo. The
- * orchestrator implements this against `cfg.workflow_dir` (which in the
- * canonical layout is the source repo) and `SYMPHONY_BASE_BRANCH` (default
- * `main`). Returns null when the SHA cannot be resolved (e.g. the source
- * repo isn't a git repo, or the base branch doesn't exist) — in that case
- * the drift detector is skipped this pass and only stale-workspace removal
- * fires.
+ * Source of truth for the base branch the dispatch-time clone targeted:
+ * its name (`main` by default) and its CURRENT SHA in the source repo. The
+ * inspector reads the workspace's own copy of `branch` to get the workspace's
+ * snapshot of base, then the resource compares the two SHAs.
+ *
+ * Why both? The workspace is cloned with `git clone --local --no-tags`, which
+ * only hardlinks objects present in the source repo at clone time. After the
+ * source repo's base advances, the workspace has no objects for the new
+ * commits — so any cross-repo `git merge-base --is-ancestor <new-sha>` run
+ * inside the workspace returns "unknown SHA" (exit 128), not "diverged". The
+ * v0 implementation conflated unknown with ancestor and silently missed every
+ * real drift case. Comparing the workspace's own copy of `<branch>` against
+ * the source repo's current tip sidesteps that boundary: both SHAs are
+ * resolvable in their own repo, and inequality is a definitive drift signal.
+ *
+ * Returns null when the SHA cannot be resolved (no `.git` in source, base
+ * branch missing, etc.) — drift detection is skipped that pass; orphan
+ * removal still fires.
  */
 export interface BaseRefProvider {
-  currentBaseSha(): Promise<string | null>;
+  currentBaseRef(): Promise<{ branch: string; sha: string } | null>;
 }
 
 export interface WorkspaceInspection {
-  /** HEAD SHA of the workspace, or null if not a git repo / cannot read. */
+  /** HEAD SHA of the workspace (agent/<id> tip), or null if not a git repo. */
   head: string | null;
+  /**
+   * SHA the workspace's LOCAL copy of the base branch points at. Captured at
+   * `git clone --local --no-tags --branch <base>` time and frozen there unless
+   * an explicit operator refresh happens. Comparing this to the source repo's
+   * current base SHA is the drift signal. Null when the workspace has no such
+   * ref (e.g. operator deleted the local base branch).
+   */
+  workspaceBaseSha: string | null;
   /** True iff `git status --porcelain` is non-empty. */
   hasUncommitted: boolean;
   /**
-   * True iff `baseSha` is an ancestor of HEAD. When the caller passes
-   * `baseSha === null`, the inspector returns true here (no drift check
-   * possible). Equivalent to `git merge-base --is-ancestor <sha> HEAD`.
-   */
-  baseAncestor: boolean;
-  /**
-   * Number of commits reachable from HEAD that are NOT in the base history.
-   * Only meaningful when `baseSha` is non-null. Used as the "would a re-clone
-   * discard agent work?" safety signal — non-zero means the workspace gets
-   * marked `stuck` instead of `stale`.
+   * Number of commits reachable from HEAD that are NOT in the workspace's
+   * local base history. Computed entirely within the workspace (no cross-repo
+   * walk). Non-zero means the workspace would lose agent work to a re-clone;
+   * surfaced as the `stuck` annotation in v1.
    */
   commitsAheadOfBase: number;
 }
@@ -97,11 +109,12 @@ export interface WorkspaceResourceOptions {
   baseRef?: BaseRefProvider;
   /**
    * Override for filesystem + git inspection (tests pass a stub). Receives the
-   * base SHA so the implementation can run the comparison in a single
-   * subprocess pass instead of forcing the resource to make two trips across
-   * the boundary.
+   * base branch name (so the inspector can `git rev-parse <branch>` in the
+   * workspace) but does NOT receive the source repo's SHA — that comparison
+   * happens in the resource so we never run a cross-repo git operation inside
+   * the workspace (which only sees objects hardlinked at clone time).
    */
-  inspect?: (workspacePath: string, baseSha: string | null) => Promise<WorkspaceInspection>;
+  inspect?: (workspacePath: string, baseBranch: string) => Promise<WorkspaceInspection>;
   /**
    * Override for the remove action (tests pass a stub). Receives the
    * sanitized dir name (which is what `WorkspaceManager.workspacePathFor`
@@ -122,51 +135,49 @@ export type RemoveReason = 'stale_issue';
 const MAX_ACTION_HISTORY = 32;
 
 /**
- * Stat-based default inspector. Spawns three git invocations against the
- * workspace path: `rev-parse HEAD`, `status --porcelain`, and (only when
- * `baseSha` is non-null) `merge-base --is-ancestor` + `rev-list --count`.
- * Returns `head: null` for anything that doesn't look like a git repo — the
- * caller treats that as "can't reason about this dir, don't touch it."
+ * Stat-based default inspector. All git invocations are workspace-local: we
+ * never reach across to the source repo's object store, which is why drift
+ * detection lives in the resource (comparing this inspector's
+ * `workspaceBaseSha` to `BaseRefProvider.currentBaseRef().sha`) rather than
+ * here. Returns `head: null` for anything that doesn't look like a git repo —
+ * the caller treats that as "can't reason about this dir, don't touch it."
  */
 export async function defaultInspectWorkspace(
   workspacePath: string,
-  baseSha: string | null,
+  baseBranch: string,
 ): Promise<WorkspaceInspection> {
   const head = await runGitCapture(workspacePath, ['rev-parse', 'HEAD']);
   if (head.exit !== 0 || head.stdout.trim().length === 0) {
     return {
       head: null,
+      workspaceBaseSha: null,
       hasUncommitted: false,
-      baseAncestor: true,
       commitsAheadOfBase: 0,
     };
   }
   const headSha = head.stdout.trim();
   const status = await runGitCapture(workspacePath, ['status', '--porcelain']);
   const hasUncommitted = status.exit === 0 && status.stdout.length > 0;
-  if (baseSha === null) {
-    return { head: headSha, hasUncommitted, baseAncestor: true, commitsAheadOfBase: 0 };
+  // Workspace's frozen view of the base branch — the SHA that was current in
+  // the source repo at clone time. The setup pipeline cuts the agent branch
+  // from this ref, so it's always present unless an operator manually deleted
+  // it.
+  const wsBase = await runGitCapture(workspacePath, ['rev-parse', baseBranch]);
+  const workspaceBaseSha =
+    wsBase.exit === 0 && wsBase.stdout.trim().length > 0 ? wsBase.stdout.trim() : null;
+  let aheadCount = 0;
+  if (workspaceBaseSha !== null) {
+    // `<base>..HEAD` walks only objects the workspace itself owns — no
+    // cross-repo reachability needed. Exits non-zero only for malformed refs;
+    // treat that as 0 commits ahead rather than poisoning the snapshot.
+    const ahead = await runGitCapture(workspacePath, [
+      'rev-list',
+      '--count',
+      `${workspaceBaseSha}..${headSha}`,
+    ]);
+    aheadCount = ahead.exit === 0 ? Number(ahead.stdout.trim()) || 0 : 0;
   }
-  // is-ancestor exits 0 iff the first arg is an ancestor of the second; 1 otherwise.
-  // Any other exit (e.g. unknown SHA) we treat as "ancestor unknown → no drift"
-  // so a transient missing-object error doesn't trigger a spurious stale flag.
-  const isAncestor = await runGitCapture(workspacePath, [
-    'merge-base',
-    '--is-ancestor',
-    baseSha,
-    headSha,
-  ]);
-  let baseAncestor: boolean;
-  if (isAncestor.exit === 0) baseAncestor = true;
-  else if (isAncestor.exit === 1) baseAncestor = false;
-  else baseAncestor = true;
-  const ahead = await runGitCapture(workspacePath, [
-    'rev-list',
-    '--count',
-    `${baseSha}..${headSha}`,
-  ]);
-  const aheadCount = ahead.exit === 0 ? Number(ahead.stdout.trim()) || 0 : 0;
-  return { head: headSha, hasUncommitted, baseAncestor, commitsAheadOfBase: aheadCount };
+  return { head: headSha, workspaceBaseSha, hasUncommitted, commitsAheadOfBase: aheadCount };
 }
 
 interface GitCaptureResult {
@@ -231,7 +242,7 @@ export class WorkspaceResource {
 
   private readonly inspect: (
     workspacePath: string,
-    baseSha: string | null,
+    baseBranch: string,
   ) => Promise<WorkspaceInspection>;
   private readonly remove: (identifier: string, reason: RemoveReason) => Promise<void>;
   private actions: ActionStatus[] = [];
@@ -280,15 +291,15 @@ export class WorkspaceResource {
     for (const id of active) wanted.add(sanitizeWorkspaceKey(id));
     for (const id of inFlight) wanted.add(sanitizeWorkspaceKey(id));
 
-    let baseSha: string | null = null;
+    let baseRef: { branch: string; sha: string } | null = null;
     if (this.opts.baseRef) {
       try {
-        baseSha = await this.opts.baseRef.currentBaseSha();
+        baseRef = await this.opts.baseRef.currentBaseRef();
       } catch (err) {
         log.debug('workspace reconcile: base ref lookup failed', {
           error: (err as Error).message,
         });
-        baseSha = null;
+        baseRef = null;
       }
     }
 
@@ -313,11 +324,12 @@ export class WorkspaceResource {
         continue;
       }
 
-      // In the desired set. Check for drift (non-destructive).
-      if (baseSha === null) continue;
+      // In the desired set. Check for drift (non-destructive). No baseRef
+      // means we can't compare; just skip and treat the workspace as ok.
+      if (baseRef === null) continue;
       let inspection: WorkspaceInspection;
       try {
-        inspection = await this.inspect(dirPath, baseSha);
+        inspection = await this.inspect(dirPath, baseRef.branch);
       } catch (err) {
         log.debug('workspace reconcile: inspect failed', {
           identifier: entry,
@@ -326,7 +338,14 @@ export class WorkspaceResource {
         continue;
       }
       if (inspection.head === null) continue;
-      if (inspection.baseAncestor) continue;
+      // Workspace has no local copy of the base branch — operator likely
+      // deleted it. Skip drift detection rather than guess.
+      if (inspection.workspaceBaseSha === null) continue;
+      // Drift = workspace's frozen base SHA disagrees with source's current
+      // base SHA. Any disagreement counts (fast-forward, divergence, rewind
+      // all surface as "the operator's base moved out from under us"); the
+      // operator can decide what to do.
+      if (inspection.workspaceBaseSha === baseRef.sha) continue;
       // Drift detected. v1 never auto-removes for drift; we annotate and move
       // on so the operator can decide whether to relaunch the workspace.
       if (inspection.hasUncommitted || inspection.commitsAheadOfBase > 0) {

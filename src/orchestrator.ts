@@ -1039,22 +1039,21 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
   }
 
   /**
-   * Implements {@link BaseRefProvider}. Returns the current tip of the
-   * configured base branch in the source repo (workflow_dir by default), or
-   * null when the SHA cannot be resolved (no `.git`, base branch missing,
-   * etc.). The workspace resource compares this SHA against each active
-   * workspace's HEAD to detect drift — i.e. "base advanced while this issue
-   * was paused" — and reports `stale` / `stuck` annotations accordingly.
+   * Implements {@link BaseRefProvider}. Returns the configured base branch
+   * name AND its current SHA in the source repo (workflow_dir by default).
+   * Returns null when the SHA can't be resolved (no `.git`, base branch
+   * missing, etc.) — drift detection skips the pass.
    *
-   * The base branch is read from `SYMPHONY_BASE_BRANCH` (default `main`), the
-   * same env var the dispatch-time clone uses, so the reconciler's drift
-   * check is comparing against the same ref the workspace was originally
-   * cloned from.
+   * Why both fields: the reconciler's drift check compares the workspace's
+   * own copy of `<branch>` (frozen at clone time) against this SHA. Returning
+   * the branch name keeps the source-of-truth in one place; the inspector
+   * uses it to run `git rev-parse <branch>` inside the workspace.
    *
-   * Returning a SHA does NOT make the janitor destructive — drift handling
-   * is a snapshot annotation only in v1.
+   * `SYMPHONY_BASE_BRANCH` (default `main`) is the same env var the
+   * dispatch-time clone honors, so the drift check is comparing against the
+   * same ref the workspace was originally cloned from.
    */
-  async currentBaseSha(): Promise<string | null> {
+  async currentBaseRef(): Promise<{ branch: string; sha: string } | null> {
     const branch =
       process.env.SYMPHONY_BASE_BRANCH && process.env.SYMPHONY_BASE_BRANCH.length > 0
         ? process.env.SYMPHONY_BASE_BRANCH
@@ -1077,7 +1076,7 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
       child.on('close', (code) => {
         if (code !== 0) return resolve(null);
         const sha = stdout.trim();
-        resolve(sha.length > 0 ? sha : null);
+        resolve(sha.length > 0 ? { branch, sha } : null);
       });
     });
   }

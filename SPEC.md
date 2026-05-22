@@ -858,12 +858,17 @@ states. The convergence loop:
    non-terminal set (after also accounting for any in-flight dispatches whose
    tracker file may not yet reflect their state).
 4. Optional drift detection: when the implementation tracks a base ref (the
-   tip of the configured base branch), a workspace whose HEAD does not
-   contain that base tip SHOULD be surfaced in the reconciler snapshot as
-   `stale` (no uncommitted changes, no commits ahead of base — re-clone
-   would be safe but is deferred to operator action) or `stuck` (re-clone
-   would discard agent work). Drift handling is non-destructive: the
-   workspace stays on disk in both cases.
+   tip of the configured base branch in the source repo), it SHOULD compare
+   each active workspace's recorded view of that branch against the source's
+   current tip. Disagreement is drift and SHOULD be surfaced in the
+   reconciler snapshot as `stale` (no uncommitted changes, no commits ahead
+   of base — re-clone would be safe but is deferred to operator action) or
+   `stuck` (re-clone would discard agent work). Drift handling is
+   non-destructive: the workspace stays on disk in both cases. Comparing
+   recorded SHAs against the source rather than running cross-repo
+   reachability checks inside the workspace avoids the object-store boundary
+   that `git clone --local` creates (the workspace cannot see commits added
+   to the source repo after clone time).
 
 This runs at startup and continuously thereafter, so stale terminal
 workspaces never accumulate even on long-lived processes.
