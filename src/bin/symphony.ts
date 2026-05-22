@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 // CLI entry (SPEC §17.7). Usage:
 //   symphony [path-to-WORKFLOW.md] [--port <port>]
+//   symphony reconcile [path-to-WORKFLOW.md] [--force] [--port <port>]
 //
 // Default workflow path is ./WORKFLOW.md.
+//
+// The `reconcile` subcommand boots symphony exactly the same way as the bare
+// form; `--force` additionally invalidates any cached bake artifact for the
+// current Smolfile hash before dispatch so the next bake is guaranteed to
+// rebuild. `--reconcile-force` is kept as a top-level alias for ergonomics.
 
 import path from 'node:path';
 import process from 'node:process';
@@ -16,20 +22,33 @@ import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
+import { Reconciler } from '../reconciler/index.js';
 import { log } from '../logging.js';
 
 interface Cli {
   workflow: string;
   port: number | null;
+  reconcileForce: boolean;
 }
 
 function parseCli(argv: string[]): Cli {
+  // Detect the `reconcile` subcommand. When the first positional is `reconcile`,
+  // the rest of the args are parsed in subcommand mode (so `--force` is
+  // recognized and the issue's documented `symphony reconcile --force` shape
+  // works). Otherwise we parse in the legacy single-command shape.
+  let subcommand: 'reconcile' | null = null;
+  let rest = argv;
+  if (argv[0] === 'reconcile') {
+    subcommand = 'reconcile';
+    rest = argv.slice(1);
+  }
   let workflow: string | null = null;
   let port: number | null = null;
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
+  let reconcileForce = false;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
     if (a === '--port' || a === '-p') {
-      const v = argv[++i];
+      const v = rest[++i];
       if (!v) {
         process.stderr.write(`error: --port requires a value\n`);
         process.exit(2);
@@ -47,10 +66,20 @@ function parseCli(argv: string[]): Cli {
         process.exit(2);
       }
       port = n;
+    } else if (subcommand === 'reconcile' && a === '--force') {
+      reconcileForce = true;
+    } else if (a === '--reconcile-force') {
+      // Top-level alias for `reconcile --force`. Kept so existing invocations and
+      // process-manager unit files don't need rewriting; the new canonical shape is
+      // `symphony reconcile --force [path]`.
+      reconcileForce = true;
     } else if (a === '-h' || a === '--help') {
       process.stdout.write(
-        `symphony [path-to-WORKFLOW.md] [--port PORT]\n\n` +
-          `If path is omitted, ./WORKFLOW.md is used.\n`,
+        `symphony [path-to-WORKFLOW.md] [--port PORT] [--reconcile-force]\n` +
+          `symphony reconcile [path-to-WORKFLOW.md] [--force] [--port PORT]\n\n` +
+          `If path is omitted, ./WORKFLOW.md is used.\n` +
+          `\`reconcile --force\` (or the alias \`--reconcile-force\`) invalidates the\n` +
+          `cached bake artifact and rebakes before dispatching.\n`,
       );
       process.exit(0);
     } else if (!workflow) {
@@ -60,7 +89,11 @@ function parseCli(argv: string[]): Cli {
       process.exit(2);
     }
   }
-  return { workflow: workflow ?? path.resolve(process.cwd(), 'WORKFLOW.md'), port };
+  return {
+    workflow: workflow ?? path.resolve(process.cwd(), 'WORKFLOW.md'),
+    port,
+    reconcileForce,
+  };
 }
 
 async function main() {
@@ -111,6 +144,11 @@ async function main() {
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
   // bind failure surfaces before we accept any dispatches.
   const acpBridge = new AcpBridge();
+  // Reconciler (issue 32). Owns the bake artifact lifecycle so the Smolfile's
+  // apt + npm install is paid once per Smolfile-content change instead of per
+  // dispatch. The orchestrator gates dispatch on `dispatchReady()` and the runner
+  // reads the resolved baked-artifact path via `setBakedArtifactProvider`.
+  const reconciler = new Reconciler(config);
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
@@ -134,8 +172,19 @@ async function main() {
     },
     mcp,
     acpBridge,
+    reconciler,
   );
-  orch = new Orchestrator(config, definition, src, tracker, workspaces, runner, smolvm);
+  orch = new Orchestrator(
+    config,
+    definition,
+    src,
+    tracker,
+    workspaces,
+    runner,
+    smolvm,
+    undefined,
+    reconciler,
+  );
 
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved
   // tracker.root, changed active/terminal states) is reflected by both the propagation
@@ -146,6 +195,9 @@ async function main() {
     workspaces.updateConfig(cfg);
     runner.updateConfig(cfg, def);
     mcp.updateStates(cfg.states);
+    // The orchestrator's onChange handler already forwards the new config to
+    // the reconciler (so a Smolfile-path change kicks off a new bake); we do
+    // not re-forward here. liveCfg drives the HTTP dashboard's tracker view.
     liveCfg = cfg;
     // Materialize any state directory the reload introduced. Best-effort: a
     // mkdir failure here would normally come from a tracker.root rotation that
@@ -251,6 +303,16 @@ async function main() {
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
     process.exit(1);
+  }
+  if (cli.reconcileForce) {
+    // `--reconcile-force`: drop any cached bake artifact and rebuild before
+    // dispatching. The orchestrator's reconciler gate keeps dispatch off until
+    // the rebuild lands, so callers that pass --force after a dependency change
+    // get a guaranteed fresh artifact on the next dispatch.
+    log.info('reconcile --force requested');
+    void orch.triggerReconcile({ force: true }).catch((err) =>
+      log.warn('reconcile --force failed', { error: (err as Error).message }),
+    );
   }
   log.info('symphony started', {
     workflow: workflowPath,

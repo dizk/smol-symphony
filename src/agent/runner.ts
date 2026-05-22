@@ -224,6 +224,17 @@ export function resolveDispatchConfig(
   return { adapter, model, effort, max_turns };
 }
 
+/**
+ * Source for the currently-ready baked `.smolmachine` artifact produced by the
+ * reconciler (issue 32). When set, the runner passes `--from <path>` to smolvm
+ * instead of `--smolfile <Smolfile>`, so the per-start `[dev].init` cost is
+ * skipped. Null means "no bake ready" — the runner then falls back to whichever
+ * of `smolvm.{from,smolfile,image}` is set in config.
+ */
+export interface BakedArtifactProvider {
+  artifactPath(): string | null;
+}
+
 export class AgentRunner {
   constructor(
     private cfg: ServiceConfig,
@@ -238,10 +249,21 @@ export class AgentRunner {
      * smolvm-exec stdio path; required at runtime — runAttempt fails fast if absent.
      */
     private acpBridge: AcpBridge | null = null,
+    /**
+     * Reconciler-driven bake artifact provider. When set and returning a path,
+     * the runner uses `from: <path>` instead of `smolfile: <Smolfile>`; the
+     * orchestrator's reconciler gate guarantees this returns non-null before
+     * any dispatch happens when `smolvm.smolfile` is configured.
+     */
+    private bakedArtifacts: BakedArtifactProvider | null = null,
   ) {}
 
   setAcpBridge(bridge: AcpBridge | null): void {
     this.acpBridge = bridge;
+  }
+
+  setBakedArtifactProvider(provider: BakedArtifactProvider | null): void {
+    this.bakedArtifacts = provider;
   }
 
   updateConfig(cfg: ServiceConfig, workflow: WorkflowDefinition): void {
@@ -439,11 +461,22 @@ export class AgentRunner {
     // unhandled-rejection crashes the orchestrator (Node ≥ 15 default). Registering after
     // a successful bring-up makes the cancel path moot for that early failure.
     let vmReady = false;
+    // Issue 32: when the reconciler has a ready baked artifact, dispatch uses
+    // `--from <cache_path>` so the per-start [dev].init cost is paid once at bake
+    // time instead of on every dispatch. Falls back to the static `smolvm.{from,
+    // smolfile,image}` config when no bake is ready (only relevant for harnesses
+    // that don't wire a reconciler; production dispatch is gated by the
+    // orchestrator on `reconciler.dispatchReady()` and reaches here only when
+    // a bake is ready or no Smolfile is configured).
+    const bakedFrom = this.bakedArtifacts?.artifactPath() ?? null;
+    const vmFrom = bakedFrom ?? this.cfg.smolvm.from;
+    const vmSmolfile = bakedFrom ? null : this.cfg.smolvm.smolfile;
+    const vmImage = bakedFrom ? null : this.cfg.smolvm.image;
     try {
       await this.smolvm.ensureRunning(vmName, {
-        image: this.cfg.smolvm.image,
-        from: this.cfg.smolvm.from,
-        smolfile: this.cfg.smolvm.smolfile,
+        image: vmImage,
+        from: vmFrom,
+        smolfile: vmSmolfile,
         cpus: this.cfg.smolvm.cpus,
         memMib: this.cfg.smolvm.mem_mib,
         net: this.cfg.smolvm.net,

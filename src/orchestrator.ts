@@ -28,6 +28,7 @@ import type { WorkspaceManager, HookCapture, HookResult } from './workspace.js';
 import { withIssue, log } from './logging.js';
 import { openRunLog, type RunLog } from './runlog.js';
 import { defaultMemProbe, computeMemoryAdmission, type MemProbe } from './memory.js';
+import type { Reconciler, ReconcilerSnapshot } from './reconciler/index.js';
 
 export interface Snapshot {
   generated_at: string;
@@ -76,6 +77,13 @@ export interface Snapshot {
     admission_room: number | null;
     clamp_active: boolean;
   };
+  /**
+   * Per-resource reconciler state (issue 32). Stage 1 surfaces a single resource —
+   * the Smolfile-driven `bake` — so the dashboard can render "baking…" / "ready" /
+   * "error: <reason>" instead of an empty queue while dispatch is gated on the
+   * bake. Null when no reconciler is wired (test stubs that don't exercise it).
+   */
+  reconciler: ReconcilerSnapshot | null;
 }
 
 interface RetrySchedule {
@@ -144,6 +152,12 @@ export class Orchestrator {
     // /proc/meminfo synchronously; tests inject a stub that returns a controlled
     // mem_available_mib so the clamp behavior is deterministic.
     private memProbe: MemProbe = defaultMemProbe,
+    // Reconciler (issue 32) — owns managed external resources (today: the
+    // Smolfile-driven bake). Optional so tests that don't exercise reconciliation
+    // don't have to construct one; when absent, dispatch is never gated on a
+    // bake and `Snapshot.reconciler` is null. Production wiring in bin/symphony.ts
+    // always passes one in when `smolvm.smolfile` is configured.
+    private reconciler: Reconciler | null = null,
   ) {
     workflowSrc.onChange((next) => {
       if ('error' in next) {
@@ -155,6 +169,10 @@ export class Orchestrator {
       this.workflowDef = next.definition;
       this.lastValidationError = null;
       this.onConfigReloaded?.(next.config, next.definition);
+      // Issue 32: a config-watcher change is one of the reconciler's declared
+      // triggers. Re-binding the resource set picks up a new `smolvm.smolfile`
+      // path or hash and kicks off a new bake if the contents changed.
+      this.reconciler?.updateConfig(next.config);
       log.info('runtime config reloaded', {
         poll_interval_ms: next.config.polling.interval_ms,
         max_concurrent_agents: next.config.agent.max_concurrent_agents,
@@ -207,6 +225,16 @@ export class Orchestrator {
     // nothing tracks; over enough restarts they accumulate until the host runs out
     // of RAM (issue 26). Best-effort: failures are logged inside cleanupOrphanVms.
     await this.cleanupOrphanVms('startup');
+    // Trigger an initial reconcile pass before dispatching. The pass returns
+    // quickly even if a bake is needed — the bake runs on a background task and
+    // dispatch is gated until ready() is true. Backstop tick keeps the loop alive
+    // for missed signals.
+    if (this.reconciler) {
+      this.reconciler.start();
+      void this.reconciler.reconcile().catch((err) =>
+        log.warn('initial reconcile pass failed', { error: (err as Error).message }),
+      );
+    }
     this.scheduleTick(0);
   }
 
@@ -215,6 +243,9 @@ export class Orchestrator {
     if (this.tickTimer) {
       clearTimeout(this.tickTimer);
       this.tickTimer = null;
+    }
+    if (this.reconciler) {
+      await this.reconciler.stop().catch(() => undefined);
     }
     for (const e of this.retryAttempts.values()) clearTimeout(e.timer_handle);
     this.retryAttempts.clear();
@@ -239,6 +270,17 @@ export class Orchestrator {
     // catch VMs that drifted out of `running` (e.g. a worker that already removed
     // itself from `running` but hadn't reached the destroy call yet).
     await this.cleanupOrphanVms('shutdown');
+  }
+
+  /**
+   * Operator trigger for an immediate reconcile pass. Used by `symphony reconcile
+   * --force` (which invalidates the cache first via `force: true`) and by any
+   * future dashboard button that wants to re-evaluate the resource DAG without
+   * waiting for the backstop tick.
+   */
+  async triggerReconcile(opts: { force?: boolean } = {}): Promise<void> {
+    if (!this.reconciler) return;
+    await this.reconciler.reconcile(opts);
   }
 
   /** Operator trigger for an immediate poll cycle (§13.7 /refresh). */
@@ -285,6 +327,21 @@ export class Orchestrator {
       snapshotTrackerRoot = result.root;
     } catch (err) {
       log.warn('candidate fetch failed', { error: (err as Error).message });
+      this.scheduleTick(this.cfg.polling.interval_ms);
+      return;
+    }
+    // Reconciler gate (issue 32): refuse to dispatch any issue whose prerequisites
+    // haven't converged. v1 only gates on the bake; later stages add VM/workspace
+    // lifecycle. When the gate is closed we trigger a reconcile pass (cheap when
+    // a bake is already in flight) so the loop self-corrects on the next poll
+    // instead of waiting on the slower backstop tick.
+    if (this.reconciler && !this.reconciler.dispatchReady()) {
+      log.debug('dispatch gated on reconciler', {
+        candidate_count: candidates.length,
+      });
+      void this.reconciler.reconcile().catch((err) =>
+        log.debug('gated-reconcile failed', { error: (err as Error).message }),
+      );
       this.scheduleTick(this.cfg.polling.interval_ms);
       return;
     }
@@ -1027,6 +1084,7 @@ export class Orchestrator {
       },
       rate_limits: this.rateLimits,
       memory_admission: this.computeAdmission(),
+      reconciler: this.reconciler ? this.reconciler.snapshot() : null,
     };
   }
 
