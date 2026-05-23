@@ -37,7 +37,9 @@ import {
   runActions,
   toActionsSnapshot,
   type ActionContext,
+  type ActionExecResult,
   type ProposeFollowupSink,
+  type RunInVmExecutor,
   type WorkflowAction,
 } from '../actions/index.js';
 import type { ResourceSnapshot } from '../reconciler/index.js';
@@ -344,11 +346,104 @@ export class AgentRunner {
   }
 
   /**
+   * Construct a `RunInVmExecutor` bound to a specific per-issue VM. Each
+   * invocation spawns a fresh `smolvm machine exec -i` session against
+   * `vmName`, with stdin closed, stdout/stderr drained into the per-issue
+   * run log, and a timeout that escalates to SIGKILL on overrun. The
+   * workspace is bind-mounted at the same host path inside the VM (the
+   * runner declares that mount at bring-up), so `workdir` is identical
+   * on both sides — no path translation needed.
+   *
+   * Wraps the smolvm.execInteractive contract rather than reaching into
+   * the SmolvmClient from the actions module so the actions package
+   * stays free of `node:child_process`/smolvm imports; the dependency
+   * inversion lets tests pass `hostRunInVm` without touching smolvm.
+   */
+  private buildVmRunInVm(vmName: string, runLog: RunLog | undefined): RunInVmExecutor {
+    return ({ name, cmd, env, workdir, timeoutMs, onStdout, onStderr }) =>
+      new Promise((resolve) => {
+        const stream = this.smolvm.execInteractive(vmName, {
+          command: cmd,
+          workdir,
+          env,
+          // execInteractive's own timeoutMs is forwarded to smolvm CLI as
+          // `--timeout`. We pass it through so the VM-side process gets
+          // killed at the same deadline as our local timer; the local
+          // timer below is the belt-and-braces fallback.
+          timeoutMs,
+        });
+        // No stdin: run_in_vm is one-shot exec; the action's `cmd` is the
+        // full command line. Closing stdin tells the in-VM process its
+        // input stream is at EOF so it never blocks waiting for input.
+        try {
+          stream.stdin.end();
+        } catch {
+          /* idempotent on already-ended stream */
+        }
+        let stdout = '';
+        let stderr = '';
+        let timedOut = false;
+        const limit = 65_536;
+        stream.stdout.setEncoding('utf8');
+        stream.stderr.setEncoding('utf8');
+        stream.stdout.on('data', (chunk: string) => {
+          stdout += chunk;
+          if (stdout.length > limit) stdout = stdout.slice(0, limit);
+          onStdout?.(chunk);
+          runLog?.record({ channel: 'hook', hook: `run_in_vm:${name}`, stream: 'stdout', text: chunk });
+        });
+        stream.stderr.on('data', (chunk: string) => {
+          stderr += chunk;
+          if (stderr.length > limit) stderr = stderr.slice(0, limit);
+          onStderr?.(chunk);
+          runLog?.record({ channel: 'hook', hook: `run_in_vm:${name}`, stream: 'stderr', text: chunk });
+        });
+        const timer = setTimeout(() => {
+          timedOut = true;
+          try {
+            stream.kill();
+          } catch {
+            /* idempotent */
+          }
+        }, timeoutMs);
+        stream.exit
+          .then(({ code, signal }) => {
+            clearTimeout(timer);
+            resolve({
+              exit_code: code,
+              signal: signal ?? null,
+              timed_out: timedOut,
+              stdout,
+              stderr,
+            });
+          })
+          .catch((err: Error) => {
+            clearTimeout(timer);
+            resolve({
+              exit_code: null,
+              signal: null,
+              timed_out: timedOut,
+              stdout,
+              stderr: stderr + `\n${err.message}`,
+            });
+          });
+      });
+  }
+
+  /**
    * Drive the typed action executor for a state's `actions:` block. Reroutes
    * the issue when an action returns `route_to` (today: `merge` on conflict).
    * Mirrors the integration-merge reroute machinery so the failure path keeps
    * the workspace + agent branch available for the operator who picks up the
    * issue in the conflict state.
+   *
+   * Returns the underlying `ActionExecResult` so the caller can distinguish
+   * "rerouted (treat as success — the agent's work is done; the issue lives
+   * on in the conflict state)" from "non-routed failure (the cleanup pass
+   * itself failed — the attempt must report `ok: false` so the orchestrator
+   * retries or surfaces the error)." A void return here is what let a failed
+   * `push_branch` / `create_pr_if_missing` look like a successful attempt
+   * in the prior implementation.
    */
   private async runStateActions(
     stateName: string,
@@ -357,7 +452,8 @@ export class AgentRunner {
     workspacePath: string,
     extraEnv: Record<string, string> | undefined,
     capture: HookCapture | undefined,
-  ): Promise<void> {
+    runInVm: RunInVmExecutor | undefined,
+  ): Promise<ActionExecResult> {
     const ctx = this.buildActionContext(entry, workspacePath, extraEnv);
     const snapshotId = `actions:${stateName}`;
     const logger = withIssue({ issue_id: entry.issue_id, issue_identifier: entry.identifier });
@@ -370,6 +466,7 @@ export class AgentRunner {
       ctx,
       capture: capture ?? undefined,
       followupSink: this.followupSink ?? undefined,
+      runInVm: runInVm ?? undefined,
       snapshotId,
     });
     // Surface on snapshot regardless of outcome; the dashboard shows the
@@ -394,6 +491,7 @@ export class AgentRunner {
         reason: result.reason,
       });
     }
+    return result;
   }
 
   /**
@@ -736,6 +834,15 @@ export class AgentRunner {
     // reference so cleanup can close it even on partial failure.
     let acpSocket: Socket | null = null;
 
+    // Captured by `cleanup` when a non-routed action failure happens during
+    // the terminal `actions:` pass. The final return below treats this as
+    // attempt failure so the orchestrator retries (or otherwise surfaces it)
+    // instead of marking the issue "done" while its push/PR-create never
+    // landed. Routed failures (merge → conflict state) intentionally do NOT
+    // set this — the agent's work succeeded; the issue lives on in the
+    // conflict state. Only failures with no `route_to` propagate.
+    let nonRoutedActionFailureReason: string | null = null;
+
     const cleanup = async (reason: string) => {
       // Cancel the bridge registration if the in-VM agent never connected. Idempotent on
       // success (already-resolved registrations ignore cancel).
@@ -858,14 +965,32 @@ export class AgentRunner {
           // both are declared we silently skip the after_run hook here — the
           // warning at startup is the documented surface.
           if (cleanupActions && cleanupActions.length > 0 && runningEntry) {
-            await this.runStateActions(
+            // run_in_vm goes through the per-issue VM's exec channel (same
+            // sandbox the agent ran in). Build the closure here so the
+            // executor never has to know about smolvm; ordering inside
+            // cleanup() guarantees the VM is still alive at this point —
+            // VM destroy is the very last step below. We only wire the
+            // closure when bring-up succeeded; the `if (vmReady)` guard
+            // mirrors the destroy guard.
+            const runInVm: RunInVmExecutor | undefined = vmReady
+              ? this.buildVmRunInVm(vmName, runLog)
+              : undefined;
+            const actionResult = await this.runStateActions(
               cleanupState,
               cleanupActions,
               runningEntry,
               workspace.path,
               extraEnv,
               hookCapture('actions'),
+              runInVm,
             );
+            if (!actionResult.ok && !actionResult.route_to) {
+              // Non-routed failure — propagate out of cleanup so runAttempt
+              // returns ok:false. Routed failures (merge on_conflict) are
+              // intentionally handled as the agent's work succeeding; the
+              // tracker has already moved the issue to the conflict state.
+              nonRoutedActionFailureReason = actionResult.reason ?? 'unknown';
+            }
           } else {
             await this.workspaces.runAfterRunBestEffort(
               workspace.path,
@@ -1174,6 +1299,20 @@ export class AgentRunner {
     await cleanup(lastReason);
     if (agentFailure) {
       return { ok: false, reason: agentFailure, threadId: sessionId, turnsCompleted };
+    }
+    if (nonRoutedActionFailureReason !== null) {
+      // Cleanup ran the state's typed actions and at least one action
+      // failed without a `route_to`. Terminal-state cleanup (push the
+      // branch, open the PR, run CI checks) is part of the attempt's
+      // success contract — failing silently was the prior bug. We surface
+      // the failure as attempt failure so the orchestrator's retry /
+      // dashboard path can react instead of marking the issue done.
+      return {
+        ok: false,
+        reason: `state action failed: ${nonRoutedActionFailureReason}`,
+        threadId: sessionId,
+        turnsCompleted,
+      };
     }
     return { ok: true, reason: lastReason, threadId: sessionId, turnsCompleted };
   }

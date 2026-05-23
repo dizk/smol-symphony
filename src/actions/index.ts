@@ -10,9 +10,11 @@ export {
   runActions,
   invalidateRunInVmByName,
   toActionsSnapshot,
+  hostRunInVm,
   type ActionExecResult,
   type ActionExecutorOptions,
   type ProposeFollowupSink,
+  type RunInVmExecutor,
 } from './executor.js';
 export { renderTemplate, renderTree, TemplateError } from './templating.js';
 export { evaluatePredicate } from './predicates.js';

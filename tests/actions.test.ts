@@ -21,12 +21,14 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   computeCacheHash,
+  hostRunInVm,
   parseActionsBlock,
   renderTemplate,
   runActions,
   TemplateError,
   invalidateRunInVmByName,
   type ActionContext,
+  type RunInVmExecutor,
   type WorkflowAction,
 } from '../src/actions/index.js';
 import { findHooksAndActionsConflicts, buildServiceConfig } from '../src/workflow.js';
@@ -474,6 +476,7 @@ describe('action: run_in_vm cache hit/miss', () => {
         ctx,
         snapshotId: 'actions:Review',
         cacheRoot,
+        runInVm: hostRunInVm,
       });
       assert.equal(r1.ok, true);
       const r2 = await runActions([action], {
@@ -481,6 +484,7 @@ describe('action: run_in_vm cache hit/miss', () => {
         ctx,
         snapshotId: 'actions:Review',
         cacheRoot,
+        runInVm: hostRunInVm,
       });
       assert.equal(r2.ok, true);
       const log = await readFile(counterPath, 'utf8');
@@ -492,6 +496,7 @@ describe('action: run_in_vm cache hit/miss', () => {
         ctx,
         snapshotId: 'actions:Review',
         cacheRoot,
+        runInVm: hostRunInVm,
       });
       assert.equal(r3.ok, true);
       const log2 = await readFile(counterPath, 'utf8');
@@ -581,6 +586,7 @@ describe('action retry-on-error policy', () => {
           ctx,
           snapshotId: 'actions:Review',
           cacheRoot,
+          runInVm: hostRunInVm,
         });
         assert.equal(r.ok, false);
         // Initial attempt + 2 retries = 3 invocations BEFORE the cache writes
@@ -673,7 +679,13 @@ describe('run_in_vm cache layout', () => {
       const ctx = baseContext(ws, '42');
       await runActions(
         [{ kind: 'run_in_vm', name: 'noop', cmd: ['true'] }],
-        { workspacePath: ws, ctx, snapshotId: 'actions:Review', cacheRoot },
+        {
+          workspacePath: ws,
+          ctx,
+          snapshotId: 'actions:Review',
+          cacheRoot,
+          runInVm: hostRunInVm,
+        },
       );
       const dir = path.join(cacheRoot, 'actions', 'run_in_vm');
       const entries = await readdir(dir);
@@ -684,6 +696,158 @@ describe('run_in_vm cache layout', () => {
       await rm(source, { recursive: true, force: true });
       await rm(wsParent, { recursive: true, force: true });
       await rm(cacheRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ----- VM-runner sandbox boundary -------------------------------------------
+
+// The reviewer flagged that `run_in_vm` was silently spawning on the host;
+// the contract is now "must run via the wired VM executor." Two surfaces:
+// (a) no runner wired → fail loudly instead of host-spawning, (b) the
+// configured runner receives the command (not a host fork).
+
+describe('run_in_vm requires a wired VM runner', () => {
+  it('fails with "no VM runner wired" when runInVm is not supplied', async () => {
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42');
+    const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
+    try {
+      const ctx = baseContext(ws, '42');
+      const sideEffect = path.join(ws, '.should-not-exist');
+      // The previous executor would have host-spawned this command and
+      // written the side-effect file. The fixed executor must short-circuit
+      // before reaching any process spawn — the file's absence is the
+      // assertion that the sandbox boundary held.
+      const r = await runActions(
+        [
+          {
+            kind: 'run_in_vm',
+            name: 'rogue',
+            cmd: ['sh', '-c', `touch "${sideEffect}"; exit 0`],
+            // Disable retry so a single failed attempt ends the run.
+            on_error: { retry: { count: 0, backoff_ms: 1 } },
+          },
+        ],
+        { workspacePath: ws, ctx, snapshotId: 'actions:Review', cacheRoot },
+      );
+      assert.equal(r.ok, false);
+      assert.match(String(r.reason), /no VM runner wired/);
+      const { stat } = await import('node:fs/promises');
+      await assert.rejects(stat(sideEffect), 'host spawn must not have happened');
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+      await rm(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('routes run_in_vm through the wired RunInVmExecutor, not a host fork', async () => {
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42');
+    const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
+    const seen: Array<{ name: string; cmd: string[]; workdir: string }> = [];
+    const fakeRunner: RunInVmExecutor = async (input) => {
+      seen.push({ name: input.name, cmd: input.cmd, workdir: input.workdir });
+      input.onStdout?.('hello\n');
+      return { exit_code: 0, signal: null, timed_out: false, stdout: 'hello\n', stderr: '' };
+    };
+    try {
+      const ctx = baseContext(ws, '42');
+      const r = await runActions(
+        [{ kind: 'run_in_vm', name: 'build', cmd: ['npm', 'run', 'build'] }],
+        {
+          workspacePath: ws,
+          ctx,
+          snapshotId: 'actions:Review',
+          cacheRoot,
+          runInVm: fakeRunner,
+        },
+      );
+      assert.equal(r.ok, true);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0]!.name, 'build');
+      assert.deepEqual(seen[0]!.cmd, ['npm', 'run', 'build']);
+      assert.equal(seen[0]!.workdir, ws);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+      await rm(cacheRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ----- Failure propagation contract -----------------------------------------
+
+// Reviewer's second finding: non-routed action failures were being swallowed,
+// so a failed push/PR-create returned ok:true at the attempt level. The
+// executor's ActionExecResult contract is the source of truth — runActions
+// must surface ok:false (with no route_to) for ungraceful failures so the
+// runner can map that to attempt failure.
+
+describe('runActions failure propagation', () => {
+  it('returns ok:false with no route_to when a typed action fails terminally', async () => {
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42');
+    try {
+      const ctx = baseContext(ws, '42');
+      // No `origin` remote configured → `git push origin` fails. Retries
+      // configured to 0 so the test runs quickly.
+      const r = await runActions(
+        [
+          {
+            kind: 'push_branch',
+            remote: 'origin',
+            ref: '$branch',
+            on_error: { retry: { count: 0, backoff_ms: 1 } },
+          },
+        ],
+        { workspacePath: ws, ctx, snapshotId: 'actions:Done' },
+      );
+      assert.equal(r.ok, false);
+      assert.equal(r.route_to, null);
+      assert.match(String(r.reason), /git push/);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+    }
+  });
+
+  it('returns ok:false WITH route_to when merge conflict reroutes', async () => {
+    // Mirrors the existing merge-conflict happy path but asserts the
+    // contract from the runner's perspective: a routed failure is still
+    // ok:false (to break out of the action loop) but carries `route_to`,
+    // which the runner uses to skip the attempt-failure path.
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42');
+    try {
+      await writeFile(path.join(ws, 'conflict.md'), 'agent-content\n', 'utf8');
+      await git(['add', '.'], ws);
+      await git(['commit', '-m', 'agent edit'], ws);
+      await git(['checkout', '-b', 'integration', 'main'], ws);
+      await writeFile(path.join(ws, 'conflict.md'), 'integration-content\n', 'utf8');
+      await git(['add', '.'], ws);
+      await git(['commit', '-m', 'integration edit'], ws);
+      await git(['checkout', 'agent/42'], ws);
+
+      const ctx = baseContext(ws, '42');
+      const r = await runActions(
+        [
+          {
+            kind: 'merge',
+            source: 'agent/42',
+            target: 'integration',
+            on_conflict: { route_to: 'Conflict' },
+            on_error: { retry: { count: 0, backoff_ms: 1 } },
+          },
+        ],
+        { workspacePath: ws, ctx, snapshotId: 'actions:Done' },
+      );
+      assert.equal(r.ok, false);
+      assert.equal(r.route_to, 'Conflict');
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
     }
   });
 });

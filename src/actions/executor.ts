@@ -69,6 +69,35 @@ export interface ProposeFollowupSink {
   }): Promise<{ identifier: string }>;
 }
 
+/**
+ * Backend that executes a `run_in_vm` action's command. Production wires the
+ * smolvm exec path (the runner constructs a closure that calls
+ * `smolvm.execInteractive(<vmName>, …)` against the per-issue VM so the
+ * command lands inside the same sandbox the agent ran in); tests pass
+ * `hostRunInVm`, which forks the command on the host. The executor never
+ * spawns a `run_in_vm` command directly — failing to wire a `runInVm`
+ * closure surfaces as a `run_in_vm: no VM runner wired` failure on the
+ * action ledger instead of silently escaping the sandbox.
+ */
+export type RunInVmExecutor = (input: {
+  /** Mirrors the action's `name` for diagnostics. */
+  name: string;
+  cmd: string[];
+  env: Record<string, string>;
+  /** Workspace root inside the VM (mounted at the same host path). */
+  workdir: string;
+  timeoutMs: number;
+  /** Forwarded to the run log + per-issue capture surface, byte-for-byte. */
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
+}) => Promise<{
+  exit_code: number | null;
+  signal: NodeJS.Signals | null;
+  timed_out: boolean;
+  stdout: string;
+  stderr: string;
+}>;
+
 export interface ActionExecutorOptions {
   workspacePath: string;
   ctx: ActionContext;
@@ -83,6 +112,13 @@ export interface ActionExecutorOptions {
   cacheRoot?: string;
   /** Required for `propose_followup`. */
   followupSink?: ProposeFollowupSink;
+  /**
+   * Required for `run_in_vm`. Production wires the smolvm exec path; tests
+   * pass `hostRunInVm`. When absent, `run_in_vm` actions fail immediately
+   * with a "no VM runner wired" diagnostic (rather than silently falling
+   * back to host spawn, which would defeat the sandbox boundary).
+   */
+  runInVm?: RunInVmExecutor;
   /** Logical scope id (e.g. `actions:Done`) for snapshot keying. */
   snapshotId: string;
   /**
@@ -502,15 +538,43 @@ async function applyRunInVm(
     );
     return { ok: true, reason: null, route_to: null, cache_hit: true };
   }
-  // Run the command on the host with workspace as cwd. The issue body
-  // describes this as "scheduled inside the VM (sandbox)"; running on the
-  // host is the stage-1 implementation that wires the cache shape and
-  // dashboard surface end-to-end. True VM-side scheduling stays a follow-up
-  // (`propose_issue` is the right surface — operators can decide whether to
-  // promote it once a concrete user need lands).
+  // The only escape hatch for arbitrary commands runs inside the per-issue
+  // VM (the sandbox the agent was just running in). When no `runInVm`
+  // closure is wired, fail loudly rather than fall back to host spawn —
+  // dropping the sandbox boundary for the one surface that can carry
+  // arbitrary commands is exactly the regression issue 36's typed-action
+  // design exists to prevent.
+  if (!opts.runInVm) {
+    return {
+      ok: false,
+      reason: `run_in_vm "${action.name}" failed: no VM runner wired`,
+      route_to: null,
+    };
+  }
   const timeoutMs = (action.timeout ?? Math.ceil((opts.defaultCommandTimeoutMs ?? 300_000) / 1000)) * 1000;
-  const [bin, ...args] = action.cmd;
-  const res = await runCommand(bin!, args, opts, /*silent*/ false, { extraEnv: env, timeoutMs });
+  const onStdout = (chunk: string): void => {
+    opts.capture?.onChunk?.('stdout', chunk);
+  };
+  const onStderr = (chunk: string): void => {
+    opts.capture?.onChunk?.('stderr', chunk);
+  };
+  const res = await opts.runInVm({
+    name: action.name,
+    cmd: action.cmd,
+    env,
+    workdir: opts.workspacePath,
+    timeoutMs,
+    onStdout,
+    onStderr,
+  });
+  opts.capture?.onResult?.({
+    ran: true,
+    exit_code: res.exit_code,
+    signal: res.signal,
+    timed_out: res.timed_out,
+    stdout: res.stdout,
+    stderr: res.stderr,
+  });
   const result = {
     exit_code: res.exit_code ?? -1,
     stdout: res.stdout,
@@ -530,6 +594,65 @@ async function applyRunInVm(
     route_to: null,
   };
 }
+
+/**
+ * Host-spawn implementation of `RunInVmExecutor`. Used by tests so a
+ * unit test can exercise the cache/retry plumbing without booting a VM,
+ * and as an explicit opt-in for harnesses that want host-mode execution
+ * (e.g. running symphony against a workspace with no smolvm available).
+ * Production wires the VM-side variant in `AgentRunner`; calling this
+ * helper from the orchestrator path would defeat the sandbox boundary
+ * the typed-action DAG exists to enforce.
+ */
+export const hostRunInVm: RunInVmExecutor = ({ cmd, env, workdir, timeoutMs, onStdout, onStderr }) =>
+  new Promise((resolve) => {
+    const [bin, ...args] = cmd;
+    const child = spawn(bin!, args, {
+      cwd: workdir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...env } as NodeJS.ProcessEnv,
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const limit = 65_536;
+    child.stdout?.on('data', (b) => {
+      const text = b.toString('utf8');
+      stdout += text;
+      if (stdout.length > limit) stdout = stdout.slice(0, limit);
+      onStdout?.(text);
+    });
+    child.stderr?.on('data', (b) => {
+      const text = b.toString('utf8');
+      stderr += text;
+      if (stderr.length > limit) stderr = stderr.slice(0, limit);
+      onStderr?.(text);
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({
+        exit_code: null,
+        signal: null,
+        timed_out: timedOut,
+        stdout,
+        stderr: stderr + `\n${err.message}`,
+      });
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      resolve({
+        exit_code: code,
+        signal: signal ?? null,
+        timed_out: timedOut,
+        stdout,
+        stderr,
+      });
+    });
+  });
 
 async function applyProposeFollowup(
   action: ProposeFollowupAction,
