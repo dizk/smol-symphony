@@ -677,6 +677,53 @@ describe('integration block', () => {
     assert.equal(cfg.pr_autopilot.poll_interval_ms, 15000);
   });
 
+  it('pr_autopilot distinguishes absent close_state (default Cancelled) from explicit null/empty (disabled)', () => {
+    // Key absent → default 'Cancelled'.
+    const absent = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        pr_autopilot: { enabled: true },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(absent.pr_autopilot.close_state, 'Cancelled');
+
+    // Explicit null → disabled (the close path is off).
+    const explicitNull = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        pr_autopilot: { enabled: true, close_state: null },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(explicitNull.pr_autopilot.close_state, null);
+
+    // Explicit empty string → disabled (treated the same as null per the
+    // template doc — "omit by setting an empty string").
+    const explicitEmpty = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        pr_autopilot: { enabled: true, close_state: '' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(explicitEmpty.pr_autopilot.close_state, null);
+
+    // Whitespace-only string → disabled (trim before checking).
+    const explicitBlank = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        pr_autopilot: { enabled: true, close_state: '   ' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(explicitBlank.pr_autopilot.close_state, null);
+  });
+
   it('pr_autopilot rejects max_rebase_attempts <= 0 at parse time', () => {
     assert.throws(() =>
       buildServiceConfig(

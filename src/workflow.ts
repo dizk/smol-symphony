@@ -408,7 +408,22 @@ export function buildServiceConfig(
   const prAutopilotEnabledRaw = prAutopilotRaw['enabled'];
   const prAutopilotEnabled = prAutopilotEnabledRaw === true;
   const mergeStateRaw = asString(prAutopilotRaw['merge_state']);
+  // close_state is "string with default Cancelled" when the key is absent, but
+  // an explicit `close_state: null` (or empty string) disables the close path
+  // entirely — see WORKFLOW.template.md. Distinguish "key absent" from "key
+  // present with a falsy value" so the default doesn't silently re-enable a
+  // path the operator turned off.
+  const closeStateKeyPresent = Object.prototype.hasOwnProperty.call(
+    prAutopilotRaw,
+    'close_state',
+  );
   const closeStateRaw = asString(prAutopilotRaw['close_state']);
+  const closeStateTrimmed = closeStateRaw?.trim() ?? '';
+  const closeState: string | null = closeStateKeyPresent
+    ? closeStateTrimmed.length > 0
+      ? closeStateTrimmed
+      : null
+    : 'Cancelled';
   const conflictRouteToRaw = asString(prAutopilotRaw['conflict_route_to']);
   const conflictHoldingRaw = asString(prAutopilotRaw['conflict_holding_state']);
   const strategyRaw = asString(prAutopilotRaw['auto_merge_strategy']) ?? 'squash';
@@ -417,8 +432,7 @@ export function buildServiceConfig(
   const prAutopilot: PrAutopilotConfig = {
     enabled: prAutopilotEnabled,
     merge_state: mergeStateRaw && mergeStateRaw.trim().length > 0 ? mergeStateRaw.trim() : 'Done',
-    close_state:
-      closeStateRaw && closeStateRaw.trim().length > 0 ? closeStateRaw.trim() : 'Cancelled',
+    close_state: closeState,
     conflict_route_to:
       conflictRouteToRaw && conflictRouteToRaw.trim().length > 0
         ? conflictRouteToRaw.trim()
