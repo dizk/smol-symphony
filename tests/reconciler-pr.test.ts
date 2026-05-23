@@ -11,12 +11,20 @@
 //   (f) force-with-lease guard: when the observed head SHA changes between ticks, the
 //       reconciler defers instead of clobbering.
 //
-// All I/O is behind stubs (PrApi, PrGitApi, PrTransitionApi, PrCleanupApi) so the suite is
-// fully in-process — no `gh`, no `git`, no GitHub round-trips.
+// All resource-level I/O is behind stubs (PrApi, PrGitApi, PrTransitionApi, PrCleanupApi)
+// so the suite is fully in-process — no `gh`, no `git`, no GitHub round-trips. A small
+// "production adapter" section at the bottom exercises GitCliPrGitApi against a real
+// on-disk git repo to pin the conflict-state-preserved behavior that the resource
+// stubs out at the interface boundary.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
 import {
+  GitCliPrGitApi,
   PrResource,
   type PrApi,
   type PrCleanupApi,
@@ -381,88 +389,218 @@ describe('PrResource — rebase conflict routing', () => {
 });
 
 describe('PrResource — circuit breaker', () => {
-  it('routes to the conflict holding state after max_rebase_attempts consecutive failures', async () => {
-    // We synthesize repeat conflicts by re-creating the PrResource state on
-    // each pass (the resource drops per-identifier state when an issue isn't
-    // in the desired set, simulating the implementing-state round trip).
-    // Easier: simulate three failures back-to-back by keeping the intent
-    // present and the rebase result conflicting, but call reconcile() three
-    // times in a row. Since the resource drops state after each successful
-    // route, attempt count for the second call starts fresh. To pin the
-    // circuit-breaker semantics we exercise the in-pass branch directly by
-    // setting maxRebaseAttempts=1, so a single failed rebase triggers the
-    // route_to_conflict_route_to, then a second conflict on the same pass
-    // would exceed.
+  it('routes to the holding state after max_rebase_attempts consecutive failures across Done → conflict_route_to cycles', async () => {
+    // Realistic production flow: each round the issue is in Done, the rebase
+    // conflicts, the resource routes Done → Todo. Meanwhile an agent resolves
+    // and pushes a new head SHA, the issue cycles back to Done, and another
+    // reconcile pass runs. Between passes the identifier is briefly OUT of
+    // the intended set (it's in Todo/Review). The rebaseAttempts counter must
+    // accumulate across these cycles so the breaker fires on the 4th attempt
+    // when max=3.
 
-    // The cleanest pin: drive the same identifier through max+1 conflicts in
-    // a single pass by NOT dropping state. The resource only drops state
-    // after a successful route; on circuit-broken route it sets completed
-    // and leaves state in place. So feeding it max+1 conflicts via repeated
-    // reconcile() calls with an intent that REMAINS in the set requires the
-    // attempt counter to survive across calls. The current implementation
-    // only resets the counter on successful rebase OR when the identifier
-    // leaves the intended set. To exercise the breaker, we keep the intent
-    // present, the rebase failing, and call reconcile() until the breaker
-    // trips.
-    //
-    // Reset state.delete() happens on each non-circuit-broken route. So:
-    //   pass 1: conflict, attempts=1, route to Todo, state dropped.
-    //   pass 2: conflict, attempts=1 again (state was dropped).
-    // The counter never accumulates. The breaker is reachable only when the
-    // SAME pass observes attempts > max — which can happen when an operator
-    // bypasses our routing (e.g. workflow with merge_state==conflict_route_to)
-    // or when state isn't dropped because the resource crashed mid-route.
-    //
-    // For v1 the breaker is best exercised by directly instantiating with
-    // maxRebaseAttempts=0 and verifying the first conflict trips the breaker.
-    const intent = makeIntent();
-    const { api } = makePrApi({});
-    const { git } = makeGit({
+    // We model the round trip with a mutable intended-set provider: when the
+    // resource calls prIntended() we feed it the current state. Between
+    // reconcile passes we flip the intent in/out and bump the head SHA so the
+    // resource sees a "fresh" PR each return.
+    let currentIntents: PrIntent[] = [];
+    const provider: PrIntendedProvider = { prIntended: async () => currentIntents };
+    let currentHead = 'head-1';
+    const { api, calls: apiCalls } = makePrApi({
+      view: () => makeView({ head_ref_oid: currentHead }),
+    });
+    const { git, calls: gitCalls } = makeGit({
       rebase: { kind: 'conflict', files: ['x.ts'], diagnostic: 'boom' },
     });
     const { transition, calls: trCalls } = makeTransition();
     const { cleanup } = makeCleanup();
     const res = new PrResource({
-      intended: intended([intent]),
+      intended: provider,
       pr: api,
       git,
       transition,
       cleanup,
       strategy: 'squash',
-      maxRebaseAttempts: 0, // first failure immediately exceeds.
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+
+    // Round 1: Done → conflict → route to Todo. attempts becomes 1.
+    currentIntents = [makeIntent()];
+    await res.reconcile();
+    assert.equal(trCalls.length, 1);
+    assert.equal(trCalls[0]!.toState, 'Todo');
+    assert.match(trCalls[0]!.notes, /attempt 1 of 3/);
+    assert.equal(res.rebaseAttemptsFor('42'), 1);
+
+    // Agent picks it up, resolves, transitions back to Review then Done. The
+    // identifier is OUT of the intended set in between. Reconciler ticks
+    // during that gap should not drop the counter.
+    currentIntents = [];
+    await res.reconcile();
+    assert.equal(res.rebaseAttemptsFor('42'), 1, 'counter survives intended-set absence');
+
+    // Round 2: Done again with a new head SHA. New conflict. attempts -> 2.
+    currentHead = 'head-2';
+    currentIntents = [makeIntent()];
+    await res.reconcile();
+    assert.equal(trCalls.length, 2);
+    assert.equal(trCalls[1]!.toState, 'Todo');
+    assert.match(trCalls[1]!.notes, /attempt 2 of 3/);
+    assert.equal(res.rebaseAttemptsFor('42'), 2);
+
+    // Gap again.
+    currentIntents = [];
+    await res.reconcile();
+    assert.equal(res.rebaseAttemptsFor('42'), 2);
+
+    // Round 3: attempts -> 3 (== max). Still routed to Todo, NOT Conflict.
+    currentHead = 'head-3';
+    currentIntents = [makeIntent()];
+    await res.reconcile();
+    assert.equal(trCalls.length, 3);
+    assert.equal(trCalls[2]!.toState, 'Todo');
+    assert.match(trCalls[2]!.notes, /attempt 3 of 3/);
+    assert.equal(res.rebaseAttemptsFor('42'), 3);
+
+    // Gap.
+    currentIntents = [];
+    await res.reconcile();
+
+    // Round 4: attempts -> 4 (> max). Now the breaker fires.
+    currentHead = 'head-4';
+    currentIntents = [makeIntent()];
+    await res.reconcile();
+    assert.equal(trCalls.length, 4);
+    assert.equal(trCalls[3]!.toState, 'Conflict');
+    assert.match(trCalls[3]!.notes, /circuit broken/i);
+
+    // After the breaker fires the counter is dropped (operator intervention
+    // is treated as a hard reset), so if the issue ever returns to Done it
+    // starts fresh.
+    assert.equal(res.rebaseAttemptsFor('42'), 0);
+
+    // Sanity: every round actually called rebase + transition.
+    assert.equal(gitCalls.rebase.length, 4);
+    assert.equal(apiCalls.list.length, 4);
+    assert.equal(apiCalls.view.length, 4);
+  });
+
+  it('preserves the counter when the identifier leaves the intended set with a non-zero count', async () => {
+    // Direct unit test of resetTransient semantics: a single conflict route
+    // leaves rebaseAttempts=1; the next pass with an empty intended set
+    // must NOT zero it out.
+    let currentIntents: PrIntent[] = [makeIntent()];
+    const provider: PrIntendedProvider = { prIntended: async () => currentIntents };
+    const { api } = makePrApi({});
+    const { git } = makeGit({
+      rebase: { kind: 'conflict', files: ['x.ts'], diagnostic: 'boom' },
+    });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: provider,
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
       conflictRouteTo: 'Todo',
       conflictHoldingState: 'Conflict',
       pollIntervalMs: 0,
     });
     await res.reconcile();
-    assert.equal(trCalls.length, 1);
-    assert.equal(trCalls[0]!.toState, 'Conflict');
-    assert.match(trCalls[0]!.notes, /circuit broken/i);
+    assert.equal(res.rebaseAttemptsFor('42'), 1);
+    currentIntents = [];
+    await res.reconcile();
+    assert.equal(res.rebaseAttemptsFor('42'), 1, 'counter must survive intended-set absence');
+    await res.reconcile();
+    assert.equal(res.rebaseAttemptsFor('42'), 1, 'counter must survive many empty passes');
   });
 
-  it('surfaces a hard error when no holding state is declared and the breaker trips', async () => {
-    const intent = makeIntent();
+  it('resets the counter on a successful rebase between conflicts (consecutive-failure semantics)', async () => {
+    // attempts -> 1 on first conflict; a subsequent successful rebase clears
+    // it back to 0 so a future conflict starts the count fresh.
+    let currentIntents: PrIntent[] = [makeIntent()];
+    const provider: PrIntendedProvider = { prIntended: async () => currentIntents };
+    let nextRebase: RebaseOutcome = {
+      kind: 'conflict',
+      files: ['x.ts'],
+      diagnostic: 'boom',
+    };
     const { api } = makePrApi({});
+    const { git } = makeGit({ rebase: () => nextRebase, push: { kind: 'ok' } });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: provider,
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+
+    await res.reconcile();
+    assert.equal(res.rebaseAttemptsFor('42'), 1);
+
+    // Round trip — agent fixed, issue back in Done, head SHA bumped.
+    currentIntents = [];
+    await res.reconcile();
+    currentIntents = [makeIntent()];
+    nextRebase = { kind: 'ok', new_head_sha: 'rebased-head' };
+    await res.reconcile();
+    assert.equal(res.rebaseAttemptsFor('42'), 0, 'successful rebase resets the counter');
+  });
+
+  it('surfaces a hard error and clamps the counter when no holding state is declared and the breaker trips', async () => {
+    // Drive max+1 conflicts back-to-back; with no holding state, the resource
+    // surfaces last_error but does not transition. The counter must clamp
+    // at `max` so it doesn't grow unbounded across subsequent passes.
+    let currentIntents: PrIntent[] = [];
+    const provider: PrIntendedProvider = { prIntended: async () => currentIntents };
+    let currentHead = 'head-1';
+    const { api } = makePrApi({
+      view: () => makeView({ head_ref_oid: currentHead }),
+    });
     const { git } = makeGit({
       rebase: { kind: 'conflict', files: [], diagnostic: 'boom' },
     });
     const { transition, calls: trCalls } = makeTransition();
     const { cleanup } = makeCleanup();
     const res = new PrResource({
-      intended: intended([intent]),
+      intended: provider,
       pr: api,
       git,
       transition,
       cleanup,
       strategy: 'squash',
-      maxRebaseAttempts: 0,
+      maxRebaseAttempts: 1,
       conflictRouteTo: 'Todo',
       conflictHoldingState: null,
       pollIntervalMs: 0,
     });
+    // Round 1: attempts -> 1 (== max), still routes to Todo.
+    currentIntents = [makeIntent()];
     await res.reconcile();
-    assert.equal(trCalls.length, 0, 'no transition fired without a holding state');
+    assert.equal(trCalls.length, 1);
+    assert.equal(trCalls[0]!.toState, 'Todo');
+    // Round 2: attempts -> 2 (> max), no holding state, surfaces last_error.
+    currentIntents = [];
+    await res.reconcile();
+    currentHead = 'head-2';
+    currentIntents = [makeIntent()];
+    await res.reconcile();
+    assert.equal(trCalls.length, 1, 'no transition fired without a holding state');
     assert.match(res.snapshot().last_error ?? '', /circuit broken/);
+    // Clamped at max so a third pass would re-fire last_error (not grow).
+    assert.equal(res.rebaseAttemptsFor('42'), 1);
   });
 });
 
@@ -747,5 +885,173 @@ describe('PrResource — error surfaces', () => {
     });
     await res.reconcile();
     assert.match(res.snapshot().last_error ?? '', /tracker exploded/);
+  });
+});
+
+// ── production adapter: GitCliPrGitApi against a real on-disk git repo ─────
+//
+// The PrResource tests above stub PrGitApi at the interface boundary. These
+// tests exercise the actual `git` shell-outs in GitCliPrGitApi against a real
+// repository to pin two production-only invariants:
+//
+//   1. On a rebase conflict, the working tree must be left WITH conflict
+//      markers AND a `.git/rebase-merge` (or `rebase-apply`) directory on
+//      disk — the rebase is left IN PROGRESS so the routed agent can
+//      `git add` + `git rebase --continue`. (Issue 38 review finding #1.)
+//   2. The concurrent-push guard fires when local HEAD diverges from the
+//      expectedHeadSha the resource passes down.
+
+async function runStep(cwd: string, cmd: string, args: string[]): Promise<{ exit: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (b) => (stdout += b.toString('utf8')));
+    child.stderr?.on('data', (b) => (stderr += b.toString('utf8')));
+    child.on('error', (err) => resolve({ exit: -1, stdout, stderr: stderr + String(err) }));
+    child.on('close', (code) => resolve({ exit: code ?? -1, stdout, stderr }));
+  });
+}
+
+async function gitOk(cwd: string, args: string[]): Promise<string> {
+  const r = await runStep(cwd, 'git', args);
+  if (r.exit !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${r.stderr.trim()}`);
+  }
+  return r.stdout.trim();
+}
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe('GitCliPrGitApi — real git', () => {
+  it('leaves the rebase IN PROGRESS with conflict markers on disk when the rebase conflicts', async () => {
+    const baseRemote = await mkdtemp(path.join(os.tmpdir(), 'pr-git-remote-'));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'pr-git-ws-'));
+    try {
+      // Bare remote so the workspace clone has an `origin` to fetch from.
+      await gitOk(baseRemote, ['init', '--bare', '-b', 'main']);
+
+      // Seed the remote with a single commit on main.
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'pr-git-seed-'));
+      try {
+        await gitOk(seed, ['init', '-b', 'main']);
+        await gitOk(seed, ['config', 'user.name', 'test']);
+        await gitOk(seed, ['config', 'user.email', 'test@example.com']);
+        await runStep(seed, 'sh', ['-c', 'echo "line one\nline two\nline three" > file.txt']);
+        await gitOk(seed, ['add', 'file.txt']);
+        await gitOk(seed, ['commit', '-m', 'seed']);
+        await gitOk(seed, ['remote', 'add', 'origin', baseRemote]);
+        await gitOk(seed, ['push', 'origin', 'main']);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+
+      // Clone the workspace from the bare remote, then create a feature
+      // branch that touches the same line as a subsequent main commit.
+      await gitOk(workspace, ['clone', baseRemote, '.']);
+      await gitOk(workspace, ['config', 'user.name', 'test']);
+      await gitOk(workspace, ['config', 'user.email', 'test@example.com']);
+      await gitOk(workspace, ['checkout', '-b', 'agent/42']);
+      await runStep(workspace, 'sh', ['-c', 'echo "line one\nFEATURE\nline three" > file.txt']);
+      await gitOk(workspace, ['commit', '-am', 'feature change']);
+      const featureHead = await gitOk(workspace, ['rev-parse', 'HEAD']);
+
+      // Advance main on the remote with a conflicting change to the same line.
+      const main = await mkdtemp(path.join(os.tmpdir(), 'pr-git-main-'));
+      try {
+        await gitOk(main, ['clone', baseRemote, '.']);
+        await gitOk(main, ['config', 'user.name', 'test']);
+        await gitOk(main, ['config', 'user.email', 'test@example.com']);
+        await runStep(main, 'sh', ['-c', 'echo "line one\nMAIN\nline three" > file.txt']);
+        await gitOk(main, ['commit', '-am', 'main change']);
+        await gitOk(main, ['push', 'origin', 'main']);
+      } finally {
+        await rm(main, { recursive: true, force: true });
+      }
+
+      const git = new GitCliPrGitApi({ timeoutMs: 30_000 });
+      const outcome = await git.rebaseOnto({
+        workspacePath: workspace,
+        branch: 'agent/42',
+        baseBranch: 'main',
+        expectedHeadSha: featureHead,
+      });
+
+      assert.equal(outcome.kind, 'conflict', `expected conflict, got ${JSON.stringify(outcome)}`);
+      if (outcome.kind !== 'conflict') return;
+      assert.ok(outcome.files.includes('file.txt'), `expected file.txt in conflicted files: ${outcome.files.join(',')}`);
+
+      // The rebase must be left IN PROGRESS for the routed agent to resolve.
+      // git keeps state in either .git/rebase-merge (interactive / m) or
+      // .git/rebase-apply (am-style). Either is acceptable.
+      const rebaseMerge = path.join(workspace, '.git', 'rebase-merge');
+      const rebaseApply = path.join(workspace, '.git', 'rebase-apply');
+      const hasRebaseDir = (await pathExists(rebaseMerge)) || (await pathExists(rebaseApply));
+      assert.ok(hasRebaseDir, 'rebase-in-progress directory must remain after a conflicted rebase');
+
+      // The conflicted file must still contain conflict markers.
+      const fileBody = await readFile(path.join(workspace, 'file.txt'), 'utf8');
+      assert.match(fileBody, /<<<<<<< /);
+      assert.match(fileBody, /=======/);
+      assert.match(fileBody, />>>>>>> /);
+
+      // And `git status` (human form) reports the rebase in progress.
+      const status = await runStep(workspace, 'git', ['status']);
+      assert.match(status.stdout, /rebase in progress/i, `git status should mention rebase, got: ${status.stdout}`);
+    } finally {
+      await rm(baseRemote, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('returns concurrent_push when local HEAD diverges from expectedHeadSha', async () => {
+    const baseRemote = await mkdtemp(path.join(os.tmpdir(), 'pr-git-remote-'));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'pr-git-ws-'));
+    try {
+      await gitOk(baseRemote, ['init', '--bare', '-b', 'main']);
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'pr-git-seed-'));
+      try {
+        await gitOk(seed, ['init', '-b', 'main']);
+        await gitOk(seed, ['config', 'user.name', 'test']);
+        await gitOk(seed, ['config', 'user.email', 'test@example.com']);
+        await runStep(seed, 'sh', ['-c', 'echo seed > file.txt']);
+        await gitOk(seed, ['add', 'file.txt']);
+        await gitOk(seed, ['commit', '-m', 'seed']);
+        await gitOk(seed, ['remote', 'add', 'origin', baseRemote]);
+        await gitOk(seed, ['push', 'origin', 'main']);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+      await gitOk(workspace, ['clone', baseRemote, '.']);
+      await gitOk(workspace, ['config', 'user.name', 'test']);
+      await gitOk(workspace, ['config', 'user.email', 'test@example.com']);
+      await gitOk(workspace, ['checkout', '-b', 'agent/42']);
+      await runStep(workspace, 'sh', ['-c', 'echo feature > file.txt']);
+      await gitOk(workspace, ['commit', '-am', 'feature']);
+      const realHead = await gitOk(workspace, ['rev-parse', 'HEAD']);
+
+      const git = new GitCliPrGitApi({ timeoutMs: 30_000 });
+      const outcome = await git.rebaseOnto({
+        workspacePath: workspace,
+        branch: 'agent/42',
+        baseBranch: 'main',
+        expectedHeadSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      });
+
+      assert.equal(outcome.kind, 'concurrent_push');
+      if (outcome.kind === 'concurrent_push') {
+        assert.equal(outcome.observed_head_sha, realHead);
+      }
+    } finally {
+      await rm(baseRemote, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+    }
   });
 });

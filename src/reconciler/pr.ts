@@ -218,6 +218,12 @@ interface PerIssueState {
   lastLookupAt: number;
   prView: PrView | null;
   lastViewAt: number;
+  // Rebase attempt counter. Persisted across Done → conflict_route_to →
+  // ... → Done cycles so the circuit breaker accumulates consecutive
+  // failures (see issue 38 acceptance criteria). Reset only on a
+  // successful rebase, terminal cleanup (merge/close), or a circuit-broken
+  // route to the holding state — NOT when the identifier leaves the
+  // intended set or when we route back to the implementing state.
   rebaseAttempts: number;
   lastObservedHeadSha: string | null;
   // True once we've called armAutoMerge for this PR; idempotency lives in
@@ -269,12 +275,24 @@ export class PrResource {
       return;
     }
 
-    // Drop per-identifier state for issues no longer in the intended set
-    // so the rebase-attempts counter resets when an issue cycles back into
-    // an active state and then returns to Done with a fresh head SHA.
+    // For identifiers no longer in the intended set, clear the transient
+    // fields (cached PR view, head SHA, armed flag, completed latch) so
+    // when they return we re-resolve everything from gh — but KEEP the
+    // rebaseAttempts counter so the circuit breaker accumulates across
+    // Done → conflict_route_to → ... → Done cycles. Without this, the
+    // counter would reset every time we route a conflict, and the
+    // max_rebase_attempts breaker would be unreachable in practice.
     const wanted = new Set(intents.map((i) => i.identifier));
     for (const id of [...this.state.keys()]) {
-      if (!wanted.has(id)) this.state.delete(id);
+      if (!wanted.has(id)) {
+        const st = this.state.get(id)!;
+        if (st.rebaseAttempts === 0) {
+          // Nothing to remember — drop the whole entry to bound the map.
+          this.state.delete(id);
+        } else {
+          this.resetTransient(st);
+        }
+      }
     }
 
     // Reset per-pass error so a transient failure that has resolved doesn't
@@ -336,6 +354,22 @@ export class PrResource {
       this.state.set(identifier, st);
     }
     return st;
+  }
+
+  /**
+   * Wipe everything except `rebaseAttempts`. Used when an identifier leaves
+   * the intended set (typically because we routed it back to the implementing
+   * state for an agent to resolve) so the next return to the merge state
+   * starts with a fresh PR view but keeps the consecutive-conflict counter.
+   */
+  private resetTransient(st: PerIssueState): void {
+    st.prSummary = undefined;
+    st.lastLookupAt = 0;
+    st.prView = null;
+    st.lastViewAt = 0;
+    st.lastObservedHeadSha = null;
+    st.armed = false;
+    st.completed = false;
   }
 
   private async processMerge(intent: PrIntent): Promise<void> {
@@ -755,6 +789,9 @@ export class PrResource {
           identifier: intent.identifier,
           attempts: attempt,
         });
+        // Roll the counter back to `max` so we don't grow unbounded if the
+        // issue stays in the merge state without a holding-state route.
+        st.rebaseAttempts = max;
         return;
       }
       const notes = this.buildConflictNotes({
@@ -766,8 +803,11 @@ export class PrResource {
         circuitBroken: true,
       });
       await this.runConflictTransition(intent, this.opts.conflictHoldingState, notes);
-      // Don't keep counting once the issue has moved out of the merge state.
-      st.completed = true;
+      // After circuit-broken routing the operator is expected to intervene.
+      // If the issue ever lands back in the merge state, start with a fresh
+      // counter — the operator's intervention is treated as a hard reset of
+      // the "consecutive failures" streak.
+      this.state.delete(intent.identifier);
       return;
     }
 
@@ -780,10 +820,14 @@ export class PrResource {
       circuitBroken: false,
     });
     await this.runConflictTransition(intent, this.opts.conflictRouteTo, notes);
-    // Drop our per-issue state once routed: the next dispatch will run the
-    // agent through Todo → Review → Done again, and we want a fresh head SHA
-    // to compare against when it comes back.
-    this.state.delete(intent.identifier);
+    // Keep `rebaseAttempts` so consecutive failures accumulate toward the
+    // circuit breaker. Clear the transient PR data so the next return to the
+    // merge state re-fetches a fresh PR view and head SHA. The intended-set
+    // walk at the top of the next reconcile() pass will hit `resetTransient`
+    // for this identifier (it's gone from the intended set while the agent
+    // resolves), but doing it eagerly here makes the invariant local to the
+    // route action.
+    this.resetTransient(st);
   }
 
   private async runConflictTransition(
@@ -868,9 +912,13 @@ export class PrResource {
       lines.push(
         'The autopilot has stopped trying. Resolve the conflict by hand (or as the operator), push the resolution to the same branch, and move the issue back to the merge state.',
       );
+    } else if (rebase !== null) {
+      lines.push(
+        `The rebase is left IN PROGRESS in the workspace (\`${intent.workspace_path ?? '<no workspace>'}\`): the conflicted files contain merge markers, and \`.git/rebase-*\` is on disk. Resolve the conflicts in-tree, \`git add\` the resolved files, and \`git rebase --continue\` (repeat per replayed commit). When the rebase finishes, re-run typecheck + tests, then transition back to the reviewer.`,
+      );
     } else {
       lines.push(
-        `Resolve the conflicts in the preserved workspace (\`${intent.workspace_path ?? '<no workspace>'}\`), ensure tests + typecheck pass, then transition back to the reviewer.`,
+        `GitHub reports a conflict against \`origin/${intent.base_branch}\`. In the workspace (\`${intent.workspace_path ?? '<no workspace>'}\`), run \`git fetch origin ${intent.base_branch} && git rebase origin/${intent.base_branch}\`, resolve any conflicts in-tree, \`git rebase --continue\`, ensure typecheck + tests pass, then transition back to the reviewer.`,
       );
     }
     return lines.join('\n');
@@ -1133,12 +1181,12 @@ export class GitCliPrGitApi implements PrGitApi {
         .split('\n')
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
-      // Abort the rebase so the working tree is left clean for the agent
-      // that picks up the conflict-routed issue.
-      await runShell('git', ['rebase', '--abort'], {
-        cwd: args.workspacePath,
-        timeoutMs: this.opts.timeoutMs,
-      }).catch(() => undefined);
+      // Leave the rebase IN PROGRESS — the agent picking up the conflict-routed
+      // issue inherits the working tree with conflict markers in place and the
+      // .git/rebase-* state on disk, so they can resolve in-tree and
+      // `git rebase --continue` rather than starting over. Running
+      // `git rebase --abort` here would discard exactly the state the routed
+      // agent is supposed to resolve.
       return {
         kind: 'conflict',
         files,
