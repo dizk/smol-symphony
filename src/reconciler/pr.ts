@@ -96,8 +96,15 @@ export interface PrView {
  * the action ledger.
  */
 export interface PrApi {
-  /** Look up the open PR whose head ref is `branch`. Null when none exists. */
-  listOpenForBranch(branch: string): Promise<PrSummary | null>;
+  /**
+   * Look up a PR whose head ref is `branch`, in any state (open, merged,
+   * closed). Returns the most recent match, or null when no PR has ever
+   * existed for this branch. State-agnostic by design: once GitHub
+   * auto-merges or an operator closes the PR, an OPEN-only filter would
+   * stop returning it and the autopilot would never observe the terminal
+   * state. `view(number)` is the source of truth for actual state.
+   */
+  listForBranch(branch: string): Promise<PrSummary | null>;
   /** Detailed PR view. Throws on transport error or unrecognized response. */
   view(prNumber: number): Promise<PrView>;
   /** Arm GitHub's auto-merge. Idempotent — gh re-arms cleanly. */
@@ -211,9 +218,16 @@ export interface PrResourceOptions {
 }
 
 interface PerIssueState {
-  // Cached PR lookup. lastLookupAt covers the listOpenForBranch call,
-  // lastViewAt covers the view call. Two timestamps because list and view
-  // are separate gh shell-outs and view is the expensive one.
+  // Cached PR lookup. `prSummary` is the PR number+url for this issue's
+  // branch. Once non-null it is STICKY for the resource's lifetime: PR
+  // numbers don't change, and a previously-discovered PR moving from OPEN
+  // → MERGED/CLOSED must not blank the cache (otherwise the next
+  // `listForBranch` may return null after the OPEN-filter, or the terminal
+  // PR could disappear from the most-recent slot, and the autopilot would
+  // never observe the terminal state to drive cleanup). `lastLookupAt`
+  // governs only the cache miss path (null result, re-poll on TTL).
+  // `lastViewAt` is independent because `view(number)` is the freshness
+  // call once the number is known.
   prSummary: PrSummary | null | undefined; // undefined = never looked up
   lastLookupAt: number;
   prView: PrView | null;
@@ -497,12 +511,19 @@ export class PrResource {
     intent: PrIntent,
     st: PerIssueState,
   ): Promise<PrSummary | null> {
+    // Sticky cache once we have a number: PR numbers don't change, and the
+    // PR moving to MERGED/CLOSED must not cause us to "forget" it — that
+    // would skip the terminal observation the autopilot needs to drive
+    // cleanup. Re-listing is restricted to the never-found-yet / still-null
+    // paths below.
+    if (st.prSummary) return st.prSummary;
     const now = this.now();
     if (
-      st.prSummary !== undefined &&
+      st.prSummary === null &&
       now - st.lastLookupAt < this.opts.pollIntervalMs
     ) {
-      return st.prSummary;
+      // Still in the null-result TTL window: defer instead of re-querying.
+      return null;
     }
     const actionKey = `list_pr_for_branch:${intent.identifier}`;
     this.pushAction({
@@ -514,7 +535,7 @@ export class PrResource {
       error: null,
     });
     try {
-      const result = await this.opts.pr.listOpenForBranch(intent.branch);
+      const result = await this.opts.pr.listForBranch(intent.branch);
       st.prSummary = result;
       st.lastLookupAt = now;
       this.markActionDone(actionKey);
@@ -1025,10 +1046,14 @@ function runShell(
 export class GhCliPrApi implements PrApi {
   constructor(private readonly opts: { timeoutMs?: number; cwd?: string } = {}) {}
 
-  async listOpenForBranch(branch: string): Promise<PrSummary | null> {
+  async listForBranch(branch: string): Promise<PrSummary | null> {
+    // `--state all` so a PR that has merged or been closed is still
+    // returned — once we have the number we drive cleanup via `view`,
+    // which works against any state. An OPEN-only filter would make a
+    // post-merge or operator-closed PR invisible to the autopilot.
     const res = await runShell(
       'gh',
-      ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,url', '--limit', '1'],
+      ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url', '--limit', '1'],
       this.opts,
     );
     if (res.exit !== 0) {

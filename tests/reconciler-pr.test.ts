@@ -97,7 +97,7 @@ function makePrApi(opts: {
   };
   let viewIdx = 0;
   const api: PrApi = {
-    async listOpenForBranch(branch) {
+    async listForBranch(branch) {
       calls.list.push(branch);
       return opts.summary === undefined ? { number: 7, url: 'https://example.test/pr/7' } : opts.summary;
     },
@@ -669,6 +669,142 @@ describe('PrResource — auto-merge observation + cleanup', () => {
   });
 });
 
+describe('PrResource — terminal state observation across TTL', () => {
+  it('observes MERGED after the PR ages out of OPEN and completes cleanup', async () => {
+    // Pass 1 observes the PR as OPEN: rebase + arm fire normally. Then time
+    // advances past the poll TTL and GitHub auto-merge has actually merged
+    // the PR. Pass 2 must NOT re-list the branch — once the number is known
+    // it is sticky, so the resource cannot regress to the pre-fix behavior
+    // of forgetting a previously-discovered PR after it leaves OPEN. Pass 2
+    // re-views and drives cleanup off the observed MERGED state.
+    let now = 1_000;
+    const intent = makeIntent();
+    let currentView: PrView = makeView();
+    const { api, calls: apiCalls } = makePrApi({
+      view: () => currentView,
+    });
+    const { git } = makeGit({
+      rebase: { kind: 'ok', new_head_sha: 'rebased' },
+      push: { kind: 'ok' },
+    });
+    const { transition } = makeTransition();
+    const { cleanup, removed } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 30_000,
+      now: () => now,
+    });
+
+    await res.reconcile();
+    assert.equal(apiCalls.list.length, 1, 'listForBranch fires on first lookup');
+    assert.equal(apiCalls.view.length, 1);
+    assert.equal(apiCalls.arm.length, 1, 'first pass arms auto-merge');
+
+    // PR has merged on GitHub. Advance the clock past the TTL so the view
+    // cache is invalidated; the listForBranch cache must remain sticky.
+    now += 60_000;
+    currentView = makeView({ state: 'MERGED' });
+
+    await res.reconcile();
+    assert.equal(
+      apiCalls.list.length,
+      1,
+      'listForBranch sticky — never re-called after PR transitions out of OPEN',
+    );
+    assert.equal(apiCalls.view.length, 2, 'view re-fetched past TTL');
+    assert.deepEqual(removed, ['42'], 'workspace cleaned up after observed merge');
+    assert.deepEqual(
+      apiCalls.deleteBranch,
+      ['agent/42'],
+      'remote branch cleaned up after observed merge',
+    );
+  });
+
+  it('observes CLOSED on a Done-state PR after TTL expires and completes cleanup', async () => {
+    // Same as above but the PR was closed (operator hand-closed without
+    // merging) instead of merged. Branch + workspace cleanup still fire.
+    let now = 1_000;
+    const intent = makeIntent();
+    let currentView: PrView = makeView();
+    const { api, calls: apiCalls } = makePrApi({
+      view: () => currentView,
+    });
+    const { git } = makeGit({
+      rebase: { kind: 'ok', new_head_sha: 'rebased' },
+      push: { kind: 'ok' },
+    });
+    const { transition } = makeTransition();
+    const { cleanup, removed } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 30_000,
+      now: () => now,
+    });
+    await res.reconcile();
+    assert.equal(apiCalls.list.length, 1);
+
+    now += 60_000;
+    currentView = makeView({ state: 'CLOSED' });
+    await res.reconcile();
+    assert.equal(apiCalls.list.length, 1, 'listForBranch sticky');
+    assert.deepEqual(removed, ['42']);
+    assert.deepEqual(apiCalls.deleteBranch, ['agent/42']);
+  });
+
+  it('re-polls listForBranch past TTL only when no PR has ever been found', async () => {
+    // No PR exists yet for this branch (local-only mode). listForBranch
+    // returns null. Within the TTL we must NOT re-poll. Past the TTL we
+    // re-poll — the PR may have been opened in the meantime.
+    let now = 1_000;
+    const intent = makeIntent();
+    const { api, calls } = makePrApi({ summary: null });
+    const { git } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 30_000,
+      now: () => now,
+    });
+    await res.reconcile();
+    assert.equal(calls.list.length, 1);
+
+    // Within TTL: cached null, no re-poll.
+    now += 5_000;
+    await res.reconcile();
+    assert.equal(calls.list.length, 1, 'null-result cache holds within TTL');
+
+    // Past TTL: re-poll for a maybe-newly-opened PR.
+    now += 30_000;
+    await res.reconcile();
+    assert.equal(calls.list.length, 2, 'null-result re-polled past TTL');
+  });
+});
+
 describe('PrResource — cancelled close path', () => {
   it('closes the PR and deletes the remote branch when intent.kind=close', async () => {
     const intent = makeIntent({ kind: 'close', state: 'Cancelled', workspace_path: null });
@@ -898,7 +1034,9 @@ describe('PrResource — poll interval cache', () => {
 
     now += 30_000; // past ttl
     await res2.reconcile();
-    assert.equal(apiNoWs.calls.list.length, 2, 'list re-fetched past TTL');
+    // listForBranch is sticky once a PR has been found — see the post-TTL
+    // terminal-state tests above. Only `view` is re-fetched past the TTL.
+    assert.equal(apiNoWs.calls.list.length, 1, 'listForBranch sticky once found');
     assert.equal(apiNoWs.calls.view.length, 2, 'view re-fetched past TTL');
   });
 });
