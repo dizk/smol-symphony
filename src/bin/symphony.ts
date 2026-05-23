@@ -2,6 +2,7 @@
 // CLI entry. Usage:
 //   symphony [path-to-WORKFLOW.md] [--port <port>]
 //   symphony reconcile [path-to-WORKFLOW.md] [--force] [--port <port>]
+//   symphony rerun --check=<name> [path-to-WORKFLOW.md]
 //
 // Default workflow path is ./WORKFLOW.md.
 //
@@ -9,11 +10,23 @@
 // form; `--force` additionally invalidates any cached bake artifact for the
 // current Smolfile hash before dispatch so the next bake is guaranteed to
 // rebuild. `--reconcile-force` is kept as a top-level alias for ergonomics.
+//
+// The `rerun` subcommand (issue 36) invalidates one `run_in_vm` action's
+// content-hash cache entries so the next dispatch into the state hosting it
+// re-executes. It does not start a long-running process — it scans the
+// workflow's state actions for a matching name and `rm`s the per-name cache
+// namespace directory under `<cacheRoot>/actions/run_in_vm/<name>/`. The
+// per-execution hash is workspace-dependent (the agent's edits change the
+// tree); namespacing the cache by action name on disk means the CLI doesn't
+// need to know any per-issue workspace state to invalidate the right
+// entries.
 
 import path from 'node:path';
 import process from 'node:process';
 import { existsSync } from 'node:fs';
-import { watchWorkflow } from '../workflow.js';
+import { loadWorkflow, buildServiceConfig, watchWorkflow } from '../workflow.js';
+import { invalidateRunInVmByName } from '../actions/index.js';
+import type { RunInVmAction, WorkflowAction } from '../actions/index.js';
 import { LocalMarkdownTracker } from '../trackers/local.js';
 import { WorkspaceManager } from '../workspace.js';
 import { SmolvmClient } from '../agent/smolvm.js';
@@ -26,25 +39,31 @@ import { Reconciler } from '../reconciler/index.js';
 import { log } from '../logging.js';
 
 interface Cli {
+  subcommand: 'serve' | 'rerun';
   workflow: string;
   port: number | null;
   reconcileForce: boolean;
+  /** When subcommand=rerun: name of the run_in_vm action to invalidate. */
+  rerunCheck: string | null;
 }
 
 function parseCli(argv: string[]): Cli {
-  // Detect the `reconcile` subcommand. When the first positional is `reconcile`,
-  // the rest of the args are parsed in subcommand mode (so `--force` is
-  // recognized and the issue's documented `symphony reconcile --force` shape
-  // works). Otherwise we parse in the legacy single-command shape.
-  let subcommand: 'reconcile' | null = null;
+  // Detect subcommands. `reconcile` and `rerun` share the parsed-args
+  // skeleton with the default `serve` mode; the subcommand is what differs
+  // at the action layer (main() dispatches accordingly).
+  let subcommand: 'serve' | 'reconcile' | 'rerun' = 'serve';
   let rest = argv;
   if (argv[0] === 'reconcile') {
     subcommand = 'reconcile';
+    rest = argv.slice(1);
+  } else if (argv[0] === 'rerun') {
+    subcommand = 'rerun';
     rest = argv.slice(1);
   }
   let workflow: string | null = null;
   let port: number | null = null;
   let reconcileForce = false;
+  let rerunCheck: string | null = null;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
     if (a === '--port' || a === '-p') {
@@ -73,13 +92,25 @@ function parseCli(argv: string[]): Cli {
       // process-manager unit files don't need rewriting; the new canonical shape is
       // `symphony reconcile --force [path]`.
       reconcileForce = true;
+    } else if (subcommand === 'rerun' && (a === '--check' || a === '-c')) {
+      const v = rest[++i];
+      if (!v) {
+        process.stderr.write(`error: --check requires a value\n`);
+        process.exit(2);
+      }
+      rerunCheck = v;
+    } else if (subcommand === 'rerun' && a.startsWith('--check=')) {
+      rerunCheck = a.slice('--check='.length);
     } else if (a === '-h' || a === '--help') {
       process.stdout.write(
         `symphony [path-to-WORKFLOW.md] [--port PORT] [--reconcile-force]\n` +
-          `symphony reconcile [path-to-WORKFLOW.md] [--force] [--port PORT]\n\n` +
+          `symphony reconcile [path-to-WORKFLOW.md] [--force] [--port PORT]\n` +
+          `symphony rerun --check=<name> [path-to-WORKFLOW.md]\n\n` +
           `If path is omitted, ./WORKFLOW.md is used.\n` +
           `\`reconcile --force\` (or the alias \`--reconcile-force\`) invalidates the\n` +
-          `cached bake artifact and rebakes before dispatching.\n`,
+          `cached bake artifact and rebakes before dispatching.\n` +
+          `\`rerun --check=<name>\` invalidates the named run_in_vm action's content-hash\n` +
+          `cache entry so the next dispatch into its state re-executes it.\n`,
       );
       process.exit(0);
     } else if (!workflow) {
@@ -90,10 +121,66 @@ function parseCli(argv: string[]): Cli {
     }
   }
   return {
+    subcommand: subcommand === 'rerun' ? 'rerun' : 'serve',
     workflow: workflow ?? path.resolve(process.cwd(), 'WORKFLOW.md'),
     port,
     reconcileForce,
+    rerunCheck,
   };
+}
+
+/**
+ * Walk every declared state's `actions:` for a run_in_vm whose `name` matches
+ * `target`. Returns the first match; duplicates would let a single rerun
+ * invalidate multiple entries, which is rarely intended (operator wants to
+ * re-run *one* named check).
+ */
+function findRunInVmByName(
+  states: Record<string, { actions?: WorkflowAction[] }>,
+  target: string,
+): { state: string; action: RunInVmAction } | null {
+  for (const [stateName, sc] of Object.entries(states)) {
+    if (!sc.actions) continue;
+    for (const a of sc.actions) {
+      if (a.kind === 'run_in_vm' && a.name === target) {
+        return { state: stateName, action: a };
+      }
+    }
+  }
+  return null;
+}
+
+async function runRerunCheck(workflowPath: string, name: string): Promise<number> {
+  let def;
+  try {
+    def = await loadWorkflow(workflowPath);
+  } catch (err) {
+    process.stderr.write(`error: failed to load workflow: ${(err as Error).message}\n`);
+    return 1;
+  }
+  let cfg;
+  try {
+    cfg = buildServiceConfig(def.config, workflowPath);
+  } catch (err) {
+    process.stderr.write(`error: failed to parse workflow: ${(err as Error).message}\n`);
+    return 1;
+  }
+  const match = findRunInVmByName(cfg.states, name);
+  if (!match) {
+    process.stderr.write(
+      `error: no run_in_vm action named "${name}" declared in WORKFLOW.md\n`,
+    );
+    return 2;
+  }
+  // Drop the per-name cache namespace directory. This invalidates every
+  // hash entry under that name regardless of which per-issue workspace the
+  // execution computed its hash against — the orchestrator's next dispatch
+  // re-executes the check because the namespace is empty.
+  await invalidateRunInVmByName(match.action);
+  process.stdout.write(
+    `invalidated run_in_vm "${name}" (state=${match.state})\n`,
+  );
+  return 0;
 }
 
 async function main() {
@@ -102,6 +189,14 @@ async function main() {
   if (!existsSync(workflowPath)) {
     process.stderr.write(`error: workflow file not found: ${workflowPath}\n`);
     process.exit(2);
+  }
+  if (cli.subcommand === 'rerun') {
+    if (!cli.rerunCheck) {
+      process.stderr.write(`error: rerun requires --check=<name>\n`);
+      process.exit(2);
+    }
+    const code = await runRerunCheck(workflowPath, cli.rerunCheck);
+    process.exit(code);
   }
 
   let src;
@@ -178,6 +273,15 @@ async function main() {
     mcp,
     acpBridge,
     reconciler,
+    // propose_followup sink (issue 36): orchestrator owns the tracker write
+    // path, mirroring how the MCP `propose_issue` tool routes through the
+    // tracker. The runner forwards the parent identifier so provenance is
+    // recorded the same way.
+    { proposeFollowup: (input) => orch.proposeFollowup(input) },
+    // Action snapshot sink (issue 36 AC5): per-attempt ledger surfaces on
+    // /api/v1/snapshot under reconciler.resources so the dashboard sees
+    // "Done.actions: …" alongside the bake/vm/workspace resources.
+    { recordActionResult: (id, snap) => orch.recordActionResult(id, snap) },
   );
   orch = new Orchestrator(
     config,

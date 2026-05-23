@@ -77,6 +77,60 @@ tracker:
 #             an auto-merge; Cancelled opts out entirely with `after_run: null`).
 #             The shared `timeout_ms` is not overridable per state.
 #
+#             DEPRECATED for new work: prefer `actions:` (below) over shell
+#             hooks for the after_run handoff. A state that declares both
+#             `hooks:` and `actions:` runs `actions:` and logs a startup-time
+#             deprecation warning naming the hook fields that were ignored.
+#   actions   (list, optional): typed action DAG (issue 36, reconciler v2).
+#             When set on a `terminal` state, this list runs on transition
+#             INTO the state, replacing the per-state `after_run` shell.
+#             Each entry is a closed-kind record:
+#
+#                 - kind: push_branch
+#                   remote: origin
+#                   ref: $branch
+#                   if: $repo
+#
+#             Recognized kinds:
+#               push_branch          { remote, ref }
+#               create_pr_if_missing { base, head, title_from, body_from }
+#               ensure_branch        { name, seed_from? }
+#               checkout             { ref }
+#               merge                { source, target, on_conflict }
+#               delete_branch        { name, scope: local|remote|both, remote? }
+#               run_in_vm            { name, cmd: [...], env?, timeout? }
+#               propose_followup     { title, body?, labels?, priority? }
+#
+#             Templating: `$varname` references the fixed ActionContext
+#             namespace ($identifier, $workspace, $branch, $base_branch,
+#             $issue_title, $issue_body, $repo, $pr_title, $pr_body_file).
+#             Unknown $vars throw at run-time (no silent "" expansion).
+#
+#             Conditional: optional `if:` field supports three predicates
+#               - `if: $repo`                       (env-var-truthy)
+#               - `if: { branch_exists: <ref> }`    (workspace branch)
+#               - `if: { file_present: <path> }`    (workspace file)
+#
+#             Retry: optional `on_error.retry: { count, backoff_ms }`. Default
+#             policy is 3 retries with exponential backoff starting at 1s,
+#             then abort. `on_error.then: { route_to: <state> }` reroutes the
+#             issue to a holding state instead of aborting.
+#
+#             merge's `on_conflict: { route_to: <state> }` is a fast-path
+#             reroute (the action's typed surface for the same shape
+#             `routeIntegrationFailureToConflict` provides for the legacy
+#             integration block). Use `on_conflict: abort` to fail the
+#             action and abort the cleanup pass without a state move.
+#
+#             run_in_vm has content-hash caching: identical (workspace tree
+#             ⊕ cmd ⊕ env) tuples skip execution and re-use the prior
+#             successful result. The workspace-tree hash reflects live
+#             contents (tracked + modified + untracked-not-gitignored), so
+#             an uncommitted agent edit forces a cache miss. Cache lives
+#             under `~/.cache/symphony/actions/run_in_vm/<name>/<sha256>/`.
+#             `symphony rerun --check=<name>` drops the whole `<name>/`
+#             namespace dir so the next dispatch re-runs that one check.
+#
 # Declaration order matters: role-filtered listings (active states, terminal
 # states) follow it, and the dashboard renders state columns in the same order.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,9 +149,21 @@ states:
     allowed_transitions: [Todo, Done]
   Done:
     role: terminal
-    # Per-state hooks let each terminal state drive its own handoff. Done could
-    # push the branch and open a PR; a sibling Merge state could push, open the
-    # PR, then auto-merge; Cancelled could opt out entirely with `after_run: null`.
+    # Terminal-state handoff via typed actions (issue 36). On transition into
+    # Done, push the branch (if SYMPHONY_REPO is set → $repo non-empty) and
+    # open a PR if one does not already exist. Templates resolve against the
+    # fixed ActionContext namespace; the orchestrator stages $pr_title and
+    # $pr_body_file from the issue file before firing.
+    # actions:
+    #   - { kind: push_branch, remote: origin, ref: $branch, if: $repo }
+    #   - kind: create_pr_if_missing
+    #     base: $base_branch
+    #     head: $branch
+    #     title_from: $pr_title
+    #     body_from: $pr_body_file
+    #     if: $repo
+    #
+    # Legacy hook form (deprecated; runs only when no `actions:` is set):
     # hooks:
     #   after_run: |
     #     # state-specific PR-create logic here

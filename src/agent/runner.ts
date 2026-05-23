@@ -32,7 +32,17 @@ import {
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
-import { resolveHooksForState } from '../workflow.js';
+import { resolveActionsForState, resolveHooksForState } from '../workflow.js';
+import {
+  runActions,
+  toActionsSnapshot,
+  type ActionContext,
+  type ActionExecResult,
+  type ProposeFollowupSink,
+  type RunInVmExecutor,
+  type WorkflowAction,
+} from '../actions/index.js';
+import type { ResourceSnapshot } from '../reconciler/index.js';
 import {
   performIntegrationMerge,
   resolveIntegrationRemote,
@@ -235,6 +245,15 @@ export interface BakedArtifactProvider {
   artifactPath(): string | null;
 }
 
+/**
+ * Sink the runner uses to surface per-attempt action ledgers (issue 36 AC5).
+ * Implemented by `Orchestrator.recordActionResult` in production; tests can
+ * stub the no-op to skip the snapshot wiring.
+ */
+export interface ActionSnapshotSink {
+  recordActionResult(id: string, snapshot: ResourceSnapshot): void;
+}
+
 export class AgentRunner {
   constructor(
     private cfg: ServiceConfig,
@@ -256,6 +275,19 @@ export class AgentRunner {
      * any dispatch happens when `smolvm.smolfile` is configured.
      */
     private bakedArtifacts: BakedArtifactProvider | null = null,
+    /**
+     * Sink for `propose_followup` actions (issue 36). Wired to the
+     * orchestrator's tracker in production; nullable for tests that don't
+     * exercise the action. Same shape as the MCP `propose_issue` tool's
+     * tracker-side write.
+     */
+    private followupSink: ProposeFollowupSink | null = null,
+    /**
+     * Sink for per-attempt action ledgers surfaced on Snapshot (issue 36 AC5).
+     * Nullable so tests that don't exercise the snapshot surface can pass
+     * undefined.
+     */
+    private actionSnapshotSink: ActionSnapshotSink | null = null,
   ) {}
 
   setAcpBridge(bridge: AcpBridge | null): void {
@@ -277,6 +309,228 @@ export class AgentRunner {
 
   vmNameFor(issue: Issue): string {
     return `${SYMPHONY_VM_PREFIX}${sanitizeWorkspaceKey(issue.identifier)}`.toLowerCase();
+  }
+
+  /**
+   * Resolve the action templating context from the staged `extraEnv` map and
+   * the running entry. The context fields mirror the SYMPHONY_* env names so
+   * a Done state that previously read `$SYMPHONY_BRANCH` from the hook env
+   * now reads `$branch` from the action template namespace.
+   */
+  private buildActionContext(
+    entry: RunningEntry,
+    workspacePath: string,
+    extraEnv: Record<string, string> | undefined,
+  ): ActionContext {
+    const branch = extraEnv?.SYMPHONY_BRANCH ?? `agent/${entry.identifier}`;
+    const baseBranch = extraEnv?.SYMPHONY_BASE_BRANCH ?? 'main';
+    const prTitle =
+      extraEnv?.SYMPHONY_PR_TITLE ??
+      (entry.issue.title.trim().length > 0
+        ? `${entry.issue.id}: ${entry.issue.title.trim()}`
+        : entry.issue.id);
+    const prBodyFile = extraEnv?.SYMPHONY_PR_BODY_FILE ?? '';
+    return {
+      identifier: entry.identifier,
+      workspace: workspacePath,
+      branch,
+      base_branch: baseBranch,
+      issue_title: entry.issue.title ?? '',
+      issue_body: entry.issue.description ?? '',
+      repo: process.env.SYMPHONY_REPO && process.env.SYMPHONY_REPO.length > 0
+        ? process.env.SYMPHONY_REPO
+        : null,
+      pr_title: prTitle,
+      pr_body_file: prBodyFile,
+    };
+  }
+
+  /**
+   * Construct a `RunInVmExecutor` bound to a specific per-issue VM. Each
+   * invocation spawns a fresh `smolvm machine exec -i` session against
+   * `vmName`, with stdin closed, stdout/stderr drained into the per-issue
+   * run log, and a timeout that escalates to SIGKILL on overrun. The
+   * workspace is bind-mounted at the same host path inside the VM (the
+   * runner declares that mount at bring-up), so `workdir` is identical
+   * on both sides — no path translation needed.
+   *
+   * Wraps the smolvm.execInteractive contract rather than reaching into
+   * the SmolvmClient from the actions module so the actions package
+   * stays free of `node:child_process`/smolvm imports; the dependency
+   * inversion lets tests pass `hostRunInVm` without touching smolvm.
+   */
+  private buildVmRunInVm(vmName: string, runLog: RunLog | undefined): RunInVmExecutor {
+    return ({ name, cmd, env, workdir, timeoutMs, onStdout, onStderr }) =>
+      new Promise((resolve) => {
+        const stream = this.smolvm.execInteractive(vmName, {
+          command: cmd,
+          workdir,
+          env,
+          // execInteractive's own timeoutMs is forwarded to smolvm CLI as
+          // `--timeout`. We pass it through so the VM-side process gets
+          // killed at the same deadline as our local timer; the local
+          // timer below is the belt-and-braces fallback.
+          timeoutMs,
+        });
+        // No stdin: run_in_vm is one-shot exec; the action's `cmd` is the
+        // full command line. Closing stdin tells the in-VM process its
+        // input stream is at EOF so it never blocks waiting for input.
+        try {
+          stream.stdin.end();
+        } catch {
+          /* idempotent on already-ended stream */
+        }
+        let stdout = '';
+        let stderr = '';
+        let timedOut = false;
+        const limit = 65_536;
+        stream.stdout.setEncoding('utf8');
+        stream.stderr.setEncoding('utf8');
+        stream.stdout.on('data', (chunk: string) => {
+          stdout += chunk;
+          if (stdout.length > limit) stdout = stdout.slice(0, limit);
+          onStdout?.(chunk);
+          runLog?.record({ channel: 'hook', hook: `run_in_vm:${name}`, stream: 'stdout', text: chunk });
+        });
+        stream.stderr.on('data', (chunk: string) => {
+          stderr += chunk;
+          if (stderr.length > limit) stderr = stderr.slice(0, limit);
+          onStderr?.(chunk);
+          runLog?.record({ channel: 'hook', hook: `run_in_vm:${name}`, stream: 'stderr', text: chunk });
+        });
+        const timer = setTimeout(() => {
+          timedOut = true;
+          try {
+            stream.kill();
+          } catch {
+            /* idempotent */
+          }
+        }, timeoutMs);
+        stream.exit
+          .then(({ code, signal }) => {
+            clearTimeout(timer);
+            resolve({
+              exit_code: code,
+              signal: signal ?? null,
+              timed_out: timedOut,
+              stdout,
+              stderr,
+            });
+          })
+          .catch((err: Error) => {
+            clearTimeout(timer);
+            resolve({
+              exit_code: null,
+              signal: null,
+              timed_out: timedOut,
+              stdout,
+              stderr: stderr + `\n${err.message}`,
+            });
+          });
+      });
+  }
+
+  /**
+   * Drive the typed action executor for a state's `actions:` block. Reroutes
+   * the issue when an action returns `route_to` (today: `merge` on conflict).
+   * Mirrors the integration-merge reroute machinery so the failure path keeps
+   * the workspace + agent branch available for the operator who picks up the
+   * issue in the conflict state.
+   *
+   * Returns the underlying `ActionExecResult` so the caller can distinguish
+   * "rerouted (treat as success — the agent's work is done; the issue lives
+   * on in the conflict state)" from "non-routed failure (the cleanup pass
+   * itself failed — the attempt must report `ok: false` so the orchestrator
+   * retries or surfaces the error)." A void return here is what let a failed
+   * `push_branch` / `create_pr_if_missing` look like a successful attempt
+   * in the prior implementation.
+   */
+  private async runStateActions(
+    stateName: string,
+    actions: readonly WorkflowAction[],
+    entry: RunningEntry,
+    workspacePath: string,
+    extraEnv: Record<string, string> | undefined,
+    capture: HookCapture | undefined,
+    runInVm: RunInVmExecutor | undefined,
+  ): Promise<ActionExecResult> {
+    const ctx = this.buildActionContext(entry, workspacePath, extraEnv);
+    const snapshotId = `actions:${stateName}`;
+    const logger = withIssue({ issue_id: entry.issue_id, issue_identifier: entry.identifier });
+    logger.info('running state actions', {
+      state: stateName,
+      action_count: actions.length,
+    });
+    const result = await runActions(actions, {
+      workspacePath,
+      ctx,
+      capture: capture ?? undefined,
+      followupSink: this.followupSink ?? undefined,
+      runInVm: runInVm ?? undefined,
+      snapshotId,
+    });
+    // Surface on snapshot regardless of outcome; the dashboard shows the
+    // full ledger including in-progress / error states.
+    this.actionSnapshotSink?.recordActionResult(snapshotId, {
+      id: snapshotId,
+      ready: result.ok,
+      desired_hash: null,
+      last_error: result.actions.find((a) => a.state === 'error')?.error ?? null,
+      actions: result.actions,
+    });
+    if (result.route_to) {
+      logger.warn('state action requested reroute', {
+        state: stateName,
+        target_state: result.route_to,
+        reason: result.reason,
+      });
+      await this.rerouteEntryAction(entry, stateName, result.route_to, result.reason);
+    } else if (!result.ok) {
+      logger.warn('state actions failed', {
+        state: stateName,
+        reason: result.reason,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Move `entry`'s tracker file into `targetState` and append a diagnostic
+   * note. Used by `runStateActions` when an action returns a route_to (e.g.
+   * `merge`'s on_conflict). Mirrors `routeIntegrationFailureToConflict` but
+   * is parameterized on the typed-action reason rather than on the
+   * integration-merge result.
+   */
+  private async rerouteEntryAction(
+    entry: RunningEntry,
+    fromState: string,
+    targetState: string,
+    reason: string | null,
+  ): Promise<void> {
+    if (!this.tracker.moveIssueToState) {
+      entry.cleanup_workspace_on_exit = false;
+      return;
+    }
+    const notes = [
+      `**Action rerouted** to \`${targetState}\` from \`${fromState}\`.`,
+      '',
+      `**Reason:** ${reason ?? 'unknown'}`,
+      '',
+      `**Workspace and \`agent/${entry.identifier}\` branch are preserved** for resolution.`,
+    ].join('\n');
+    try {
+      await this.tracker.moveIssueToState(entry.issue_id, targetState, {
+        fromRoot: entry.tracker_root_at_dispatch ?? undefined,
+        fromState,
+        notes,
+        actor: entry.resolved_actor,
+      });
+    } catch {
+      entry.cleanup_workspace_on_exit = false;
+      return;
+    }
+    entry.cleanup_workspace_on_exit = false;
+    entry.issue.state = targetState;
   }
 
   async runAttempt(
@@ -580,6 +834,15 @@ export class AgentRunner {
     // reference so cleanup can close it even on partial failure.
     let acpSocket: Socket | null = null;
 
+    // Captured by `cleanup` when a non-routed action failure happens during
+    // the terminal `actions:` pass. The final return below treats this as
+    // attempt failure so the orchestrator retries (or otherwise surfaces it)
+    // instead of marking the issue "done" while its push/PR-create never
+    // landed. Routed failures (merge → conflict state) intentionally do NOT
+    // set this — the agent's work succeeded; the issue lives on in the
+    // conflict state. Only failures with no `route_to` propagate.
+    let nonRoutedActionFailureReason: string | null = null;
+
     const cleanup = async (reason: string) => {
       // Cancel the bridge registration if the in-VM agent never connected. Idempotent on
       // success (already-resolved registrations ignore cancel).
@@ -673,14 +936,20 @@ export class AgentRunner {
         }
       }
       const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
-      // Stage SYMPHONY_* env vars + a temp body file for the hook (collapses the Done
-      // after_run from ~80 lines of awk/git plumbing to a few git/gh calls). The runner
-      // owns the temp body file's lifecycle; the post-hook cleanup always fires.
+      const cleanupActions = resolveActionsForState(this.cfg, cleanupState);
+      // Stage SYMPHONY_* env vars + a temp body file once. Both the legacy
+      // after_run shell and the typed-action executor consume the same values
+      // (the action templating context derives from this map); building it
+      // once avoids two redundant tracker reads on the Done state's transition.
       let extraEnv: Record<string, string> | undefined;
       let extraEnvCleanup: (() => Promise<void>) | null = null;
-      if (!integrationFailed && runningEntry && cleanupHooks.after_run) {
+      const needsStaging =
+        !integrationFailed &&
+        runningEntry &&
+        ((cleanupActions && cleanupActions.length > 0) || cleanupHooks.after_run);
+      if (needsStaging) {
         try {
-          const staged = await buildAfterRunHookEnv(runningEntry);
+          const staged = await buildAfterRunHookEnv(runningEntry!);
           extraEnv = staged.env;
           extraEnvCleanup = staged.cleanup;
         } catch (err) {
@@ -691,12 +960,45 @@ export class AgentRunner {
       }
       try {
         if (!integrationFailed) {
-          await this.workspaces.runAfterRunBestEffort(
-            workspace.path,
-            cleanupHooks,
-            hookCapture('after_run'),
-            extraEnv,
-          );
+          // Per-state `actions:` block wins over `hooks.after_run` (issue 36
+          // AC2; deprecation warning fires once at orchestrator startup). When
+          // both are declared we silently skip the after_run hook here — the
+          // warning at startup is the documented surface.
+          if (cleanupActions && cleanupActions.length > 0 && runningEntry) {
+            // run_in_vm goes through the per-issue VM's exec channel (same
+            // sandbox the agent ran in). Build the closure here so the
+            // executor never has to know about smolvm; ordering inside
+            // cleanup() guarantees the VM is still alive at this point —
+            // VM destroy is the very last step below. We only wire the
+            // closure when bring-up succeeded; the `if (vmReady)` guard
+            // mirrors the destroy guard.
+            const runInVm: RunInVmExecutor | undefined = vmReady
+              ? this.buildVmRunInVm(vmName, runLog)
+              : undefined;
+            const actionResult = await this.runStateActions(
+              cleanupState,
+              cleanupActions,
+              runningEntry,
+              workspace.path,
+              extraEnv,
+              hookCapture('actions'),
+              runInVm,
+            );
+            if (!actionResult.ok && !actionResult.route_to) {
+              // Non-routed failure — propagate out of cleanup so runAttempt
+              // returns ok:false. Routed failures (merge on_conflict) are
+              // intentionally handled as the agent's work succeeding; the
+              // tracker has already moved the issue to the conflict state.
+              nonRoutedActionFailureReason = actionResult.reason ?? 'unknown';
+            }
+          } else {
+            await this.workspaces.runAfterRunBestEffort(
+              workspace.path,
+              cleanupHooks,
+              hookCapture('after_run'),
+              extraEnv,
+            );
+          }
         }
       } finally {
         if (extraEnvCleanup) await extraEnvCleanup();
@@ -997,6 +1299,20 @@ export class AgentRunner {
     await cleanup(lastReason);
     if (agentFailure) {
       return { ok: false, reason: agentFailure, threadId: sessionId, turnsCompleted };
+    }
+    if (nonRoutedActionFailureReason !== null) {
+      // Cleanup ran the state's typed actions and at least one action
+      // failed without a `route_to`. Terminal-state cleanup (push the
+      // branch, open the PR, run CI checks) is part of the attempt's
+      // success contract — failing silently was the prior bug. We surface
+      // the failure as attempt failure so the orchestrator's retry /
+      // dashboard path can react instead of marking the issue done.
+      return {
+        ok: false,
+        reason: `state action failed: ${nonRoutedActionFailureReason}`,
+        threadId: sessionId,
+        turnsCompleted,
+      };
     }
     return { ok: true, reason: lastReason, threadId: sessionId, turnsCompleted };
   }
