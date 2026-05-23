@@ -396,10 +396,12 @@ export class PrResource {
       return;
     }
     if (view.state === 'CLOSED') {
-      // The operator closed the PR while it was supposed to merge.
-      // Treat the same as merged-cleanup: drop the workspace + branch so
-      // the autopilot doesn't keep polling. The remote branch is left
-      // alone (we don't know if the operator wants it).
+      // The PR was closed (likely by the operator) instead of merging.
+      // The issue contract says PR closed -> cleanup_branches, so reap
+      // the remote agent/<id> branch alongside the workspace; otherwise
+      // an operator-closed PR would leave the branch on origin forever.
+      // The delete is best-effort (gh exits non-zero if it's already gone).
+      await this.runDeleteRemoteBranch(intent.identifier, intent.branch);
       await this.runCleanupWorkspace(intent.identifier);
       st.completed = true;
       return;
@@ -476,6 +478,12 @@ export class PrResource {
     const view = await this.fetchPrView(intent.identifier, summary.number, st);
     if (!view) return;
     if (view.state === 'MERGED' || view.state === 'CLOSED') {
+      // PR is already terminal — the operator closed/merged it before the
+      // autopilot got to it. Still attempt the remote-branch delete: a PR
+      // closed by hand typically leaves `agent/<id>` behind on origin, and
+      // the contract says cleanup_branches fires whenever a closed-or-merged
+      // PR has a branch present. Best-effort; gh exits non-zero on absence.
+      await this.runDeleteRemoteBranch(intent.identifier, intent.branch);
       st.completed = true;
       return;
     }

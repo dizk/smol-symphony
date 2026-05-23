@@ -637,9 +637,12 @@ describe('PrResource — auto-merge observation + cleanup', () => {
     assert.deepEqual(removed, ['42'], 'cleanup only fires once');
   });
 
-  it('cleans up workspace on a PR that was CLOSED out from under the autopilot', async () => {
+  it('cleans up workspace AND remote branch on a PR that was CLOSED out from under the autopilot', async () => {
+    // Issue contract: PR closed OR merged + agent/<id> branch present -> cleanup_branches.
+    // An operator who closes a Done-state PR by hand will leave agent/<id> on
+    // origin forever unless the autopilot reaps it here.
     const intent = makeIntent();
-    const { api } = makePrApi({ view: makeView({ state: 'CLOSED' }) });
+    const { api, calls } = makePrApi({ view: makeView({ state: 'CLOSED' }) });
     const { git } = makeGit({});
     const { transition } = makeTransition();
     const { cleanup, removed } = makeCleanup();
@@ -657,6 +660,12 @@ describe('PrResource — auto-merge observation + cleanup', () => {
     });
     await res.reconcile();
     assert.deepEqual(removed, ['42']);
+    assert.deepEqual(calls.deleteBranch, ['agent/42'], 'remote agent branch must be deleted on operator-closed PR');
+
+    // Subsequent pass with the same intent must not re-delete or re-clean.
+    await res.reconcile();
+    assert.equal(calls.deleteBranch.length, 1, 'branch delete only fires once');
+    assert.equal(removed.length, 1, 'workspace cleanup only fires once');
   });
 });
 
@@ -709,6 +718,62 @@ describe('PrResource — cancelled close path', () => {
     await res.reconcile();
     assert.equal(calls.close.length, 1);
     assert.equal(calls.deleteBranch.length, 1);
+  });
+
+  it('still deletes the remote branch when the PR is already CLOSED before the autopilot observes it', async () => {
+    // The operator (or an external automation) closed the PR before this
+    // reconciler tick. The contract still wants the agent/<id> branch reaped.
+    const intent = makeIntent({ kind: 'close', state: 'Cancelled', workspace_path: null });
+    const { api, calls } = makePrApi({ view: makeView({ state: 'CLOSED' }) });
+    const { git } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup, removed } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+    assert.equal(calls.close.length, 0, 'no close call when already closed');
+    assert.deepEqual(calls.deleteBranch, ['agent/42'], 'remote branch must still be deleted');
+    assert.equal(removed.length, 0, 'cancelled close path leaves workspace to normal terminal cleanup');
+
+    // Latch holds across the next pass.
+    await res.reconcile();
+    assert.equal(calls.deleteBranch.length, 1, 'branch delete fires exactly once');
+  });
+
+  it('still deletes the remote branch when the PR is already MERGED before the autopilot observes the cancel', async () => {
+    // Edge case: the PR merged just before the issue was cancelled. The
+    // branch may still be on origin (e.g. operator armed without
+    // --delete-branch). Best-effort delete.
+    const intent = makeIntent({ kind: 'close', state: 'Cancelled', workspace_path: null });
+    const { api, calls } = makePrApi({ view: makeView({ state: 'MERGED' }) });
+    const { git } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+    assert.equal(calls.close.length, 0);
+    assert.deepEqual(calls.deleteBranch, ['agent/42']);
   });
 });
 
