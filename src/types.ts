@@ -244,6 +244,41 @@ export interface McpConfig {
   explicit_host_url: string | null;
 }
 
+// PR autopilot (issue 38). When `enabled` is true the reconciler grows a `pr`
+// resource that keeps each terminal-state issue's GitHub PR rebased on the base
+// branch, arms GitHub's auto-merge, and routes rebase conflicts back to the
+// implementing state with the conflict context attached. Default off so a
+// workflow that does not declare the block (or declares it with enabled:false)
+// behaves exactly as before — the orchestrator's old "Done → cleanup workspace,
+// terminal hook opens the PR, operator merges by hand" path is unchanged.
+//
+// `merge_state` is the terminal state whose issues should have their PRs kept
+// rebased + auto-merge armed. `close_state` is the terminal state whose issues
+// should have their PRs closed without merge (typically Cancelled). Both are
+// case-insensitive lookups against the declared `states:` map; missing entries
+// disable the corresponding action.
+//
+// `conflict_route_to` is the state the reconciler routes a Done issue back into
+// when its rebase produces a conflict (defaults to the first declared `active`
+// state — for symphony's WORKFLOW that's `Todo`). `conflict_holding_state` is
+// the holding state the issue lands in after `max_rebase_attempts` consecutive
+// failures (defaults to the first declared `holding` state named `Conflict`,
+// else falls back to the first declared holding state).
+//
+// `poll_interval_ms` is the per-PR GitHub view cache TTL. The reconciler may
+// run more often than this (its own backstop tick is independent), but a
+// single PR view is reused within the window.
+export interface PrAutopilotConfig {
+  enabled: boolean;
+  merge_state: string;
+  close_state: string | null;
+  conflict_route_to: string | null;
+  conflict_holding_state: string | null;
+  max_rebase_attempts: number;
+  auto_merge_strategy: 'squash' | 'merge' | 'rebase';
+  poll_interval_ms: number;
+}
+
 // Shared-integration-branch configuration. When `merge_on_states` is non-empty, a
 // successful terminal transition into one of those states triggers a host-side
 // merge of `agent/<id>` into `branch` (followed by a push if a network remote is
@@ -272,6 +307,7 @@ export interface ServiceConfig {
   server: ServerConfig;
   mcp: McpConfig;
   integration: IntegrationConfig;
+  pr_autopilot: PrAutopilotConfig;
   // Canonical per-state configuration map. The same map is mirrored onto
   // `tracker.states` so the tracker (which only sees its slice of config)
   // keeps the state set without reaching back into the full ServiceConfig.

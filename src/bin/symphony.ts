@@ -35,7 +35,7 @@ import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
-import { Reconciler } from '../reconciler/index.js';
+import { GhCliPrApi, GitCliPrGitApi, Reconciler } from '../reconciler/index.js';
 import { log } from '../logging.js';
 
 interface Cli {
@@ -234,6 +234,7 @@ async function main() {
   // and answers all routes with "not active."
   const mcp = new McpRegistry(tracker, {
     states: config.states,
+    prAutopilot: config.pr_autopilot,
   });
   // ACP transport. The bridge listens on a TCP port for the in-VM agent's dial-back,
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
@@ -321,6 +322,22 @@ async function main() {
     create: (identifier, state) => orch.createWorkspace(identifier, state),
   });
 
+  // PR autopilot wiring (issue 38). The Reconciler ignores this when
+  // `pr_autopilot.enabled` is false (it stays a no-op pass), so we set the
+  // providers unconditionally — a reload that flips the flag picks them up
+  // via `updateConfig`'s rebuild path.
+  reconciler.setPrAutopilotProviders({
+    intended: orch,
+    pr: new GhCliPrApi({ timeoutMs: 30_000 }),
+    git: new GitCliPrGitApi({ timeoutMs: 60_000 }),
+    transition: {
+      routeIssue: (input) => orch.routeIssueForAutopilot(input),
+    },
+    cleanup: {
+      removeWorkspace: (identifier) => orch.removeWorkspace(identifier),
+    },
+  });
+
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved
   // tracker.root, changed active/terminal states) is reflected by both the propagation
   // hook and the HTTP UI without rebinding the server.
@@ -329,7 +346,7 @@ async function main() {
     tracker.updateConfig(cfg.tracker);
     workspaces.updateConfig(cfg);
     runner.updateConfig(cfg, def);
-    mcp.updateStates(cfg.states);
+    mcp.updateStates(cfg.states, cfg.pr_autopilot);
     // The orchestrator's onChange handler already forwards the new config to
     // the reconciler (so a Smolfile-path change kicks off a new bake); we do
     // not re-forward here. liveCfg drives the HTTP dashboard's tracker view.

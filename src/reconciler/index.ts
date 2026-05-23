@@ -27,6 +27,14 @@ import {
   type WorkspaceIntendedProvider,
   type WorkspaceResourceOptions,
 } from './workspace.js';
+import {
+  PrResource,
+  type PrApi,
+  type PrCleanupApi,
+  type PrGitApi,
+  type PrIntendedProvider,
+  type PrTransitionApi,
+} from './pr.js';
 import type { ServiceConfig, SmolvmConfig } from '../types.js';
 import type { SmolvmClient } from '../agent/smolvm.js';
 import { log } from '../logging.js';
@@ -58,6 +66,15 @@ export interface ReconcilerOptions {
   workspaceInspect?: WorkspaceResourceOptions['inspect'];
   workspaceRemove?: WorkspaceResourceOptions['remove'];
   workspaceCreate?: WorkspaceResourceOptions['create'];
+  // PR autopilot resource (issue 38). When `pr_autopilot.enabled` is false the
+  // resource is not constructed and `reconcile()` skips the pass. Wired via
+  // `setPrAutopilotProviders` after construction so the orchestrator (which
+  // implements every callback) can be built after the Reconciler.
+  prIntendedProvider?: PrIntendedProvider;
+  prApi?: PrApi;
+  prGit?: PrGitApi;
+  prTransition?: PrTransitionApi;
+  prCleanup?: PrCleanupApi;
 }
 
 export class Reconciler {
@@ -83,6 +100,14 @@ export class Reconciler {
   private workspaceCreate?: WorkspaceResourceOptions['create'];
   private workspaceBaseRef?: BaseRefProvider;
   private workspaceIntended: WorkspaceIntendedProvider | null = null;
+  // PR autopilot (issue 38). Built only when `pr_autopilot.enabled` and
+  // providers have been wired. Null otherwise; reconcile() skips the pass.
+  private pr: PrResource | null = null;
+  private prIntended: PrIntendedProvider | null = null;
+  private prApi: PrApi | null = null;
+  private prGit: PrGitApi | null = null;
+  private prTransition: PrTransitionApi | null = null;
+  private prCleanup: PrCleanupApi | null = null;
   private backstopTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   // Single-flight: collapse concurrent reconcile() calls into one ongoing pass so
@@ -121,6 +146,48 @@ export class Reconciler {
       this.workspaceIntended = opts.workspaceIntendedProvider;
       this.workspace = this.buildWorkspaceResource();
     }
+    if (opts.prIntendedProvider) this.prIntended = opts.prIntendedProvider;
+    if (opts.prApi) this.prApi = opts.prApi;
+    if (opts.prGit) this.prGit = opts.prGit;
+    if (opts.prTransition) this.prTransition = opts.prTransition;
+    if (opts.prCleanup) this.prCleanup = opts.prCleanup;
+    this.pr = this.buildPrResource();
+  }
+
+  /**
+   * Construct (or rebuild) the PR autopilot resource against the current
+   * config + wired providers. Returns null when `pr_autopilot.enabled` is
+   * false OR any required provider is missing — the latter happens on the
+   * production path during the brief window between Reconciler construction
+   * and the orchestrator wiring its callbacks via {@link setPrAutopilotProviders}.
+   */
+  private buildPrResource(): PrResource | null {
+    if (!this.cfg.pr_autopilot.enabled) return null;
+    if (
+      !this.prIntended ||
+      !this.prApi ||
+      !this.prGit ||
+      !this.prTransition ||
+      !this.prCleanup
+    ) {
+      return null;
+    }
+    const conflictRouteTo =
+      this.cfg.pr_autopilot.conflict_route_to ?? defaultConflictRouteTo(this.cfg);
+    return new PrResource({
+      intended: this.prIntended,
+      pr: this.prApi,
+      git: this.prGit,
+      transition: this.prTransition,
+      cleanup: this.prCleanup,
+      strategy: this.cfg.pr_autopilot.auto_merge_strategy,
+      maxRebaseAttempts: this.cfg.pr_autopilot.max_rebase_attempts,
+      conflictRouteTo,
+      conflictHoldingState:
+        this.cfg.pr_autopilot.conflict_holding_state ?? defaultConflictHolding(this.cfg),
+      pollIntervalMs: this.cfg.pr_autopilot.poll_interval_ms,
+      actor: 'pr-autopilot',
+    });
   }
 
   private buildWorkspaceResource(): WorkspaceResource | null {
@@ -155,6 +222,30 @@ export class Reconciler {
       killProcess: this.vmKillProcess,
       killGraceMs: this.vmKillGraceMs,
     });
+  }
+
+  /**
+   * Wire the PR autopilot resource after construction. Same ordering reason
+   * as the VM and workspace janitors: the orchestrator implements every
+   * provider but is built after the Reconciler. Idempotent — the resource
+   * is rebuilt against the latest providers on each call.
+   *
+   * Calling this with `pr_autopilot.enabled` false in the live config is a
+   * no-op (the resource stays null).
+   */
+  setPrAutopilotProviders(opts: {
+    intended: PrIntendedProvider;
+    pr: PrApi;
+    git: PrGitApi;
+    transition: PrTransitionApi;
+    cleanup: PrCleanupApi;
+  }): void {
+    this.prIntended = opts.intended;
+    this.prApi = opts.pr;
+    this.prGit = opts.git;
+    this.prTransition = opts.transition;
+    this.prCleanup = opts.cleanup;
+    this.pr = this.buildPrResource();
   }
 
   /**
@@ -245,6 +336,10 @@ export class Reconciler {
     if (this.workspace) {
       this.workspace = this.buildWorkspaceResource();
     }
+    // PR autopilot reads strategy / max_rebase_attempts / route-state fields
+    // from cfg at construction. Rebuild so a reload that flips `enabled` or
+    // changes any field takes effect on the next pass.
+    this.pr = this.buildPrResource();
     void this.reconcile().catch((err) =>
       log.warn('reconcile after config reload failed', { error: (err as Error).message }),
     );
@@ -340,6 +435,13 @@ export class Reconciler {
             log.warn('workspace reconcile pass threw', { error: (err as Error).message });
           }
         }
+        if (this.pr) {
+          try {
+            await this.pr.reconcile();
+          } catch (err) {
+            log.warn('pr reconcile pass threw', { error: (err as Error).message });
+          }
+        }
       } catch (err) {
         log.warn('reconcile pass threw', { error: (err as Error).message });
       } finally {
@@ -378,8 +480,39 @@ export class Reconciler {
     const resources = [this.bake.snapshot()];
     if (this.vm) resources.push(this.vm.snapshot());
     if (this.workspace) resources.push(this.workspace.snapshot());
+    if (this.pr) resources.push(this.pr.snapshot());
     return { resources };
   }
+}
+
+/**
+ * First declared active state, used as the default `conflict_route_to` when
+ * the workflow doesn't pin one. Mirrors symphony's convention of routing
+ * conflict-handling work to "Todo" without hardcoding the name.
+ */
+function defaultConflictRouteTo(cfg: ServiceConfig): string {
+  for (const [name, sc] of Object.entries(cfg.states)) {
+    if (sc.role === 'active') return name;
+  }
+  // Validation already rejects workflows with no active state, but keep a
+  // sentinel just in case so the PrResource can construct without throwing.
+  return 'Todo';
+}
+
+/**
+ * Default holding state for circuit-broken issues. Prefers a declared state
+ * literally named `Conflict` (case-insensitive); otherwise falls back to the
+ * first declared holding state. Returns null when no holding state exists,
+ * which only happens on a workflow that bypassed validation.
+ */
+function defaultConflictHolding(cfg: ServiceConfig): string | null {
+  let firstHolding: string | null = null;
+  for (const [name, sc] of Object.entries(cfg.states)) {
+    if (sc.role !== 'holding') continue;
+    if (firstHolding === null) firstHolding = name;
+    if (name.toLowerCase() === 'conflict') return name;
+  }
+  return firstHolding;
 }
 
 export type { BakeExecutor } from './bake.js';
@@ -391,3 +524,19 @@ export type {
   WorkspaceInspection,
   RemoveReason,
 } from './workspace.js';
+export type {
+  PrIntent,
+  PrIntentKind,
+  PrIntendedProvider,
+  PrSummary,
+  PrView,
+  PrState,
+  PrMergeable,
+  PrApi,
+  PrGitApi,
+  PrTransitionApi,
+  PrCleanupApi,
+  RebaseOutcome,
+  PushOutcome,
+} from './pr.js';
+export { GhCliPrApi, GitCliPrGitApi, PrResource } from './pr.js';

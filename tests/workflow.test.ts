@@ -639,6 +639,117 @@ describe('integration block', () => {
     });
   });
 
+  it('pr_autopilot defaults off when block is absent', () => {
+    const cfg = buildServiceConfig(
+      { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.pr_autopilot.enabled, false);
+    assert.equal(cfg.pr_autopilot.merge_state, 'Done');
+    assert.equal(cfg.pr_autopilot.close_state, 'Cancelled');
+    assert.equal(cfg.pr_autopilot.max_rebase_attempts, 3);
+    assert.equal(cfg.pr_autopilot.auto_merge_strategy, 'squash');
+  });
+
+  it('pr_autopilot parses explicit fields and normalizes auto_merge_strategy', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        pr_autopilot: {
+          enabled: true,
+          merge_state: 'Done',
+          close_state: 'Cancelled',
+          conflict_route_to: 'Todo',
+          conflict_holding_state: 'Conflict',
+          max_rebase_attempts: 5,
+          auto_merge_strategy: 'rebase',
+          poll_interval_ms: 15000,
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.pr_autopilot.enabled, true);
+    assert.equal(cfg.pr_autopilot.conflict_route_to, 'Todo');
+    assert.equal(cfg.pr_autopilot.conflict_holding_state, 'Conflict');
+    assert.equal(cfg.pr_autopilot.max_rebase_attempts, 5);
+    assert.equal(cfg.pr_autopilot.auto_merge_strategy, 'rebase');
+    assert.equal(cfg.pr_autopilot.poll_interval_ms, 15000);
+  });
+
+  it('pr_autopilot rejects max_rebase_attempts <= 0 at parse time', () => {
+    assert.throws(() =>
+      buildServiceConfig(
+        {
+          tracker: { kind: 'local', root: '/tmp/issues' },
+          states: minimalStates,
+          pr_autopilot: { enabled: true, max_rebase_attempts: 0 },
+        },
+        '/tmp/WORKFLOW.md',
+      ),
+    );
+  });
+
+  it('pr_autopilot validation: rejects merge_state that is not terminal', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+            Conflict: { role: 'holding' },
+          },
+          pr_autopilot: { enabled: true, merge_state: 'Todo' },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /merge_state .* must be a terminal state/);
+    });
+  });
+
+  it('pr_autopilot validation: rejects conflict_route_to that is not active', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active' },
+            Done: { role: 'terminal' },
+            Cancelled: { role: 'terminal' },
+            Triage: { role: 'holding' },
+            Conflict: { role: 'holding' },
+          },
+          pr_autopilot: {
+            enabled: true,
+            conflict_route_to: 'Triage',
+          },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /conflict_route_to .* must be an active state/);
+    });
+  });
+
+  it('pr_autopilot disabled bypasses cross-reference validation', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: minimalStates,
+          // enabled:false skips the state lookup, so an undeclared name does not error.
+          pr_autopilot: { enabled: false, merge_state: 'Nope' },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.equal(err, null);
+    });
+  });
+
   it('validation: empty merge_on_states skips the cross-reference check', async () => {
     // Operators who don't opt into integration shouldn't be gated on having a
     // Conflict directory declared. validateDispatch only walks the integration
