@@ -808,7 +808,9 @@ export class PrResource {
     const attempt = st.rebaseAttempts;
     const max = this.opts.maxRebaseAttempts;
 
-    if (attempt > max) {
+    // Per the issue contract: "rebase counter >= N → route_to_conflict_state".
+    // With max=3 the 3rd consecutive failure (attempt == max) trips the breaker.
+    if (attempt >= max) {
       // Circuit broken: route to the holding state if declared, else log a
       // hard error and stop attempting (the next pass will see the issue
       // still in merge_state and re-enter this branch).
@@ -818,7 +820,7 @@ export class PrResource {
           identifier: intent.identifier,
           attempts: attempt,
         });
-        // Roll the counter back to `max` so we don't grow unbounded if the
+        // Clamp the counter at `max` so it doesn't grow unbounded if the
         // issue stays in the merge state without a holding-state route.
         st.rebaseAttempts = max;
         return;

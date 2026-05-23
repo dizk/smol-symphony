@@ -395,8 +395,8 @@ describe('PrResource — circuit breaker', () => {
     // and pushes a new head SHA, the issue cycles back to Done, and another
     // reconcile pass runs. Between passes the identifier is briefly OUT of
     // the intended set (it's in Todo/Review). The rebaseAttempts counter must
-    // accumulate across these cycles so the breaker fires on the 4th attempt
-    // when max=3.
+    // accumulate across these cycles so the breaker fires on the 3rd attempt
+    // when max=3 (per the issue contract: counter >= N → route to conflict).
 
     // We model the round trip with a mutable intended-set provider: when the
     // resource calls prIntended() we feed it the current state. Between
@@ -455,26 +455,13 @@ describe('PrResource — circuit breaker', () => {
     await res.reconcile();
     assert.equal(res.rebaseAttemptsFor('42'), 2);
 
-    // Round 3: attempts -> 3 (== max). Still routed to Todo, NOT Conflict.
+    // Round 3: attempts -> 3 (== max). Breaker fires — route to Conflict.
     currentHead = 'head-3';
     currentIntents = [makeIntent()];
     await res.reconcile();
     assert.equal(trCalls.length, 3);
-    assert.equal(trCalls[2]!.toState, 'Todo');
-    assert.match(trCalls[2]!.notes, /attempt 3 of 3/);
-    assert.equal(res.rebaseAttemptsFor('42'), 3);
-
-    // Gap.
-    currentIntents = [];
-    await res.reconcile();
-
-    // Round 4: attempts -> 4 (> max). Now the breaker fires.
-    currentHead = 'head-4';
-    currentIntents = [makeIntent()];
-    await res.reconcile();
-    assert.equal(trCalls.length, 4);
-    assert.equal(trCalls[3]!.toState, 'Conflict');
-    assert.match(trCalls[3]!.notes, /circuit broken/i);
+    assert.equal(trCalls[2]!.toState, 'Conflict');
+    assert.match(trCalls[2]!.notes, /circuit broken/i);
 
     // After the breaker fires the counter is dropped (operator intervention
     // is treated as a hard reset), so if the issue ever returns to Done it
@@ -482,9 +469,9 @@ describe('PrResource — circuit breaker', () => {
     assert.equal(res.rebaseAttemptsFor('42'), 0);
 
     // Sanity: every round actually called rebase + transition.
-    assert.equal(gitCalls.rebase.length, 4);
-    assert.equal(apiCalls.list.length, 4);
-    assert.equal(apiCalls.view.length, 4);
+    assert.equal(gitCalls.rebase.length, 3);
+    assert.equal(apiCalls.list.length, 3);
+    assert.equal(apiCalls.view.length, 3);
   });
 
   it('preserves the counter when the identifier leaves the intended set with a non-zero count', async () => {
@@ -560,9 +547,10 @@ describe('PrResource — circuit breaker', () => {
   });
 
   it('surfaces a hard error and clamps the counter when no holding state is declared and the breaker trips', async () => {
-    // Drive max+1 conflicts back-to-back; with no holding state, the resource
-    // surfaces last_error but does not transition. The counter must clamp
-    // at `max` so it doesn't grow unbounded across subsequent passes.
+    // With max=2 and no holding state declared: round 1 routes to Todo,
+    // round 2 trips the breaker but has nowhere to route — it must surface
+    // last_error and clamp the counter at `max` so subsequent passes don't
+    // grow it unbounded.
     let currentIntents: PrIntent[] = [];
     const provider: PrIntendedProvider = { prIntended: async () => currentIntents };
     let currentHead = 'head-1';
@@ -581,17 +569,19 @@ describe('PrResource — circuit breaker', () => {
       transition,
       cleanup,
       strategy: 'squash',
-      maxRebaseAttempts: 1,
+      maxRebaseAttempts: 2,
       conflictRouteTo: 'Todo',
       conflictHoldingState: null,
       pollIntervalMs: 0,
     });
-    // Round 1: attempts -> 1 (== max), still routes to Todo.
+    // Round 1: attempts -> 1 (< max), routes to Todo.
     currentIntents = [makeIntent()];
     await res.reconcile();
     assert.equal(trCalls.length, 1);
     assert.equal(trCalls[0]!.toState, 'Todo');
-    // Round 2: attempts -> 2 (> max), no holding state, surfaces last_error.
+    assert.equal(res.rebaseAttemptsFor('42'), 1);
+    // Round 2: attempts -> 2 (== max), breaker would fire but no holding
+    // state — surfaces last_error and clamps at max.
     currentIntents = [];
     await res.reconcile();
     currentHead = 'head-2';
@@ -599,8 +589,16 @@ describe('PrResource — circuit breaker', () => {
     await res.reconcile();
     assert.equal(trCalls.length, 1, 'no transition fired without a holding state');
     assert.match(res.snapshot().last_error ?? '', /circuit broken/);
-    // Clamped at max so a third pass would re-fire last_error (not grow).
-    assert.equal(res.rebaseAttemptsFor('42'), 1);
+    assert.equal(res.rebaseAttemptsFor('42'), 2);
+    // Round 3: attempts increments to 3, still clamps back to max=2 — no
+    // unbounded growth.
+    currentIntents = [];
+    await res.reconcile();
+    currentHead = 'head-3';
+    currentIntents = [makeIntent()];
+    await res.reconcile();
+    assert.equal(trCalls.length, 1, 'still no transition');
+    assert.equal(res.rebaseAttemptsFor('42'), 2, 'counter clamped at max');
   });
 });
 
