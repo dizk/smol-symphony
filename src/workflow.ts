@@ -31,6 +31,8 @@ import {
   type AcpAdapterId,
 } from './agent/adapters.js';
 import { accessSync, constants as fsConstants } from 'node:fs';
+import { parseActionsBlock } from './actions/parsing.js';
+import type { WorkflowAction } from './actions/types.js';
 
 export class WorkflowError extends Error {
   constructor(public code: string, message: string) {
@@ -491,6 +493,7 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
       );
     }
     const stateHooks = parseStateHooksBlock(name, m['hooks']);
+    const stateActions = parseActionsBlock(name, m['actions']);
     const sc: StateConfig = { role: roleRaw };
     if (adapter !== null) sc.adapter = adapter;
     if (model !== undefined) sc.model = model;
@@ -498,6 +501,7 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     if (maxTurns !== undefined) sc.max_turns = maxTurns;
     if (allowed !== undefined) sc.allowed_transitions = allowed;
     if (stateHooks !== undefined) sc.hooks = stateHooks;
+    if (stateActions !== undefined) sc.actions = stateActions;
     out[name] = sc;
   }
   return out;
@@ -540,6 +544,33 @@ function parseStateHooksBlock(stateName: string, raw: unknown): StateHooksConfig
   return out;
 }
 
+/**
+ * Resolve the typed action list a given state should run on transition-in.
+ * Mirrors {@link resolveHooksForState}'s case-insensitive lookup but returns
+ * the parsed `WorkflowAction[]` (or undefined when the state has no actions
+ * block). The runner consults this instead of `after_run` when present.
+ */
+export function resolveActionsForState(
+  cfg: ServiceConfig,
+  stateName: string,
+): WorkflowAction[] | undefined {
+  const states = cfg.states;
+  let key: string | null = null;
+  if (Object.prototype.hasOwnProperty.call(states, stateName)) {
+    key = stateName;
+  } else {
+    const lower = stateName.toLowerCase();
+    for (const name of Object.keys(states)) {
+      if (name.toLowerCase() === lower) {
+        key = name;
+        break;
+      }
+    }
+  }
+  if (key === null) return undefined;
+  return states[key]!.actions;
+}
+
 // Effective hooks for an issue currently in `stateName`. Per-state hook fields override
 // the workflow-level ones; absent fields fall through. An explicit `null` in a state's
 // hooks block suppresses that hook for the state even if the workflow declares it. The
@@ -572,6 +603,51 @@ export function resolveHooksForState(cfg: ServiceConfig, stateName: string): Hoo
     before_remove: pick('before_remove'),
     timeout_ms: base.timeout_ms,
   };
+}
+
+/**
+ * Detect states that declare BOTH `hooks:` and `actions:`. The actions list
+ * wins on those states (issue 36 AC2); we emit a single startup-time warning
+ * per state so the operator knows the `hooks:` block is being ignored. Pure
+ * function so the same surface is reachable from tests without the side
+ * effect of the global log. Returns the list of (state, hook-fields) tuples
+ * the caller can render however it likes; the production caller logs at
+ * warn via {@link warnOnHooksAndActionsConflict}.
+ */
+export function findHooksAndActionsConflicts(
+  cfg: ServiceConfig,
+): Array<{ state: string; hook_fields: string[] }> {
+  const out: Array<{ state: string; hook_fields: string[] }> = [];
+  for (const [name, sc] of Object.entries(cfg.states)) {
+    if (!sc.actions || sc.actions.length === 0) continue;
+    const hooks = sc.hooks;
+    if (!hooks) continue;
+    const setFields: string[] = [];
+    for (const k of ['after_create', 'before_run', 'after_run', 'before_remove'] as const) {
+      if (Object.prototype.hasOwnProperty.call(hooks, k) && hooks[k] !== null && hooks[k] !== undefined) {
+        setFields.push(k);
+      }
+    }
+    if (setFields.length > 0) out.push({ state: name, hook_fields: setFields });
+  }
+  return out;
+}
+
+/**
+ * Log a deprecation warning for every state that declares both `hooks:` and
+ * `actions:`. Called from the orchestrator at startup so the warning fires
+ * before the first dispatch into a terminal state. The action-list wins
+ * silently in the runtime; this surface is the operator-visible "we saw
+ * your hook and ignored it" signal.
+ */
+export function warnOnHooksAndActionsConflict(cfg: ServiceConfig): void {
+  const conflicts = findHooksAndActionsConflicts(cfg);
+  for (const c of conflicts) {
+    log.warn('state declares both `hooks:` and `actions:`; running actions and ignoring hooks (deprecated)', {
+      state: c.state,
+      ignored_hook_fields: c.hook_fields,
+    });
+  }
 }
 
 // Dispatch preflight validation.

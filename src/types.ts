@@ -32,6 +32,11 @@ export interface WorkflowDefinition {
 // "no hook for this state, even if workflow-level declares one" so a terminal state
 // can opt out of a global after_run that otherwise no-ops on it. `timeout_ms` is
 // not overridable per state — it's a global safety bound, not behavior.
+//
+// Deprecated for state-machine-mutating glue: prefer the `actions:` block on a state
+// (typed records, see src/actions/types.ts) over shell hooks for new work. A state
+// that declares both `hooks:` and `actions:` runs `actions:` and ignores `hooks:`;
+// a startup deprecation warning is logged in validateDispatch.
 export interface StateHooksConfig {
   after_create?: string | null;
   before_run?: string | null;
@@ -63,6 +68,16 @@ export interface StateConfig {
   max_turns?: number;
   allowed_transitions?: string[] | null;
   hooks?: StateHooksConfig;
+  /**
+   * Typed action DAG (issue 36, reconciler v2). When set on a `terminal` state,
+   * this list runs in place of `after_run` shell on transition into the state.
+   * When `actions:` and `hooks:` are both declared, the actions list wins and a
+   * startup-time deprecation warning is logged. Schema lives in
+   * src/actions/types.ts (`WorkflowAction` union); the field is typed via a
+   * `type-only` import so the data model doesn't create a runtime cycle with
+   * the action executor.
+   */
+  actions?: import('./actions/types.js').WorkflowAction[];
 }
 
 export interface TrackerConfig {

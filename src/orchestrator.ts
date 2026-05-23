@@ -13,7 +13,15 @@ import type {
 } from './types.js';
 import type { IssueTracker } from './trackers/types.js';
 import type { WorkflowSource } from './workflow.js';
-import { resolveHooksForState, validateDispatch, WorkflowError } from './workflow.js';
+import {
+  resolveHooksForState,
+  validateDispatch,
+  warnOnHooksAndActionsConflict,
+  WorkflowError,
+} from './workflow.js';
+import { writeIssueFile, pickHoldingState } from './issues.js';
+import type { ResourceSnapshot } from './reconciler/index.js';
+import type { ProposeFollowupSink } from './actions/index.js';
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
 import { resolveDispatchConfig } from './agent/runner.js';
@@ -103,11 +111,18 @@ interface RetrySchedule {
 const CONTINUATION_DELAY_MS = 1_000;
 const FAILURE_BASE_MS = 10_000;
 
-export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvider, BaseRefProvider {
+export class Orchestrator
+  implements IntendedVmProvider, WorkspaceIntendedProvider, BaseRefProvider, ProposeFollowupSink
+{
   private running = new Map<string, RunningEntry>();
   private claimed = new Set<string>();
   private retryAttempts = new Map<string, RetryEntry>();
   private completed = new Set<string>();
+  // Per-state ledger of the most-recent action-list execution. Surfaced via
+  // `snapshot.reconciler.resources` so the dashboard can render "Done.actions:
+  // push_branch ok, create_pr_if_missing in_progress" without a separate
+  // first-class surface for action state (issue 36 AC5).
+  private lastActionResults = new Map<string, ResourceSnapshot>();
   // Per-issue JSONL run log. Opened lazily on first dispatch for an issue, kept open across
   // retries so the file is one chronological stream per issue, and closed only when the
   // issue finally unwinds (terminal cleanup, claim release without redispatch, or stop()).
@@ -192,6 +207,10 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
       log.error('startup validation failed', { error: validation });
       throw new WorkflowError('workflow_parse_error', validation);
     }
+    // Issue 36 AC2: warn once at startup for every state that declares both
+    // `hooks:` and `actions:`. The actions list wins at runtime; this log line
+    // is the operator-visible "we noticed your hooks but ignored them" signal.
+    warnOnHooksAndActionsConflict(this.cfg);
     // Fail fast when symphony will auto-stage credentials but the host file an
     // adapter needs is missing. Per-state overrides can change the adapter for
     // individual states (e.g. Review running on codex while Todo runs on claude),
@@ -1034,6 +1053,59 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
   }
 
   /**
+   * Implements {@link ProposeFollowupSink} for the action executor's
+   * `propose_followup` action (issue 36). Same tracker shape as the MCP
+   * `propose_issue` tool — file lands in the first declared `holding` state,
+   * with `proposed_by` set to the parent issue's identifier. Uses the live
+   * tracker root (passed-in parent identifier is the canonical attribution).
+   */
+  async proposeFollowup(input: {
+    title: string;
+    description?: string;
+    labels?: string[];
+    priority?: number;
+    parent_identifier: string;
+  }): Promise<{ identifier: string }> {
+    const root = this.tracker.currentRoot ? this.tracker.currentRoot() : this.cfg.tracker.root;
+    if (!root) {
+      throw new Error('tracker root not available; cannot file propose_followup');
+    }
+    const landingState = pickHoldingState(this.cfg.states);
+    const result = await writeIssueFile({
+      trackerRoot: root,
+      state: landingState,
+      title: input.title,
+      description: input.description ?? '',
+      priority: input.priority ?? null,
+      labels: input.labels ?? [],
+      extra_front_matter: {
+        proposed_by: input.parent_identifier,
+        proposed_at: new Date().toISOString(),
+      },
+    });
+    log.info('action propose_followup', {
+      proposed_by: input.parent_identifier,
+      identifier: result.identifier,
+      state: result.state,
+    });
+    return { identifier: result.identifier };
+  }
+
+  /**
+   * Receive a per-attempt action ledger from the runner's cleanup pass. The
+   * snapshot is keyed by state so the dashboard can render "Done.actions:
+   * push_branch ok, create_pr_if_missing rate-limited, retrying" without the
+   * orchestrator having to know about specific action kinds.
+   *
+   * `id` should follow the `actions:<StateName>` convention so it sorts
+   * predictably next to reconciler-resource rows in
+   * `snapshot.reconciler.resources`.
+   */
+  recordActionResult(id: string, snapshot: ResourceSnapshot): void {
+    this.lastActionResults.set(id, snapshot);
+  }
+
+  /**
    * Workspace removal callback the reconciler invokes for stale dirs (issue
    * 34). Defers to `WorkspaceManager.remove`, resolved against the live
    * workflow-level hooks so a reload that changed `before_remove` takes
@@ -1202,8 +1274,23 @@ export class Orchestrator implements IntendedVmProvider, WorkspaceIntendedProvid
       },
       rate_limits: this.rateLimits,
       memory_admission: this.computeAdmission(),
-      reconciler: this.reconciler ? this.reconciler.snapshot() : null,
+      reconciler: this.buildReconcilerSnapshot(),
     };
+  }
+
+  /**
+   * Combine the reconciler's resource snapshot with the most recent action
+   * results so the dashboard sees both surfaces under one `reconciler.resources`
+   * list. When neither side has anything to report (no reconciler wired AND no
+   * actions ever ran), the field is null to preserve the existing test
+   * harness's "no reconciler" shape.
+   */
+  private buildReconcilerSnapshot(): ReconcilerSnapshot | null {
+    const base = this.reconciler ? this.reconciler.snapshot() : null;
+    if (!base && this.lastActionResults.size === 0) return null;
+    const resources = base ? [...base.resources] : [];
+    for (const snap of this.lastActionResults.values()) resources.push(snap);
+    return { resources };
   }
 
   /** Issue-detail view used by the HTTP /api/v1/<identifier> endpoint. */

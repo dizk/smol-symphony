@@ -32,7 +32,15 @@ import {
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
-import { resolveHooksForState } from '../workflow.js';
+import { resolveActionsForState, resolveHooksForState } from '../workflow.js';
+import {
+  runActions,
+  toActionsSnapshot,
+  type ActionContext,
+  type ProposeFollowupSink,
+  type WorkflowAction,
+} from '../actions/index.js';
+import type { ResourceSnapshot } from '../reconciler/index.js';
 import {
   performIntegrationMerge,
   resolveIntegrationRemote,
@@ -235,6 +243,15 @@ export interface BakedArtifactProvider {
   artifactPath(): string | null;
 }
 
+/**
+ * Sink the runner uses to surface per-attempt action ledgers (issue 36 AC5).
+ * Implemented by `Orchestrator.recordActionResult` in production; tests can
+ * stub the no-op to skip the snapshot wiring.
+ */
+export interface ActionSnapshotSink {
+  recordActionResult(id: string, snapshot: ResourceSnapshot): void;
+}
+
 export class AgentRunner {
   constructor(
     private cfg: ServiceConfig,
@@ -256,6 +273,19 @@ export class AgentRunner {
      * any dispatch happens when `smolvm.smolfile` is configured.
      */
     private bakedArtifacts: BakedArtifactProvider | null = null,
+    /**
+     * Sink for `propose_followup` actions (issue 36). Wired to the
+     * orchestrator's tracker in production; nullable for tests that don't
+     * exercise the action. Same shape as the MCP `propose_issue` tool's
+     * tracker-side write.
+     */
+    private followupSink: ProposeFollowupSink | null = null,
+    /**
+     * Sink for per-attempt action ledgers surfaced on Snapshot (issue 36 AC5).
+     * Nullable so tests that don't exercise the snapshot surface can pass
+     * undefined.
+     */
+    private actionSnapshotSink: ActionSnapshotSink | null = null,
   ) {}
 
   setAcpBridge(bridge: AcpBridge | null): void {
@@ -277,6 +307,132 @@ export class AgentRunner {
 
   vmNameFor(issue: Issue): string {
     return `${SYMPHONY_VM_PREFIX}${sanitizeWorkspaceKey(issue.identifier)}`.toLowerCase();
+  }
+
+  /**
+   * Resolve the action templating context from the staged `extraEnv` map and
+   * the running entry. The context fields mirror the SYMPHONY_* env names so
+   * a Done state that previously read `$SYMPHONY_BRANCH` from the hook env
+   * now reads `$branch` from the action template namespace.
+   */
+  private buildActionContext(
+    entry: RunningEntry,
+    workspacePath: string,
+    extraEnv: Record<string, string> | undefined,
+  ): ActionContext {
+    const branch = extraEnv?.SYMPHONY_BRANCH ?? `agent/${entry.identifier}`;
+    const baseBranch = extraEnv?.SYMPHONY_BASE_BRANCH ?? 'main';
+    const prTitle =
+      extraEnv?.SYMPHONY_PR_TITLE ??
+      (entry.issue.title.trim().length > 0
+        ? `${entry.issue.id}: ${entry.issue.title.trim()}`
+        : entry.issue.id);
+    const prBodyFile = extraEnv?.SYMPHONY_PR_BODY_FILE ?? '';
+    return {
+      identifier: entry.identifier,
+      workspace: workspacePath,
+      branch,
+      base_branch: baseBranch,
+      issue_title: entry.issue.title ?? '',
+      issue_body: entry.issue.description ?? '',
+      repo: process.env.SYMPHONY_REPO && process.env.SYMPHONY_REPO.length > 0
+        ? process.env.SYMPHONY_REPO
+        : null,
+      pr_title: prTitle,
+      pr_body_file: prBodyFile,
+    };
+  }
+
+  /**
+   * Drive the typed action executor for a state's `actions:` block. Reroutes
+   * the issue when an action returns `route_to` (today: `merge` on conflict).
+   * Mirrors the integration-merge reroute machinery so the failure path keeps
+   * the workspace + agent branch available for the operator who picks up the
+   * issue in the conflict state.
+   */
+  private async runStateActions(
+    stateName: string,
+    actions: readonly WorkflowAction[],
+    entry: RunningEntry,
+    workspacePath: string,
+    extraEnv: Record<string, string> | undefined,
+    capture: HookCapture | undefined,
+  ): Promise<void> {
+    const ctx = this.buildActionContext(entry, workspacePath, extraEnv);
+    const snapshotId = `actions:${stateName}`;
+    const logger = withIssue({ issue_id: entry.issue_id, issue_identifier: entry.identifier });
+    logger.info('running state actions', {
+      state: stateName,
+      action_count: actions.length,
+    });
+    const result = await runActions(actions, {
+      workspacePath,
+      ctx,
+      capture: capture ?? undefined,
+      followupSink: this.followupSink ?? undefined,
+      snapshotId,
+    });
+    // Surface on snapshot regardless of outcome; the dashboard shows the
+    // full ledger including in-progress / error states.
+    this.actionSnapshotSink?.recordActionResult(snapshotId, {
+      id: snapshotId,
+      ready: result.ok,
+      desired_hash: null,
+      last_error: result.actions.find((a) => a.state === 'error')?.error ?? null,
+      actions: result.actions,
+    });
+    if (result.route_to) {
+      logger.warn('state action requested reroute', {
+        state: stateName,
+        target_state: result.route_to,
+        reason: result.reason,
+      });
+      await this.rerouteEntryAction(entry, stateName, result.route_to, result.reason);
+    } else if (!result.ok) {
+      logger.warn('state actions failed', {
+        state: stateName,
+        reason: result.reason,
+      });
+    }
+  }
+
+  /**
+   * Move `entry`'s tracker file into `targetState` and append a diagnostic
+   * note. Used by `runStateActions` when an action returns a route_to (e.g.
+   * `merge`'s on_conflict). Mirrors `routeIntegrationFailureToConflict` but
+   * is parameterized on the typed-action reason rather than on the
+   * integration-merge result.
+   */
+  private async rerouteEntryAction(
+    entry: RunningEntry,
+    fromState: string,
+    targetState: string,
+    reason: string | null,
+  ): Promise<void> {
+    if (!this.tracker.moveIssueToState) {
+      entry.cleanup_workspace_on_exit = false;
+      return;
+    }
+    const notes = [
+      `**Action rerouted** to \`${targetState}\` from \`${fromState}\`.`,
+      '',
+      `**Reason:** ${reason ?? 'unknown'}`,
+      '',
+      `**Workspace and \`agent/${entry.identifier}\` branch are preserved** for resolution.`,
+    ].join('\n');
+    try {
+      await this.tracker.moveIssueToState(entry.issue_id, targetState, {
+        fromRoot: entry.tracker_root_at_dispatch ?? undefined,
+        fromState,
+        notes,
+        actor: entry.resolved_actor,
+      });
+    } catch {
+      entry.cleanup_workspace_on_exit = false;
+      return;
+    }
+    entry.cleanup_workspace_on_exit = false;
+    entry.issue.state = targetState;
   }
 
   async runAttempt(
@@ -673,14 +829,20 @@ export class AgentRunner {
         }
       }
       const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
-      // Stage SYMPHONY_* env vars + a temp body file for the hook (collapses the Done
-      // after_run from ~80 lines of awk/git plumbing to a few git/gh calls). The runner
-      // owns the temp body file's lifecycle; the post-hook cleanup always fires.
+      const cleanupActions = resolveActionsForState(this.cfg, cleanupState);
+      // Stage SYMPHONY_* env vars + a temp body file once. Both the legacy
+      // after_run shell and the typed-action executor consume the same values
+      // (the action templating context derives from this map); building it
+      // once avoids two redundant tracker reads on the Done state's transition.
       let extraEnv: Record<string, string> | undefined;
       let extraEnvCleanup: (() => Promise<void>) | null = null;
-      if (!integrationFailed && runningEntry && cleanupHooks.after_run) {
+      const needsStaging =
+        !integrationFailed &&
+        runningEntry &&
+        ((cleanupActions && cleanupActions.length > 0) || cleanupHooks.after_run);
+      if (needsStaging) {
         try {
-          const staged = await buildAfterRunHookEnv(runningEntry);
+          const staged = await buildAfterRunHookEnv(runningEntry!);
           extraEnv = staged.env;
           extraEnvCleanup = staged.cleanup;
         } catch (err) {
@@ -691,12 +853,27 @@ export class AgentRunner {
       }
       try {
         if (!integrationFailed) {
-          await this.workspaces.runAfterRunBestEffort(
-            workspace.path,
-            cleanupHooks,
-            hookCapture('after_run'),
-            extraEnv,
-          );
+          // Per-state `actions:` block wins over `hooks.after_run` (issue 36
+          // AC2; deprecation warning fires once at orchestrator startup). When
+          // both are declared we silently skip the after_run hook here — the
+          // warning at startup is the documented surface.
+          if (cleanupActions && cleanupActions.length > 0 && runningEntry) {
+            await this.runStateActions(
+              cleanupState,
+              cleanupActions,
+              runningEntry,
+              workspace.path,
+              extraEnv,
+              hookCapture('actions'),
+            );
+          } else {
+            await this.workspaces.runAfterRunBestEffort(
+              workspace.path,
+              cleanupHooks,
+              hookCapture('after_run'),
+              extraEnv,
+            );
+          }
         }
       } finally {
         if (extraEnvCleanup) await extraEnvCleanup();

@@ -51,27 +51,31 @@ states:
     allowed_transitions: [Todo, Done]
   Done:
     role: terminal
-    # Per-state after_run fires only on transition INTO this state. The host
-    # pre-stages SYMPHONY_PR_TITLE / SYMPHONY_PR_BODY_FILE / SYMPHONY_BRANCH for
-    # us (title is already issue-id prefixed; the body file carries the full
-    # multi-hop notes from the issue's tracker file), so the hook is just the
-    # push + PR-create. Local-only mode (no SYMPHONY_REPO) exits 0 and leaves
-    # the per-issue branch in the workspace; the orchestrator removes the
-    # workspace after this hook returns.
-    hooks:
-      after_run: |
-        set -eu
-        [ -n "${SYMPHONY_REPO:-}" ] || exit 0
-        git push -u origin "$SYMPHONY_BRANCH"
-        if gh pr view "$SYMPHONY_BRANCH" >/dev/null 2>&1; then
-          echo "PR already exists for $SYMPHONY_BRANCH; pushed updates"
-          exit 0
-        fi
-        gh pr create \
-          --base "$SYMPHONY_BASE_BRANCH" \
-          --head "$SYMPHONY_BRANCH" \
-          --title "$SYMPHONY_PR_TITLE" \
-          --body-file "$SYMPHONY_PR_BODY_FILE"
+    # Issue 36 (reconciler v2 / typed action DAG): the legacy `after_run`
+    # shell that pushed the branch and opened a PR is replaced by two typed
+    # actions. The host pre-stages SYMPHONY_PR_TITLE / SYMPHONY_PR_BODY_FILE /
+    # SYMPHONY_BRANCH (the same values the old shell read); the action
+    # executor exposes them as $pr_title / $pr_body_file / $branch /
+    # $base_branch / $repo in the fixed template namespace
+    # (src/actions/types.ts → ActionContext). The `if: $repo` predicate
+    # matches the old `[ -n "${SYMPHONY_REPO:-}" ] || exit 0` short-circuit
+    # so the local-only mode is still a no-op. Per-action retry/snapshot
+    # plumbing replaces the opaque shell-exit-code surface; on rate-limit
+    # the create_pr_if_missing action shows "retrying in 60s" on the
+    # dashboard instead of a silent failure.
+    actions:
+      - kind: push_branch
+        name: push-branch
+        remote: origin
+        ref: $branch
+        if: $repo
+      - kind: create_pr_if_missing
+        name: open-pr
+        base: $base_branch
+        head: $branch
+        title_from: $pr_title
+        body_from: $pr_body_file
+        if: $repo
   Cancelled:
     role: terminal
     # Cancelled means the work was abandoned; no patch, no PR. The workspace is

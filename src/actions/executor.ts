@@ -1,0 +1,694 @@
+// Action executor (issue 36). Runs a per-state typed-action list during the
+// runner's terminal cleanup, replacing the `after_run` shell hook for states
+// that declare an `actions:` block.
+//
+// Per-action lifecycle:
+//   1. Render templates against the ActionContext.
+//   2. Evaluate `if:` predicate; skip when false (record state=done with
+//      `cache_hit: skipped` semantics).
+//   3. Apply the action via its kind-specific executor.
+//   4. On failure, consult `on_error.retry`; replay with exponential backoff.
+//   5. After retries exhausted, consult `on_error.then`: abort the cleanup
+//      run, or reroute the issue to a holding state.
+//
+// The executor never mutates the issue's tracker state directly; reroute
+// requests are returned as `route_to` on the result and the runner (which
+// holds the McpRegistry / tracker) performs the move. Same separation as
+// `routeIntegrationFailureToConflict`: keep the git/gh/exec side
+// pure-functional, the orchestrator-state side next to the runner.
+
+import { setTimeout as delay } from 'node:timers/promises';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import type {
+  ActionContext,
+  ActionErrorPolicy,
+  ActionOutcome,
+  ActionStatus,
+  ActionState,
+  ActionsSnapshot,
+  CreatePrIfMissingAction,
+  DeleteBranchAction,
+  EnsureBranchAction,
+  CheckoutAction,
+  MergeAction,
+  ProposeFollowupAction,
+  PushBranchAction,
+  RunInVmAction,
+  WorkflowAction,
+} from './types.js';
+import { renderTemplate, renderTree, TemplateError } from './templating.js';
+import { evaluatePredicate } from './predicates.js';
+import {
+  computeCacheHash,
+  invalidateCache,
+  readCache,
+  runInVmCacheRoot,
+  writeCache,
+} from './cache.js';
+import type { HookCapture } from '../workspace.js';
+import { log } from '../logging.js';
+
+const DEFAULT_RETRY_COUNT = 3;
+const DEFAULT_RETRY_BACKOFF_MS = 1_000;
+const MAX_ACTION_HISTORY = 16;
+
+export interface ProposeFollowupSink {
+  /**
+   * Propagate a `propose_followup` action through the same tracker path
+   * `symphony.propose_issue` uses. The orchestrator wires this; the runner
+   * passes the closure through. Returns the identifier of the proposal (for
+   * the run log) — failures throw and trip the action's retry policy.
+   */
+  proposeFollowup(input: {
+    title: string;
+    description?: string;
+    labels?: string[];
+    priority?: number;
+    parent_identifier: string;
+  }): Promise<{ identifier: string }>;
+}
+
+export interface ActionExecutorOptions {
+  workspacePath: string;
+  ctx: ActionContext;
+  /**
+   * Run-log capture; the executor mirrors stdout/stderr of every spawned
+   * command (and the action lifecycle) through the same shape the workspace
+   * hooks use, so the per-issue JSONL log carries a uniform event stream
+   * across hook-era and action-era runs.
+   */
+  capture?: HookCapture;
+  /** Override for tests; production uses `~/.cache/symphony`. */
+  cacheRoot?: string;
+  /** Required for `propose_followup`. */
+  followupSink?: ProposeFollowupSink;
+  /** Logical scope id (e.g. `actions:Done`) for snapshot keying. */
+  snapshotId: string;
+  /**
+   * Bound per-command timeout. Default 5 minutes; `run_in_vm` overrides via
+   * its own `timeout` field. Used for git/gh/exec to keep a wedged remote
+   * from hanging the run forever.
+   */
+  defaultCommandTimeoutMs?: number;
+}
+
+export interface ActionExecResult {
+  ok: boolean;
+  reason: string | null;
+  route_to: string | null;
+  /** Most-recent-first ledger; safe to embed in a snapshot. */
+  actions: ActionStatus[];
+}
+
+/**
+ * Run a sequence of declared actions. Returns the aggregated outcome. The
+ * caller is responsible for placing the result in the snapshot store.
+ *
+ * Sequential by design: today's actions all touch the same workspace and
+ * the same remote, so parallelism would require declared inputs/outputs to
+ * be honored (the issue body sketches that as future work). Stage-1
+ * semantics: each action runs after the prior completes; the first
+ * non-routed failure stops the loop with `ok=false`.
+ */
+export async function runActions(
+  actions: readonly WorkflowAction[],
+  opts: ActionExecutorOptions,
+): Promise<ActionExecResult> {
+  const ledger: ActionStatus[] = [];
+  const push = (status: ActionStatus) => {
+    ledger.unshift(status);
+    if (ledger.length > MAX_ACTION_HISTORY * 2) ledger.length = MAX_ACTION_HISTORY * 2;
+  };
+  const upd = (action: string, next: Partial<ActionStatus>) => {
+    const idx = ledger.findIndex((a) => a.action === action && a.state === 'in_progress');
+    if (idx >= 0) ledger[idx] = { ...ledger[idx]!, ...next };
+  };
+
+  let routeTo: string | null = null;
+  let aborted = false;
+  let abortReason: string | null = null;
+
+  for (let i = 0; i < actions.length; i++) {
+    if (aborted) break;
+    const action = actions[i]!;
+    const actionKey = actionSnapshotKey(action, i);
+    const startedAt = new Date().toISOString();
+    push({
+      resource: opts.snapshotId,
+      action: actionKey,
+      state: 'in_progress',
+      started_at: startedAt,
+      finished_at: null,
+      error: null,
+    });
+
+    // Render the action's string-typed fields once up front. We re-render on
+    // retry to be robust to context mutations during the retry window, but in
+    // practice the ActionContext is built once per cleanup pass.
+    let rendered: WorkflowAction;
+    try {
+      rendered = renderTree(action, opts.ctx);
+    } catch (err) {
+      const msg = err instanceof TemplateError ? err.message : (err as Error).message;
+      upd(actionKey, { state: 'error', finished_at: new Date().toISOString(), error: msg });
+      log.warn('action template render failed', {
+        action: actionKey,
+        error: msg,
+      });
+      aborted = true;
+      abortReason = msg;
+      break;
+    }
+
+    // Conditional `if:`. A false predicate marks the action done with a
+    // "skipped (if=false)" reason so the snapshot/log shows why nothing
+    // happened. We re-use the `done` state because there's no "skipped"
+    // ActionState; the run log captures the discriminator.
+    let shouldRun: boolean;
+    try {
+      shouldRun = await evaluatePredicate(rendered.if, opts.ctx, opts.workspacePath);
+    } catch (err) {
+      const msg = (err as Error).message;
+      upd(actionKey, { state: 'error', finished_at: new Date().toISOString(), error: msg });
+      aborted = true;
+      abortReason = msg;
+      break;
+    }
+    if (!shouldRun) {
+      upd(actionKey, { state: 'done', finished_at: new Date().toISOString() });
+      opts.capture?.onChunk?.('stdout', `[action ${actionKey}] skipped (if=false)\n`);
+      log.debug('action skipped', { action: actionKey, reason: 'if=false' });
+      continue;
+    }
+
+    // Retry loop. Default policy: 3 retries with exponential backoff starting
+    // at 1s, then `abort`. The on_error.then field overrides the default.
+    const policy = effectivePolicy(action.on_error);
+    let attempt = 0;
+    let outcome: ActionOutcome | null = null;
+    while (true) {
+      outcome = await applyAction(rendered, opts).catch((err): ActionOutcome => ({
+        ok: false,
+        reason: (err as Error).message,
+        route_to: null,
+      }));
+      if (outcome.ok) break;
+      // Routed failure (e.g. merge conflict) — short-circuit the retry loop;
+      // the route_to value will be returned to the runner.
+      if (outcome.route_to) break;
+      if (attempt >= policy.retry.count) break;
+      const backoff = policy.retry.backoff_ms * Math.pow(2, attempt);
+      opts.capture?.onChunk?.(
+        'stderr',
+        `[action ${actionKey}] attempt ${attempt + 1} failed: ${outcome.reason ?? 'unknown'}; retrying in ${backoff}ms\n`,
+      );
+      log.warn('action retrying', {
+        action: actionKey,
+        attempt: attempt + 1,
+        next_backoff_ms: backoff,
+        error: outcome.reason,
+      });
+      await delay(backoff);
+      attempt++;
+    }
+
+    if (outcome.ok) {
+      const note = outcome.cache_hit ? ' (cache hit)' : '';
+      upd(actionKey, { state: 'done', finished_at: new Date().toISOString() });
+      opts.capture?.onChunk?.('stdout', `[action ${actionKey}] ok${note}\n`);
+      continue;
+    }
+
+    // Failure path. Two routes:
+    //   1. action-typed routing (merge's on_conflict route_to fired by the
+    //      executor): outcome.route_to is set.
+    //   2. policy-typed routing (on_error.then.route_to): convert here.
+    let route: string | null = outcome.route_to;
+    if (!route && typeof policy.then === 'object' && policy.then.route_to) {
+      route = policy.then.route_to;
+    }
+    upd(actionKey, {
+      state: 'error',
+      finished_at: new Date().toISOString(),
+      error: outcome.reason ?? 'unknown',
+    });
+    opts.capture?.onChunk?.(
+      'stderr',
+      `[action ${actionKey}] failed: ${outcome.reason ?? 'unknown'}${route ? `; routing to ${route}` : ''}\n`,
+    );
+    log.warn('action failed', {
+      action: actionKey,
+      reason: outcome.reason,
+      route_to: route,
+    });
+    if (route) {
+      routeTo = route;
+      aborted = true;
+      abortReason = outcome.reason ?? 'unknown';
+      break;
+    }
+    // No route; abort the cleanup actions list. (Default `then: "abort"`.)
+    aborted = true;
+    abortReason = outcome.reason ?? 'unknown';
+  }
+
+  return {
+    ok: !aborted,
+    reason: abortReason,
+    route_to: routeTo,
+    actions: ledger.slice(0, MAX_ACTION_HISTORY),
+  };
+}
+
+function effectivePolicy(p: ActionErrorPolicy | undefined): {
+  retry: { count: number; backoff_ms: number };
+  then: 'abort' | { route_to: string };
+} {
+  return {
+    retry: {
+      count: p?.retry?.count ?? DEFAULT_RETRY_COUNT,
+      backoff_ms: p?.retry?.backoff_ms ?? DEFAULT_RETRY_BACKOFF_MS,
+    },
+    then: p?.then ?? 'abort',
+  };
+}
+
+function actionSnapshotKey(action: WorkflowAction, idx: number): string {
+  if (action.name && action.name.length > 0) return `${action.kind}:${action.name}`;
+  return `${action.kind}:#${idx}`;
+}
+
+// ===== Per-kind appliers ==================================================
+
+async function applyAction(
+  action: WorkflowAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  switch (action.kind) {
+    case 'push_branch':
+      return applyPushBranch(action, opts);
+    case 'create_pr_if_missing':
+      return applyCreatePrIfMissing(action, opts);
+    case 'ensure_branch':
+      return applyEnsureBranch(action, opts);
+    case 'checkout':
+      return applyCheckout(action, opts);
+    case 'merge':
+      return applyMerge(action, opts);
+    case 'delete_branch':
+      return applyDeleteBranch(action, opts);
+    case 'run_in_vm':
+      return applyRunInVm(action, opts);
+    case 'propose_followup':
+      return applyProposeFollowup(action, opts);
+    default: {
+      const _exhaustive: never = action;
+      void _exhaustive;
+      return { ok: false, reason: 'unknown action kind', route_to: null };
+    }
+  }
+}
+
+async function applyPushBranch(
+  action: PushBranchAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  const res = await runCommand('git', ['push', '-u', action.remote, action.ref], opts);
+  if (res.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `git push ${action.remote} ${action.ref} exited ${res.exit_code}: ${diagnostic(res)}`,
+      route_to: null,
+    };
+  }
+  return { ok: true, reason: null, route_to: null };
+}
+
+async function applyCreatePrIfMissing(
+  action: CreatePrIfMissingAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  const view = await runCommand('gh', ['pr', 'view', action.head], opts);
+  if (view.exit_code === 0) {
+    opts.capture?.onChunk?.('stdout', `[create_pr_if_missing] PR for ${action.head} already exists\n`);
+    return { ok: true, reason: null, route_to: null };
+  }
+  // `gh pr view` returns non-zero when no PR exists (or any other error). We
+  // treat that as "open one"; gh will reject if the auth is missing or the
+  // remote disagrees, and the failure surfaces as the create's diagnostic.
+  const title = action.title_from;
+  const body = action.body_from;
+  const args = ['pr', 'create', '--base', action.base, '--head', action.head, '--title', title];
+  // Convention: if `body_from` looks like an existing file path, pass via
+  // `--body-file` (mirrors the SYMPHONY_PR_BODY_FILE hook contract); else
+  // pass via `--body`. The orchestrator stages the body file before firing
+  // actions for the Done state.
+  if (await looksLikeFile(opts.workspacePath, body)) {
+    args.push('--body-file', body);
+  } else {
+    args.push('--body', body);
+  }
+  const create = await runCommand('gh', args, opts);
+  if (create.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `gh pr create exited ${create.exit_code}: ${diagnostic(create)}`,
+      route_to: null,
+    };
+  }
+  return { ok: true, reason: null, route_to: null };
+}
+
+async function looksLikeFile(workspacePath: string, value: string): Promise<boolean> {
+  if (!value || value.length === 0) return false;
+  // Absolute path: probe directly. Relative path: probe against workspace.
+  // Skip the probe for clearly-non-path strings (multi-line bodies, etc.).
+  if (value.includes('\n')) return false;
+  const probePath = path.isAbsolute(value) ? value : path.join(workspacePath, value);
+  try {
+    const { stat } = await import('node:fs/promises');
+    const st = await stat(probePath);
+    return st.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function applyEnsureBranch(
+  action: EnsureBranchAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  const exists = await runCommand(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `refs/heads/${action.name}`],
+    opts,
+    /*silent*/ true,
+  );
+  if (exists.exit_code === 0) return { ok: true, reason: null, route_to: null };
+  const args = ['branch', action.name];
+  if (action.seed_from && action.seed_from.length > 0) args.push(action.seed_from);
+  const create = await runCommand('git', args, opts);
+  if (create.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `git branch ${action.name} exited ${create.exit_code}: ${diagnostic(create)}`,
+      route_to: null,
+    };
+  }
+  return { ok: true, reason: null, route_to: null };
+}
+
+async function applyCheckout(
+  action: CheckoutAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  const res = await runCommand('git', ['checkout', action.ref], opts);
+  if (res.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `git checkout ${action.ref} exited ${res.exit_code}: ${diagnostic(res)}`,
+      route_to: null,
+    };
+  }
+  return { ok: true, reason: null, route_to: null };
+}
+
+async function applyMerge(
+  action: MergeAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  // Switch to target, merge source. On conflict, abort the merge so the
+  // working tree is clean and route to `on_conflict.route_to` (if set);
+  // otherwise propagate as a failure for the generic retry/on_error path.
+  const co = await runCommand('git', ['checkout', action.target], opts);
+  if (co.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `git checkout ${action.target} exited ${co.exit_code}: ${diagnostic(co)}`,
+      route_to: null,
+    };
+  }
+  const mergeMsg = `Merge ${action.source} into ${action.target}`;
+  const res = await runCommand(
+    'git',
+    ['merge', '--no-ff', '--no-edit', '-m', mergeMsg, action.source],
+    opts,
+  );
+  if (res.exit_code === 0) return { ok: true, reason: null, route_to: null };
+  // Conflict: abort the merge so the working tree is clean.
+  await runCommand('git', ['merge', '--abort'], opts, /*silent*/ true).catch(() => undefined);
+  if (action.on_conflict === 'abort') {
+    return {
+      ok: false,
+      reason: `merge of ${action.source} into ${action.target} failed: ${diagnostic(res)}`,
+      route_to: null,
+    };
+  }
+  return {
+    ok: false,
+    reason: `merge conflict: ${diagnostic(res)}`,
+    route_to: action.on_conflict.route_to,
+  };
+}
+
+async function applyDeleteBranch(
+  action: DeleteBranchAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  if (action.scope === 'local' || action.scope === 'both') {
+    const res = await runCommand('git', ['branch', '-D', action.name], opts);
+    if (res.exit_code !== 0) {
+      return {
+        ok: false,
+        reason: `git branch -D ${action.name} exited ${res.exit_code}: ${diagnostic(res)}`,
+        route_to: null,
+      };
+    }
+  }
+  if (action.scope === 'remote' || action.scope === 'both') {
+    if (!action.remote) {
+      return { ok: false, reason: 'delete_branch: remote scope requires a remote', route_to: null };
+    }
+    const res = await runCommand('git', ['push', action.remote, '--delete', action.name], opts);
+    if (res.exit_code !== 0) {
+      return {
+        ok: false,
+        reason: `git push --delete exited ${res.exit_code}: ${diagnostic(res)}`,
+        route_to: null,
+      };
+    }
+  }
+  return { ok: true, reason: null, route_to: null };
+}
+
+async function applyRunInVm(
+  action: RunInVmAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  const cacheRoot = opts.cacheRoot ?? runInVmCacheRoot();
+  const env = action.env ?? {};
+  const hash = await computeCacheHash({ workspacePath: opts.workspacePath, cmd: action.cmd, env });
+  const cached = await readCache(cacheRoot, hash);
+  if (cached && cached.exit_code === 0) {
+    // Cache hits only on prior success: "Did `npm test` already pass against
+    // this tree hash?" The issue body's framing matches Bazel's semantics —
+    // failures are transient (flaky test, network blip) and must not gate
+    // a fresh execution. The retry policy + per-attempt re-execution work
+    // together to give the in-process retry window a real chance.
+    opts.capture?.onChunk?.(
+      'stdout',
+      `[run_in_vm ${action.name}] cache hit (hash=${hash.slice(0, 12)}…); skipping execution\n`,
+    );
+    return { ok: true, reason: null, route_to: null, cache_hit: true };
+  }
+  // Run the command on the host with workspace as cwd. The issue body
+  // describes this as "scheduled inside the VM (sandbox)"; running on the
+  // host is the stage-1 implementation that wires the cache shape and
+  // dashboard surface end-to-end. True VM-side scheduling stays a follow-up
+  // (`propose_issue` is the right surface — operators can decide whether to
+  // promote it once a concrete user need lands).
+  const timeoutMs = (action.timeout ?? Math.ceil((opts.defaultCommandTimeoutMs ?? 300_000) / 1000)) * 1000;
+  const [bin, ...args] = action.cmd;
+  const res = await runCommand(bin!, args, opts, /*silent*/ false, { extraEnv: env, timeoutMs });
+  const result = {
+    exit_code: res.exit_code ?? -1,
+    stdout: res.stdout,
+    stderr: res.stderr,
+    finished_at: new Date().toISOString(),
+  };
+  if (res.exit_code === 0) {
+    // Cache successes only; see comment above the readCache branch.
+    await writeCache(cacheRoot, hash, result).catch((err) =>
+      log.warn('run_in_vm cache write failed', { hash, error: (err as Error).message }),
+    );
+    return { ok: true, reason: null, route_to: null };
+  }
+  return {
+    ok: false,
+    reason: `run_in_vm "${action.name}" exit=${res.exit_code}: ${diagnostic(res)}`,
+    route_to: null,
+  };
+}
+
+async function applyProposeFollowup(
+  action: ProposeFollowupAction,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  if (!opts.followupSink) {
+    return {
+      ok: false,
+      reason: 'propose_followup action declared but no tracker sink wired',
+      route_to: null,
+    };
+  }
+  const input: Parameters<ProposeFollowupSink['proposeFollowup']>[0] = {
+    title: action.title,
+    parent_identifier: opts.ctx.identifier,
+  };
+  if (action.body !== undefined) input.description = action.body;
+  if (action.labels !== undefined) input.labels = action.labels;
+  if (action.priority !== undefined) input.priority = action.priority;
+  try {
+    const r = await opts.followupSink.proposeFollowup(input);
+    opts.capture?.onChunk?.(
+      'stdout',
+      `[propose_followup] proposed ${r.identifier}: "${action.title}"\n`,
+    );
+    return { ok: true, reason: null, route_to: null };
+  } catch (err) {
+    return { ok: false, reason: `propose_followup failed: ${(err as Error).message}`, route_to: null };
+  }
+}
+
+// ===== Process helpers ====================================================
+
+interface CmdResult {
+  exit_code: number | null;
+  signal: NodeJS.Signals | null;
+  timed_out: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+interface RunCommandExtra {
+  extraEnv?: Record<string, string>;
+  timeoutMs?: number;
+}
+
+function diagnostic(res: CmdResult): string {
+  const parts = [res.stderr.trim(), res.stdout.trim()].filter((s) => s.length > 0);
+  const combined = parts.join('\n');
+  if (combined.length <= 2048) return combined;
+  return combined.slice(0, 2048) + '\n…(truncated)';
+}
+
+function runCommand(
+  bin: string,
+  args: string[],
+  opts: ActionExecutorOptions,
+  silent = false,
+  extra: RunCommandExtra = {},
+): Promise<CmdResult> {
+  return new Promise((resolve) => {
+    const env = extra.extraEnv ? { ...process.env, ...extra.extraEnv } : process.env;
+    const child = spawn(bin, args, {
+      cwd: opts.workspacePath,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: env as NodeJS.ProcessEnv,
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const limit = 65_536;
+    child.stdout?.on('data', (b) => {
+      const text = b.toString('utf8');
+      stdout += text;
+      if (stdout.length > limit) stdout = stdout.slice(0, limit);
+      if (!silent) opts.capture?.onChunk?.('stdout', text);
+    });
+    child.stderr?.on('data', (b) => {
+      const text = b.toString('utf8');
+      stderr += text;
+      if (stderr.length > limit) stderr = stderr.slice(0, limit);
+      if (!silent) opts.capture?.onChunk?.('stderr', text);
+    });
+    const timeout = extra.timeoutMs ?? opts.defaultCommandTimeoutMs ?? 300_000;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeout);
+    const finish = (r: CmdResult) => {
+      if (!silent) opts.capture?.onResult?.({
+        ran: true,
+        exit_code: r.exit_code,
+        signal: r.signal,
+        timed_out: r.timed_out,
+        stdout: r.stdout,
+        stderr: r.stderr,
+      });
+      resolve(r);
+    };
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      finish({
+        exit_code: null,
+        signal: null,
+        timed_out: timedOut,
+        stdout,
+        stderr: stderr + `\n${err.message}`,
+      });
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      finish({
+        exit_code: code,
+        signal: signal ?? null,
+        timed_out: timedOut,
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
+// ===== Cache invalidation by name (rerun CLI) =============================
+
+/**
+ * Compute the cache key for a specific `run_in_vm` action without running
+ * it, and remove the cache entry. Used by `symphony rerun --check=<name>`
+ * so the next dispatch's Review state (or whichever state hosts the check)
+ * re-executes that one check while leaving the rest of the cache alone.
+ */
+export async function invalidateRunInVmByName(
+  workspacePath: string,
+  action: RunInVmAction,
+  cacheRoot?: string,
+): Promise<{ hash: string }> {
+  const env = action.env ?? {};
+  const hash = await computeCacheHash({ workspacePath, cmd: action.cmd, env });
+  await invalidateCache(cacheRoot ?? runInVmCacheRoot(), hash);
+  return { hash };
+}
+
+/**
+ * Pack the executor's per-action ledger into a Snapshot-shaped record so
+ * the orchestrator can surface it alongside reconciler resources. `id` is
+ * the same scope id passed at run time (`actions:<state>`); `ready=true`
+ * mirrors the bake resource's "no outstanding work" semantic.
+ */
+export function toActionsSnapshot(
+  id: string,
+  result: ActionExecResult,
+): ActionsSnapshot {
+  const lastErr = result.actions.find((a) => a.state === 'error')?.error ?? null;
+  return {
+    id,
+    ready: result.ok,
+    last_error: lastErr,
+    actions: result.actions.slice(0, MAX_ACTION_HISTORY),
+  };
+}
+
+// Re-export for convenience.
+export type { ActionStatus, ActionState };
