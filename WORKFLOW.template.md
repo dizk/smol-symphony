@@ -124,9 +124,12 @@ tracker:
 #
 #             run_in_vm has content-hash caching: identical (workspace tree
 #             ⊕ cmd ⊕ env) tuples skip execution and re-use the prior
-#             successful result. Cache lives under
-#             `~/.cache/symphony/actions/run_in_vm/<sha256>/result.json`.
-#             Invalidate one entry with `symphony rerun --check=<name>`.
+#             successful result. The workspace-tree hash reflects live
+#             contents (tracked + modified + untracked-not-gitignored), so
+#             an uncommitted agent edit forces a cache miss. Cache lives
+#             under `~/.cache/symphony/actions/run_in_vm/<name>/<sha256>/`.
+#             `symphony rerun --check=<name>` drops the whole `<name>/`
+#             namespace dir so the next dispatch re-runs that one check.
 #
 # Declaration order matters: role-filtered listings (active states, terminal
 # states) follow it, and the dashboard renders state columns in the same order.

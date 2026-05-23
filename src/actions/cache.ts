@@ -1,15 +1,22 @@
 // Content-hash cache for run_in_vm actions (issue 36 AC4).
 //
 // Cache layout:
-//   <cacheRoot>/actions/run_in_vm/<sha256(workspace_tree ⊕ cmd ⊕ env)>/result.json
+//   <cacheRoot>/actions/run_in_vm/<name>/<sha256(workspace_tree ⊕ cmd ⊕ env)>/result.json
 //
-// `workspace_tree` is computed via `git ls-files | xargs sha1sum`-style:
-// stable tree-of-tracked-files hash that ignores per-file mtimes. We use git
-// because every action workspace is a clone (the workspace setup is
-// orchestrator-owned, see src/workspace.ts) — so `git ls-tree --full-tree`
-// against HEAD is always available and cheap. Untracked files are ignored
-// for cache purposes; the alternative (hashing the whole directory) would
-// trip every time `node_modules/` mtimed.
+// The name is the first path segment so `symphony rerun --check=<name>` can
+// drop an entire check's cache without recomputing the workspace-dependent
+// hash (which the CLI doesn't know — it has no per-issue workspace). The
+// per-execution path computes the hash against the actual per-issue
+// workspace; the CLI just removes the namespace dir, and the next execution
+// re-runs because no cached hash entry exists.
+//
+// `workspace_tree` hashes the live workspace contents the VM command will
+// see: every file `git ls-files --cached --others --exclude-standard` would
+// list (tracked, untracked-not-gitignored), read from the working tree (not
+// from the index), so an uncommitted edit to a tracked file or a newly
+// added untracked source file forces a cache miss. This is the whole point
+// of `run_in_vm`: CI-style checks against the user's project as it exists
+// in the per-issue workspace, post-agent-edits.
 
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -58,22 +65,53 @@ export async function computeCacheHash(key: RunInVmCacheKey): Promise<string> {
 }
 
 /**
- * Stable hash of the workspace's tracked-files state. Returns `'no-git'`
- * when the workspace is not a git repo so the cache key still computes
- * (useful for tests with non-git workspaces); the no-git form keys every
- * unchanged (cmd, env) tuple to the same hash, so the cache still skips
- * re-execution when nothing about the call changed.
+ * Hash of the workspace's live, .gitignore-aware contents — what the VM
+ * command will actually see. Uses `git ls-files --cached --others
+ * --exclude-standard -z` to enumerate (cheap, handles .gitignore correctly),
+ * then reads each file from the working tree (so uncommitted modifications
+ * are captured). Tracked-but-deleted-in-worktree paths are folded in as a
+ * deletion marker so removing a file still bumps the hash.
+ *
+ * Returns `'no-git'` when the workspace is not a git repo so the cache key
+ * still computes; the cmd/env contribution still differentiates calls.
  */
 async function workspaceTreeHash(workspacePath: string): Promise<string> {
-  // Prefer `git rev-parse HEAD^{tree}` for a stable tree id; fall back to
-  // `git ls-files -s` if HEAD doesn't exist yet (fresh repo with no
-  // commits). Both forms ignore unstaged + untracked changes — a deliberate
-  // tradeoff: the cache is keyed off committed state.
-  const tree = await runGitCapture(['rev-parse', '--verify', '--quiet', 'HEAD^{tree}'], workspacePath);
-  if (tree && tree.length > 0) return tree.trim();
-  const ls = await runGitCapture(['ls-files', '-s'], workspacePath);
-  if (ls === null) return 'no-git';
-  return createHash('sha256').update(ls).digest('hex');
+  const lsZ = await runGitCapture(
+    ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+    workspacePath,
+  );
+  if (lsZ === null) return 'no-git';
+  // -z output: NUL-separated paths, possibly with a trailing NUL.
+  const paths = lsZ.split('\0').filter((p) => p.length > 0);
+  // A path can appear in both --cached and --others (a freshly added but
+  // git-add'd file may show up in both lists depending on git's index
+  // state); dedupe and sort so the hash is order-stable.
+  const unique = Array.from(new Set(paths)).sort();
+  const h = createHash('sha256');
+  for (const rel of unique) {
+    const abs = path.join(workspacePath, rel);
+    let buf: Buffer;
+    try {
+      buf = await readFile(abs);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // ENOENT: tracked file deleted in worktree; record deletion so the
+      // cache key differs from "file still present." EISDIR / other errors:
+      // record as an error marker so we don't silently bucket two
+      // distinguishable states together.
+      h.update(code === 'ENOENT' ? 'D\0' : 'E\0');
+      h.update(rel);
+      h.update('\0');
+      continue;
+    }
+    h.update('F\0');
+    h.update(rel);
+    h.update('\0');
+    h.update(buf.length.toString(10));
+    h.update('\0');
+    h.update(buf);
+  }
+  return h.digest('hex');
 }
 
 function runGitCapture(args: string[], cwd: string): Promise<string | null> {
@@ -92,15 +130,44 @@ function runGitCapture(args: string[], cwd: string): Promise<string | null> {
   });
 }
 
-function cacheEntryDir(cacheRoot: string, hash: string): string {
-  return path.join(actionCacheDir(cacheRoot, RUN_IN_VM_CACHE_KIND), hash);
+/**
+ * Sanitize an action name for use as a path segment. We validate at parse
+ * time (see parseActionsBlock for run_in_vm) but defensively encode here so
+ * a future relaxation of the parser rule can't silently make two names
+ * collide on the filesystem.
+ */
+function sanitizeNameSegment(name: string): string {
+  // Map every char outside [A-Za-z0-9._-] to `_<hex>`; the underscore prefix
+  // guarantees the encoded form is unambiguous against a literal "_" because
+  // a literal underscore would not be followed by two hex chars... actually
+  // since `_` is in the safe set, `_AB` is a possible literal name. To keep
+  // collision-freedom we use `%` as the escape sentinel (which is unsafe and
+  // therefore always escaped if it appears literally).
+  let out = '';
+  for (const ch of name) {
+    if (/[A-Za-z0-9._-]/.test(ch)) {
+      out += ch;
+    } else {
+      out += '%' + ch.charCodeAt(0).toString(16).padStart(2, '0');
+    }
+  }
+  return out.length > 0 ? out : '_';
+}
+
+function cacheNameDir(cacheRoot: string, name: string): string {
+  return path.join(actionCacheDir(cacheRoot, RUN_IN_VM_CACHE_KIND), sanitizeNameSegment(name));
+}
+
+function cacheEntryDir(cacheRoot: string, name: string, hash: string): string {
+  return path.join(cacheNameDir(cacheRoot, name), hash);
 }
 
 export async function readCache(
   cacheRoot: string,
+  name: string,
   hash: string,
 ): Promise<RunInVmCachedResult | null> {
-  const dir = cacheEntryDir(cacheRoot, hash);
+  const dir = cacheEntryDir(cacheRoot, name, hash);
   try {
     const buf = await readFile(path.join(dir, 'result.json'), 'utf8');
     const parsed = JSON.parse(buf) as RunInVmCachedResult;
@@ -113,22 +180,29 @@ export async function readCache(
 
 export async function writeCache(
   cacheRoot: string,
+  name: string,
   hash: string,
   result: RunInVmCachedResult,
 ): Promise<void> {
-  const dir = cacheEntryDir(cacheRoot, hash);
+  const dir = cacheEntryDir(cacheRoot, name, hash);
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, 'result.json'), JSON.stringify(result), 'utf8');
 }
 
 /**
- * Drop the cache entry for a given hash. Used by
- * `symphony rerun --check=<name>`: the caller computes the hash from the
- * workflow's `run_in_vm` declaration and clears just that one entry rather
- * than blowing away the entire cache.
+ * Drop every cache entry for a named check. Used by `symphony rerun
+ * --check=<name>`: the operator names the check, not the workspace, and the
+ * orchestrator's next dispatch into the state hosting it re-executes
+ * because the namespace directory is empty.
+ *
+ * Per-name (rather than per-hash) invalidation is the cache-layout fix for
+ * the rerun CLI: the CLI has no per-issue workspace to hash against, so any
+ * hash-based invalidation would key off the wrong workspace and miss the
+ * entry the per-issue execution actually wrote. Dropping the namespace dir
+ * sidesteps the problem entirely.
  */
-export async function invalidateCache(cacheRoot: string, hash: string): Promise<void> {
-  const dir = cacheEntryDir(cacheRoot, hash);
+export async function invalidateCacheByName(cacheRoot: string, name: string): Promise<void> {
+  const dir = cacheNameDir(cacheRoot, name);
   try {
     await rm(dir, { recursive: true, force: true });
   } catch {

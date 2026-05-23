@@ -462,10 +462,16 @@ describe('action: run_in_vm cache hit/miss', () => {
     const source = await makeSourceRepo();
     const { wsParent, ws } = await makeWorkspace(source, '42');
     const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
+    // Counter file lives OUTSIDE the workspace so its growth doesn't bump
+    // the workspace-tree hash and break the cache-hit expectation. The
+    // workspace-tree hash now reflects live workspace contents
+    // (tracked + modified + untracked-not-gitignored) — see the regression
+    // tests below — so any per-test side-effect needs an out-of-workspace
+    // sentinel to survive across calls.
+    const counterDir = await mkdtemp(path.join(os.tmpdir(), 'symphony-counter-'));
+    const counterPath = path.join(counterDir, 'runs');
     try {
       const ctx = baseContext(ws, '42');
-      // Use a side-effect to detect re-execution: each run touches a file.
-      const counterPath = path.join(ws, '.runs');
       const action: WorkflowAction = {
         kind: 'run_in_vm',
         name: 'count',
@@ -490,7 +496,7 @@ describe('action: run_in_vm cache hit/miss', () => {
       const log = await readFile(counterPath, 'utf8');
       assert.equal(log.trim().split('\n').length, 1, 'second run should be a cache hit');
       // Cache invalidation: re-run after invalidating should re-execute.
-      await invalidateRunInVmByName(ws, action as import('../src/actions/index.js').RunInVmAction, cacheRoot);
+      await invalidateRunInVmByName(action as import('../src/actions/index.js').RunInVmAction, cacheRoot);
       const r3 = await runActions([action], {
         workspacePath: ws,
         ctx,
@@ -505,6 +511,7 @@ describe('action: run_in_vm cache hit/miss', () => {
       await rm(source, { recursive: true, force: true });
       await rm(wsParent, { recursive: true, force: true });
       await rm(cacheRoot, { recursive: true, force: true });
+      await rm(counterDir, { recursive: true, force: true });
     }
   });
 
@@ -516,6 +523,104 @@ describe('action: run_in_vm cache hit/miss', () => {
       assert.notEqual(h1, h2);
     } finally {
       await rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  // Reviewer's first finding (round 2): the cache key was based on
+  // `git rev-parse HEAD^{tree}`, which only sees committed state. A
+  // cached `npm test` could therefore be reused after the agent edited
+  // files without committing, or after an untracked source file landed —
+  // exactly the silent-skip the issue's "CI against the user's project"
+  // framing rules out. The fix hashes live workspace contents (tracked +
+  // modified + untracked-not-gitignored); these two regression tests pin
+  // that behavior.
+  it('cache miss when an uncommitted tracked-file edit lands', async () => {
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42');
+    const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
+    const counterDir = await mkdtemp(path.join(os.tmpdir(), 'symphony-counter-'));
+    const counterPath = path.join(counterDir, 'runs');
+    try {
+      const ctx = baseContext(ws, '42');
+      const action: WorkflowAction = {
+        kind: 'run_in_vm',
+        name: 'count-edit',
+        cmd: ['sh', '-c', `echo run >> "${counterPath}"; exit 0`],
+      };
+      await runActions([action], {
+        workspacePath: ws,
+        ctx,
+        snapshotId: 'actions:Review',
+        cacheRoot,
+        runInVm: hostRunInVm,
+      });
+      // Edit README.md (tracked) without committing. The OLD HEAD-tree hash
+      // would not change; the NEW live-tree hash must.
+      await writeFile(path.join(ws, 'README.md'), '# edited (uncommitted)\n', 'utf8');
+      await runActions([action], {
+        workspacePath: ws,
+        ctx,
+        snapshotId: 'actions:Review',
+        cacheRoot,
+        runInVm: hostRunInVm,
+      });
+      const lines = (await readFile(counterPath, 'utf8')).trim().split('\n').length;
+      assert.equal(
+        lines,
+        2,
+        'uncommitted edit to a tracked file must invalidate the run_in_vm cache',
+      );
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+      await rm(cacheRoot, { recursive: true, force: true });
+      await rm(counterDir, { recursive: true, force: true });
+    }
+  });
+
+  it('cache miss when an untracked source file is added', async () => {
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42');
+    const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
+    const counterDir = await mkdtemp(path.join(os.tmpdir(), 'symphony-counter-'));
+    const counterPath = path.join(counterDir, 'runs');
+    try {
+      const ctx = baseContext(ws, '42');
+      const action: WorkflowAction = {
+        kind: 'run_in_vm',
+        name: 'count-untracked',
+        cmd: ['sh', '-c', `echo run >> "${counterPath}"; exit 0`],
+      };
+      await runActions([action], {
+        workspacePath: ws,
+        ctx,
+        snapshotId: 'actions:Review',
+        cacheRoot,
+        runInVm: hostRunInVm,
+      });
+      // Drop a brand-new untracked file (not in .gitignore — source
+      // repo's only tracked file is README.md and it ships no gitignore).
+      // The OLD HEAD-tree hash would not change; the NEW live-tree hash
+      // includes untracked-not-gitignored paths, so this must invalidate.
+      await writeFile(path.join(ws, 'new-source.ts'), 'export {};\n', 'utf8');
+      await runActions([action], {
+        workspacePath: ws,
+        ctx,
+        snapshotId: 'actions:Review',
+        cacheRoot,
+        runInVm: hostRunInVm,
+      });
+      const lines = (await readFile(counterPath, 'utf8')).trim().split('\n').length;
+      assert.equal(
+        lines,
+        2,
+        'new untracked source file must invalidate the run_in_vm cache',
+      );
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+      await rm(cacheRoot, { recursive: true, force: true });
+      await rm(counterDir, { recursive: true, force: true });
     }
   });
 });
@@ -668,10 +773,10 @@ describe('hooks ∧ actions deprecation', () => {
   });
 });
 
-// ----- Smoke: confirm the cache lives under actions/run_in_vm/<hash>/ -------
+// ----- Smoke: confirm the cache lives under actions/run_in_vm/<name>/<hash>/ -
 
 describe('run_in_vm cache layout', () => {
-  it('writes to <cacheRoot>/actions/run_in_vm/<hash>/result.json', async () => {
+  it('writes to <cacheRoot>/actions/run_in_vm/<name>/<hash>/result.json', async () => {
     const source = await makeSourceRepo();
     const { wsParent, ws } = await makeWorkspace(source, '42');
     const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
@@ -687,15 +792,104 @@ describe('run_in_vm cache layout', () => {
           runInVm: hostRunInVm,
         },
       );
-      const dir = path.join(cacheRoot, 'actions', 'run_in_vm');
-      const entries = await readdir(dir);
-      assert.equal(entries.length, 1);
-      const sub = await readdir(path.join(dir, entries[0]!));
-      assert.deepEqual(sub.sort(), ['result.json']);
+      // Layout: <cacheRoot>/actions/run_in_vm/<name>/<hash>/result.json.
+      // The `<name>/` directory is the namespace `symphony rerun
+      // --check=<name>` drops to invalidate every hash entry without
+      // needing to know the per-issue workspace.
+      const kindDir = path.join(cacheRoot, 'actions', 'run_in_vm');
+      const names = await readdir(kindDir);
+      assert.deepEqual(names, ['noop']);
+      const hashes = await readdir(path.join(kindDir, 'noop'));
+      assert.equal(hashes.length, 1, 'one hash entry under the name namespace');
+      const files = await readdir(path.join(kindDir, 'noop', hashes[0]!));
+      assert.deepEqual(files.sort(), ['result.json']);
     } finally {
       await rm(source, { recursive: true, force: true });
       await rm(wsParent, { recursive: true, force: true });
       await rm(cacheRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ----- rerun --check parity: name-namespaced invalidation -------------------
+
+// Reviewer's second finding (round 2): `symphony rerun --check=<name>`
+// computed the cache hash against the workflow's source repo, but
+// execution computes it against the per-issue workspace (often the
+// agent/<id> branch with the agent's edits). Those hashes diverge as soon
+// as the agent commits anything, so the CLI's rm-by-hash missed the entry
+// execution actually wrote and the next dispatch happily cache-hit.
+//
+// The fix is layout: cache is keyed by `<name>/<hash>` on disk, and
+// invalidation drops the whole `<name>/` directory. This test pins the
+// fix from the CLI's perspective — invalidateRunInVmByName takes no
+// workspace path and still removes the entry written by a divergent
+// per-issue workspace.
+
+describe('invalidateRunInVmByName (rerun CLI shape)', () => {
+  it('drops entries written by execution even when the per-issue workspace has diverged', async () => {
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42');
+    const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
+    const counterDir = await mkdtemp(path.join(os.tmpdir(), 'symphony-counter-'));
+    const counterPath = path.join(counterDir, 'runs');
+    try {
+      // Diverge the per-issue workspace from the source repo: commit an
+      // agent-side edit so the workspace tree (and therefore the
+      // execution-time cache hash) differs from anything the CLI could
+      // compute against the source repo.
+      await writeFile(path.join(ws, 'agent-edit.md'), 'agent work\n', 'utf8');
+      await git(['add', '.'], ws);
+      await git(['commit', '-m', 'agent edit'], ws);
+
+      const ctx = baseContext(ws, '42');
+      const action: import('../src/actions/index.js').RunInVmAction = {
+        kind: 'run_in_vm',
+        name: 'integration-build',
+        cmd: ['sh', '-c', `echo run >> "${counterPath}"; exit 0`],
+      };
+      await runActions([action], {
+        workspacePath: ws,
+        ctx,
+        snapshotId: 'actions:Review',
+        cacheRoot,
+        runInVm: hostRunInVm,
+      });
+      // Sanity: a second run inside the same divergent workspace cache-hits.
+      await runActions([action], {
+        workspacePath: ws,
+        ctx,
+        snapshotId: 'actions:Review',
+        cacheRoot,
+        runInVm: hostRunInVm,
+      });
+      assert.equal(
+        (await readFile(counterPath, 'utf8')).trim().split('\n').length,
+        1,
+        'second run cache-hits before invalidation',
+      );
+      // Invalidate by name — note: no workspace argument. This is the
+      // contract the rerun CLI relies on; previously the CLI needed to
+      // probe the source repo's workspace hash, which mismatched the
+      // per-issue execution hash and silently missed the entry.
+      await invalidateRunInVmByName(action, cacheRoot);
+      await runActions([action], {
+        workspacePath: ws,
+        ctx,
+        snapshotId: 'actions:Review',
+        cacheRoot,
+        runInVm: hostRunInVm,
+      });
+      assert.equal(
+        (await readFile(counterPath, 'utf8')).trim().split('\n').length,
+        2,
+        'post-invalidate run must re-execute',
+      );
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+      await rm(cacheRoot, { recursive: true, force: true });
+      await rm(counterDir, { recursive: true, force: true });
     }
   });
 });

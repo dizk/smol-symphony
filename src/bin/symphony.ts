@@ -12,11 +12,14 @@
 // rebuild. `--reconcile-force` is kept as a top-level alias for ergonomics.
 //
 // The `rerun` subcommand (issue 36) invalidates one `run_in_vm` action's
-// content-hash cache entry so the next dispatch into the state hosting it
-// re-executes it. It does not start a long-running process — it scans the
-// workflow's state actions for a matching name, computes the cache key
-// against the workflow's source repo (the workspace tree git would resolve
-// from in the dispatched workspace), and `rm`s that one cache dir.
+// content-hash cache entries so the next dispatch into the state hosting it
+// re-executes. It does not start a long-running process — it scans the
+// workflow's state actions for a matching name and `rm`s the per-name cache
+// namespace directory under `<cacheRoot>/actions/run_in_vm/<name>/`. The
+// per-execution hash is workspace-dependent (the agent's edits change the
+// tree); namespacing the cache by action name on disk means the CLI doesn't
+// need to know any per-issue workspace state to invalidate the right
+// entries.
 
 import path from 'node:path';
 import process from 'node:process';
@@ -169,20 +172,13 @@ async function runRerunCheck(workflowPath: string, name: string): Promise<number
     );
     return 2;
   }
-  // The cache key is computed against the per-issue workspace tree, which
-  // the rerun CLI doesn't know in advance. We use the source repo
-  // (workflow_dir, or $SYMPHONY_SOURCE_REPO when set) as the workspace
-  // probe: any dispatched workspace is a fresh clone of this repo at base,
-  // so the tree hash matches what the dispatched run computes when the base
-  // hasn't moved. This is exactly the same "predictable cache key based on
-  // the source repo at boot time" shape `symphony reconcile --force` uses.
-  const sourceRepo =
-    process.env.SYMPHONY_SOURCE_REPO && process.env.SYMPHONY_SOURCE_REPO.length > 0
-      ? process.env.SYMPHONY_SOURCE_REPO
-      : cfg.workflow_dir;
-  const { hash } = await invalidateRunInVmByName(sourceRepo, match.action);
+  // Drop the per-name cache namespace directory. This invalidates every
+  // hash entry under that name regardless of which per-issue workspace the
+  // execution computed its hash against — the orchestrator's next dispatch
+  // re-executes the check because the namespace is empty.
+  await invalidateRunInVmByName(match.action);
   process.stdout.write(
-    `invalidated run_in_vm "${name}" (state=${match.state}, hash=${hash.slice(0, 12)}…)\n`,
+    `invalidated run_in_vm "${name}" (state=${match.state})\n`,
   );
   return 0;
 }

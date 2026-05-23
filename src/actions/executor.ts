@@ -41,7 +41,7 @@ import { renderTemplate, renderTree, TemplateError } from './templating.js';
 import { evaluatePredicate } from './predicates.js';
 import {
   computeCacheHash,
-  invalidateCache,
+  invalidateCacheByName,
   readCache,
   runInVmCacheRoot,
   writeCache,
@@ -525,7 +525,7 @@ async function applyRunInVm(
   const cacheRoot = opts.cacheRoot ?? runInVmCacheRoot();
   const env = action.env ?? {};
   const hash = await computeCacheHash({ workspacePath: opts.workspacePath, cmd: action.cmd, env });
-  const cached = await readCache(cacheRoot, hash);
+  const cached = await readCache(cacheRoot, action.name, hash);
   if (cached && cached.exit_code === 0) {
     // Cache hits only on prior success: "Did `npm test` already pass against
     // this tree hash?" The issue body's framing matches Bazel's semantics —
@@ -583,8 +583,8 @@ async function applyRunInVm(
   };
   if (res.exit_code === 0) {
     // Cache successes only; see comment above the readCache branch.
-    await writeCache(cacheRoot, hash, result).catch((err) =>
-      log.warn('run_in_vm cache write failed', { hash, error: (err as Error).message }),
+    await writeCache(cacheRoot, action.name, hash, result).catch((err) =>
+      log.warn('run_in_vm cache write failed', { name: action.name, hash, error: (err as Error).message }),
     );
     return { ok: true, reason: null, route_to: null };
   }
@@ -778,20 +778,23 @@ function runCommand(
 // ===== Cache invalidation by name (rerun CLI) =============================
 
 /**
- * Compute the cache key for a specific `run_in_vm` action without running
- * it, and remove the cache entry. Used by `symphony rerun --check=<name>`
- * so the next dispatch's Review state (or whichever state hosts the check)
- * re-executes that one check while leaving the rest of the cache alone.
+ * Drop every cache entry for a named `run_in_vm` action. Used by
+ * `symphony rerun --check=<name>`: the next dispatch into the state hosting
+ * the check sees an empty cache namespace and re-executes, while every
+ * other check's entries stay in place.
+ *
+ * No workspace argument: the cache is namespaced by action name on disk
+ * (`<root>/actions/run_in_vm/<name>/<hash>/`), so invalidation is a
+ * namespace-directory drop, not a hash lookup. This is the layout fix for
+ * the rerun CLI — the CLI has no per-issue workspace to hash against, and
+ * the per-execution hash is workspace-dependent, so any hash-keyed
+ * invalidation would miss the entry the per-issue execution actually wrote.
  */
 export async function invalidateRunInVmByName(
-  workspacePath: string,
   action: RunInVmAction,
   cacheRoot?: string,
-): Promise<{ hash: string }> {
-  const env = action.env ?? {};
-  const hash = await computeCacheHash({ workspacePath, cmd: action.cmd, env });
-  await invalidateCache(cacheRoot ?? runInVmCacheRoot(), hash);
-  return { hash };
+): Promise<void> {
+  await invalidateCacheByName(cacheRoot ?? runInVmCacheRoot(), action.name);
 }
 
 /**

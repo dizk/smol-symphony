@@ -225,6 +225,18 @@ function parseAction(stateName: string, idx: number, raw: unknown): WorkflowActi
           `state "${stateName}": actions[${idx}] (run_in_vm): "name" is required (used by cache + rerun CLI)`,
         );
       }
+      // Names are used as a path segment in the cache layout
+      // (`<root>/actions/run_in_vm/<name>/<hash>/result.json`). Restrict to a
+      // safe identifier set so `--check=<name>` is unambiguous and no name
+      // can escape the namespace (e.g. via `..`). The cache layer also
+      // defensively encodes unsafe chars, but rejecting at parse time keeps
+      // the CLI surface honest.
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+        throw new WorkflowError(
+          'workflow_parse_error',
+          `state "${stateName}": actions[${idx}] (run_in_vm): "name" must match /^[A-Za-z0-9][A-Za-z0-9._-]*$/ (got: ${JSON.stringify(name)})`,
+        );
+      }
       const cmdRaw = m.cmd;
       if (!Array.isArray(cmdRaw) || cmdRaw.length === 0 || !cmdRaw.every((s) => typeof s === 'string')) {
         throw new WorkflowError(

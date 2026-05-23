@@ -20,7 +20,7 @@ export { renderTemplate, renderTree, TemplateError } from './templating.js';
 export { evaluatePredicate } from './predicates.js';
 export {
   computeCacheHash,
-  invalidateCache,
+  invalidateCacheByName,
   readCache,
   writeCache,
   runInVmCacheRoot,
