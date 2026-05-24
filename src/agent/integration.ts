@@ -22,11 +22,11 @@
 // JSONL run log under a synthetic hook name so the evaluation pass sees the same shape
 // it would for any other shell-out (the wrapper does not introduce a new channel kind).
 
-import { spawn } from 'node:child_process';
 import path from 'node:path';
 import type { IssueTracker } from '../trackers/types.js';
 import type { RunningEntry } from '../types.js';
 import type { HookCapture } from '../workspace.js';
+import { runProcess, type RunResult } from '../util/process.js';
 import { log } from '../logging.js';
 
 export type IntegrationRemote =
@@ -66,69 +66,21 @@ export type IntegrationMergeResult = IntegrationMergeOk | IntegrationMergeFail;
 // in local mode) survives both the success and the failure paths.
 const LOCAL_REMOTE_NAME = 'sym_local_integration';
 
-interface GitResult {
-  exit_code: number | null;
-  signal: NodeJS.Signals | null;
-  timed_out: boolean;
-  stdout: string;
-  stderr: string;
-}
-
-function runGit(args: string[], opts: IntegrationMergeOptions): Promise<GitResult> {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, {
-      cwd: opts.workspacePath,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    child.stdout?.on('data', (b) => {
-      const t = b.toString('utf8');
-      stdout += t;
-      if (stdout.length > 65_536) stdout = stdout.slice(0, 65_536);
-      opts.capture?.onChunk?.('stdout', t);
-    });
-    child.stderr?.on('data', (b) => {
-      const t = b.toString('utf8');
-      stderr += t;
-      if (stderr.length > 65_536) stderr = stderr.slice(0, 65_536);
-      opts.capture?.onChunk?.('stderr', t);
-    });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, opts.timeoutMs);
-    const finish = (r: GitResult) => {
-      opts.capture?.onResult?.({
-        ran: true,
-        exit_code: r.exit_code,
-        signal: r.signal,
-        timed_out: r.timed_out,
-        stdout: r.stdout,
-        stderr: r.stderr,
-      });
-      resolve(r);
-    };
-    child.on('error', () => {
-      clearTimeout(timer);
-      finish({ exit_code: null, signal: null, timed_out: timedOut, stdout, stderr });
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      finish({
-        exit_code: code,
-        signal: signal ?? null,
-        timed_out: timedOut,
-        stdout,
-        stderr,
-      });
-    });
+// Thin specialization over the unified `runProcess`: glues the integration
+// merge's per-call workspace/timeout/capture into the shared options bag.
+function runGit(args: string[], opts: IntegrationMergeOptions): Promise<RunResult> {
+  return runProcess('git', args, {
+    cwd: opts.workspacePath,
+    timeoutMs: opts.timeoutMs,
+    capture: opts.capture,
+    // Legacy behavior: integration's git runner did not append spawn-error
+    // messages to stderr. Preserve that so diagnostic substrings tests grep
+    // for don't change shape.
+    appendErrorToStderr: false,
   });
 }
 
-function gitOk(r: GitResult): boolean {
+function gitOk(r: RunResult): boolean {
   return r.exit_code === 0 && !r.timed_out && r.signal === null;
 }
 

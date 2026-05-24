@@ -31,8 +31,8 @@
 
 import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { sanitizeWorkspaceKey } from '../workspace.js';
+import { runProcess } from '../util/process.js';
 import { log } from '../logging.js';
 import type { ActionStatus, ResourceSnapshot } from './types.js';
 
@@ -211,22 +211,13 @@ interface GitCaptureResult {
   stderr: string;
 }
 
-function runGitCapture(cwd: string, args: string[]): Promise<GitCaptureResult> {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (b) => {
-      stdout += b.toString('utf8');
-      if (stdout.length > 16_384) stdout = stdout.slice(0, 16_384);
-    });
-    child.stderr?.on('data', (b) => {
-      stderr += b.toString('utf8');
-      if (stderr.length > 16_384) stderr = stderr.slice(0, 16_384);
-    });
-    child.on('error', () => resolve({ exit: -1, stdout, stderr }));
-    child.on('close', (code) => resolve({ exit: code ?? -1, stdout, stderr }));
-  });
+// Thin shape adapter over runProcess. Stays as a named local because the
+// inspector's call sites read `result.exit` rather than `exit_code`, and
+// historical clamp is 16 KiB (smaller than the unified default — the
+// inspector only ever reads a SHA or a single porcelain status line).
+async function runGitCapture(cwd: string, args: string[]): Promise<GitCaptureResult> {
+  const r = await runProcess('git', args, { cwd, maxBytes: 16_384, appendErrorToStderr: false });
+  return { exit: r.exit_code ?? -1, stdout: r.stdout, stderr: r.stderr };
 }
 
 /**

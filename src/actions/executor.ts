@@ -18,8 +18,8 @@
 // pure-functional, the orchestrator-state side next to the runner.
 
 import { setTimeout as delay } from 'node:timers/promises';
-import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { runProcess, type RunResult } from '../util/process.js';
 import type {
   ActionContext,
   ActionErrorPolicy,
@@ -604,55 +604,27 @@ async function applyRunInVm(
  * helper from the orchestrator path would defeat the sandbox boundary
  * the typed-action DAG exists to enforce.
  */
-export const hostRunInVm: RunInVmExecutor = ({ cmd, env, workdir, timeoutMs, onStdout, onStderr }) =>
-  new Promise((resolve) => {
-    const [bin, ...args] = cmd;
-    const child = spawn(bin!, args, {
-      cwd: workdir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ...env } as NodeJS.ProcessEnv,
-    });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    const limit = 65_536;
-    child.stdout?.on('data', (b) => {
-      const text = b.toString('utf8');
-      stdout += text;
-      if (stdout.length > limit) stdout = stdout.slice(0, limit);
-      onStdout?.(text);
-    });
-    child.stderr?.on('data', (b) => {
-      const text = b.toString('utf8');
-      stderr += text;
-      if (stderr.length > limit) stderr = stderr.slice(0, limit);
-      onStderr?.(text);
-    });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, timeoutMs);
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({
-        exit_code: null,
-        signal: null,
-        timed_out: timedOut,
-        stdout,
-        stderr: stderr + `\n${err.message}`,
-      });
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({
-        exit_code: code,
-        signal: signal ?? null,
-        timed_out: timedOut,
-        stdout,
-        stderr,
-      });
-    });
+export const hostRunInVm: RunInVmExecutor = async ({
+  cmd,
+  env,
+  workdir,
+  timeoutMs,
+  onStdout,
+  onStderr,
+}) => {
+  const [bin, ...args] = cmd;
+  return runProcess(bin!, args, {
+    cwd: workdir,
+    env,
+    timeoutMs,
+    capture: {
+      onChunk: (stream, text) => {
+        if (stream === 'stdout') onStdout?.(text);
+        else onStderr?.(text);
+      },
+    },
   });
+};
 
 async function applyProposeFollowup(
   action: ProposeFollowupAction,
@@ -686,26 +658,24 @@ async function applyProposeFollowup(
 
 // ===== Process helpers ====================================================
 
-interface CmdResult {
-  exit_code: number | null;
-  signal: NodeJS.Signals | null;
-  timed_out: boolean;
-  stdout: string;
-  stderr: string;
-}
+type CmdResult = RunResult;
 
 interface RunCommandExtra {
   extraEnv?: Record<string, string>;
   timeoutMs?: number;
 }
 
-function diagnostic(res: CmdResult): string {
+function diagnostic(res: { stdout: string; stderr: string }): string {
   const parts = [res.stderr.trim(), res.stdout.trim()].filter((s) => s.length > 0);
   const combined = parts.join('\n');
   if (combined.length <= 2048) return combined;
   return combined.slice(0, 2048) + '\n…(truncated)';
 }
 
+// Thin specialization over the unified `runProcess`: glues per-action workspace
+// + capture + per-action timeout into the shared options bag, and threads the
+// `silent` flag so cleanup-side commands (e.g. `git merge --abort`) don't
+// double-log into the per-issue capture surface.
 function runCommand(
   bin: string,
   args: string[],
@@ -713,65 +683,11 @@ function runCommand(
   silent = false,
   extra: RunCommandExtra = {},
 ): Promise<CmdResult> {
-  return new Promise((resolve) => {
-    const env = extra.extraEnv ? { ...process.env, ...extra.extraEnv } : process.env;
-    const child = spawn(bin, args, {
-      cwd: opts.workspacePath,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: env as NodeJS.ProcessEnv,
-    });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    const limit = 65_536;
-    child.stdout?.on('data', (b) => {
-      const text = b.toString('utf8');
-      stdout += text;
-      if (stdout.length > limit) stdout = stdout.slice(0, limit);
-      if (!silent) opts.capture?.onChunk?.('stdout', text);
-    });
-    child.stderr?.on('data', (b) => {
-      const text = b.toString('utf8');
-      stderr += text;
-      if (stderr.length > limit) stderr = stderr.slice(0, limit);
-      if (!silent) opts.capture?.onChunk?.('stderr', text);
-    });
-    const timeout = extra.timeoutMs ?? opts.defaultCommandTimeoutMs ?? 300_000;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, timeout);
-    const finish = (r: CmdResult) => {
-      if (!silent) opts.capture?.onResult?.({
-        ran: true,
-        exit_code: r.exit_code,
-        signal: r.signal,
-        timed_out: r.timed_out,
-        stdout: r.stdout,
-        stderr: r.stderr,
-      });
-      resolve(r);
-    };
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      finish({
-        exit_code: null,
-        signal: null,
-        timed_out: timedOut,
-        stdout,
-        stderr: stderr + `\n${err.message}`,
-      });
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      finish({
-        exit_code: code,
-        signal: signal ?? null,
-        timed_out: timedOut,
-        stdout,
-        stderr,
-      });
-    });
+  return runProcess(bin, args, {
+    cwd: opts.workspacePath,
+    env: extra.extraEnv,
+    timeoutMs: extra.timeoutMs ?? opts.defaultCommandTimeoutMs ?? 300_000,
+    capture: silent ? undefined : opts.capture,
   });
 }
 

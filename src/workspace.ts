@@ -7,8 +7,13 @@
 
 import { mkdir, rm, lstat, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import type { Workspace, HooksConfig, ServiceConfig } from './types.js';
+import {
+  runProcess,
+  runHookScript as runHookScriptUtil,
+  type RunResult,
+  type RunCapture,
+} from './util/process.js';
 
 export class WorkspaceError extends Error {
   constructor(public code: string, message: string) {
@@ -53,23 +58,17 @@ export function assertContained(workspaceRoot: string, candidate: string): void 
   }
 }
 
-export interface HookResult {
-  ran: boolean;
-  exit_code: number | null;
-  signal: NodeJS.Signals | null;
-  timed_out: boolean;
-  stdout: string;
-  stderr: string;
-}
+// Hook-shaped result. Aliased to the unified RunResult since hook callers and
+// every other shell-out share the same shape; the `ran: false` convention
+// (no hook configured) is encoded by the caller returning `null` rather than
+// by a field on this type.
+export type HookResult = RunResult;
 
 // Optional streaming capture for hook execution. `onChunk` fires for every stdout/stderr
 // burst the hook produces; `onResult` fires once with the final outcome. The orchestrator
 // uses this to mirror hook output into the per-issue JSONL run log in real time. The
 // existing buffered stdout/stderr in HookResult is preserved for callers that don't care.
-export interface HookCapture {
-  onChunk?: (stream: 'stdout' | 'stderr', text: string) => void;
-  onResult?: (result: HookResult) => void;
-}
+export type HookCapture = RunCapture;
 
 // A hook failed when it timed out, exited with a non-zero status, or was terminated by a
 // signal. The signal-termination case is important — otherwise a fatal `before_run` script
@@ -89,6 +88,9 @@ function hookFailureReason(res: HookResult): string {
 // run logs) and reports the final result to the same callback. Optional `extraEnv` is
 // merged on top of `process.env` so callers (e.g. the runner's after_run handoff) can
 // stage hook-specific values without polluting the host process environment.
+//
+// Positional arity is preserved so callers (orchestrator, runner, tests) don't have to be
+// touched; the body delegates to the unified `runHookScriptUtil` in `util/process.ts`.
 export async function runHookScript(
   script: string,
   cwd: string,
@@ -96,50 +98,15 @@ export async function runHookScript(
   capture?: HookCapture,
   extraEnv?: Record<string, string>,
 ): Promise<HookResult> {
-  return new Promise((resolve) => {
-    const child = spawn('sh', ['-lc', script], {
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
-    });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    child.stdout?.on('data', (b) => {
-      const text = b.toString('utf8');
-      stdout += text;
-      if (stdout.length > 65_536) stdout = stdout.slice(0, 65_536);
-      capture?.onChunk?.('stdout', text);
-    });
-    child.stderr?.on('data', (b) => {
-      const text = b.toString('utf8');
-      stderr += text;
-      if (stderr.length > 65_536) stderr = stderr.slice(0, 65_536);
-      capture?.onChunk?.('stderr', text);
-    });
-    const finish = (result: HookResult) => {
-      capture?.onResult?.(result);
-      resolve(result);
-    };
-    const t = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, timeoutMs);
-    child.on('error', () => {
-      clearTimeout(t);
-      finish({ ran: true, exit_code: null, signal: null, timed_out: timedOut, stdout, stderr });
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(t);
-      finish({
-        ran: true,
-        exit_code: code,
-        signal: signal ?? null,
-        timed_out: timedOut,
-        stdout,
-        stderr,
-      });
-    });
+  return runHookScriptUtil(script, {
+    cwd,
+    timeoutMs,
+    env: extraEnv,
+    capture,
+    // The legacy hook wrapper did not append the spawn error message to
+    // stderr (`child.on('error', () => { ... })` discarded `err`). Keep that
+    // behavior so existing hook-failure diagnostics still read identically.
+    appendErrorToStderr: false,
   });
 }
 
@@ -165,43 +132,14 @@ export interface SetupWorkspaceDirOptions {
   gitIdentity: { name: string; email: string };
 }
 
-interface GitRunResult {
-  exit_code: number;
-  stdout: string;
-  stderr: string;
+// `runGit` / `runGitExpect` are thin specializations over the unified
+// `runProcess` in util/process.ts: WorkspaceError wrapping is the reason they
+// exist as named locals (the spawn quirks live in the util).
+async function runGit(args: string[], cwd: string): Promise<RunResult> {
+  return runProcess('git', args, { cwd });
 }
 
-function runCommand(
-  command: string,
-  args: string[],
-  cwd: string,
-): Promise<GitRunResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (b) => {
-      stdout += b.toString('utf8');
-      if (stdout.length > 65_536) stdout = stdout.slice(0, 65_536);
-    });
-    child.stderr?.on('data', (b) => {
-      stderr += b.toString('utf8');
-      if (stderr.length > 65_536) stderr = stderr.slice(0, 65_536);
-    });
-    child.on('error', (err) => reject(err));
-    child.on('close', (code) => resolve({ exit_code: code ?? -1, stdout, stderr }));
-  });
-}
-
-async function runGit(args: string[], cwd: string): Promise<GitRunResult> {
-  return runCommand('git', args, cwd);
-}
-
-async function runGitExpect(args: string[], cwd: string): Promise<GitRunResult> {
+async function runGitExpect(args: string[], cwd: string): Promise<RunResult> {
   const r = await runGit(args, cwd);
   if (r.exit_code !== 0) {
     throw new WorkspaceError(
@@ -305,7 +243,7 @@ export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise
     // `gh auth setup-git` is best-effort: a host without gh installed should
     // still get a working workspace with an origin pointing at the HTTPS URL,
     // even if a later push fails for lack of credentials.
-    await runCommand('gh', ['auth', 'setup-git'], workspacePath).catch(() => undefined);
+    await runProcess('gh', ['auth', 'setup-git'], { cwd: workspacePath });
   }
 
   // 5. Pin commit identity. Local-only so this never leaks into ~/.gitconfig.
