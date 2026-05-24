@@ -12,6 +12,14 @@ hand work off between them via a single MCP call.
 
 ### Added
 
+- Persistent orchestrator log file. Every structured log line that symphony
+  writes to stderr is also appended to `<logs.root>/symphony.log` (same
+  `key=value` format, created on demand), so a post-hoc reviewer — typically
+  an agent inside a VM with `.symphony/logs/` mounted in — can replay
+  orchestrator-side events (dispatch, hooks, reconciler ticks, shutdown)
+  alongside the per-issue JSONL run logs already in the same directory. Set
+  `SYMPHONY_LOG_FILE` to override the path; set it to the empty string to
+  disable the file sink (stderr remains).
 - `pr_autopilot` workflow block (default off). When `enabled: true` the
   reconciler grows a `pr` resource that, on every tick, keeps each
   terminal-state issue's GitHub PR rebased on `origin/<base>`, arms

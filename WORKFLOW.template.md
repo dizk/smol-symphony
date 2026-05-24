@@ -315,11 +315,13 @@ workspace:
   root: ./.symphony/workspaces
 
 # ─────────────────────────────────────────────────────────────────────────────
-# logs — per-issue JSONL run logs (everything to/from the VM, plus hooks).
+# logs — per-issue JSONL run logs (everything to/from the VM, plus hooks) AND
+# the orchestrator-side text log mirrored to disk for offline debugging.
 #
-# One file per issue at `<root>/<sanitized-identifier>.jsonl`, appended across
-# attempts AND across symphony process restarts. Each line is a self-describing
-# JSON object with `ts`, `issue_id`, `attempt`, and a `channel` discriminator:
+# Per-issue: one file per issue at `<root>/<sanitized-identifier>.jsonl`,
+# appended across attempts AND across symphony process restarts. Each line is
+# a self-describing JSON object with `ts`, `issue_id`, `attempt`, and a
+# `channel` discriminator:
 #
 #   channel: "acp"     — JSON-RPC frame between host and the in-VM adapter.
 #                        `direction` ("host_to_vm" | "vm_to_host") and `frame`
@@ -332,12 +334,21 @@ workspace:
 #   channel: "system"  — orchestrator lifecycle events (attempt_started,
 #                        attempt_ended, reconciliation_terminating, etc.).
 #
+# Orchestrator-side: a single `<root>/symphony.log` (created on demand) gets
+# every structured log line that symphony writes to stderr — workflow loads,
+# dispatch decisions, hook results, reconciler ticks, shutdown — in the same
+# `key=value` text format. Lets an agent reviewing a finished run (typically
+# with `.symphony/logs/` mounted into a VM) replay orchestrator-side events
+# alongside the per-issue JSONL traces in the same directory. Set the
+# `SYMPHONY_LOG_FILE` env var to override the path; set it to the empty
+# string to disable the file sink entirely (stderr remains).
+#
 # Intended for later evaluation — typically by another agent running inside a VM
 # — so the schema is verbose on purpose. Writes are best-effort: a failure to
 # write a log line never crashes the orchestrator.
 # ─────────────────────────────────────────────────────────────────────────────
 logs:
-  # root (path): directory holding per-issue JSONL files.
+  # root (path): directory holding per-issue JSONL files and symphony.log.
   # Default: ./.symphony/logs
   root: ./.symphony/logs
 

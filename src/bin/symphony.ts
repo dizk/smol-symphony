@@ -36,7 +36,7 @@ import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
 import { GhCliPrApi, GitCliPrGitApi, Reconciler } from '../reconciler/index.js';
-import { log } from '../logging.js';
+import { log, setLogFile } from '../logging.js';
 
 interface Cli {
   subcommand: 'serve' | 'rerun';
@@ -215,6 +215,24 @@ async function main() {
     process.exit(2);
   }
 
+  // Persistent log file. Mirrors the stderr structured stream to disk so an
+  // agent reviewing a run after the fact (typically inside a VM with the
+  // workspace + .symphony/logs/ mounted in) can read orchestrator-side events
+  // — workflow reloads, dispatch decisions, hook results, reconciler ticks —
+  // alongside the per-issue JSONL run logs already in the same directory.
+  //
+  // Path resolution: SYMPHONY_LOG_FILE env override wins ("" disables the
+  // sink); otherwise `<logs.root>/symphony.log`. The directory is created on
+  // demand. File-sink failure is swallowed: symphony continues on stderr only.
+  const envLogFile = process.env.SYMPHONY_LOG_FILE;
+  const logFile =
+    envLogFile === undefined
+      ? path.join(config.logs.root, 'symphony.log')
+      : envLogFile === ''
+        ? null
+        : envLogFile;
+  setLogFile(logFile);
+
   const tracker = new LocalMarkdownTracker(config.tracker);
   // Materialize every declared state directory under tracker.root up front so
   // the dashboard sees the full set of columns (including `holding` states like
@@ -351,6 +369,11 @@ async function main() {
     // the reconciler (so a Smolfile-path change kicks off a new bake); we do
     // not re-forward here. liveCfg drives the HTTP dashboard's tracker view.
     liveCfg = cfg;
+    // Retarget the persistent log file sink if logs.root rotated. The env
+    // override locks the path for the process lifetime — reload cannot move it.
+    if (envLogFile === undefined) {
+      setLogFile(path.join(cfg.logs.root, 'symphony.log'));
+    }
     // Materialize any state directory the reload introduced. Best-effort: a
     // mkdir failure here would normally come from a tracker.root rotation that
     // also failed at validateDispatch, so logging is enough.
@@ -470,6 +493,7 @@ async function main() {
     workflow: workflowPath,
     workspace_root: config.workspace.root,
     tracker_root: config.tracker.root,
+    log_file: logFile ?? '<disabled>',
     poll_interval_ms: config.polling.interval_ms,
     http_port: httpPort,
   });

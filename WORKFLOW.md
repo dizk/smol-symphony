@@ -127,11 +127,14 @@ polling:
 workspace:
   root: ./.symphony/workspaces
 
-# Per-issue JSONL run logs. One file per issue, appended across attempts and
-# process restarts. Captures every ACP JSON-RPC frame to/from the VM, raw
-# adapter stderr, host-side hook output, and orchestrator lifecycle events —
-# intended for later evaluation by another agent. See WORKFLOW.template.md
-# for the full schema.
+# Per-issue JSONL run logs plus an orchestrator-side `symphony.log` mirror.
+# One JSONL file per issue, appended across attempts and process restarts;
+# captures every ACP JSON-RPC frame to/from the VM, raw adapter stderr,
+# host-side hook output, and orchestrator lifecycle events — intended for
+# later evaluation by another agent. The sibling `symphony.log` mirrors the
+# orchestrator's stderr structured log (dispatch, hooks, reconciler, shutdown)
+# in the same `key=value` format so a post-hoc review has both surfaces in
+# one directory. See WORKFLOW.template.md for the full schema.
 logs:
   root: ./.symphony/logs
 
