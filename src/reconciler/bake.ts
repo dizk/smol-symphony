@@ -15,7 +15,8 @@ import { promisify } from 'node:util';
 import type { SmolvmConfig } from '../types.js';
 import { log } from '../logging.js';
 import { actionCacheDir, ensureCacheDir, tryAcquireLock, type FileLock } from './cache.js';
-import type { ActionStatus, ResourceSnapshot } from './types.js';
+import { ResourceActionLedger } from './ledger.js';
+import type { ResourceSnapshot } from './types.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -141,9 +142,6 @@ interface BakeState {
   readyHash: string | null;
   inFlight: Promise<void> | null;
   inFlightHash: string | null;
-  // Bounded ledger (most-recent-first). Older entries are dropped to keep
-  // Snapshot payloads small.
-  actions: ActionStatus[];
   lastError: string | null;
   // Sticky "operator wants a fresh bake" flag. Set by `markStale()` (called from
   // `Reconciler.reconcile({ force: true })` synchronously, before any await can
@@ -179,10 +177,11 @@ export class BakeResource {
     readyHash: null,
     inFlight: null,
     inFlightHash: null,
-    actions: [],
     lastError: null,
     forcePending: false,
   };
+
+  private readonly ledger = new ResourceActionLedger(this.id, { maxHistory: MAX_ACTION_HISTORY });
 
   constructor(private readonly opts: BakeResourceOptions) {}
 
@@ -242,15 +241,7 @@ export class BakeResource {
       // prerequisite (a readable Smolfile) no longer converges.
       this.state.desiredHash = null;
       this.state.readyHash = null;
-      const now = new Date().toISOString();
-      this.pushAction({
-        resource: this.id,
-        action: 'bake:read-smolfile',
-        state: 'error',
-        started_at: now,
-        finished_at: now,
-        error: msg,
-      });
+      this.ledger.record('bake:read-smolfile', 'error', msg);
       log.warn('bake reconcile: smolfile read failed', {
         smolfile: this.opts.smolvm.smolfile,
         error: msg,
@@ -324,7 +315,7 @@ export class BakeResource {
       ready: this.ready(),
       desired_hash: this.state.desiredHash,
       last_error: this.state.lastError,
-      actions: this.state.actions.slice(0, MAX_ACTION_HISTORY),
+      actions: this.ledger.snapshot(),
     };
   }
 
@@ -359,27 +350,12 @@ export class BakeResource {
       // the cached artifact and pick up the winner's output. Record an in-progress
       // action so the dashboard shows "waiting on concurrent bake".
       log.info('bake: another instance holds the lock; waiting', { hash, lock_path: lockPath });
-      this.pushAction({
-        resource: this.id,
-        action: `bake:${hash}`,
-        state: 'in_progress',
-        started_at: new Date().toISOString(),
-        finished_at: null,
-        error: null,
-      });
+      this.ledger.start(`bake:${hash}`);
       this.state.inFlightHash = hash;
       return;
     }
 
-    const startedAt = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: `bake:${hash}`,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
+    this.ledger.start(`bake:${hash}`);
     this.state.inFlightHash = hash;
     log.info('reconciling bake', {
       hash,
@@ -400,7 +376,7 @@ export class BakeResource {
       if (!ok) {
         throw new Error('bake completed but artifact is missing');
       }
-      this.markActionDone(hash);
+      this.ledger.done(`bake:${hash}`);
       this.state.readyHash = hash;
       this.state.lastError = null;
       // Any successful bake against the current desiredHash satisfies a pending
@@ -422,49 +398,7 @@ export class BakeResource {
 
   private recordFailure(hash: string, error: string): void {
     this.state.lastError = error;
-    this.markActionError(hash, error);
-  }
-
-  private pushAction(status: ActionStatus): void {
-    this.state.actions.unshift(status);
-    if (this.state.actions.length > MAX_ACTION_HISTORY * 2) {
-      this.state.actions.length = MAX_ACTION_HISTORY * 2;
-    }
-  }
-
-  private markActionDone(hash: string): void {
-    const key = `bake:${hash}`;
-    const idx = this.state.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    if (idx >= 0) {
-      this.state.actions[idx] = {
-        ...this.state.actions[idx]!,
-        state: 'done',
-        finished_at: new Date().toISOString(),
-      };
-    }
-  }
-
-  private markActionError(hash: string, error: string): void {
-    const key = `bake:${hash}`;
-    const idx = this.state.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date().toISOString();
-    if (idx >= 0) {
-      this.state.actions[idx] = {
-        ...this.state.actions[idx]!,
-        state: 'error',
-        finished_at: finished,
-        error,
-      };
-    } else {
-      this.pushAction({
-        resource: this.id,
-        action: key,
-        state: 'error',
-        started_at: finished,
-        finished_at: finished,
-        error,
-      });
-    }
+    this.ledger.error(`bake:${hash}`, error);
   }
 
   // Keep at most BAKE_CACHE_MAX_ENTRIES bake artifacts. The current ready hash is
