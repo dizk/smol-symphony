@@ -23,8 +23,10 @@
 
 import path from 'node:path';
 import process from 'node:process';
+import readline from 'node:readline';
 import { existsSync } from 'node:fs';
 import { loadWorkflow, buildServiceConfig, watchWorkflow } from '../workflow.js';
+import { scaffoldWorkflow, ScaffoldError } from '../scaffold.js';
 import { invalidateRunInVmByName } from '../actions/index.js';
 import type { RunInVmAction, WorkflowAction } from '../actions/index.js';
 import { LocalMarkdownTracker } from '../trackers/local.js';
@@ -183,10 +185,76 @@ async function runRerunCheck(workflowPath: string, name: string): Promise<number
   return 0;
 }
 
+/**
+ * Read a single line from stdin with the given prompt. Resolves to the
+ * trimmed input string (without the trailing newline). The readline interface
+ * is closed before resolving so the process can exit cleanly afterwards.
+ */
+function promptLine(message: string): Promise<string> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return new Promise<string>((resolve) => {
+    rl.question(message, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
+/**
+ * When the workflow file is missing and the operator is at an interactive
+ * terminal, ask whether to scaffold a starter file. Returns true if the
+ * scaffold was written (caller can continue boot), false otherwise (caller
+ * should fall through to the usual "file not found" error).
+ *
+ * Non-interactive invocations (cron jobs, CI, container ENTRYPOINTs) skip the
+ * prompt entirely and return false — silently scaffolding files into someone
+ * else's working tree without a confirmed yes is the wrong default for a tool
+ * that's usually run by an operator who knows where their workflow lives.
+ */
+async function maybeScaffoldMissingWorkflow(workflowPath: string): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+  const answer = await promptLine(
+    `WORKFLOW.md not found at ${workflowPath}.\nScaffold a starter workflow file here? [Y/n] `,
+  );
+  const normalized = answer.trim().toLowerCase();
+  // Default-accept: bare enter, "y", "yes". Anything else is "no".
+  const accept = normalized === '' || normalized === 'y' || normalized === 'yes';
+  if (!accept) return false;
+  try {
+    const result = await scaffoldWorkflow({ workflowPath });
+    process.stdout.write(`wrote ${result.workflowPath}\n`);
+    process.stdout.write(
+      `Edit it to point smolvm at your image / Smolfile / packed artifact, ` +
+        `then run \`symphony ${path.relative(process.cwd(), result.workflowPath) || workflowPath}\` again.\n`,
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof ScaffoldError ? err.message : (err as Error).message;
+    process.stderr.write(`error: scaffold failed: ${msg}\n`);
+    return false;
+  }
+}
+
 async function main() {
   const cli = parseCli(process.argv.slice(2));
   const workflowPath = path.resolve(cli.workflow);
   if (!existsSync(workflowPath)) {
+    // `rerun` operates on an existing workflow's action namespace; there is
+    // nothing to scaffold against. Same for `reconcile`, which only makes sense
+    // when a workflow already exists. Prompt only on the bare `serve` path.
+    if (cli.subcommand === 'serve') {
+      const scaffolded = await maybeScaffoldMissingWorkflow(workflowPath);
+      if (scaffolded) {
+        // Stop here on purpose: the operator hasn't finished filling in
+        // smolvm/source-of-truth fields yet, and dispatching immediately
+        // would just fail at the first attempt with a confusing error. The
+        // scaffold message already tells them how to relaunch.
+        process.exit(0);
+      }
+    }
     process.stderr.write(`error: workflow file not found: ${workflowPath}\n`);
     process.exit(2);
   }
