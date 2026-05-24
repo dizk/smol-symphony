@@ -78,6 +78,22 @@ export interface StateConfig {
    * the action executor.
    */
   actions?: import('./actions/types.js').WorkflowAction[];
+  /**
+   * Eval/debug mode (issue 40). When true, the runner adds two extra
+   * read-only bind mounts to dispatches in this state so an in-VM agent can
+   * inspect symphony's own state for evaluation or debugging:
+   *
+   *   • `tracker.root` → `/symphony/issues` (every issue file across every
+   *     state directory)
+   *   • `logs.root`    → `/symphony/logs`   (per-issue JSONL run-log
+   *     transcripts captured by RunLog)
+   *
+   * Either mount is skipped if the corresponding root is unset. Smolvm has a
+   * small per-VM mount cap so the flag is opt-in per state rather than a
+   * workflow-wide default — flip it on for a dedicated eval state, not for
+   * routine implement/review flow.
+   */
+  eval_mode?: boolean;
 }
 
 export interface TrackerConfig {

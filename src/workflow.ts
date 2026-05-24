@@ -556,6 +556,18 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     }
     const stateHooks = parseStateHooksBlock(name, m['hooks']);
     const stateActions = parseActionsBlock(name, m['actions']);
+    // eval_mode is a strict boolean opt-in: only true enables it, any other
+    // value (including undefined, null, "true" string) leaves it off. Strict
+    // typing here matches the rest of the YAML-flag plumbing in the parser
+    // and stops a YAML-quoting accident ("true") from silently enabling the
+    // mounts.
+    const evalModeRaw = m['eval_mode'];
+    if (evalModeRaw !== undefined && typeof evalModeRaw !== 'boolean') {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${name}": eval_mode must be a boolean (true/false)`,
+      );
+    }
     const sc: StateConfig = { role: roleRaw };
     if (adapter !== null) sc.adapter = adapter;
     if (model !== undefined) sc.model = model;
@@ -564,6 +576,7 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     if (allowed !== undefined) sc.allowed_transitions = allowed;
     if (stateHooks !== undefined) sc.hooks = stateHooks;
     if (stateActions !== undefined) sc.actions = stateActions;
+    if (evalModeRaw === true) sc.eval_mode = true;
     out[name] = sc;
   }
   return out;

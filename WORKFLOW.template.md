@@ -65,6 +65,20 @@ tracker:
 #             allowed out of this state" — the agent's `transition` calls will
 #             always be rejected with `transition_not_allowed`. Useful for
 #             review-style states that should pause until a human re-routes.
+#   eval_mode (bool, optional): when true, the runner adds two extra read-only
+#             bind mounts to every per-issue VM dispatched in this state so an
+#             in-VM agent can inspect symphony's own state for evaluation /
+#             debugging:
+#               • `tracker.root` → `/symphony/issues` (every issue file across
+#                 every state directory)
+#               • `logs.root`    → `/symphony/logs`   (per-issue JSONL run-log
+#                 transcripts captured by RunLog — ACP frames, stderr, hooks,
+#                 system events)
+#             Either mount is skipped silently if the corresponding root is
+#             unset. Smolvm has a small per-VM mount cap (the workspace itself
+#             already consumes one slot), so this is opt-in per state rather
+#             than a workflow-wide default — flip it on for a dedicated eval
+#             state, not for the routine implement/review flow. Default: false.
 #   hooks     (map, optional): per-state overrides for the workflow-level `hooks:`
 #             block. Each of `after_create`, `before_run`, `after_run`, and
 #             `before_remove` is optional; an omitted key inherits the
