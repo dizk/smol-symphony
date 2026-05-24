@@ -36,7 +36,7 @@ import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
 import { GhCliPrApi, GitCliPrGitApi, Reconciler } from '../reconciler/index.js';
-import { log } from '../logging.js';
+import { closeLogFile, log, setLogFile } from '../logging.js';
 
 interface Cli {
   subcommand: 'serve' | 'rerun';
@@ -215,6 +215,30 @@ async function main() {
     process.exit(2);
   }
 
+  // Persistent log file. Mirrors the stderr structured stream to disk so an
+  // agent reviewing a run after the fact (typically inside a VM with the
+  // workspace + .symphony/logs/ mounted in) can read orchestrator-side events
+  // — workflow reloads, dispatch decisions, hook results, reconciler ticks —
+  // alongside the per-issue JSONL run logs already in the same directory.
+  //
+  // Path resolution: SYMPHONY_LOG_FILE env override wins ("" disables the
+  // sink); otherwise `<logs.root>/symphony.log`. The directory is created on
+  // demand. File-sink failure is swallowed: symphony continues on stderr only.
+  const envLogFile = process.env.SYMPHONY_LOG_FILE;
+  const logFile =
+    envLogFile === undefined
+      ? path.join(config.logs.root, 'symphony.log')
+      : envLogFile === ''
+        ? null
+        : envLogFile;
+  setLogFile(logFile);
+
+  // Flush the persistent log sink before any process.exit() that runs after
+  // setLogFile(). `process.exit` does not drain pending WriteStream writes,
+  // so without this the final log lines (startup-failure stderr is unaffected,
+  // but any buffered log.* output) would be dropped from symphony.log.
+  const flushLogs = () => closeLogFile().catch(() => undefined);
+
   const tracker = new LocalMarkdownTracker(config.tracker);
   // Materialize every declared state directory under tracker.root up front so
   // the dashboard sees the full set of columns (including `holding` states like
@@ -224,6 +248,7 @@ async function main() {
   } catch (err) {
     process.stderr.write(`error: tracker init failed: ${(err as Error).message}\n`);
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(1);
   }
   const workspaces = new WorkspaceManager(config);
@@ -351,6 +376,11 @@ async function main() {
     // the reconciler (so a Smolfile-path change kicks off a new bake); we do
     // not re-forward here. liveCfg drives the HTTP dashboard's tracker view.
     liveCfg = cfg;
+    // Retarget the persistent log file sink if logs.root rotated. The env
+    // override locks the path for the process lifetime — reload cannot move it.
+    if (envLogFile === undefined) {
+      setLogFile(path.join(cfg.logs.root, 'symphony.log'));
+    }
     // Materialize any state directory the reload introduced. Best-effort: a
     // mkdir failure here would normally come from a tracker.root rotation that
     // also failed at validateDispatch, so logging is enough.
@@ -368,6 +398,7 @@ async function main() {
       `error: failed to bind ACP bridge on ${config.acp.bridge.bind_host}:${config.acp.bridge.bind_port}: ${(err as Error).message}\n`,
     );
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(1);
   }
 
@@ -406,6 +437,7 @@ async function main() {
         `error: failed to bind HTTP server on ${config.server.host}:${httpPort}: ${(err as Error).message}\n`,
       );
       await src.stop().catch(() => undefined);
+      await flushLogs();
       process.exit(1);
     }
   }
@@ -430,6 +462,7 @@ async function main() {
           `endpoint, even when mcp.host_url points the in-VM agent at a reverse proxy.\n`,
       );
       await src.stop().catch(() => undefined);
+      await flushLogs();
       process.exit(1);
     }
     const probeUrl = mcp.buildUrl('startup-check', {
@@ -444,6 +477,7 @@ async function main() {
       );
       if (http) await http.close().catch(() => undefined);
       await src.stop().catch(() => undefined);
+      await flushLogs();
       process.exit(1);
     }
   }
@@ -454,6 +488,7 @@ async function main() {
     process.stderr.write(`startup failed: ${(err as Error).message}\n`);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(1);
   }
   if (cli.reconcileForce) {
@@ -470,6 +505,7 @@ async function main() {
     workflow: workflowPath,
     workspace_root: config.workspace.root,
     tracker_root: config.tracker.root,
+    log_file: logFile ?? '<disabled>',
     poll_interval_ms: config.polling.interval_ms,
     http_port: httpPort,
   });
@@ -480,13 +516,17 @@ async function main() {
     await acpBridge.stop().catch(() => undefined);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   process.stderr.write(`fatal: ${(err as Error).message}\n${(err as Error).stack ?? ''}\n`);
+  // setLogFile() may have been called before main() threw; flush the sink so
+  // any log.* lines emitted before the fault reach symphony.log.
+  await closeLogFile().catch(() => undefined);
   process.exit(1);
 });
