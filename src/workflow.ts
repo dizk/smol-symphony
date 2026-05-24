@@ -22,6 +22,7 @@ import type {
   ServerConfig,
   McpConfig,
   IntegrationConfig,
+  PrAutopilotConfig,
 } from './types.js';
 import { log } from './logging.js';
 import {
@@ -397,6 +398,66 @@ export function buildServiceConfig(
     merge_on_states: asStringList(integrationRaw['merge_on_states'], []),
   };
 
+  // pr_autopilot (issue 38). Optional block; default off. When enabled the
+  // reconciler keeps each terminal-state issue's PR rebased on origin/<base>
+  // and arms GitHub auto-merge. State-name fields are resolved against the
+  // declared states map at validation time — the parser only normalizes the
+  // raw string, so an undeclared name surfaces in `validateDispatch` with a
+  // clearer error than a runtime lookup failure.
+  const prAutopilotRaw = getObject(raw, 'pr_autopilot');
+  const prAutopilotEnabledRaw = prAutopilotRaw['enabled'];
+  const prAutopilotEnabled = prAutopilotEnabledRaw === true;
+  const mergeStateRaw = asString(prAutopilotRaw['merge_state']);
+  // close_state is "string with default Cancelled" when the key is absent, but
+  // an explicit `close_state: null` (or empty string) disables the close path
+  // entirely — see WORKFLOW.template.md. Distinguish "key absent" from "key
+  // present with a falsy value" so the default doesn't silently re-enable a
+  // path the operator turned off.
+  const closeStateKeyPresent = Object.prototype.hasOwnProperty.call(
+    prAutopilotRaw,
+    'close_state',
+  );
+  const closeStateRaw = asString(prAutopilotRaw['close_state']);
+  const closeStateTrimmed = closeStateRaw?.trim() ?? '';
+  const closeState: string | null = closeStateKeyPresent
+    ? closeStateTrimmed.length > 0
+      ? closeStateTrimmed
+      : null
+    : 'Cancelled';
+  const conflictRouteToRaw = asString(prAutopilotRaw['conflict_route_to']);
+  const conflictHoldingRaw = asString(prAutopilotRaw['conflict_holding_state']);
+  const strategyRaw = asString(prAutopilotRaw['auto_merge_strategy']) ?? 'squash';
+  const autoMergeStrategy: 'squash' | 'merge' | 'rebase' =
+    strategyRaw === 'merge' || strategyRaw === 'rebase' ? strategyRaw : 'squash';
+  const prAutopilot: PrAutopilotConfig = {
+    enabled: prAutopilotEnabled,
+    merge_state: mergeStateRaw && mergeStateRaw.trim().length > 0 ? mergeStateRaw.trim() : 'Done',
+    close_state: closeState,
+    conflict_route_to:
+      conflictRouteToRaw && conflictRouteToRaw.trim().length > 0
+        ? conflictRouteToRaw.trim()
+        : null,
+    conflict_holding_state:
+      conflictHoldingRaw && conflictHoldingRaw.trim().length > 0
+        ? conflictHoldingRaw.trim()
+        : null,
+    max_rebase_attempts: asInt(prAutopilotRaw['max_rebase_attempts'], 3),
+    auto_merge_strategy: autoMergeStrategy,
+    poll_interval_ms: asInt(prAutopilotRaw['poll_interval_ms'], 30_000),
+  };
+  if (prAutopilot.max_rebase_attempts <= 0) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      'pr_autopilot.max_rebase_attempts must be a positive integer',
+    );
+  }
+  if (prAutopilot.poll_interval_ms < 0) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      'pr_autopilot.poll_interval_ms must be non-negative',
+    );
+  }
+
   return {
     workflow_path: workflowAbs,
     workflow_dir: workflowDir,
@@ -411,6 +472,7 @@ export function buildServiceConfig(
     server,
     mcp,
     integration,
+    pr_autopilot: prAutopilot,
     states,
   };
 }
@@ -694,6 +756,67 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
     const integrationError = validateIntegration(cfg.integration, cfg.states);
     if (integrationError) return integrationError;
   }
+  // pr_autopilot is always populated by buildServiceConfig, but test harnesses
+  // sometimes hand-build a ServiceConfig from an earlier shape; treat a
+  // missing block as `{ enabled: false }` so legacy fixtures keep validating.
+  if (cfg.pr_autopilot && cfg.pr_autopilot.enabled) {
+    const prError = validatePrAutopilot(cfg.pr_autopilot, cfg.states);
+    if (prError) return prError;
+  }
+  return null;
+}
+
+/**
+ * Cross-reference the pr_autopilot block against the declared states map.
+ * Only fires when `pr_autopilot.enabled` is true so a workflow that hasn't
+ * opted in isn't gated on the `merge_state` / `close_state` / conflict-state
+ * names referring to live states.
+ */
+function validatePrAutopilot(
+  cfg: PrAutopilotConfig,
+  states: Record<string, StateConfig>,
+): string | null {
+  const byLower = new Map<string, string>();
+  for (const name of Object.keys(states)) byLower.set(name.toLowerCase(), name);
+
+  const mergeCanonical = byLower.get(cfg.merge_state.toLowerCase());
+  if (!mergeCanonical) {
+    return `pr_autopilot.merge_state references undeclared state "${cfg.merge_state}"`;
+  }
+  if (states[mergeCanonical]!.role !== 'terminal') {
+    return `pr_autopilot.merge_state "${cfg.merge_state}" must be a terminal state (got role: ${states[mergeCanonical]!.role})`;
+  }
+
+  if (cfg.close_state !== null) {
+    const closeCanonical = byLower.get(cfg.close_state.toLowerCase());
+    if (!closeCanonical) {
+      return `pr_autopilot.close_state references undeclared state "${cfg.close_state}"`;
+    }
+    if (states[closeCanonical]!.role !== 'terminal') {
+      return `pr_autopilot.close_state "${cfg.close_state}" must be a terminal state (got role: ${states[closeCanonical]!.role})`;
+    }
+  }
+
+  if (cfg.conflict_route_to !== null) {
+    const routeCanonical = byLower.get(cfg.conflict_route_to.toLowerCase());
+    if (!routeCanonical) {
+      return `pr_autopilot.conflict_route_to references undeclared state "${cfg.conflict_route_to}"`;
+    }
+    if (states[routeCanonical]!.role !== 'active') {
+      return `pr_autopilot.conflict_route_to "${cfg.conflict_route_to}" must be an active state (got role: ${states[routeCanonical]!.role})`;
+    }
+  }
+
+  if (cfg.conflict_holding_state !== null) {
+    const holdingCanonical = byLower.get(cfg.conflict_holding_state.toLowerCase());
+    if (!holdingCanonical) {
+      return `pr_autopilot.conflict_holding_state references undeclared state "${cfg.conflict_holding_state}"`;
+    }
+    if (states[holdingCanonical]!.role !== 'holding') {
+      return `pr_autopilot.conflict_holding_state "${cfg.conflict_holding_state}" must be a holding state (got role: ${states[holdingCanonical]!.role})`;
+    }
+  }
+
   return null;
 }
 

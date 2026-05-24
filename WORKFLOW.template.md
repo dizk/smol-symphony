@@ -216,6 +216,89 @@ integration:
   merge_on_states: [Done]
 
 # ─────────────────────────────────────────────────────────────────────────────
+# pr_autopilot — keep terminal-state PRs rebased on origin/<base> and let
+# GitHub auto-merge them when checks pass.
+#
+# Optional. When `enabled: true` the reconciler grows a `pr` resource that, on
+# every tick, looks up each issue in `merge_state` (default `Done`) via
+# `gh pr list --head agent/<id>`, fetches its detail with `gh pr view`, and:
+#
+#   • Force-with-lease rebases `agent/<id>` onto `origin/<base>` when the PR
+#     is behind the base branch. The lease binds the head SHA the autopilot
+#     last observed, so a concurrent push (operator or sibling tool) is
+#     detected rather than clobbered.
+#   • Arms GitHub's auto-merge once the PR is mergeable
+#     (`gh pr merge --auto --<strategy> --delete-branch`). GitHub merges as
+#     soon as required checks pass and review requirements are satisfied.
+#   • On rebase conflict — or when `gh pr view` reports
+#     `mergeable: CONFLICTING` — appends a structured notes block to the
+#     issue file (conflicted file list + diagnostic) and routes the issue
+#     from `merge_state` back to `conflict_route_to` (default: the first
+#     declared `role: active` state). The workspace + `agent/<id>` branch
+#     are preserved across the round trip; the dispatch loop picks up the
+#     issue again with the conflict markers in place.
+#   • After `max_rebase_attempts` consecutive failures, routes the issue
+#     into `conflict_holding_state` (default: a `role: holding` state
+#     literally named `Conflict`, else the first declared holding state)
+#     and stops attempting until the operator intervenes.
+#   • For issues in `close_state` (default `Cancelled`) with an open PR,
+#     closes the PR without merge and best-effort-deletes the remote branch.
+#
+# Requires `gh` authenticated on the host (`gh auth status` clean). The token
+# never enters the VM. Auto-merge ALSO requires at least one branch protection
+# rule on the base branch, or `gh pr merge --auto` will error — set one in
+# the repo's GitHub settings before flipping `enabled: true`.
+#
+# When `enabled: false` (or the block is absent) the autopilot is fully
+# inert: the resource is never constructed and the orchestrator's existing
+# Done-state behavior (workspace cleanup + after_run PR-create hook +
+# operator-merge) is unchanged.
+#
+# Workspace lifecycle gotcha: when `enabled: true`, transitions into
+# `merge_state` no longer fire the standard terminal workspace cleanup. The
+# pr resource owns the workspace from that point on and removes it once the
+# PR has merged (or been closed). Transitions into `close_state` (and any
+# other terminal state) keep the standard cleanup-on-transition behavior.
+# ─────────────────────────────────────────────────────────────────────────────
+pr_autopilot:
+  # enabled (bool): master switch. Default false.
+  enabled: false
+
+  # merge_state (string): terminal state whose issues should have their PRs
+  # auto-merged. Default 'Done'.
+  merge_state: Done
+
+  # close_state (string, optional): terminal state whose issues should have
+  # their PRs closed without merge. Default 'Cancelled'. Set to null (or
+  # omit by setting an empty string) to disable the close path.
+  close_state: Cancelled
+
+  # conflict_route_to (string, optional): active state to route an issue
+  # back to on rebase conflict. Defaults to the first declared `role: active`
+  # state — for symphony's two-stage Todo/Review workflow that's Todo.
+  conflict_route_to: Todo
+
+  # conflict_holding_state (string, optional): holding state for the circuit
+  # breaker. After max_rebase_attempts consecutive failures the issue lands
+  # here. Defaults to a declared `role: holding` state literally named
+  # `Conflict` (case-insensitive); falls back to the first declared holding
+  # state if there's no Conflict.
+  conflict_holding_state: Conflict
+
+  # max_rebase_attempts (int): how many consecutive rebase conflicts to
+  # tolerate before tripping the circuit breaker. Default 3.
+  max_rebase_attempts: 3
+
+  # auto_merge_strategy (enum: squash|merge|rebase): forwarded to
+  # `gh pr merge --auto --<strategy>`. Default 'squash'.
+  auto_merge_strategy: squash
+
+  # poll_interval_ms (int): per-PR GitHub view cache TTL, milliseconds. The
+  # reconciler may tick more often than this; a single PR view is reused
+  # within the window. Default 30000.
+  poll_interval_ms: 30000
+
+# ─────────────────────────────────────────────────────────────────────────────
 # polling — how often to poll the tracker.
 # ─────────────────────────────────────────────────────────────────────────────
 polling:

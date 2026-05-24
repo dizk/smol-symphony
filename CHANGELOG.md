@@ -12,6 +12,21 @@ hand work off between them via a single MCP call.
 
 ### Added
 
+- `pr_autopilot` workflow block (default off). When `enabled: true` the
+  reconciler grows a `pr` resource that, on every tick, keeps each
+  terminal-state issue's GitHub PR rebased on `origin/<base>`, arms
+  `gh pr merge --auto --<strategy>`, and routes rebase conflicts back to
+  the implementing state with a structured notes block (conflicted file
+  list + diagnostic) appended to the issue body. After
+  `max_rebase_attempts` consecutive failures the issue lands in the
+  configured holding state (default `Conflict`). For issues in
+  `close_state` (default `Cancelled`) with an open PR, the autopilot
+  closes the PR without merge and best-effort-deletes the remote branch.
+  Requires `gh` authenticated on the host AND a branch protection rule on
+  the base requiring at least one check (`gh pr merge --auto` errors
+  without one). When enabled, transitions into `merge_state` skip the
+  standard terminal workspace cleanup — the autopilot owns the workspace
+  until the PR merges or closes.
 - `smolvm.smolfile` workflow key. Point it at a TOML
   [Smolfile](https://github.com/smol-machines/smolvm) and symphony hands it
   to `smolvm machine create --smolfile` for every per-issue VM. The repo

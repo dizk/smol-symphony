@@ -24,7 +24,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import type { IssueTracker } from './trackers/types.js';
-import type { RunningEntry, StateConfig } from './types.js';
+import type { PrAutopilotConfig, RunningEntry, StateConfig } from './types.js';
 import { log } from './logging.js';
 import { writeIssueFile, pickHoldingState, NoHoldingStateError } from './issues.js';
 
@@ -148,17 +148,38 @@ export class McpRegistry {
   // which is the correct behaviour: without a declared states map, the agent
   // has no valid target to name.
   private states: Record<string, StateConfig> = {};
+  // Issue 38: when set and `enabled` is true, transitions into
+  // `pr_autopilot.merge_state` do NOT flip `cleanup_workspace_on_exit` even
+  // though the target state's role is `terminal`. The pr resource owns the
+  // workspace lifecycle for those issues — it rebases inside the workspace
+  // and cleans it up after the PR merges/closes. Without this gate the
+  // terminal-cleanup path would reap the workspace before the autopilot
+  // could ever use it.
+  private prAutopilot: PrAutopilotConfig | null = null;
 
   constructor(
     private tracker: IssueTracker,
-    opts: { states?: Record<string, StateConfig> } = {},
+    opts: {
+      states?: Record<string, StateConfig>;
+      prAutopilot?: PrAutopilotConfig;
+    } = {},
   ) {
     if (opts.states) this.states = opts.states;
+    if (opts.prAutopilot) this.prAutopilot = opts.prAutopilot;
   }
 
-  /** Push the latest state-config map in after a workflow reload. */
-  updateStates(states: Record<string, StateConfig>): void {
+  /**
+   * Push the latest state-config map (and optional pr_autopilot block) in
+   * after a workflow reload. Tests that don't care about the autopilot can
+   * call with a single argument; production wires both so reloads that flip
+   * `pr_autopilot.enabled` take effect on subsequent transitions.
+   */
+  updateStates(
+    states: Record<string, StateConfig>,
+    prAutopilot?: PrAutopilotConfig | null,
+  ): void {
     this.states = states;
+    if (prAutopilot !== undefined) this.prAutopilot = prAutopilot;
   }
 
   /** Called once after the HTTP server binds, so URL construction uses the real port. */
@@ -391,8 +412,20 @@ export class McpRegistry {
     // so the role lookup matches the workflow's `states:` map.
     const stateMap = this.states;
     const canonicalName = canonicalStateName(stateMap, result.toState);
-    active.entry.cleanup_workspace_on_exit =
+    const targetIsTerminal =
       canonicalName !== null && stateMap[canonicalName]!.role === 'terminal';
+    // Issue 38: suppress terminal cleanup when the pr autopilot owns this
+    // state's workspace. The pr resource will reap the workspace once the
+    // PR has merged (or been closed). Other terminal states (Cancelled
+    // typically) still cleanup immediately — the close path on the autopilot
+    // only needs to talk to GitHub, not the workspace.
+    const suppressCleanupForAutopilot =
+      targetIsTerminal &&
+      canonicalName !== null &&
+      this.prAutopilot !== null &&
+      this.prAutopilot.enabled &&
+      canonicalName.toLowerCase() === this.prAutopilot.merge_state.toLowerCase();
+    active.entry.cleanup_workspace_on_exit = targetIsTerminal && !suppressCleanupForAutopilot;
     // Mutate the entry's view of the issue's state so downstream code (runner's
     // cleanup, orchestrator's terminal-state workspace removal) resolves the right
     // state's hooks. Without this, after_run / before_remove would resolve against

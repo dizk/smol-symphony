@@ -40,6 +40,8 @@ import type {
   IntendedVmProvider,
   WorkspaceIntendedProvider,
   BaseRefProvider,
+  PrIntent,
+  PrIntendedProvider,
 } from './reconciler/index.js';
 import { spawn } from 'node:child_process';
 
@@ -111,8 +113,24 @@ interface RetrySchedule {
 const CONTINUATION_DELAY_MS = 1_000;
 const FAILURE_BASE_MS = 10_000;
 
+/**
+ * Resolve the base branch the autopilot should rebase against. Mirrors the
+ * after_create hook contract — operators export `SYMPHONY_BASE_BRANCH` to
+ * override; default is `main`.
+ */
+function baseBranchName(): string {
+  const env = process.env.SYMPHONY_BASE_BRANCH;
+  if (env && env.length > 0) return env;
+  return 'main';
+}
+
 export class Orchestrator
-  implements IntendedVmProvider, WorkspaceIntendedProvider, BaseRefProvider, ProposeFollowupSink
+  implements
+    IntendedVmProvider,
+    WorkspaceIntendedProvider,
+    BaseRefProvider,
+    PrIntendedProvider,
+    ProposeFollowupSink
 {
   private running = new Map<string, RunningEntry>();
   private claimed = new Set<string>();
@@ -1034,6 +1052,21 @@ export class Orchestrator
     }
     const issues = await this.tracker.fetchIssuesByStates(nonTerminal);
     for (const i of issues) out.set(i.identifier, i.state);
+    // Issue 38: when pr_autopilot is enabled, the merge-state issues' workspaces
+    // are owned by the pr resource (it rebases inside them and cleans them up
+    // post-merge). Include those identifiers in the desired set so the
+    // workspace janitor doesn't reap a workspace the pr resource is actively
+    // driving. The orchestrator's `createWorkspace` callback declines to
+    // eagerly recreate a missing merge-state workspace — so adding it here is
+    // safe: the workspace either already exists from the dispatch that ran
+    // the issue into the merge state, or it doesn't and the autopilot just
+    // skips the rebase step for that PR.
+    if (this.cfg.pr_autopilot.enabled) {
+      const mergeIssues = await this.tracker.fetchIssuesByStates([
+        this.cfg.pr_autopilot.merge_state,
+      ]);
+      for (const i of mergeIssues) out.set(i.identifier, i.state);
+    }
     return out;
   }
 
@@ -1136,8 +1169,112 @@ export class Orchestrator
    * once whether the reconciler or the runner wins the race.
    */
   async createWorkspace(identifier: string, state: string | null): Promise<void> {
+    // Issue 38: refuse to eagerly recreate a missing workspace for an issue
+    // in the autopilot's merge state. Those workspaces only exist as
+    // leftovers from a prior dispatch; recreating one from scratch would
+    // miss the agent's local commits (the agent's branch is on the remote,
+    // but a fresh clone would still need a separate fetch to pick it up).
+    // Operators who genuinely want a recreated workspace can cancel the
+    // issue (Cancelled triggers the close path + normal cleanup) and refile.
+    if (
+      this.cfg.pr_autopilot.enabled &&
+      state !== null &&
+      state.toLowerCase() === this.cfg.pr_autopilot.merge_state.toLowerCase()
+    ) {
+      return;
+    }
     const hooks = state !== null ? resolveHooksForState(this.cfg, state) : this.cfg.hooks;
     await this.workspaces.ensureFor(identifier, hooks);
+  }
+
+  /**
+   * Implements {@link PrIntendedProvider} (issue 38). Returns the set of
+   * terminal-state issues the PR autopilot should manage:
+   *
+   *   • Issues in the configured `merge_state` (default `Done`) become
+   *     `kind: 'merge'` intents. The autopilot rebases them on
+   *     `origin/<base>` and arms GitHub auto-merge.
+   *   • Issues in the configured `close_state` (default `Cancelled`) become
+   *     `kind: 'close'` intents. The autopilot closes the PR without merge
+   *     and best-effort-deletes the remote branch. The workspace is NOT
+   *     supplied — Cancelled cleanup goes through the orchestrator's
+   *     standard terminal path so the per-state `before_remove` hook still
+   *     fires.
+   *
+   * Both queries hit the tracker; failures bubble (the pr resource catches
+   * and surfaces in last_error so a transient tracker hiccup doesn't blank
+   * the autopilot's intended set).
+   *
+   * When `pr_autopilot.enabled` is false this method is never invoked
+   * (the reconciler skips its pr pass entirely), but the early return keeps
+   * the public surface idempotent.
+   */
+  async prIntended(): Promise<PrIntent[]> {
+    if (!this.cfg.pr_autopilot.enabled) return [];
+    const out: PrIntent[] = [];
+    const mergeState = this.cfg.pr_autopilot.merge_state;
+    const closeState = this.cfg.pr_autopilot.close_state;
+    const baseBranch = baseBranchName();
+    const states = closeState ? [mergeState, closeState] : [mergeState];
+    const issues = await this.tracker.fetchIssuesByStates(states);
+    for (const i of issues) {
+      const stateLower = i.state.toLowerCase();
+      const isMerge = stateLower === mergeState.toLowerCase();
+      const isClose = closeState !== null && stateLower === closeState.toLowerCase();
+      if (!isMerge && !isClose) continue;
+      const branch = i.branch_name && i.branch_name.length > 0 ? i.branch_name : `agent/${i.identifier}`;
+      out.push({
+        identifier: i.identifier,
+        kind: isMerge ? 'merge' : 'close',
+        state: i.state,
+        workspace_path: isMerge ? this.workspaces.workspacePathFor(i.identifier) : null,
+        branch,
+        base_branch: baseBranch,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Tracker-side transition the PR autopilot uses to route a conflict-rebasing
+   * issue back into the implementing state (or, after exceeding the attempt
+   * limit, into the holding state). Same shape as the MCP transition tool —
+   * the tracker handles atomic notes-append + cross-directory rename.
+   *
+   * No workspace flag is touched here: the target state's `role` decides
+   * cleanup at the transition's own level (active/holding never trigger
+   * cleanup), and the workspace was preserved across the move into the merge
+   * state in the first place because `pr_autopilot.enabled` suppresses the
+   * terminal cleanup for that target. See {@link McpRegistry.performTransition}
+   * for the role-driven rule.
+   */
+  async routeIssueForAutopilot(input: {
+    identifier: string;
+    fromState: string;
+    toState: string;
+    notes: string;
+    actor: string;
+  }): Promise<void> {
+    if (!this.tracker.moveIssueToState) {
+      throw new Error('tracker does not support state transitions');
+    }
+    // The tracker file's `id` may diverge from the identifier when the file
+    // sets an explicit front-matter `id`. Resolve via a candidate scan so the
+    // tracker can find the right file even with that aliasing.
+    let issueId: string | null = null;
+    try {
+      const candidates = await this.tracker.fetchIssuesByStates([input.fromState]);
+      const match = candidates.find((c) => c.identifier === input.identifier);
+      if (match) issueId = match.id;
+    } catch {
+      // Fall through to identifier fallback below.
+    }
+    if (issueId === null) issueId = input.identifier;
+    await this.tracker.moveIssueToState(issueId, input.toState, {
+      fromState: input.fromState,
+      notes: input.notes,
+      actor: input.actor,
+    });
   }
 
   /**

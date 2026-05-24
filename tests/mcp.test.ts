@@ -757,6 +757,99 @@ describe('McpRegistry transition', () => {
     }
   });
 
+  it('suppresses cleanup_workspace_on_exit on active→merge_state when pr_autopilot is enabled', async () => {
+    // Issue 38: the pr autopilot owns the workspace for issues in the merge
+    // state — it rebases inside the workspace and removes it once the PR
+    // merges. The MCP transition must NOT flip cleanup on transition into
+    // that state, or the terminal cleanup path would reap the workspace
+    // before the autopilot could ever use it. Other terminal states (e.g.
+    // Cancelled) keep the standard cleanup-on-transition behavior.
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(
+        path.join(root, 'Review', 'AB-1.md'),
+        `---\ntitle: Issue\n---\nbody`,
+      );
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, {
+        states,
+        prAutopilot: {
+          enabled: true,
+          merge_state: 'Done',
+          close_state: 'Cancelled',
+          conflict_route_to: null,
+          conflict_holding_state: null,
+          max_rebase_attempts: 3,
+          auto_merge_strategy: 'squash',
+          poll_interval_ms: 30000,
+        },
+      });
+      const entry = makeEntry('AB-1', 'Review', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('AB-1', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Done', notes: 'LGTM' } },
+      });
+      const result = (res as { result: { isError: boolean; structuredContent: { cleanup_workspace_on_exit: boolean } } })
+        .result;
+      assert.equal(result.isError, false);
+      assert.equal(
+        entry.cleanup_workspace_on_exit,
+        false,
+        'pr_autopilot suppresses cleanup so the autopilot can rebase in the workspace',
+      );
+      assert.equal(result.structuredContent.cleanup_workspace_on_exit, false);
+      // Issue file did move into Done/.
+      assert.deepEqual(await readdir(path.join(root, 'Done')), ['AB-1.md']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('still cleans up on active→close_state (Cancelled) even when pr_autopilot is enabled', async () => {
+    // The close_state path doesn't need a workspace — the autopilot just
+    // closes the PR via the GH API. Normal terminal cleanup runs so the
+    // workspace + agent branch are reaped immediately. Start from Todo
+    // because Review declares `allowed_transitions: [Todo, Done]` in this
+    // suite's fixture (Cancelled isn't reachable from Review).
+    const { root, cleanup } = await setupStateTree();
+    try {
+      await writeFile(
+        path.join(root, 'Todo', 'AB-2.md'),
+        `---\ntitle: Issue\n---\nbody`,
+      );
+      const t = makeStateTracker(root);
+      const reg = new McpRegistry(t, {
+        states,
+        prAutopilot: {
+          enabled: true,
+          merge_state: 'Done',
+          close_state: 'Cancelled',
+          conflict_route_to: null,
+          conflict_holding_state: null,
+          max_rebase_attempts: 3,
+          auto_merge_strategy: 'squash',
+          poll_interval_ms: 30000,
+        },
+      });
+      const entry = makeEntry('AB-2', 'Todo', { tracker_root_at_dispatch: root });
+      const token = reg.activate(entry);
+      const res = await reg.handleJsonRpc('AB-2', token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'transition', arguments: { to_state: 'Cancelled' } },
+      });
+      const result = (res as { result: { isError: boolean } }).result;
+      assert.equal(result.isError, false);
+      assert.equal(entry.cleanup_workspace_on_exit, true);
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('active→terminal sets cleanup_workspace_on_exit', async () => {
     const { root, cleanup } = await setupStateTree();
     try {
