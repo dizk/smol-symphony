@@ -1,6 +1,6 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, existsSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { closeLogFile, log, setLogFile } from '../src/logging.js';
@@ -103,5 +103,19 @@ describe('logging file sink', () => {
     assert.equal(opened, null);
     // Subsequent log calls must still succeed (stderr-only).
     assert.doesNotThrow(() => log.info('still alive'));
+  });
+
+  it('reports failure synchronously when the target path is a directory', () => {
+    // EISDIR surfaces from `openSync(path, 'a')` synchronously. The first
+    // implementation relied on createWriteStream's async open event, which
+    // meant setLogFile() would return the path and only later flip the sink
+    // into a broken state. The synchronous open closes that gap so the
+    // return value reflects the actual sink state.
+    const asDir = path.join(tmpDir, 'sink-is-a-directory');
+    mkdirSync(asDir, { recursive: true });
+    const opened = setLogFile(asDir);
+    assert.equal(opened, null);
+    // The sink must not be installed; subsequent log calls go to stderr only.
+    assert.doesNotThrow(() => log.info('after eisdir'));
   });
 });

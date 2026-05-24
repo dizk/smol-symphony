@@ -36,7 +36,7 @@ import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
 import { GhCliPrApi, GitCliPrGitApi, Reconciler } from '../reconciler/index.js';
-import { log, setLogFile } from '../logging.js';
+import { closeLogFile, log, setLogFile } from '../logging.js';
 
 interface Cli {
   subcommand: 'serve' | 'rerun';
@@ -233,6 +233,12 @@ async function main() {
         : envLogFile;
   setLogFile(logFile);
 
+  // Flush the persistent log sink before any process.exit() that runs after
+  // setLogFile(). `process.exit` does not drain pending WriteStream writes,
+  // so without this the final log lines (startup-failure stderr is unaffected,
+  // but any buffered log.* output) would be dropped from symphony.log.
+  const flushLogs = () => closeLogFile().catch(() => undefined);
+
   const tracker = new LocalMarkdownTracker(config.tracker);
   // Materialize every declared state directory under tracker.root up front so
   // the dashboard sees the full set of columns (including `holding` states like
@@ -242,6 +248,7 @@ async function main() {
   } catch (err) {
     process.stderr.write(`error: tracker init failed: ${(err as Error).message}\n`);
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(1);
   }
   const workspaces = new WorkspaceManager(config);
@@ -391,6 +398,7 @@ async function main() {
       `error: failed to bind ACP bridge on ${config.acp.bridge.bind_host}:${config.acp.bridge.bind_port}: ${(err as Error).message}\n`,
     );
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(1);
   }
 
@@ -429,6 +437,7 @@ async function main() {
         `error: failed to bind HTTP server on ${config.server.host}:${httpPort}: ${(err as Error).message}\n`,
       );
       await src.stop().catch(() => undefined);
+      await flushLogs();
       process.exit(1);
     }
   }
@@ -453,6 +462,7 @@ async function main() {
           `endpoint, even when mcp.host_url points the in-VM agent at a reverse proxy.\n`,
       );
       await src.stop().catch(() => undefined);
+      await flushLogs();
       process.exit(1);
     }
     const probeUrl = mcp.buildUrl('startup-check', {
@@ -467,6 +477,7 @@ async function main() {
       );
       if (http) await http.close().catch(() => undefined);
       await src.stop().catch(() => undefined);
+      await flushLogs();
       process.exit(1);
     }
   }
@@ -477,6 +488,7 @@ async function main() {
     process.stderr.write(`startup failed: ${(err as Error).message}\n`);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(1);
   }
   if (cli.reconcileForce) {
@@ -504,13 +516,17 @@ async function main() {
     await acpBridge.stop().catch(() => undefined);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
+    await flushLogs();
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   process.stderr.write(`fatal: ${(err as Error).message}\n${(err as Error).stack ?? ''}\n`);
+  // setLogFile() may have been called before main() threw; flush the sink so
+  // any log.* lines emitted before the fault reach symphony.log.
+  await closeLogFile().catch(() => undefined);
   process.exit(1);
 });

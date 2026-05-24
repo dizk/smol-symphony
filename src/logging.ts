@@ -8,7 +8,7 @@
 // failures are swallowed (one stderr warning on first failure, then silent)
 // per §9.2 so a full disk or permission error can never crash the orchestrator.
 
-import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
+import { closeSync, createWriteStream, mkdirSync, openSync, type WriteStream } from 'node:fs';
 import path from 'node:path';
 
 type Level = 'debug' | 'info' | 'warn' | 'error';
@@ -61,42 +61,34 @@ function emit(level: Level, msg: string, fields: Record<string, unknown> = {}) {
  * Enable (or replace) the persistent file sink. Pass `null` to close any
  * currently-open file sink and revert to stderr-only.
  *
- * The directory is created on demand. If the file cannot be opened, the call
- * itself does not throw — a single stderr warning is emitted and subsequent
- * logs continue to flow to stderr only. After a successful open, runtime
- * stream errors flip the sink into a broken state (silently dropping further
- * writes) so a mid-run disk-full condition cannot recursively spam stderr.
+ * The directory is created on demand. The file is opened synchronously via
+ * `openSync` so failures (EISDIR, EACCES, ENOTDIR, ENOSPC) raise before the
+ * sink is installed — by the time this returns a non-null path, the file is
+ * known to be writable. Open failures do not throw: a single stderr warning
+ * is emitted and the function returns `null` so callers can branch without a
+ * try/catch. After a successful open, runtime stream errors flip the sink
+ * into a broken state (silently dropping further writes) so a mid-run
+ * disk-full condition cannot recursively spam stderr.
  *
  * Idempotent for repeated calls with the same path. Returns the absolute path
  * actually opened, or `null` when the sink was disabled or failed to open.
  */
 export function setLogFile(filePath: string | null): string | null {
   if (filePath === null || filePath === '') {
-    closeLogFile();
+    void closeLogFile();
     return null;
   }
   const abs = path.resolve(filePath);
   if (fileSink && fileSinkPath === abs && !fileSinkBroken) return abs;
-  closeLogFile();
+  void closeLogFile();
+  let fd: number;
   try {
     mkdirSync(path.dirname(abs), { recursive: true });
-    const stream = createWriteStream(abs, { flags: 'a', encoding: 'utf8' });
-    stream.on('error', (err) => {
-      if (!fileSinkBroken) {
-        fileSinkBroken = true;
-        try {
-          process.stderr.write(
-            format('warn', 'log file sink write failed', { path: abs, error: err.message }) + '\n',
-          );
-        } catch {
-          // stderr itself failed; nothing left to do.
-        }
-      }
-    });
-    fileSink = stream;
-    fileSinkPath = abs;
-    fileSinkBroken = false;
-    return abs;
+    // Open synchronously so EISDIR / EACCES / ENOTDIR surface here instead of
+    // arriving asynchronously on the stream's 'error' event after setLogFile()
+    // has already returned the path. Passing the fd into createWriteStream
+    // tells Node to reuse it (the stream's close still releases the fd).
+    fd = openSync(abs, 'a');
   } catch (err) {
     try {
       process.stderr.write(
@@ -111,12 +103,52 @@ export function setLogFile(filePath: string | null): string | null {
     fileSinkBroken = false;
     return null;
   }
+  let stream: WriteStream;
+  try {
+    stream = createWriteStream(abs, { encoding: 'utf8', fd, autoClose: true });
+  } catch (err) {
+    try {
+      closeSync(fd);
+    } catch {
+      // fd already gone; nothing to do.
+    }
+    try {
+      process.stderr.write(
+        format('warn', 'log file sink open failed', { path: abs, error: (err as Error).message }) +
+          '\n',
+      );
+    } catch {
+      // stderr itself failed; nothing left to do.
+    }
+    fileSink = null;
+    fileSinkPath = null;
+    fileSinkBroken = false;
+    return null;
+  }
+  stream.on('error', (err) => {
+    if (!fileSinkBroken) {
+      fileSinkBroken = true;
+      try {
+        process.stderr.write(
+          format('warn', 'log file sink write failed', { path: abs, error: err.message }) + '\n',
+        );
+      } catch {
+        // stderr itself failed; nothing left to do.
+      }
+    }
+  });
+  fileSink = stream;
+  fileSinkPath = abs;
+  fileSinkBroken = false;
+  return abs;
 }
 
 /**
  * Close the file sink and await the underlying stream's flush. Safe to call
- * repeatedly. The orchestrator's signal-shutdown path does not need to await
- * this (process.exit flushes); tests that read the file back must.
+ * repeatedly. Callers that intend to `process.exit()` immediately afterwards
+ * MUST await this — `process.exit` does not drain pending WriteStream writes,
+ * so the final log lines (including the shutdown banner) would otherwise be
+ * lost. Tests that read the file back also await.
  */
 export async function closeLogFile(): Promise<void> {
   const sink = fileSink;
