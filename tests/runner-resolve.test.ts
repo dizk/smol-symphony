@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveDispatchConfig } from '../src/agent/runner.js';
+import {
+  buildEvalModeMounts,
+  EVAL_MODE_ISSUES_GUEST_PATH,
+  EVAL_MODE_LOGS_GUEST_PATH,
+  resolveDispatchConfig,
+} from '../src/agent/runner.js';
 import { buildServiceConfig } from '../src/workflow.js';
 
 // Phase 2 contract: `resolveDispatchConfig` is the single resolution site for
@@ -30,12 +35,14 @@ describe('resolveDispatchConfig', () => {
       model: 'claude-sonnet-4-5',
       effort: null,
       max_turns: 5,
+      eval_mode: false,
     });
     assert.deepEqual(resolveDispatchConfig(cfg, 'Review'), {
       adapter: 'codex',
       model: 'gpt-5-codex',
       effort: null,
       max_turns: 4,
+      eval_mode: false,
     });
   });
 
@@ -58,6 +65,7 @@ describe('resolveDispatchConfig', () => {
       model: 'gpt-5-codex',
       effort: null,
       max_turns: 17,
+      eval_mode: false,
     });
   });
 
@@ -81,6 +89,7 @@ describe('resolveDispatchConfig', () => {
       model: 'claude-opus-4-7',
       effort: null,
       max_turns: 30,
+      eval_mode: false,
     });
   });
 
@@ -183,5 +192,98 @@ describe('resolveDispatchConfig', () => {
     // Parser normalizes a blank model string to null; resolveDispatchConfig
     // must keep that null instead of replacing it with the workflow fallback.
     assert.equal(resolveDispatchConfig(cfg, 'Todo').model, null);
+  });
+
+  it('surfaces per-state eval_mode and defaults it to false', () => {
+    // Issue 40: a state opts in to read-only symphony mounts via
+    // `eval_mode: true`. resolveDispatchConfig pins the flag at attempt start
+    // so a workflow reload mid-attempt can't toggle mounts on a live VM.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'claude' },
+        states: {
+          Todo: { role: 'active' },
+          Eval: { role: 'active', eval_mode: true },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(resolveDispatchConfig(cfg, 'Todo').eval_mode, false);
+    assert.equal(resolveDispatchConfig(cfg, 'Eval').eval_mode, true);
+  });
+});
+
+describe('buildEvalModeMounts', () => {
+  it('returns no mounts when the state did not opt in', () => {
+    // Defensive: even with both roots configured, a state that didn't set
+    // eval_mode: true should contribute zero extra mounts. Smolvm's per-VM
+    // mount cap is small so this is a load-bearing assertion — flipping it
+    // by accident would consume mount slots on every dispatch.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        acp: { adapter: 'claude' },
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    const resolved = resolveDispatchConfig(cfg, 'Todo');
+    assert.deepEqual(buildEvalModeMounts(cfg, resolved), []);
+  });
+
+  it('mounts tracker.root and logs.root read-only when the state opts in', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        // Explicit logs.root so we don't depend on the cwd-relative default.
+        logs: { root: '/tmp/logs' },
+        acp: { adapter: 'claude' },
+        states: {
+          Eval: { role: 'active', eval_mode: true },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    const resolved = resolveDispatchConfig(cfg, 'Eval');
+    const mounts = buildEvalModeMounts(cfg, resolved);
+    assert.deepEqual(mounts, [
+      { host: '/tmp/issues', guest: EVAL_MODE_ISSUES_GUEST_PATH, readonly: true },
+      { host: '/tmp/logs', guest: EVAL_MODE_LOGS_GUEST_PATH, readonly: true },
+    ]);
+  });
+
+  it('skips the tracker mount when tracker.root is unset', () => {
+    // Defense in depth: the local-tracker loader always pins tracker.root,
+    // but a hand-built ServiceConfig (or a future non-local tracker) might
+    // leave it null. The eval-mode mounts then degrade to whichever roots
+    // are available rather than passing a null host path to smolvm.
+    const cfg = buildServiceConfig(
+      {
+        // Non-local tracker — parser does not auto-default tracker.root.
+        tracker: { kind: 'remote' },
+        logs: { root: '/tmp/logs' },
+        acp: { adapter: 'claude' },
+        states: {
+          Eval: { role: 'active', eval_mode: true },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    const resolved = resolveDispatchConfig(cfg, 'Eval');
+    const mounts = buildEvalModeMounts(cfg, resolved);
+    assert.deepEqual(mounts, [
+      { host: '/tmp/logs', guest: EVAL_MODE_LOGS_GUEST_PATH, readonly: true },
+    ]);
   });
 });

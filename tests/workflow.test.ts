@@ -250,6 +250,50 @@ describe('workflow states block', () => {
       /hooks must be a map/,
     );
   });
+
+  it('parses per-state eval_mode boolean opt-in', () => {
+    // Issue 40: per-state opt-in for symphony self-introspection mounts. Only
+    // `true` enables it; absent / false / any non-boolean is rejected so a
+    // YAML-quoting accident ("true" as a string) can't silently turn the
+    // extra mounts on.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active' },
+          Eval: { role: 'active', eval_mode: true },
+          Calm: { role: 'active', eval_mode: false },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.states.Eval!.eval_mode, true);
+    // Explicit false normalizes to "not opted in" (omitted on the parsed
+    // shape; consumers branch on `=== true`).
+    assert.equal(cfg.states.Calm!.eval_mode, undefined);
+    assert.equal(cfg.states.Todo!.eval_mode, undefined);
+  });
+
+  it('rejects a non-boolean eval_mode value', () => {
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          {
+            tracker: { kind: 'local', root: '/tmp/issues' },
+            states: {
+              Todo: { role: 'active' },
+              Eval: { role: 'active', eval_mode: 'true' },
+              Done: { role: 'terminal' },
+              Triage: { role: 'holding' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        ),
+      /eval_mode must be a boolean/,
+    );
+  });
 });
 
 describe('resolveHooksForState', () => {

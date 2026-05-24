@@ -182,7 +182,24 @@ export interface ResolvedDispatchConfig {
   model: string | null;
   effort: string | null;
   max_turns: number;
+  /**
+   * Per-state opt-in flag (issue 40). When true, the runner adds two extra
+   * read-only mounts to the per-issue VM (`tracker.root` → `/symphony/issues`,
+   * `logs.root` → `/symphony/logs`) so an in-VM eval/debug agent can inspect
+   * symphony's own state. Pinned at attempt start through this struct so a
+   * workflow reload mid-attempt can't add or remove the mounts on the live VM.
+   */
+  eval_mode: boolean;
 }
+
+/**
+ * Fixed guest paths for the eval/debug read-only mounts. Hardcoded (not
+ * configurable) so the prompt body can reference them by literal path. Kept
+ * as exports for tests and any future operator-facing surface that needs to
+ * mention them.
+ */
+export const EVAL_MODE_ISSUES_GUEST_PATH = '/symphony/issues';
+export const EVAL_MODE_LOGS_GUEST_PATH = '/symphony/logs';
 
 /**
  * Resolve effective adapter/model/max_turns for an issue's current state. Per-state
@@ -231,7 +248,37 @@ export function resolveDispatchConfig(
   const model = s.model === undefined ? cfg.acp.model : s.model;
   const effort = s.effort === undefined ? cfg.acp.effort : s.effort;
   const max_turns = s.max_turns ?? cfg.agent.max_turns;
-  return { adapter, model, effort, max_turns };
+  const eval_mode = s.eval_mode === true;
+  return { adapter, model, effort, max_turns, eval_mode };
+}
+
+/**
+ * Derive the extra read-only bind mounts the eval/debug mode contributes for
+ * a single dispatch. Returns an empty list when the state did not opt in or
+ * when neither symphony state root is configured (defense in depth — the
+ * local tracker always sets `tracker.root` and the loader always sets
+ * `logs.root`, but a hand-built ServiceConfig in tests might not).
+ *
+ * Pure so tests can assert the mount shape without spinning up the runner.
+ * The host paths are absolute (the loader normalizes both roots), and the
+ * guest paths are the fixed `EVAL_MODE_*` constants so the prompt body can
+ * reference them by literal path.
+ */
+export function buildEvalModeMounts(
+  cfg: ServiceConfig,
+  resolved: ResolvedDispatchConfig,
+): Array<{ host: string; guest: string; readonly: true }> {
+  if (!resolved.eval_mode) return [];
+  const mounts: Array<{ host: string; guest: string; readonly: true }> = [];
+  const trackerRoot = cfg.tracker.root;
+  if (trackerRoot && trackerRoot.length > 0) {
+    mounts.push({ host: trackerRoot, guest: EVAL_MODE_ISSUES_GUEST_PATH, readonly: true });
+  }
+  const logsRoot = cfg.logs.root;
+  if (logsRoot && logsRoot.length > 0) {
+    mounts.push({ host: logsRoot, guest: EVAL_MODE_LOGS_GUEST_PATH, readonly: true });
+  }
+  return mounts;
 }
 
 /**
@@ -701,6 +748,15 @@ export class AgentRunner {
     ];
     for (const v of this.cfg.smolvm.volumes) {
       mounts.push({ host: v.host, guest: v.guest, readonly: v.readonly });
+    }
+    // Eval/debug mode (issue 40): when the resolved state opts in, mount the
+    // tracker root + logs root read-only so an in-VM agent can inspect every
+    // issue file and the per-issue JSONL transcripts. Skipped silently when
+    // the state did not opt in; the mount list grows by at most two slots
+    // here (smolvm's per-VM mount cap is small but the workspace itself only
+    // takes one slot, so the two extras fit comfortably).
+    for (const m of buildEvalModeMounts(this.cfg, resolved)) {
+      mounts.push(m);
     }
     const env: Record<string, string> = {};
     for (const k of this.cfg.smolvm.forward_env) {
