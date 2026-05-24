@@ -61,6 +61,10 @@ Prerequisites:
   subsequent dispatch — the per-start `[dev].init` (apt + npm install) only runs
   once per Smolfile-content change. Run `symphony reconcile --force` (or pass
   the legacy `--reconcile-force` flag) to drop the cached artifact and rebake.
+  A Rust starter Smolfile lives at `templates/Smolfile.rust` (rustup + cargo
+  + stable toolchain layered with NodeSource so the in-VM proxy still has a
+  Node runtime); point `smolvm.smolfile` at it, or copy it to the project
+  root and adjust the `volumes` path noted in its header.
 - For the default `acp.adapter: claude`: a credentials file at
   `~/.claude/.credentials.json` on the host (symphony reads and stages it; the
   host directory is **not** bind-mounted into the VM).
