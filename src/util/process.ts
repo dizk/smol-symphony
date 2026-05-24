@@ -93,6 +93,7 @@ export function runProcess(
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let settled = false;
     child.stdout?.on('data', (b) => {
       const text = b.toString('utf8');
       stdout += text;
@@ -113,6 +114,13 @@ export function runProcess(
           }, opts.timeoutMs)
         : null;
     const finish = (r: RunResult): void => {
+      // Spawn failures emit both `error` and `close` for the same child (Node
+      // emits ENOENT as `error` then synthesizes a `close` with code=-2). Both
+      // handlers route here, so guard against double-settling — `onResult` is
+      // documented as firing once, and downstream consumers (run-log, hooks,
+      // action results) rely on that.
+      if (settled) return;
+      settled = true;
       if (timer) clearTimeout(timer);
       opts.capture?.onResult?.(r);
       resolve(r);

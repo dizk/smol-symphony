@@ -102,6 +102,24 @@ describe('runProcess', () => {
     assert.equal(r.exit_code, 3);
   });
 
+  it('fires onResult exactly once when spawn fails (ENOENT)', async () => {
+    // Spawn failures emit both `error` and `close` for the same child — Node
+    // emits ENOENT as `error` then synthesizes a `close` with code=-2. Without
+    // the settled guard, onResult would fire twice for one runProcess() call.
+    let onResultCalled = 0;
+    await runProcess('this-binary-does-not-exist-xyz', [], {
+      capture: {
+        onResult: () => {
+          onResultCalled += 1;
+        },
+      },
+    });
+    // Give the synthesized `close` event a tick to fire after the promise
+    // resolved, so a missing settled-guard would manifest as a second call.
+    await new Promise((res) => setImmediate(res));
+    assert.equal(onResultCalled, 1);
+  });
+
   it('merges env on top of process.env without leaking back to the host', async () => {
     const sentinel = `host-${Date.now()}`;
     process.env.SYMPHONY_TEST_HOST_VAR = sentinel;
