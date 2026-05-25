@@ -1243,9 +1243,21 @@ export class Orchestrator
     // Re-cloning lands `agent/<id>` at base; the agent's commits live on
     // origin/<branch>. Fetch + reset so the local branch is at the remote
     // tip (which is what the PR points at) before the rebase runs.
-    const fetchRes = await runProcess('git', ['fetch', '--no-tags', 'origin', args.branch], {
-      cwd: args.workspacePath,
-    });
+    //
+    // The fetch uses an explicit `<branch>:refs/remotes/origin/<branch>`
+    // refspec so the remote-tracking ref is unconditionally created. We
+    // can't rely on the default fetch refspec's opportunistic update here:
+    // `setupWorkspaceDir` clones from the local source repo (which lacks
+    // the agent branch) and then strips + re-adds origin, leaving no
+    // `refs/remotes/origin/<branch>` ref behind. Without an explicit refspec
+    // the post-fetch `git reset --hard origin/<branch>` can fail with
+    // "Needed a single revision" on configurations where opportunistic
+    // remote-tracking updates don't kick in.
+    const fetchRes = await runProcess(
+      'git',
+      ['fetch', '--no-tags', 'origin', `${args.branch}:refs/remotes/origin/${args.branch}`],
+      { cwd: args.workspacePath },
+    );
     if (fetchRes.exit_code !== 0) {
       const diag = (fetchRes.stderr || fetchRes.stdout).trim();
       log.warn('pr autopilot: fetch agent branch failed', {

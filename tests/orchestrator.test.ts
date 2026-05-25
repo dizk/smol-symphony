@@ -512,7 +512,8 @@ describe('Orchestrator VM lifecycle reaping', () => {
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-tracker-'));
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-ws-'));
     const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-remote-'));
-    const seedRepo = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-seed-'));
+    const sourceRepo = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-source-'));
+    const pusher = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-pusher-'));
     const runGit = (cwd: string, args: string[]): Promise<void> =>
       new Promise((resolve, reject) => {
         const child = spawn('git', args, { cwd, stdio: 'ignore' });
@@ -532,24 +533,37 @@ describe('Orchestrator VM lifecycle reaping', () => {
         );
       });
     try {
-      // Bare remote with `main` seeded, then an `agent/77` branch with one
-      // extra commit on top — mirroring the "agent ran in a VM, pushed its
-      // work, then the workspace was reaped" production scenario.
+      // Production shape: the *source repo* (the operator's workflow_dir,
+      // i.e. what `setupWorkspaceDir` clones from) holds only `main`. The
+      // agent/<id> branch lives only on the GitHub-like origin — the
+      // dispatched agent pushed it from inside its VM and the source repo
+      // never tracked it. We use a separate `pusher` clone of the bare remote
+      // to seed the agent branch so `sourceRepo` stays untouched.
       await runGit(bareRemote, ['init', '--bare', '-b', 'main']);
-      await runGit(seedRepo, ['init', '-b', 'main']);
-      await runGit(seedRepo, ['config', 'user.name', 'test']);
-      await runGit(seedRepo, ['config', 'user.email', 'test@example.com']);
-      await writeFile(path.join(seedRepo, 'README.md'), 'seed\n');
-      await runGit(seedRepo, ['add', 'README.md']);
-      await runGit(seedRepo, ['commit', '-m', 'seed']);
-      await runGit(seedRepo, ['remote', 'add', 'origin', bareRemote]);
-      await runGit(seedRepo, ['push', 'origin', 'main']);
-      await runGit(seedRepo, ['checkout', '-b', 'agent/77']);
-      await writeFile(path.join(seedRepo, 'agent-work.md'), 'agent commit\n');
-      await runGit(seedRepo, ['add', 'agent-work.md']);
-      await runGit(seedRepo, ['commit', '-m', 'agent work']);
-      const expectedAgentSha = await captureGit(seedRepo, ['rev-parse', 'HEAD']);
-      await runGit(seedRepo, ['push', 'origin', 'agent/77']);
+      await runGit(sourceRepo, ['init', '-b', 'main']);
+      await runGit(sourceRepo, ['config', 'user.name', 'test']);
+      await runGit(sourceRepo, ['config', 'user.email', 'test@example.com']);
+      await writeFile(path.join(sourceRepo, 'README.md'), 'seed\n');
+      await runGit(sourceRepo, ['add', 'README.md']);
+      await runGit(sourceRepo, ['commit', '-m', 'seed']);
+      await runGit(sourceRepo, ['remote', 'add', 'origin', bareRemote]);
+      await runGit(sourceRepo, ['push', 'origin', 'main']);
+      // Detach the source from the bare remote so it cannot opportunistically
+      // know about `agent/77`: that branch must exist *only* on the bare
+      // remote, never reachable from `sourceRepo`'s refs.
+      await runGit(sourceRepo, ['remote', 'remove', 'origin']);
+
+      // Seed `agent/77` on the bare remote from a throwaway clone — mirrors
+      // "agent ran in its VM and pushed its branch back to GitHub".
+      await runGit(pusher, ['clone', '--branch', 'main', bareRemote, '.']);
+      await runGit(pusher, ['config', 'user.name', 'agent']);
+      await runGit(pusher, ['config', 'user.email', 'agent@example.com']);
+      await runGit(pusher, ['checkout', '-b', 'agent/77']);
+      await writeFile(path.join(pusher, 'agent-work.md'), 'agent commit\n');
+      await runGit(pusher, ['add', 'agent-work.md']);
+      await runGit(pusher, ['commit', '-m', 'agent work']);
+      const expectedAgentSha = await captureGit(pusher, ['rev-parse', 'HEAD']);
+      await runGit(pusher, ['push', 'origin', 'agent/77']);
 
       const { cfg, def } = await buildCfgAndDef(
         {
@@ -572,22 +586,19 @@ describe('Orchestrator VM lifecycle reaping', () => {
         },
         trackerRoot,
       );
-      // Fake WorkspaceManager that mimics setupWorkspaceDir's outcome but
-      // points origin at our local bare remote. Production goes through
-      // setupWorkspaceDir which hardcodes the github.com URL from
-      // SYMPHONY_REPO; for the test we just need an origin git can fetch from.
+      // Fake WorkspaceManager that mimics setupWorkspaceDir's outcome: it
+      // clones the *source repo* (which only has `main`) and then strips +
+      // re-adds origin pointing at the bare remote. After this, the workspace
+      // has NO `refs/remotes/origin/agent/77` ref — exactly the production
+      // shape, so the orchestrator's fetch+reset has to materialize it.
       const fakeWorkspaces = {
         workspacePathFor: (identifier: string) => path.join(wsRoot, identifier),
         ensureFor: async (identifier: string) => {
           const wsPath = path.join(wsRoot, identifier);
           await mkdir(wsPath, { recursive: true });
-          // Clone the bare remote into the per-issue workspace on the base
-          // branch (this is what setupWorkspaceDir does in production).
-          await runGit(wsPath, ['clone', '--branch', 'main', bareRemote, '.']);
+          await runGit(wsPath, ['clone', '--local', '--branch', 'main', sourceRepo, '.']);
           await runGit(wsPath, ['config', 'user.name', 'symphony-agent']);
           await runGit(wsPath, ['config', 'user.email', 'agent@symphony.local']);
-          // Strip the clone's origin and re-add it pointing at our bare
-          // remote (mirrors setupWorkspaceDir's strip + re-add pattern).
           await runGit(wsPath, ['remote', 'remove', 'origin']);
           await runGit(wsPath, ['remote', 'add', 'origin', bareRemote]);
           await runGit(wsPath, ['checkout', '-b', `agent/${identifier}`]);
@@ -605,6 +616,13 @@ describe('Orchestrator VM lifecycle reaping', () => {
         expectedHeadSha: expectedAgentSha,
       });
       assert.equal(outcome.kind, 'ok', JSON.stringify(outcome));
+      // The fetch must create `refs/remotes/origin/agent/77` so the
+      // subsequent `git reset --hard origin/agent/77` resolves. This is the
+      // specific regression: an unscoped `git fetch origin <branch>` cannot
+      // be relied on to update the remote-tracking ref in every git config,
+      // so the orchestrator uses an explicit refspec.
+      const remoteAgentSha = await captureGit(wsPath, ['rev-parse', 'refs/remotes/origin/agent/77']);
+      assert.equal(remoteAgentSha, expectedAgentSha, 'origin/agent/77 ref points at pushed tip');
       // Local HEAD must equal the remote agent branch SHA so the standard
       // rebaseOnto can run its rev-parse HEAD == expectedHeadSha check.
       const headAfter = await captureGit(wsPath, ['rev-parse', 'HEAD']);
@@ -617,7 +635,8 @@ describe('Orchestrator VM lifecycle reaping', () => {
       await rm(trackerRoot, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });
       await rm(bareRemote, { recursive: true, force: true });
-      await rm(seedRepo, { recursive: true, force: true });
+      await rm(sourceRepo, { recursive: true, force: true });
+      await rm(pusher, { recursive: true, force: true });
     }
   });
 
