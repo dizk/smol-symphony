@@ -307,13 +307,13 @@ export class Orchestrator
       this.runLogs.delete(issueId);
     }
     await Promise.all(closures);
-    // The runner's per-attempt cleanup destroys its own VM, but stop() does NOT wait
-    // for in-flight workers to unwind before returning — the bin script then exits
-    // the process, which kills the smolvm CLI children but NOT the libkrun VMs they
-    // launched (those are owned by the smolvm daemon). Without this backstop, every
-    // SIGTERM during an active run leaks one VM per running entry, and over enough
-    // operator restarts the host OOMs (issue 26). `running` is cleared above, so
-    // the reaper's intended set is ∅ and every `symphony-*` VM (registry + any
+    // VM teardown lives in the reconciler `vm` resource (issue 52). stop() does NOT
+    // wait for in-flight workers to unwind before returning — the bin script then
+    // exits the process, which kills the smolvm CLI children but NOT the libkrun VMs
+    // they launched (those are owned by the smolvm daemon). Without this backstop,
+    // every SIGTERM during an active run leaks one VM per running entry, and over
+    // enough operator restarts the host OOMs (issue 26). `running` is cleared above,
+    // so the reaper's intended set is ∅ and every `symphony-*` VM (registry + any
     // surviving `_boot-vm` worker) gets torn down.
     if (this.reconciler) {
       await this.reconciler.reapVms();
@@ -795,14 +795,13 @@ export class Orchestrator
   /** on_worker_exit */
   private onWorkerExit(issueId: string, normal: boolean, reason: string, entry: RunningEntry): void {
     this.running.delete(issueId);
-    // Issue 33: a non-clean exit may have skipped the runner's per-attempt VM
-    // destroy (e.g. JS throw before cleanup ran, smolvm CLI failure, the upstream
-    // smolvm bug that leaves the `_boot-vm` worker alive after `machine delete`).
-    // The `running` entry is gone now so the reaper's intended set excludes it
-    // and the VM / boot-worker — if either survives — is reaped. Clean exits get
-    // the same coverage via the backstop tick; we don't pay the enumeration cost
-    // on every well-behaved dispatch.
-    if (!normal && this.reconciler && !this.stopped) {
+    // Issue 52: the reconciler `vm` resource is the sole owner of VM teardown.
+    // The runner no longer destroys imperatively, so every worker exit — clean
+    // or not — kicks the reaper. With `running.delete` above, the intended set
+    // excludes this issue's VM and the reaper converges it (stop+delete) in a
+    // single pass. Latency stays close to the prior eager path because the kick
+    // is unconditional; with the issue-51 `name`-file reads enumeration is cheap.
+    if (this.reconciler && !this.stopped) {
       void this.reconciler.reapVms().catch((err) =>
         log.debug('post-exit vm reap failed', { error: (err as Error).message }),
       );

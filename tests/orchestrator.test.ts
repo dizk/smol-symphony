@@ -698,6 +698,149 @@ describe('Orchestrator VM lifecycle reaping', () => {
     }
   });
 
+  it('kicks the reaper after a clean worker exit so the VM is freed within one tick (issue 52)', async () => {
+    // Issue 52: VM teardown is owned solely by the reconciler `vm` resource;
+    // the runner no longer calls `smolvm.destroy()` directly. To keep latency
+    // close to the prior eager path, `onWorkerExit` must kick `reapVms()` on
+    // *every* exit, not just non-clean ones. Pre-issue-52 the kick was guarded
+    // by `if (!normal)` so a clean exit waited for the 5-minute backstop tick.
+    // This test pins the new contract by counting `reapVms()` calls observed
+    // by the reconciler stub: a successful `runAttempt` resolution must
+    // trigger one kick from `onWorkerExit`.
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-clean-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-clean-tracker-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          agent: { max_concurrent_agents: 1, memory_admission_enabled: false },
+          polling: { interval_ms: 30 },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+
+      const issue: Issue = {
+        id: 'it1',
+        identifier: 'it1',
+        title: 'issue it1',
+        description: null,
+        priority: null,
+        state: 'Todo',
+        branch_name: null,
+        url: null,
+        labels: [],
+        blocked_by: [],
+        created_at: null,
+        updated_at: null,
+      };
+      let issues: Issue[] = [issue];
+      const tracker: IssueTracker = {
+        async fetchCandidateIssues(): Promise<CandidateFetchResult> {
+          return { issues: issues.map((i) => ({ ...i })), root: null };
+        },
+        async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
+          const set = new Set(stateNames.map((s) => s.toLowerCase()));
+          return issues.filter((i) => set.has(i.state.toLowerCase())).map((i) => ({ ...i }));
+        },
+        async fetchIssueStatesByIds(ids: string[]): Promise<Issue[]> {
+          const set = new Set(ids);
+          return issues.filter((i) => set.has(i.id)).map((i) => ({ ...i }));
+        },
+      };
+
+      // Fake runner: parks `runAttempt` on a promise until the test releases
+      // it with a clean result so the orchestrator's worker can be observed
+      // mid-flight and then exited deterministically.
+      let release: (r: RunAttemptResult) => void = () => undefined;
+      let onDispatch: () => void = () => undefined;
+      const runner = {
+        vmNameFor: (i: Issue) => `symphony-${i.identifier}`,
+        async runAttempt(): Promise<RunAttemptResult> {
+          onDispatch();
+          return new Promise<RunAttemptResult>((r) => {
+            release = r;
+          });
+        },
+      } as unknown as AgentRunner;
+
+      const fake = makeFakeSmolvm([]);
+      const reconciler = makeReconcilerWith(cfg, fake);
+      // Spy on reapVms. The orchestrator calls it at startup (initial sweep)
+      // and after every worker exit. We only care about post-exit calls, so
+      // we snapshot the count at the moment `release` resolves.
+      let reapCalls = 0;
+      const realReap = reconciler.reapVms.bind(reconciler);
+      reconciler.reapVms = async () => {
+        reapCalls++;
+        return realReap();
+      };
+      const fakeWorkspaces = {
+        workspacePathFor(identifier: string): string {
+          return `/tmp/symphony-vm-clean-ws/${identifier}`;
+        },
+        async ensureFor() {
+          return { path: '/tmp/ignored', workspace_key: 'it1', created_now: true };
+        },
+        async remove(): Promise<void> {
+          /* no-op */
+        },
+      } as unknown as WorkspaceManager;
+      const orch = new Orchestrator(
+        cfg,
+        def,
+        { onChange: () => () => undefined, current: () => ({} as any), stop: async () => undefined } as unknown as WorkflowSource,
+        tracker,
+        fakeWorkspaces,
+        runner,
+        undefined,
+        reconciler,
+      );
+      reconciler.setIntendedVmProvider(orch);
+      const dispatched = new Promise<void>((resolve) => {
+        onDispatch = () => resolve();
+      });
+      await orch.start();
+      await dispatched;
+      const preExitCalls = reapCalls;
+
+      // Take the issue off the tracker so the orchestrator's next poll tick
+      // doesn't immediately re-dispatch (the test only cares about the
+      // clean-exit kick, not retry semantics). Then release with a clean
+      // result — this is the path the pre-52 code did NOT kick the reaper on.
+      issues = [{ ...issue, state: 'Done' }];
+      release({ ok: true, reason: 'done', threadId: null, turnsCompleted: 1 });
+
+      // The kick happens synchronously inside onWorkerExit (it's
+      // fire-and-forget but the .reapVms invocation itself is sync). Poll
+      // briefly for the post-exit count to bump above the snapshot.
+      const deadline = Date.now() + 2_000;
+      while (reapCalls <= preExitCalls && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.ok(
+        reapCalls > preExitCalls,
+        `reapVms should fire on clean exit; saw ${preExitCalls} before, ${reapCalls} after`,
+      );
+
+      await orch.stop();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
   it('skips reaping when no Reconciler is wired (test/stub harness)', async () => {
     // The orchestrator's Reconciler parameter is optional so tests that don't
     // care about VM lifecycle can omit it. Confirm that path stays silent and
