@@ -12,19 +12,5 @@
       "severity": "error",
       "name": "adapters↛inward"
     }
-  },
-  {
-    "type": "dependency",
-    "from": "src/workflow.ts",
-    "to": "src/agent/adapters.ts",
-    "unresolvedTo": "./agent/adapters.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "config↛up"
-    }
   }
 ]

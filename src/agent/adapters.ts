@@ -22,9 +22,17 @@
 import { constants as fsConstants } from 'node:fs';
 import { access, copyFile, mkdir, chmod, lstat, rm, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
+import {
+  HOST_CREDENTIAL_PATHS,
+  hostCredentialAbsPathForId,
+  isKnownAdapter,
+  type AcpAdapterId,
+} from './adapter-names.js';
 
-export type AcpAdapterId = 'claude' | 'codex';
+// Re-export the names registry so orchestrator-side callers can keep importing
+// `isKnownAdapter` / `AcpAdapterId` from this module. The canonical home is
+// adapter-names.ts; this is just a convenience re-export.
+export { isKnownAdapter, type AcpAdapterId };
 
 /**
  * How a chosen runtime knob (model, effort, …) is surfaced to a specific adapter.
@@ -93,7 +101,7 @@ export interface AdapterProfile {
 export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   claude: {
     id: 'claude',
-    hostCredentialPath: '.claude/.credentials.json',
+    hostCredentialPath: HOST_CREDENTIAL_PATHS.claude,
     guestCredentialPath: '/root/.claude/.credentials.json',
     binary: ['claude-agent-acp'],
     // claude-agent-acp reads ANTHROPIC_MODEL on startup (see acp-agent.js getAvailableModels:
@@ -121,7 +129,7 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   },
   codex: {
     id: 'codex',
-    hostCredentialPath: '.codex/auth.json',
+    hostCredentialPath: HOST_CREDENTIAL_PATHS.codex,
     guestCredentialPath: '/root/.codex/auth.json',
     binary: ['codex-acp'],
     // codex-acp takes config overrides via `-c key=value` where value is parsed as TOML
@@ -131,17 +139,13 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   },
 };
 
-export function isKnownAdapter(id: string): id is AcpAdapterId {
-  return id === 'claude' || id === 'codex';
-}
-
 export function profileFor(id: AcpAdapterId): AdapterProfile {
   return ADAPTERS[id];
 }
 
 /** Absolute path on the host where the adapter's credential file lives. */
 export function hostCredentialAbsPath(profile: AdapterProfile): string {
-  return path.join(os.homedir(), profile.hostCredentialPath);
+  return hostCredentialAbsPathForId(profile.id);
 }
 
 /**

@@ -27,10 +27,9 @@ import type {
 import { log } from './logging.js';
 import {
   isKnownAdapter,
-  ADAPTERS,
-  hostCredentialAbsPath,
+  hostCredentialAbsPathForId,
   type AcpAdapterId,
-} from './agent/adapters.js';
+} from './agent/adapter-names.js';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { parseActionsBlock } from './actions/parsing.js';
 import type { WorkflowAction } from './actions/types.js';
@@ -882,7 +881,7 @@ function validateStates(states: Record<string, StateConfig>): string | null {
       if (!isKnownAdapter(cfg.adapter)) {
         return `state "${name}": adapter "${cfg.adapter}" is not a known profile; use one of: claude, codex`;
       }
-      const credPath = hostCredentialAbsPath(ADAPTERS[cfg.adapter as AcpAdapterId]);
+      const credPath = hostCredentialAbsPathForId(cfg.adapter as AcpAdapterId);
       try {
         accessSync(credPath, fsConstants.R_OK);
       } catch (err) {
