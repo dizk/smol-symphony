@@ -784,10 +784,10 @@ export class AgentRunner {
     } catch (err) {
       logger.error('smolvm bring-up failed', { error: (err as Error).message });
       // ensureRunning can fail after `machine create` succeeded but before `machine start`
-      // — leaving a halted VM behind. Attempt a destroy so we don't leak it. No bridge
-      // registration exists yet (intentional ordering); nothing else to cancel.
-      runLog?.system('vm_destroy', { vm: vmName, reason: 'bring_up_failed' });
-      await this.smolvm.destroy(vmName);
+      // — leaving a halted VM behind. Teardown is the reconciler `vm` resource's job
+      // (issue 52): on return, the orchestrator drops this issue from `running`, so the
+      // reaper sees the half-created VM as a stray and destroys it on the next kick
+      // (fired from `onWorkerExit`).
       await this.workspaces.runAfterRunBestEffort(
         workspace.path,
         initialHooks,
@@ -810,8 +810,9 @@ export class AgentRunner {
       bridgeReg = this.acpBridge.register(issue.id, issue.identifier);
     } catch (err) {
       logger.error('acp bridge register failed', { error: (err as Error).message });
-      runLog?.system('vm_destroy', { vm: vmName, reason: 'bridge_register_failed' });
-      await this.smolvm.destroy(vmName);
+      // VM is live but the bridge is gone; teardown belongs to the reconciler `vm`
+      // resource (issue 52). Returning here drops the running entry, and the reaper
+      // kick in `onWorkerExit` converges the now-orphaned VM.
       await this.workspaces.runAfterRunBestEffort(
         workspace.path,
         initialHooks,
@@ -971,8 +972,8 @@ export class AgentRunner {
           integrationFailed = true;
           // The reroute mutates runningEntry.issue.state to the conflict state.
           // Refresh the local copy so after_run resolution below picks up the
-          // conflict state's hooks (typically none) and so vm_destroy logging
-          // shows the post-reroute state.
+          // conflict state's hooks (typically none) and so vm_teardown_deferred
+          // logging shows the post-reroute state.
           cleanupState = runningEntry.issue.state;
         }
       }
@@ -1044,13 +1045,13 @@ export class AgentRunner {
       } finally {
         if (extraEnvCleanup) await extraEnvCleanup();
       }
-      // Per the agreed lifecycle, every attempt gets a fresh VM. Destroy is best-effort:
-      // smolvm.destroy already swallows errors and logs at warn, so a stuck/lost VM here
-      // never aborts the attempt's return path. The next attempt's ensureRunning will
-      // notice the VM is absent and create a new one.
+      // Per the agreed lifecycle, every attempt gets a fresh VM. Teardown is the
+      // reconciler `vm` resource's job (issue 52): the runner only mutates desired
+      // state. By the time this `cleanup()` returns, `runAttempt` returns to the
+      // orchestrator, which deletes the running entry and kicks the reaper —
+      // converging the now-orphan VM in one tick.
       if (vmReady) {
-        runLog?.system('vm_destroy', { vm: vmName, reason });
-        await this.smolvm.destroy(vmName);
+        runLog?.system('vm_teardown_deferred', { vm: vmName, reason });
       }
     };
 
