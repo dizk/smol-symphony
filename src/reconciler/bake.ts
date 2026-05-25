@@ -7,13 +7,17 @@
 // via `smolvm machine create --from <cache_path>` instead of `--smolfile <path>`,
 // skipping the per-start init pay.
 
-import { createHash } from 'node:crypto';
 import { readFile, stat, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { SmolvmConfig } from '../types.js';
 import { log } from '../logging.js';
+import {
+  computeBakeHash,
+  selectGcVictims,
+  type CachedArtifact,
+} from './bake-plan.js';
 import { actionCacheDir, ensureCacheDir, tryAcquireLock, type FileLock } from './cache.js';
 import { ResourceActionLedger } from './ledger.js';
 import type { ResourceSnapshot } from './types.js';
@@ -226,28 +230,8 @@ export class BakeResource {
       this.state.forcePending = false;
       return;
     }
-    let desiredHash: string;
-    try {
-      const buf = await readFile(this.opts.smolvm.smolfile);
-      desiredHash = createHash('sha256').update(buf).digest('hex');
-    } catch (err) {
-      const msg = `read Smolfile failed: ${(err as Error).message}`;
-      this.state.lastError = msg;
-      // Clear desired/ready so a Smolfile that becomes unreadable after a
-      // successful bake (deletion, permission change) drops the dispatch gate
-      // instead of leaving stale `readyHash === desiredHash` from the prior
-      // pass. Without this, `dispatchReady()` would stay true and the runner
-      // would dispatch against the previous artifact even though the
-      // prerequisite (a readable Smolfile) no longer converges.
-      this.state.desiredHash = null;
-      this.state.readyHash = null;
-      this.ledger.record('bake:read-smolfile', 'error', msg);
-      log.warn('bake reconcile: smolfile read failed', {
-        smolfile: this.opts.smolvm.smolfile,
-        error: msg,
-      });
-      return;
-    }
+    const desiredHash = await this.readDesiredHash();
+    if (!desiredHash) return;
     this.state.desiredHash = desiredHash;
 
     // Fold the sticky `forcePending` flag into the per-call force decision. This is
@@ -258,36 +242,21 @@ export class BakeResource {
     // observes forcePending=true here and runs force semantics (unlink + rebake)
     // instead of the cache-hit branch.
     const force = opts.force === true || this.state.forcePending;
-    if (force) {
-      try {
-        await unlink(this.cachePath(desiredHash));
-      } catch {
-        /* already absent */
-      }
-      this.state.readyHash = null;
-    }
+    if (force) await this.invalidateCachedArtifact(desiredHash);
 
     // Cache hit? Update ready flag and we're done. (Unreachable under force in the
     // common case because we just unlinked; but a concurrent writer could land an
     // artifact between the unlink and the stat, in which case we accept it as fresh
     // and clear forcePending.)
-    const cached = await this.cachedArtifactExists(desiredHash);
-    if (cached) {
-      this.state.readyHash = desiredHash;
-      if (this.state.forcePending) this.state.forcePending = false;
-      // Best-effort GC every reconcile pass; cheap when the cache is small.
-      await this.gcCache(desiredHash).catch((err) =>
-        log.debug('bake gc failed', { error: (err as Error).message }),
-      );
+    if (await this.cachedArtifactExists(desiredHash)) {
+      await this.adoptCachedArtifact(desiredHash);
       return;
     }
 
     // Already baking the right hash? Don't kick off a duplicate. forcePending will
     // be cleared when that bake completes (any successful bake against the current
     // desiredHash is by definition "fresh" enough to satisfy the operator's force).
-    if (this.state.inFlight && this.state.inFlightHash === desiredHash) {
-      return;
-    }
+    if (this.state.inFlight && this.state.inFlightHash === desiredHash) return;
 
     // Synchronously claim this hash BEFORE awaiting runBake's first await. Without
     // this, two reconcile() calls landing in the same microtask window would both
@@ -301,6 +270,45 @@ export class BakeResource {
       this.state.inFlight = null;
       this.state.inFlightHash = null;
     });
+  }
+
+  // Read the Smolfile and hash it. On failure, record the error, drop
+  // desired/ready (so a vanished Smolfile closes the dispatch gate even after
+  // a successful prior bake), and return null so the caller short-circuits.
+  private async readDesiredHash(): Promise<string | null> {
+    try {
+      const buf = await readFile(this.opts.smolvm.smolfile!);
+      return computeBakeHash(buf);
+    } catch (err) {
+      const msg = `read Smolfile failed: ${(err as Error).message}`;
+      this.state.lastError = msg;
+      this.state.desiredHash = null;
+      this.state.readyHash = null;
+      this.ledger.record('bake:read-smolfile', 'error', msg);
+      log.warn('bake reconcile: smolfile read failed', {
+        smolfile: this.opts.smolvm.smolfile,
+        error: msg,
+      });
+      return null;
+    }
+  }
+
+  private async invalidateCachedArtifact(hash: string): Promise<void> {
+    try {
+      await unlink(this.cachePath(hash));
+    } catch {
+      /* already absent */
+    }
+    this.state.readyHash = null;
+  }
+
+  private async adoptCachedArtifact(hash: string): Promise<void> {
+    this.state.readyHash = hash;
+    this.state.forcePending = false;
+    // Best-effort GC every reconcile pass; cheap when the cache is small.
+    await this.gcCache(hash).catch((err) =>
+      log.debug('bake gc failed', { error: (err as Error).message }),
+    );
   }
 
   async waitForInFlight(): Promise<void> {
@@ -336,24 +344,8 @@ export class BakeResource {
     const outputPath = this.cachePath(hash);
     const lockPath = `${outputPath}.lock`;
     await ensureCacheDir(actionCacheDir(this.opts.cacheRoot, 'bake'));
-
-    let lock: FileLock | null;
-    try {
-      lock = await tryAcquireLock(lockPath);
-    } catch (err) {
-      this.recordFailure(hash, `lock acquire failed: ${(err as Error).message}`);
-      return;
-    }
-    if (!lock) {
-      // Another symphony instance is baking this hash. We don't compete; the next
-      // reconcile pass (config-change/tracker-change/backstop tick) will re-check
-      // the cached artifact and pick up the winner's output. Record an in-progress
-      // action so the dashboard shows "waiting on concurrent bake".
-      log.info('bake: another instance holds the lock; waiting', { hash, lock_path: lockPath });
-      this.ledger.start(`bake:${hash}`);
-      this.state.inFlightHash = hash;
-      return;
-    }
+    const lock = await this.acquireBakeLock(hash, lockPath);
+    if (!lock) return;
 
     this.ledger.start(`bake:${hash}`);
     this.state.inFlightHash = hash;
@@ -364,29 +356,7 @@ export class BakeResource {
     });
 
     try {
-      await this.opts.executor.bake({
-        smolfile_path: this.opts.smolvm.smolfile!,
-        output_path: outputPath,
-        cpus: this.opts.smolvm.cpus,
-        mem_mib: this.opts.smolvm.mem_mib,
-      });
-      // Re-check the artifact actually landed. A buggy executor that returns without
-      // writing would otherwise flip ready=true erroneously.
-      const ok = await this.cachedArtifactExists(hash);
-      if (!ok) {
-        throw new Error('bake completed but artifact is missing');
-      }
-      this.ledger.done(`bake:${hash}`);
-      this.state.readyHash = hash;
-      this.state.lastError = null;
-      // Any successful bake against the current desiredHash satisfies a pending
-      // force request: a fresh artifact exists on disk. Clear forcePending so
-      // ready() flips true and dispatch can proceed.
-      this.state.forcePending = false;
-      log.info('bake ready', { hash, output: outputPath });
-      await this.gcCache(hash).catch((err) =>
-        log.debug('bake gc failed', { error: (err as Error).message }),
-      );
+      await this.bakeAndVerify(hash, outputPath);
     } catch (err) {
       const msg = (err as Error).message;
       this.recordFailure(hash, msg);
@@ -396,6 +366,58 @@ export class BakeResource {
     }
   }
 
+  // Try to claim the bake lock for `hash`. Returns null when either acquire
+  // failed (recorded as ledger error) or another symphony instance already
+  // holds the lock (logged + ledger-started so the dashboard surfaces it).
+  // Caller short-circuits on null.
+  private async acquireBakeLock(hash: string, lockPath: string): Promise<FileLock | null> {
+    let lock: FileLock | null;
+    try {
+      lock = await tryAcquireLock(lockPath);
+    } catch (err) {
+      this.recordFailure(hash, `lock acquire failed: ${(err as Error).message}`);
+      return null;
+    }
+    if (!lock) {
+      // Another symphony instance is baking this hash. We don't compete; the next
+      // reconcile pass (config-change/tracker-change/backstop tick) will re-check
+      // the cached artifact and pick up the winner's output. Record an in-progress
+      // action so the dashboard shows "waiting on concurrent bake".
+      log.info('bake: another instance holds the lock; waiting', { hash, lock_path: lockPath });
+      this.ledger.start(`bake:${hash}`);
+      this.state.inFlightHash = hash;
+      return null;
+    }
+    return lock;
+  }
+
+  // Drive the executor, verify the artifact actually landed, and record success.
+  // Throws on any step's failure so `runBake`'s catch handles it uniformly.
+  private async bakeAndVerify(hash: string, outputPath: string): Promise<void> {
+    await this.opts.executor.bake({
+      smolfile_path: this.opts.smolvm.smolfile!,
+      output_path: outputPath,
+      cpus: this.opts.smolvm.cpus,
+      mem_mib: this.opts.smolvm.mem_mib,
+    });
+    // Re-check the artifact actually landed. A buggy executor that returns without
+    // writing would otherwise flip ready=true erroneously.
+    if (!(await this.cachedArtifactExists(hash))) {
+      throw new Error('bake completed but artifact is missing');
+    }
+    this.ledger.done(`bake:${hash}`);
+    this.state.readyHash = hash;
+    this.state.lastError = null;
+    // Any successful bake against the current desiredHash satisfies a pending
+    // force request: a fresh artifact exists on disk. Clear forcePending so
+    // ready() flips true and dispatch can proceed.
+    this.state.forcePending = false;
+    log.info('bake ready', { hash, output: outputPath });
+    await this.gcCache(hash).catch((err) =>
+      log.debug('bake gc failed', { error: (err as Error).message }),
+    );
+  }
+
   private recordFailure(hash: string, error: string): void {
     this.state.lastError = error;
     this.ledger.error(`bake:${hash}`, error);
@@ -403,39 +425,44 @@ export class BakeResource {
 
   // Keep at most BAKE_CACHE_MAX_ENTRIES bake artifacts. The current ready hash is
   // always preserved; older artifacts are evicted by mtime ascending (LRU). Lock
-  // files are ignored.
+  // files are ignored. The selection itself is pure (`selectGcVictims`); this
+  // method just does the IO.
   private async gcCache(keepHash: string): Promise<void> {
     const dir = actionCacheDir(this.opts.cacheRoot, 'bake');
+    const artifacts = await this.listCachedArtifacts(dir);
+    const victims = selectGcVictims(
+      artifacts,
+      `${keepHash}.smolmachine`,
+      BAKE_CACHE_MAX_ENTRIES,
+    );
+    for (const name of victims) {
+      try {
+        await unlink(path.join(dir, name));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  private async listCachedArtifacts(dir: string): Promise<CachedArtifact[]> {
     let entries: string[];
     try {
       entries = await readdir(dir);
     } catch {
-      return;
+      return [];
     }
-    const artifacts: Array<{ name: string; mtime: number }> = [];
+    const out: CachedArtifact[] = [];
     for (const name of entries) {
       if (!name.endsWith('.smolmachine')) continue;
-      const full = path.join(dir, name);
       try {
-        const st = await stat(full);
+        const st = await stat(path.join(dir, name));
         if (!st.isFile()) continue;
-        artifacts.push({ name, mtime: st.mtimeMs });
+        out.push({ name, mtime: st.mtimeMs });
       } catch {
         /* ignore */
       }
     }
-    if (artifacts.length <= BAKE_CACHE_MAX_ENTRIES) return;
-    artifacts.sort((a, b) => b.mtime - a.mtime);
-    const keep = new Set<string>([`${keepHash}.smolmachine`]);
-    for (const a of artifacts.slice(0, BAKE_CACHE_MAX_ENTRIES)) keep.add(a.name);
-    for (const a of artifacts) {
-      if (keep.has(a.name)) continue;
-      try {
-        await unlink(path.join(dir, a.name));
-      } catch {
-        /* ignore */
-      }
-    }
+    return out;
   }
 }
 
