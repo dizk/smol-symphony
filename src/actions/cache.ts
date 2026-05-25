@@ -20,9 +20,9 @@
 
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { actionCacheDir, defaultCacheRoot } from '../reconciler/cache.js';
+import { runProcess } from '../util/process.js';
 
 export const RUN_IN_VM_CACHE_KIND = 'run_in_vm';
 
@@ -114,20 +114,19 @@ async function workspaceTreeHash(workspacePath: string): Promise<string> {
   return h.digest('hex');
 }
 
-function runGitCapture(args: string[], cwd: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, {
-      cwd,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      env: process.env,
-    });
-    let out = '';
-    child.stdout?.on('data', (b) => {
-      out += b.toString('utf8');
-    });
-    child.on('error', () => resolve(null));
-    child.on('close', (code) => resolve(code === 0 ? out : null));
+// Thin shape adapter: workspace-tree hashing wants `stdout | null` (null on
+// any non-zero/error). The unified `runProcess` returns the full result; we
+// throw away stderr (workspace-tree probes are quiet on the happy path) and
+// project exit_code into the nullable signal. `maxBytes` is raised well above
+// the unified default because `ls-files` output for a non-trivial workspace
+// quickly exceeds 64 KiB; the cache hash MUST see the complete file list.
+async function runGitCapture(args: string[], cwd: string): Promise<string | null> {
+  const r = await runProcess('git', args, {
+    cwd,
+    maxBytes: 16 * 1024 * 1024,
+    appendErrorToStderr: false,
   });
+  return r.exit_code === 0 ? r.stdout : null;
 }
 
 /**

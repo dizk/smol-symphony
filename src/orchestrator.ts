@@ -43,7 +43,7 @@ import type {
   PrIntent,
   PrIntendedProvider,
 } from './reconciler/index.js';
-import { spawn } from 'node:child_process';
+import { runProcess } from './util/process.js';
 
 export interface Snapshot {
   generated_at: string;
@@ -1301,23 +1301,10 @@ export class Orchestrator
       process.env.SYMPHONY_SOURCE_REPO && process.env.SYMPHONY_SOURCE_REPO.length > 0
         ? process.env.SYMPHONY_SOURCE_REPO
         : this.cfg.workflow_dir;
-    return new Promise((resolve) => {
-      const child = spawn('git', ['rev-parse', branch], {
-        cwd: sourceRepo,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
-      });
-      let stdout = '';
-      child.stdout?.on('data', (b) => {
-        stdout += b.toString('utf8');
-      });
-      child.on('error', () => resolve(null));
-      child.on('close', (code) => {
-        if (code !== 0) return resolve(null);
-        const sha = stdout.trim();
-        resolve(sha.length > 0 ? { branch, sha } : null);
-      });
-    });
+    const r = await runProcess('git', ['rev-parse', branch], { cwd: sourceRepo });
+    if (r.exit_code !== 0) return null;
+    const sha = r.stdout.trim();
+    return sha.length > 0 ? { branch, sha } : null;
   }
 
   // Public hooks the runner uses to feed events back.

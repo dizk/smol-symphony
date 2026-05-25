@@ -34,8 +34,8 @@
 // All git + GH I/O is behind injectable callbacks. Production wires real
 // shell-outs; tests pass synchronous stubs.
 
-import { spawn } from 'node:child_process';
 import { log } from '../logging.js';
+import { runProcess } from '../util/process.js';
 import type { ActionStatus, ResourceSnapshot } from './types.js';
 
 export type PrIntentKind = 'merge' | 'close';
@@ -1008,40 +1008,27 @@ interface ShellResult {
   stderr: string;
 }
 
-function runShell(
+// Thin shape adapter over the unified runProcess. `exit: -1` is the historical
+// PR-autopilot sentinel for "spawn errored or process signalled"; map runProcess's
+// `exit_code: null` into it so downstream gh-output / git-stderr parsing stays
+// identical to the pre-refactor shape.
+async function runShell(
   cmd: string,
   args: string[],
   opts: { cwd?: string; timeoutMs?: number } = {},
 ): Promise<ShellResult> {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, {
-      cwd: opts.cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    });
-    let stdout = '';
-    let stderr = '';
-    let timer: NodeJS.Timeout | null = null;
-    if (opts.timeoutMs && opts.timeoutMs > 0) {
-      timer = setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs);
-    }
-    child.stdout?.on('data', (b) => {
-      stdout += b.toString('utf8');
-      if (stdout.length > 1_048_576) stdout = stdout.slice(0, 1_048_576);
-    });
-    child.stderr?.on('data', (b) => {
-      stderr += b.toString('utf8');
-      if (stderr.length > 1_048_576) stderr = stderr.slice(0, 1_048_576);
-    });
-    child.on('error', (err) => {
-      if (timer) clearTimeout(timer);
-      resolve({ exit: -1, stdout, stderr: stderr + String(err) });
-    });
-    child.on('close', (code) => {
-      if (timer) clearTimeout(timer);
-      resolve({ exit: code ?? -1, stdout, stderr });
-    });
+  const r = await runProcess(cmd, args, {
+    cwd: opts.cwd,
+    timeoutMs: opts.timeoutMs,
+    // PR autopilot's git/gh output can be large (rebase trees, gh json blobs);
+    // keep the historical 1 MiB clamp rather than the 64 KiB default.
+    maxBytes: 1_048_576,
   });
+  return {
+    exit: r.exit_code ?? -1,
+    stdout: r.stdout,
+    stderr: r.stderr,
+  };
 }
 
 /** Default production PrApi backed by the `gh` CLI on the host. */

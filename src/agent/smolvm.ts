@@ -6,14 +6,11 @@
 // needs.
 
 import { spawn, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
-import { promisify } from 'node:util';
-import { execFile as execFileCb } from 'node:child_process';
 import path from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import type { SmolvmConfig } from '../types.js';
+import { runProcess, describeRunFailure } from '../util/process.js';
 import { log } from '../logging.js';
-
-const execFile = promisify(execFileCb);
 
 // Prefix used by every VM the orchestrator creates. The runner mints VM names as
 // `${SYMPHONY_VM_PREFIX}<sanitized-identifier>`; the orchestrator owns this namespace
@@ -104,21 +101,22 @@ export class SmolvmClient {
     return out.join(' ');
   }
 
+  // Smolvm CLI invocations route through the unified `runProcess`. The legacy
+  // `execFile` shape used a 32 MiB maxBuffer; we keep that ceiling here because
+  // `machine ls --json` can return a long list of machines on a busy daemon.
   private async run(args: string[], opts: { timeoutMs?: number } = {}): Promise<{ stdout: string; stderr: string }> {
     log.debug('smolvm cli', { argv: this.redactArgv(args) });
-    try {
-      const { stdout, stderr } = await execFile('smolvm', args, {
-        maxBuffer: 32 * 1024 * 1024,
-        timeout: opts.timeoutMs,
-      });
-      return { stdout, stderr };
-    } catch (err) {
-      const e = err as Error & { stdout?: string; stderr?: string; code?: string | number };
+    const r = await runProcess('smolvm', args, {
+      timeoutMs: opts.timeoutMs,
+      maxBytes: 32 * 1024 * 1024,
+    });
+    if (r.exit_code !== 0 || r.timed_out || r.signal !== null) {
       throw new SmolvmError(
         'smolvm_cli_failed',
-        `smolvm ${args.join(' ')} failed: ${e.stderr ?? e.message ?? e.code ?? 'unknown'}`,
+        `smolvm ${args.join(' ')} ${describeRunFailure(r)}: ${r.stderr.trim() || r.stdout.trim()}`,
       );
     }
+    return { stdout: r.stdout, stderr: r.stderr };
   }
 
   // List all VM names known to the smolvm daemon. Failures (daemon down, malformed

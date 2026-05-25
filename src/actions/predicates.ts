@@ -7,9 +7,9 @@
 
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import type { ActionContext, ActionPredicate } from './types.js';
 import { renderTemplate } from './templating.js';
+import { runProcess } from '../util/process.js';
 
 /**
  * Evaluate a predicate against the context. `null`/undefined → always true
@@ -54,14 +54,10 @@ export async function evaluatePredicate(
   return false;
 }
 
-function runGitSilent(args: string[], cwd: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, {
-      cwd,
-      stdio: ['ignore', 'ignore', 'ignore'],
-      env: process.env,
-    });
-    child.on('error', () => resolve(false));
-    child.on('close', (code) => resolve(code === 0));
-  });
+// Thin shape adapter over runProcess: predicates only care about exit==0.
+// The underlying invocation already uses `--verify --quiet` so neither stream
+// should produce meaningful output; the tiny default clamp is plenty.
+async function runGitSilent(args: string[], cwd: string): Promise<boolean> {
+  const r = await runProcess('git', args, { cwd, appendErrorToStderr: false });
+  return r.exit_code === 0;
 }
