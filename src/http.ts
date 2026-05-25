@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { parseFrontMatterLenient } from './util/frontmatter.js';
 import type { Orchestrator } from './orchestrator.js';
 import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
@@ -188,37 +188,23 @@ async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
       } catch {
         continue;
       }
-      let title = f.slice(0, -3);
-      const titleMatch = /^---[\s\S]*?\ntitle:\s*(.+)\n[\s\S]*?---/m.exec(text);
-      if (titleMatch) {
-        title = titleMatch[1]!.trim().replace(/^["'](.*)["']$/, '$1');
-      }
-      const proposed_by = matchFrontMatterString(text, 'proposed_by');
-      const proposed_at = matchFrontMatterString(text, 'proposed_at');
+      const { fields } = parseFrontMatterLenient(text);
+      const title = asString(fields['title']) ?? f.slice(0, -3);
+      const proposed_by = asString(fields['proposed_by']);
+      const proposed_at = asString(fields['proposed_at']);
       // Prefer the front-matter `identifier:` when set so the dashboard reports the
       // same identifier the orchestrator dispatches under (LocalMarkdownTracker's
       // normalize() at src/trackers/local.ts uses `fm.identifier ?? filename`).
       // Without this, an issue whose front-matter identifier differs from its
       // filename loses its overlaid running/retrying/awaiting state on the board
       // and its ticker jump-link points at a missing #row anchor.
-      const fmIdent = matchFrontMatterString(text, 'identifier');
+      const fmIdent = asString(fields['identifier']);
       const identifier = fmIdent && fmIdent.length > 0 ? fmIdent : f.slice(0, -3);
       out.push({ identifier, state: stateDir, title, proposed_by, proposed_at });
     }
   }
   out.sort((a, b) => a.identifier.localeCompare(b.identifier));
   return out;
-}
-
-// Read a single string-valued key from the YAML front-matter block at the top of the file.
-// Mirrors the cheap regex approach used for `title` rather than a full YAML parse — the
-// dashboard only needs the value for display, and the local tracker's reader (which uses
-// the real YAML parser) is still authoritative for dispatch.
-function matchFrontMatterString(text: string, key: string): string | null {
-  const re = new RegExp(`^---[\\s\\S]*?\\n${key}:\\s*(.+)\\n[\\s\\S]*?---`, 'm');
-  const m = re.exec(text);
-  if (!m) return null;
-  return m[1]!.trim().replace(/^["'](.*)["']$/, '$1');
 }
 
 // Read a single issue file by basename identifier. Walks every state directory under the
@@ -263,8 +249,8 @@ async function readIssueFromDisk(
     } catch {
       continue;
     }
-    const { frontMatter, body } = splitMarkdownFrontMatter(text);
-    return { identifier, state: stateDir, filePath, frontMatter, body };
+    const { fields, body } = parseFrontMatterLenient(text);
+    return { identifier, state: stateDir, filePath, frontMatter: fields, body };
   }
   // Fallback: scan every .md file in every state directory and match by the
   // front-matter `identifier:` field. Handles the case where the orchestrator
@@ -296,48 +282,12 @@ async function readIssueFromDisk(
       } catch {
         continue;
       }
-      const fmIdent = matchFrontMatterString(text, 'identifier');
-      if (fmIdent !== identifier) continue;
-      const { frontMatter, body } = splitMarkdownFrontMatter(text);
-      return { identifier, state: stateDir, filePath, frontMatter, body };
+      const { fields, body } = parseFrontMatterLenient(text);
+      if (asString(fields['identifier']) !== identifier) continue;
+      return { identifier, state: stateDir, filePath, frontMatter: fields, body };
     }
   }
   return null;
-}
-
-// Mirrors trackers/local.ts's splitFrontMatter — local copy keeps http.ts self-contained
-// for tests that don't construct a tracker. Failures fall through to an empty front matter
-// rather than throwing so the detail page still renders the body for files with malformed
-// YAML (the orchestrator would have skipped them anyway).
-function splitMarkdownFrontMatter(text: string): {
-  frontMatter: Record<string, unknown>;
-  body: string;
-} {
-  if (!text.startsWith('---')) return { frontMatter: {}, body: text.trim() };
-  const lines = text.split(/\r?\n/);
-  const isFence = (l: string | undefined) => /^---\s*$/.test(l ?? '');
-  if (!isFence(lines[0])) return { frontMatter: {}, body: text.trim() };
-  let endIdx = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (isFence(lines[i])) {
-      endIdx = i;
-      break;
-    }
-  }
-  if (endIdx < 0) return { frontMatter: {}, body: text.trim() };
-  const fmText = lines.slice(1, endIdx).join('\n').trim();
-  const body = lines.slice(endIdx + 1).join('\n').trim();
-  let parsed: unknown = {};
-  if (fmText.length > 0) {
-    try {
-      parsed = parseYaml(fmText);
-    } catch {
-      parsed = {};
-    }
-  }
-  if (parsed === null || parsed === undefined) parsed = {};
-  if (typeof parsed !== 'object' || Array.isArray(parsed)) parsed = {};
-  return { frontMatter: parsed as Record<string, unknown>, body };
 }
 
 async function gatherPartialInputs(
