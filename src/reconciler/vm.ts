@@ -28,7 +28,7 @@
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { SYMPHONY_VM_PREFIX, type SmolvmClient } from '../agent/smolvm.js';
+import { SYMPHONY_VM_PREFIX, type SmolvmClient } from '../agent/smolvm-port.js';
 import { log } from '../logging.js';
 import { ResourceActionLedger } from './ledger.js';
 import type { ResourceSnapshot } from './types.js';

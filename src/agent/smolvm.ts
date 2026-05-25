@@ -11,61 +11,20 @@ import type { Readable, Writable } from 'node:stream';
 import type { SmolvmConfig } from '../types.js';
 import { runProcess, describeRunFailure } from '../util/process.js';
 import { log } from '../logging.js';
+import type {
+  SmolvmClient as SmolvmClientPort,
+  CreateOptions,
+  ExecOptions,
+  ExecStream,
+  VmMount,
+} from './smolvm-port.js';
 
-// Prefix used by every VM the orchestrator creates. The runner mints VM names as
-// `${SYMPHONY_VM_PREFIX}<sanitized-identifier>`; the orchestrator owns this namespace
-// so any matching VM that survives across symphony process restarts (e.g. a SIGKILL'd
-// previous instance) is treated as orphaned and destroyed at start/stop.
-export const SYMPHONY_VM_PREFIX = 'symphony-';
-
-export interface VmMount {
-  host: string;
-  guest: string;
-  readonly: boolean;
-}
-
-export interface CreateOptions {
-  // Source for the VM. At most one of:
-  //   - `image`    : OCI image reference (`--image`).
-  //   - `from`     : path to a packed .smolmachine artifact (`--from`). Boots from
-  //                  pre-extracted layers (~250ms).
-  //   - `smolfile` : path to a TOML Smolfile (`--smolfile`). The Smolfile declares
-  //                  image + resources + `[dev].init` + `[dev].volumes`; symphony's
-  //                  CLI flags merge with the Smolfile per smolvm's precedence rules
-  //                  (CLI > Smolfile > defaults).
-  // Mutual exclusion is enforced upstream in `validateDispatch`. When two are
-  // somehow still set, `from` > `smolfile` > `image` so the highest-fidelity source
-  // wins.
-  image: string | null;
-  from: string | null;
-  smolfile: string | null;
-  cpus: number;
-  memMib: number;
-  net: boolean;
-  mounts: VmMount[];
-  env: Record<string, string>;
-  workdir: string | null;
-  sshAgent: boolean;
-}
-
-export interface ExecOptions {
-  command: string[];
-  workdir: string | null;
-  env: Record<string, string>;
-  timeoutMs: number | null;
-}
-
-export interface ExecStream {
-  child: ChildProcessByStdio<Writable, Readable, Readable>;
-  stdin: Writable;
-  stdout: Readable;
-  stderr: Readable;
-  pid: number | undefined;
-  /** Resolves with the child's exit info when the subprocess closes. */
-  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
-  /** Send SIGTERM, then SIGKILL after a short grace period. */
-  kill(): void;
-}
+// Re-export the port's surface from the concrete adapter so the handful of
+// existing call sites that import value/types from `./smolvm.js` keep working
+// without code churn. New domain code should import from `./smolvm-port.js`
+// directly to keep the hexagonal direction clean.
+export { SYMPHONY_VM_PREFIX } from './smolvm-port.js';
+export type { CreateOptions, ExecOptions, ExecStream, VmMount } from './smolvm-port.js';
 
 export class SmolvmError extends Error {
   constructor(public code: string, message: string) {
@@ -74,7 +33,7 @@ export class SmolvmError extends Error {
   }
 }
 
-export class SmolvmClient {
+export class SmolvmClient implements SmolvmClientPort {
   constructor(private readonly cfg: SmolvmConfig) {}
 
   // The smolvm binary is invoked directly. The endpoint config is reserved for a future HTTP
