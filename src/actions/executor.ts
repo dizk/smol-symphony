@@ -48,6 +48,7 @@ import {
 } from './cache.js';
 import type { HookCapture } from '../workspace.js';
 import { log } from '../logging.js';
+import { realClock, isoFromClock, type ClockNow } from '../util/clock.js';
 
 const DEFAULT_RETRY_COUNT = 3;
 const DEFAULT_RETRY_BACKOFF_MS = 1_000;
@@ -127,6 +128,13 @@ export interface ActionExecutorOptions {
    * from hanging the run forever.
    */
   defaultCommandTimeoutMs?: number;
+  /**
+   * Wall-clock injection point. Tests pin time; production wires `Date.now`
+   * (or the realClock util default). Used to stamp ledger row started_at /
+   * finished_at fields. Mirrors the `now` seam on PrResource / ledger so the
+   * whole reconciler/action side of the core is deterministic.
+   */
+  now?: ClockNow;
 }
 
 export interface ActionExecResult {
@@ -151,6 +159,8 @@ export async function runActions(
   actions: readonly WorkflowAction[],
   opts: ActionExecutorOptions,
 ): Promise<ActionExecResult> {
+  const now = opts.now ?? realClock;
+  const iso = () => isoFromClock(now);
   const ledger: ActionStatus[] = [];
   const push = (status: ActionStatus) => {
     ledger.unshift(status);
@@ -169,7 +179,7 @@ export async function runActions(
     if (aborted) break;
     const action = actions[i]!;
     const actionKey = actionSnapshotKey(action, i);
-    const startedAt = new Date().toISOString();
+    const startedAt = iso();
     push({
       resource: opts.snapshotId,
       action: actionKey,
@@ -187,7 +197,7 @@ export async function runActions(
       rendered = renderTree(action, opts.ctx);
     } catch (err) {
       const msg = err instanceof TemplateError ? err.message : (err as Error).message;
-      upd(actionKey, { state: 'error', finished_at: new Date().toISOString(), error: msg });
+      upd(actionKey, { state: 'error', finished_at: iso(), error: msg });
       log.warn('action template render failed', {
         action: actionKey,
         error: msg,
@@ -206,13 +216,13 @@ export async function runActions(
       shouldRun = await evaluatePredicate(rendered.if, opts.ctx, opts.workspacePath);
     } catch (err) {
       const msg = (err as Error).message;
-      upd(actionKey, { state: 'error', finished_at: new Date().toISOString(), error: msg });
+      upd(actionKey, { state: 'error', finished_at: iso(), error: msg });
       aborted = true;
       abortReason = msg;
       break;
     }
     if (!shouldRun) {
-      upd(actionKey, { state: 'done', finished_at: new Date().toISOString() });
+      upd(actionKey, { state: 'done', finished_at: iso() });
       opts.capture?.onChunk?.('stdout', `[action ${actionKey}] skipped (if=false)\n`);
       log.debug('action skipped', { action: actionKey, reason: 'if=false' });
       continue;
@@ -251,7 +261,7 @@ export async function runActions(
 
     if (outcome.ok) {
       const note = outcome.cache_hit ? ' (cache hit)' : '';
-      upd(actionKey, { state: 'done', finished_at: new Date().toISOString() });
+      upd(actionKey, { state: 'done', finished_at: iso() });
       opts.capture?.onChunk?.('stdout', `[action ${actionKey}] ok${note}\n`);
       continue;
     }
@@ -266,7 +276,7 @@ export async function runActions(
     }
     upd(actionKey, {
       state: 'error',
-      finished_at: new Date().toISOString(),
+      finished_at: iso(),
       error: outcome.reason ?? 'unknown',
     });
     opts.capture?.onChunk?.(
@@ -579,7 +589,7 @@ async function applyRunInVm(
     exit_code: res.exit_code ?? -1,
     stdout: res.stdout,
     stderr: res.stderr,
-    finished_at: new Date().toISOString(),
+    finished_at: isoFromClock(opts.now ?? realClock),
   };
   if (res.exit_code === 0) {
     // Cache successes only; see comment above the readCache branch.
