@@ -34,6 +34,7 @@ import {
   type PrGitApi,
   type PrIntendedProvider,
   type PrTransitionApi,
+  type PrWorkspaceEnsureApi,
 } from './pr.js';
 import type { ServiceConfig, SmolvmConfig } from '../types.js';
 import type { SmolvmClient } from '../agent/smolvm.js';
@@ -75,6 +76,7 @@ export interface ReconcilerOptions {
   prGit?: PrGitApi;
   prTransition?: PrTransitionApi;
   prCleanup?: PrCleanupApi;
+  prWorkspaceEnsure?: PrWorkspaceEnsureApi;
 }
 
 export class Reconciler {
@@ -108,6 +110,7 @@ export class Reconciler {
   private prGit: PrGitApi | null = null;
   private prTransition: PrTransitionApi | null = null;
   private prCleanup: PrCleanupApi | null = null;
+  private prWorkspaceEnsure: PrWorkspaceEnsureApi | null = null;
   private backstopTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   // Single-flight: collapse concurrent reconcile() calls into one ongoing pass so
@@ -151,6 +154,7 @@ export class Reconciler {
     if (opts.prGit) this.prGit = opts.prGit;
     if (opts.prTransition) this.prTransition = opts.prTransition;
     if (opts.prCleanup) this.prCleanup = opts.prCleanup;
+    if (opts.prWorkspaceEnsure) this.prWorkspaceEnsure = opts.prWorkspaceEnsure;
     this.pr = this.buildPrResource();
   }
 
@@ -180,6 +184,7 @@ export class Reconciler {
       git: this.prGit,
       transition: this.prTransition,
       cleanup: this.prCleanup,
+      workspaceEnsure: this.prWorkspaceEnsure ?? undefined,
       strategy: this.cfg.pr_autopilot.auto_merge_strategy,
       maxRebaseAttempts: this.cfg.pr_autopilot.max_rebase_attempts,
       conflictRouteTo,
@@ -239,12 +244,14 @@ export class Reconciler {
     git: PrGitApi;
     transition: PrTransitionApi;
     cleanup: PrCleanupApi;
+    workspaceEnsure?: PrWorkspaceEnsureApi;
   }): void {
     this.prIntended = opts.intended;
     this.prApi = opts.pr;
     this.prGit = opts.git;
     this.prTransition = opts.transition;
     this.prCleanup = opts.cleanup;
+    if (opts.workspaceEnsure !== undefined) this.prWorkspaceEnsure = opts.workspaceEnsure;
     this.pr = this.buildPrResource();
   }
 
@@ -536,6 +543,8 @@ export type {
   PrGitApi,
   PrTransitionApi,
   PrCleanupApi,
+  PrWorkspaceEnsureApi,
+  EnsureWorkspaceOutcome,
   RebaseOutcome,
   PushOutcome,
 } from './pr.js';

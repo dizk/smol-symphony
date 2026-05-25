@@ -361,6 +361,13 @@ async function main() {
     cleanup: {
       removeWorkspace: (identifier) => orch.removeWorkspace(identifier),
     },
+    // Issue 53: re-materialize a missing workspace before the autopilot's
+    // rebase step so a Done-state PR whose workspace was reaped (e.g.
+    // pr_autopilot was enabled after the dir was cleaned by the pre-autopilot
+    // terminal rule) gets recovered instead of stalling silently.
+    workspaceEnsure: {
+      ensureWorkspace: (args) => orch.ensureWorkspaceForAutopilot(args),
+    },
   });
 
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved

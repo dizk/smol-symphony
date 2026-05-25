@@ -445,6 +445,240 @@ describe('Orchestrator VM lifecycle reaping', () => {
     }
   });
 
+  it('ensureWorkspaceForAutopilot short-circuits when the workspace dir already exists (issue 53)', async () => {
+    // Idempotency contract: the PR resource calls ensureWorkspace on every
+    // rebase pass, so when the dir is already there the orchestrator must
+    // NOT re-invoke WorkspaceManager.ensureFor (a re-clone would clobber the
+    // working tree and lose the agent's in-progress commits).
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-exists-tracker-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-exists-ws-'));
+    try {
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          workspace: { root: wsRoot },
+          acp: { adapter: 'claude' },
+          pr_autopilot: {
+            enabled: true,
+            merge_state: 'Done',
+            close_state: 'Cancelled',
+            max_rebase_attempts: 3,
+            auto_merge_strategy: 'squash',
+            poll_interval_ms: 30000,
+          },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Cancelled: { role: 'terminal' },
+            Conflict: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      let ensureForCalls = 0;
+      const fakeWorkspaces = {
+        workspacePathFor: (identifier: string) => path.join(wsRoot, identifier),
+        ensureFor: async () => {
+          ensureForCalls += 1;
+          return { path: '/tmp/ignored', workspace_key: 'x', created_now: true };
+        },
+      } as unknown as WorkspaceManager;
+      const { workflowSrc, tracker, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, fakeWorkspaces, runner);
+      // Pre-create the workspace directory: the autopilot's caller observes
+      // it on disk, so ensureWorkspaceForAutopilot must take the short path.
+      const existingDir = path.join(wsRoot, 'issue-77');
+      await mkdir(existingDir, { recursive: true });
+      const outcome = await orch.ensureWorkspaceForAutopilot({
+        identifier: 'issue-77',
+        workspacePath: existingDir,
+        branch: 'agent/77',
+        baseBranch: 'main',
+        expectedHeadSha: 'deadbeef',
+      });
+      assert.deepEqual(outcome, { kind: 'ok' });
+      assert.equal(ensureForCalls, 0, 'ensureFor must NOT be called when the dir already exists');
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('ensureWorkspaceForAutopilot materializes a missing workspace and positions HEAD at the remote agent tip (issue 53)', async () => {
+    // End-to-end happy path: bare remote has main + an agent/<id> branch with
+    // one extra commit. The local workspace dir does not exist. The orchestrator
+    // must (a) re-clone via WorkspaceManager.ensureFor, (b) fetch origin
+    // agent/<id>, and (c) hard-reset the local branch to the remote tip — so
+    // `git rev-parse HEAD` after the call equals the remote agent branch SHA.
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-tracker-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-ws-'));
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-remote-'));
+    const seedRepo = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-e2e-seed-'));
+    const runGit = (cwd: string, args: string[]): Promise<void> =>
+      new Promise((resolve, reject) => {
+        const child = spawn('git', args, { cwd, stdio: 'ignore' });
+        child.on('error', reject);
+        child.on('close', (code) =>
+          code === 0 ? resolve() : reject(new Error(`git ${args.join(' ')} exit ${code}`)),
+        );
+      });
+    const captureGit = async (cwd: string, args: string[]): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+        let out = '';
+        child.stdout?.on('data', (b) => (out += b.toString('utf8')));
+        child.on('error', reject);
+        child.on('close', (code) =>
+          code === 0 ? resolve(out.trim()) : reject(new Error(`git ${args.join(' ')} exit ${code}`)),
+        );
+      });
+    try {
+      // Bare remote with `main` seeded, then an `agent/77` branch with one
+      // extra commit on top — mirroring the "agent ran in a VM, pushed its
+      // work, then the workspace was reaped" production scenario.
+      await runGit(bareRemote, ['init', '--bare', '-b', 'main']);
+      await runGit(seedRepo, ['init', '-b', 'main']);
+      await runGit(seedRepo, ['config', 'user.name', 'test']);
+      await runGit(seedRepo, ['config', 'user.email', 'test@example.com']);
+      await writeFile(path.join(seedRepo, 'README.md'), 'seed\n');
+      await runGit(seedRepo, ['add', 'README.md']);
+      await runGit(seedRepo, ['commit', '-m', 'seed']);
+      await runGit(seedRepo, ['remote', 'add', 'origin', bareRemote]);
+      await runGit(seedRepo, ['push', 'origin', 'main']);
+      await runGit(seedRepo, ['checkout', '-b', 'agent/77']);
+      await writeFile(path.join(seedRepo, 'agent-work.md'), 'agent commit\n');
+      await runGit(seedRepo, ['add', 'agent-work.md']);
+      await runGit(seedRepo, ['commit', '-m', 'agent work']);
+      const expectedAgentSha = await captureGit(seedRepo, ['rev-parse', 'HEAD']);
+      await runGit(seedRepo, ['push', 'origin', 'agent/77']);
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          workspace: { root: wsRoot },
+          acp: { adapter: 'claude' },
+          pr_autopilot: {
+            enabled: true,
+            merge_state: 'Done',
+            close_state: 'Cancelled',
+            max_rebase_attempts: 3,
+            auto_merge_strategy: 'squash',
+            poll_interval_ms: 30000,
+          },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Cancelled: { role: 'terminal' },
+            Conflict: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      // Fake WorkspaceManager that mimics setupWorkspaceDir's outcome but
+      // points origin at our local bare remote. Production goes through
+      // setupWorkspaceDir which hardcodes the github.com URL from
+      // SYMPHONY_REPO; for the test we just need an origin git can fetch from.
+      const fakeWorkspaces = {
+        workspacePathFor: (identifier: string) => path.join(wsRoot, identifier),
+        ensureFor: async (identifier: string) => {
+          const wsPath = path.join(wsRoot, identifier);
+          await mkdir(wsPath, { recursive: true });
+          // Clone the bare remote into the per-issue workspace on the base
+          // branch (this is what setupWorkspaceDir does in production).
+          await runGit(wsPath, ['clone', '--branch', 'main', bareRemote, '.']);
+          await runGit(wsPath, ['config', 'user.name', 'symphony-agent']);
+          await runGit(wsPath, ['config', 'user.email', 'agent@symphony.local']);
+          // Strip the clone's origin and re-add it pointing at our bare
+          // remote (mirrors setupWorkspaceDir's strip + re-add pattern).
+          await runGit(wsPath, ['remote', 'remove', 'origin']);
+          await runGit(wsPath, ['remote', 'add', 'origin', bareRemote]);
+          await runGit(wsPath, ['checkout', '-b', `agent/${identifier}`]);
+          return { path: wsPath, workspace_key: identifier, created_now: true };
+        },
+      } as unknown as WorkspaceManager;
+      const { workflowSrc, tracker, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, fakeWorkspaces, runner);
+      const wsPath = path.join(wsRoot, '77');
+      const outcome = await orch.ensureWorkspaceForAutopilot({
+        identifier: '77',
+        workspacePath: wsPath,
+        branch: 'agent/77',
+        baseBranch: 'main',
+        expectedHeadSha: expectedAgentSha,
+      });
+      assert.equal(outcome.kind, 'ok', JSON.stringify(outcome));
+      // Local HEAD must equal the remote agent branch SHA so the standard
+      // rebaseOnto can run its rev-parse HEAD == expectedHeadSha check.
+      const headAfter = await captureGit(wsPath, ['rev-parse', 'HEAD']);
+      assert.equal(headAfter, expectedAgentSha, 'HEAD repositioned to remote agent branch tip');
+      // The agent's extra commit must be present in the working tree.
+      const { readFile } = await import('node:fs/promises');
+      const agentWork = await readFile(path.join(wsPath, 'agent-work.md'), 'utf8');
+      assert.match(agentWork, /agent commit/);
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(seedRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('ensureWorkspaceForAutopilot returns a typed error when materialization fails (issue 53)', async () => {
+    // When workspaces.ensureFor throws (e.g., source repo missing), the
+    // orchestrator must surface it as { kind: 'error', diagnostic } so the
+    // PR resource can record it in the action ledger and the operator sees
+    // a concrete failure on the dashboard instead of silent stall.
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-fail-tracker-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ensure-fail-ws-'));
+    try {
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          workspace: { root: wsRoot },
+          acp: { adapter: 'claude' },
+          pr_autopilot: {
+            enabled: true,
+            merge_state: 'Done',
+            close_state: 'Cancelled',
+            max_rebase_attempts: 3,
+            auto_merge_strategy: 'squash',
+            poll_interval_ms: 30000,
+          },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Cancelled: { role: 'terminal' },
+            Conflict: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      const fakeWorkspaces = {
+        workspacePathFor: (identifier: string) => path.join(wsRoot, identifier),
+        ensureFor: async () => {
+          throw new Error('source repo not a git repository');
+        },
+      } as unknown as WorkspaceManager;
+      const { workflowSrc, tracker, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, fakeWorkspaces, runner);
+      // The dir does NOT exist, so the orchestrator goes into the materialize
+      // path; ensureFor throws and we expect a typed error back.
+      const missingDir = path.join(wsRoot, 'issue-88');
+      const outcome = await orch.ensureWorkspaceForAutopilot({
+        identifier: 'issue-88',
+        workspacePath: missingDir,
+        branch: 'agent/88',
+        baseBranch: 'main',
+        expectedHeadSha: 'deadbeef',
+      });
+      assert.equal(outcome.kind, 'error');
+      if (outcome.kind === 'error') {
+        assert.match(outcome.diagnostic, /ensure_workspace_clone_failed/);
+        assert.match(outcome.diagnostic, /source repo not a git repository/);
+      }
+    } finally {
+      await rm(trackerRoot, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('skips reaping when no Reconciler is wired (test/stub harness)', async () => {
     // The orchestrator's Reconciler parameter is optional so tests that don't
     // care about VM lifecycle can omit it. Confirm that path stays silent and
