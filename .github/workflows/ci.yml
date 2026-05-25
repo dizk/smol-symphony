@@ -10,11 +10,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the diff-size gate can compare against the base
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run lint:arch # dependency-cruiser: import direction + hexagonal (fails on NEW violations)
+      - run: npm run lint # eslint: core purity + shell complexity ratchet (--max-warnings)
       - run: npm test
       - run: npm run build
+      - name: diff-size gate
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          SIZE_OVERRIDE: ${{ contains(github.event.pull_request.labels.*.name, 'size:override') }}
+        run: npm run check:size

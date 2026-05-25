@@ -47,7 +47,10 @@
     "dev": "tsx watch src/bin/symphony.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test --import tsx tests/*.test.ts",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "lint": "eslint src --max-warnings 130",
+    "lint:arch": "depcruise src --ts-config tsconfig.json --ignore-known",
+    "check:size": "node scripts/check-diff-size.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.22.1",
@@ -57,6 +60,9 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
+    "@typescript-eslint/parser": "^8.60.0",
+    "dependency-cruiser": "^17.4.2",
+    "eslint": "^10.4.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   },
