@@ -12,16 +12,25 @@ import type { McpRegistry } from './mcp.js';
 import { writeIssueFile } from './issues.js';
 import type { IssueTracker } from './trackers/types.js';
 import type { StateConfig } from './types.js';
+import {
+  type Route,
+  type StateView,
+  matchRoute,
+  resolvePartialName,
+  extractBearerToken,
+  classifyContentType,
+  checkSteeringCsrf,
+  checkTriageCsrf,
+  extractFormText,
+  extractJsonText,
+  decideCreateIssue,
+  decideTriageTransition,
+} from './http-handlers.js';
 
-// Compact view of the declared per-state config used by the dashboard. The view-builder
-// in src/bin/symphony.ts derives this from `cfg.states` on every request so a workflow
-// reload (which mutates the live config in place) is reflected without rebinding the
-// server. Order is the workflow declaration order — operators get state columns and
-// approve/discard targets in the sequence they wrote them in `states:`.
-export interface StateView {
-  name: string;
-  role: 'active' | 'terminal' | 'holding';
-}
+// Re-export so existing imports of StateView (e.g. src/bin/symphony.ts uses the same
+// shape via `getTrackerView`) and any future consumer of the public surface continue
+// to resolve through src/http.ts.
+export type { StateView };
 
 function jsonResponse(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -1734,6 +1743,25 @@ export async function startHttpServer(
   };
 }
 
+// ─── Per-route handler dispatch ─────────────────────────────────────────
+// matchRoute (in http-handlers.ts) returns a discriminated union; the table below
+// maps each route kind to a thin shell handler. The handler signature carries the
+// narrowed route variant so each function sees the parsed identifier/action it
+// expects without a manual cast. Everything that decides "what to do" lives in
+// http-handlers; everything here is IO + response writing.
+interface HandlerCtx<R extends Route> {
+  req: IncomingMessage;
+  res: ServerResponse;
+  orch: Orchestrator;
+  opts: HttpServerOptions;
+  view: ReturnType<HttpServerOptions['getTrackerView']>;
+  method: string;
+  route: R;
+}
+type RouteHandlers = {
+  [K in Route['kind']]: (ctx: HandlerCtx<Extract<Route, { kind: K }>>) => Promise<void>;
+};
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1743,493 +1771,388 @@ async function handleRequest(
   // URL parsing inside the handler so a malformed Host header doesn't crash the listener.
   let pathname: string;
   try {
-    const url = new URL(req.url ?? '/', 'http://symphony.local');
-    pathname = url.pathname;
+    pathname = new URL(req.url ?? '/', 'http://symphony.local').pathname;
   } catch {
     return badRequest(res, 'invalid request URL');
   }
   const method = (req.method ?? 'GET').toUpperCase();
   const view = opts.getTrackerView();
+  const route = matchRoute(pathname);
+  const handler = ROUTE_HANDLERS[route.kind] as (
+    ctx: HandlerCtx<Route>,
+  ) => Promise<void>;
+  await handler({ req, res, orch, opts, view, method, route });
+}
 
-  if (pathname === '/') {
-    if (method !== 'GET') return methodNotAllowed(res);
-    const p = await gatherPartialInputs(orch, view);
-    const html = renderDashboardHtml(p);
-    res.statusCode = 200;
-    res.setHeader('content-type', 'text/html; charset=utf-8');
-    res.end(html);
-    return;
+async function handleDashboard(ctx: HandlerCtx<{ kind: 'dashboard' }>): Promise<void> {
+  if (ctx.method !== 'GET') return methodNotAllowed(ctx.res);
+  const p = await gatherPartialInputs(ctx.orch, ctx.view);
+  ctx.res.statusCode = 200;
+  ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+  ctx.res.end(renderDashboardHtml(p));
+}
+
+// Static preview for impeccable live mode. The file under .impeccable/preview/ is a
+// captured snapshot of the dashboard with polling disabled, used as a variant playground.
+// Read on every request so live-wrap edits land immediately.
+async function handlePreview(ctx: HandlerCtx<{ kind: 'preview' }>): Promise<void> {
+  if (ctx.method !== 'GET') return methodNotAllowed(ctx.res);
+  try {
+    const html = await readFile('.impeccable/preview/dashboard.html', 'utf8');
+    ctx.res.statusCode = 200;
+    ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+    ctx.res.setHeader('cache-control', 'no-store');
+    ctx.res.end(html);
+  } catch (err) {
+    notFound(ctx.res, 'preview_missing', `preview not available: ${(err as Error).message}`);
   }
-  // Static preview for impeccable live mode. The file under .impeccable/preview/ is a
-  // captured snapshot of the dashboard with polling disabled, used as a variant playground.
-  // Read on every request so live-wrap edits land immediately.
-  if (pathname === '/preview' || pathname === '/preview/') {
-    if (method !== 'GET') return methodNotAllowed(res);
-    try {
-      const html = await readFile('.impeccable/preview/dashboard.html', 'utf8');
-      res.statusCode = 200;
-      res.setHeader('content-type', 'text/html; charset=utf-8');
-      res.setHeader('cache-control', 'no-store');
-      res.end(html);
-    } catch (err) {
-      return notFound(res, 'preview_missing', `preview not available: ${(err as Error).message}`);
-    }
-    return;
+}
+
+// HTMX partials. Each region polls its own endpoint at 2s; this is what the dashboard
+// <section hx-get=...> elements consume. They return only the inner HTML; the outer
+// wrapper is in the dashboard shell.
+async function handlePartial(ctx: HandlerCtx<{ kind: 'partial'; slug: string }>): Promise<void> {
+  if (ctx.method !== 'GET') return methodNotAllowed(ctx.res);
+  const name = resolvePartialName(ctx.route.slug);
+  if (!name) {
+    return notFound(ctx.res, 'partial_not_found', `partial ${ctx.route.slug} does not exist`);
   }
-  // HTMX partials. Each region polls its own endpoint at 2s; this is what the dashboard
-  // <section hx-get=...> elements consume. They return only the inner HTML; the outer
-  // wrapper is in the dashboard shell.
-  if (pathname.startsWith('/api/v1/partials/')) {
-    if (method !== 'GET') return methodNotAllowed(res);
-    const p = await gatherPartialInputs(orch, view);
-    const slug = pathname.slice('/api/v1/partials/'.length);
-    let body: string | null = null;
-    if (slug === 'header') body = renderHeaderPartial(p);
-    else if (slug === 'attention') body = renderAttentionPartial(p);
-    else if (slug === 'board') body = renderBoardPartial(p);
-    else if (slug === 'totals') body = renderTotalsPartial(p);
-    if (body === null) return notFound(res, 'partial_not_found', `partial ${slug} does not exist`);
-    res.statusCode = 200;
-    res.setHeader('content-type', 'text/html; charset=utf-8');
-    res.setHeader('cache-control', 'no-store');
-    res.end(body);
-    return;
+  const p = await gatherPartialInputs(ctx.orch, ctx.view);
+  const body =
+    name === 'header' ? renderHeaderPartial(p)
+    : name === 'attention' ? renderAttentionPartial(p)
+    : name === 'board' ? renderBoardPartial(p)
+    : renderTotalsPartial(p);
+  ctx.res.statusCode = 200;
+  ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+  ctx.res.setHeader('cache-control', 'no-store');
+  ctx.res.end(body);
+}
+
+async function handleState(ctx: HandlerCtx<{ kind: 'state' }>): Promise<void> {
+  if (ctx.method !== 'GET') return methodNotAllowed(ctx.res);
+  jsonResponse(ctx.res, 200, ctx.orch.snapshot());
+}
+
+async function handleRefresh(ctx: HandlerCtx<{ kind: 'refresh' }>): Promise<void> {
+  if (ctx.method !== 'POST') return methodNotAllowed(ctx.res);
+  const status = ctx.orch.triggerRefresh();
+  jsonResponse(ctx.res, 202, {
+    ...status,
+    requested_at: new Date().toISOString(),
+    operations: ['poll', 'reconcile'],
+  });
+}
+
+async function handleIssues(ctx: HandlerCtx<{ kind: 'issues' }>): Promise<void> {
+  if (ctx.method === 'GET') return handleListIssues(ctx);
+  if (ctx.method === 'POST') return handleCreateIssue(ctx);
+  methodNotAllowed(ctx.res);
+}
+
+async function handleListIssues(ctx: HandlerCtx<{ kind: 'issues' }>): Promise<void> {
+  const root = ctx.view.trackerRoot;
+  if (!root) return jsonResponse(ctx.res, 200, { issues: [] });
+  const issues = await listIssuesFromDisk(root);
+  jsonResponse(ctx.res, 200, { issues });
+}
+
+async function handleCreateIssue(ctx: HandlerCtx<{ kind: 'issues' }>): Promise<void> {
+  const root = ctx.view.trackerRoot;
+  if (!root) return badRequest(ctx.res, 'tracker.root not configured');
+  let body: unknown;
+  try {
+    body = await readJsonBody(ctx.req);
+  } catch (err) {
+    return badRequest(ctx.res, (err as Error).message);
   }
-  if (pathname === '/api/v1/state') {
-    if (method !== 'GET') return methodNotAllowed(res);
-    return jsonResponse(res, 200, orch.snapshot());
-  }
-  if (pathname === '/api/v1/refresh') {
-    if (method !== 'POST') return methodNotAllowed(res);
-    const status = orch.triggerRefresh();
-    return jsonResponse(res, 202, {
-      ...status,
-      requested_at: new Date().toISOString(),
-      operations: ['poll', 'reconcile'],
+  const decision = decideCreateIssue(body, ctx.view.states);
+  if (!decision.ok) {
+    return jsonResponse(ctx.res, decision.status, {
+      error: { code: decision.code, message: decision.message },
     });
   }
-  if (pathname === '/api/v1/issues') {
-    if (method === 'GET') {
-      const root = view.trackerRoot;
-      if (!root) return jsonResponse(res, 200, { issues: [] });
-      const issues = await listIssuesFromDisk(root);
-      return jsonResponse(res, 200, { issues });
-    }
-    if (method === 'POST') {
-      const root = view.trackerRoot;
-      if (!root) return badRequest(res, 'tracker.root not configured');
-      let body: unknown;
-      try {
-        body = await readJsonBody(req);
-      } catch (err) {
-        return badRequest(res, (err as Error).message);
-      }
-      if (!body || typeof body !== 'object' || Array.isArray(body)) {
-        return badRequest(res, 'body must be a JSON object');
-      }
-      const b = body as Record<string, unknown>;
-      const identifier = typeof b.identifier === 'string' ? b.identifier.trim() : '';
-      const title = typeof b.title === 'string' ? b.title.trim() : '';
-      const stateInput = typeof b.state === 'string' ? b.state.trim() : '';
-      if (!title) return badRequest(res, 'title is required');
-      // `identifier` and `state` are optional: identifier is derived from the title when
-      // omitted, state defaults to the first declared active state (typically `Todo`). This
-      // keeps the dispatch surface to a single required field for callers that just want to
-      // hand the orchestrator a task.
-      const firstActiveName = view.states.find((s) => s.role === 'active')?.name ?? '';
-      const state = stateInput || firstActiveName;
-      if (!state) {
-        return badRequest(res, 'state is required (no active states declared to default to)');
-      }
-      // Restrict `state` to one of the declared non-terminal states (active or holding).
-      // The kanban dashboard exposes a `+ new issue` affordance on every non-terminal
-      // column header — including Triage (holding) — so an operator can deliberately
-      // file proposals into the human-approval queue alongside agent-generated ones.
-      // Terminal states stay closed: creating an issue directly in Done/Cancelled would
-      // mean dispatching to an archive. Values containing path separators / `..` are
-      // rejected by the set lookup so the request cannot escape the tracker root via
-      // `path.join`.
-      const allowedNames = view.states
-        .filter((s) => s.role !== 'terminal')
-        .map((s) => s.name);
-      const allowedStates = new Set(allowedNames);
-      if (!allowedStates.has(state)) {
-        return badRequest(
-          res,
-          `state must be one of: ${allowedNames.join(', ') || '<none configured>'}`,
-        );
-      }
-      const description = typeof b.description === 'string' ? b.description : undefined;
-      const priority =
-        typeof b.priority === 'number' && Number.isFinite(b.priority) ? b.priority : null;
-      const labels = Array.isArray(b.labels)
-        ? b.labels.filter((x): x is string => typeof x === 'string')
-        : [];
-      const blockedBy = Array.isArray(b.blocked_by)
-        ? b.blocked_by.filter((x): x is string => typeof x === 'string')
-        : [];
-      try {
-        const created = await writeIssueFile({
-          trackerRoot: root,
-          identifier,
-          title,
-          state,
-          description,
-          priority,
-          labels,
-          blocked_by: blockedBy,
-        });
-        log.info('issue created via http', { identifier: created.identifier, state: created.state });
-        return jsonResponse(res, 201, created);
-      } catch (err) {
-        return jsonResponse(res, 409, {
-          error: { code: 'create_failed', message: (err as Error).message },
-        });
-      }
-    }
-    return methodNotAllowed(res);
+  try {
+    const created = await writeIssueFile({
+      trackerRoot: root,
+      identifier: decision.identifier,
+      title: decision.title,
+      state: decision.state,
+      description: decision.description,
+      priority: decision.priority,
+      labels: decision.labels,
+      blocked_by: decision.blocked_by,
+    });
+    log.info('issue created via http', { identifier: created.identifier, state: created.state });
+    jsonResponse(ctx.res, 201, created);
+  } catch (err) {
+    jsonResponse(ctx.res, 409, {
+      error: { code: 'create_failed', message: (err as Error).message },
+    });
   }
-  // MCP JSON-RPC endpoint: agent (inside the smolvm) POSTs JSON-RPC envelopes here. The
-  // URL is per-issue (the agent only knows its own /<id>/mcp), backed by a bearer token
-  // generated at dispatch. Both layers are belt-and-braces against the no-auth 8787 socket.
-  const mcpMatch = /^\/api\/v1\/issues\/([^/]+)\/mcp$/.exec(pathname);
-  if (mcpMatch) {
-    if (method !== 'POST') return methodNotAllowed(res);
-    const mcp = opts.mcp;
-    if (!mcp) return notFound(res, 'mcp_disabled', 'mcp endpoint not enabled');
-    const identifier = decodeURIComponent(mcpMatch[1]!);
-    const auth = (req.headers['authorization'] ?? req.headers['Authorization']) as
-      | string
-      | undefined;
-    const token = auth && auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : '';
-    if (!token) {
-      res.statusCode = 401;
-      res.setHeader('content-type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ error: { code: 'unauthorized', message: 'bearer token required' } }));
-      return;
-    }
-    if (!mcp.isActive(identifier, token)) {
-      res.statusCode = 404;
-      res.setHeader('content-type', 'application/json; charset=utf-8');
-      res.end(
-        JSON.stringify({ error: { code: 'not_found', message: 'issue not active or token mismatch' } }),
-      );
-      return;
-    }
-    let body: unknown;
-    try {
-      body = await readJsonBody(req);
-    } catch (err) {
-      return badRequest(res, (err as Error).message);
-    }
-    const reply = await mcp.handleJsonRpc(identifier, token, body);
-    if (reply === null) {
-      // JSON-RPC notification (no id) → 204 No Content
-      res.statusCode = 204;
-      res.end();
-      return;
-    }
-    return jsonResponse(res, 200, reply);
+}
+
+// MCP JSON-RPC endpoint: agent (inside the smolvm) POSTs JSON-RPC envelopes here. The
+// URL is per-issue (the agent only knows its own /<id>/mcp), backed by a bearer token
+// generated at dispatch. Both layers are belt-and-braces against the no-auth 8787 socket.
+async function handleMcp(
+  ctx: HandlerCtx<{ kind: 'mcp'; identifier: string }>,
+): Promise<void> {
+  if (ctx.method !== 'POST') return methodNotAllowed(ctx.res);
+  const mcp = ctx.opts.mcp;
+  if (!mcp) return notFound(ctx.res, 'mcp_disabled', 'mcp endpoint not enabled');
+  const { identifier } = ctx.route;
+  const auth = (ctx.req.headers['authorization'] ?? ctx.req.headers['Authorization']) as
+    | string
+    | undefined;
+  const token = extractBearerToken(auth);
+  if (!token) return jsonResponse(ctx.res, 401, { error: { code: 'unauthorized', message: 'bearer token required' } });
+  if (!mcp.isActive(identifier, token)) {
+    return jsonResponse(ctx.res, 404, {
+      error: { code: 'not_found', message: 'issue not active or token mismatch' },
+    });
   }
-
-  // Steering reply: the dashboard (or any operator with access) submits the human's
-  // response to a queued request_human_steering call. The orchestrator-side runner is
-  // awaiting on the registry; this POST unblocks it.
-  //
-  // Two callers:
-  //  • Dashboard via HTMX (form-encoded body, `HX-Request: true`, same-origin). We accept
-  //    only this combination for form bodies and reply with an HTML partial that swaps
-  //    into #attention.
-  //  • Direct API client (JSON body). Replies with a structured JSON acknowledgement.
-  //
-  // The form-encoded branch is gated on `HX-Request: true` and a same-origin check so a
-  // simple cross-site form POST cannot inject a steering reply: form-encoded is a "simple"
-  // CORS request that bypasses preflight, and the steering endpoint is unauthenticated.
-  // HTMX errors land at 200 OK with an inline `.steering-error` message because HTMX's
-  // default response-handling does not swap on 4xx/5xx; returning 200 keeps the operator's
-  // form in sync with reality (their textarea text is preserved by hx-preserve regardless).
-  const steeringMatch = /^\/api\/v1\/issues\/([^/]+)\/steering-reply$/.exec(pathname);
-  if (steeringMatch) {
-    if (method !== 'POST') return methodNotAllowed(res);
-    const mcp = opts.mcp;
-    if (!mcp) return notFound(res, 'mcp_disabled', 'steering endpoint not enabled');
-    const identifier = decodeURIComponent(steeringMatch[1]!);
-    const isHtmx = req.headers['hx-request'] === 'true';
-    const ctype = (req.headers['content-type'] ?? '').toLowerCase();
-    const baseCtype = ctype.split(';', 1)[0]!.trim();
-    const isFormBody = baseCtype === 'application/x-www-form-urlencoded';
-    const isJsonBody = baseCtype === 'application/json';
-
-    // Content-type gates against CSRF: form-urlencoded, text/plain, and multipart/form-data
-    // are "simple" CORS requests and bypass preflight. Only application/json (non-simple,
-    // triggers preflight) is accepted on the JSON path; the form path is additionally
-    // gated on HX-Request + same-origin. Anything else is rejected outright.
-    if (!isFormBody && !isJsonBody) {
-      return jsonResponse(res, 415, {
-        error: {
-          code: 'unsupported_media_type',
-          message: 'content-type must be application/json or application/x-www-form-urlencoded',
-        },
-      });
-    }
-    if (isFormBody) {
-      if (!isHtmx || !isSameOriginRequest(req)) {
-        return jsonResponse(res, 403, {
-          error: {
-            code: 'forbidden',
-            message: 'form-encoded steering replies require an HTMX same-origin request',
-          },
-        });
-      }
-    }
-
-    let text = '';
-    if (isFormBody) {
-      try {
-        const raw = await readTextBody(req);
-        const params = new URLSearchParams(raw);
-        text = (params.get('text') ?? '').trim();
-      } catch (err) {
-        return htmxOrJsonError(res, isHtmx, orch, view, 400, 'bad_request', (err as Error).message);
-      }
-    } else {
-      let body: unknown;
-      try {
-        body = await readJsonBody(req);
-      } catch (err) {
-        return badRequest(res, (err as Error).message);
-      }
-      text =
-        body && typeof body === 'object' && !Array.isArray(body) && typeof (body as Record<string, unknown>).text === 'string'
-          ? ((body as Record<string, unknown>).text as string).trim()
-          : '';
-    }
-
-    if (!text) {
-      return htmxOrJsonError(
-        res,
-        isHtmx,
-        orch,
-        view,
-        400,
-        'bad_request',
-        'text is required and must be a non-empty string',
-      );
-    }
-    const ok = mcp.submitSteeringReply(identifier, text);
-    if (!ok) {
-      return htmxOrJsonError(
-        res,
-        isHtmx,
-        orch,
-        view,
-        409,
-        'no_pending_steering',
-        'no agent is awaiting steering for this issue',
-      );
-    }
-    if (isHtmx) {
-      const p = await gatherPartialInputs(orch, view);
-      res.statusCode = 200;
-      res.setHeader('content-type', 'text/html; charset=utf-8');
-      res.end(renderAttentionPartial(p));
-      return;
-    }
-    return jsonResponse(res, 202, { identifier, accepted_at: new Date().toISOString() });
+  let body: unknown;
+  try {
+    body = await readJsonBody(ctx.req);
+  } catch (err) {
+    return badRequest(ctx.res, (err as Error).message);
   }
-
-  // Triage approve / discard. The dashboard renders these as buttons inside the triage
-  // section; an operator clicks one and we move the issue file out of Triage/. Approve
-  // sends it to the first active state (typically Todo) where the orchestrator will pick
-  // it up on the next poll; discard sends it to the first terminal state that looks like a
-  // cancellation (case-insensitive "Cancelled" match preferred) so the proposal is
-  // archived rather than deleted — operators can still grep for what was proposed and
-  // turned down.
-  //
-  // CSRF posture mirrors the steering-reply endpoint: form-encoded requires HX-Request
-  // + same-origin; JSON requires application/json (preflight-triggering). HTMX errors
-  // come back as 200 with a partial so the section doesn't go stale.
-  const triageMatch = /^\/api\/v1\/issues\/([^/]+)\/(approve|discard)$/.exec(pathname);
-  if (triageMatch) {
-    if (method !== 'POST') return methodNotAllowed(res);
-    const tracker = opts.tracker;
-    if (!tracker || !tracker.moveIssueToState) {
-      return notFound(
-        res,
-        'tracker_no_state_transitions',
-        'tracker does not support state transitions',
-      );
-    }
-    const root = view.trackerRoot;
-    if (!root) return badRequest(res, 'tracker.root not configured');
-    const identifier = decodeURIComponent(triageMatch[1]!);
-    const action = triageMatch[2]!;
-    const isHtmx = req.headers['hx-request'] === 'true';
-    const ctype = (req.headers['content-type'] ?? '').toLowerCase();
-    const baseCtype = ctype.split(';', 1)[0]!.trim();
-    const isFormBody = baseCtype === 'application/x-www-form-urlencoded';
-    const isJsonBody = baseCtype === 'application/json';
-    // HTMX form submits arrive with an empty body and the standard form content-type;
-    // direct API callers send application/json. An empty Content-Type from curl is
-    // treated as a JSON call (consistent with how /issues handles bodyless POSTs).
-    const isEmptyCtype = baseCtype === '';
-    if (!isFormBody && !isJsonBody && !isEmptyCtype) {
-      return jsonResponse(res, 415, {
-        error: {
-          code: 'unsupported_media_type',
-          message: 'content-type must be application/json or application/x-www-form-urlencoded',
-        },
-      });
-    }
-    // Both form-encoded and empty Content-Type are "simple" CORS requests that bypass
-    // preflight, so a cross-origin page can POST them without the browser blocking.
-    // Gate both on HX-Request + same-origin; only application/json (which triggers a
-    // preflight on cross-origin fetches) is exempt.
-    if (isFormBody || isEmptyCtype) {
-      if (!isHtmx || !isSameOriginRequest(req)) {
-        return jsonResponse(res, 403, {
-          error: {
-            code: 'forbidden',
-            message: 'triage actions require an HTMX same-origin request or application/json',
-          },
-        });
-      }
-    }
-    let toState: string;
-    if (action === 'approve') {
-      // First declared `active` state in declaration order, falling back to the
-      // literal "Todo" so a workflow without any active states still produces a
-      // defined error path rather than crashing the handler. (validateStates
-      // refuses configs without an active role, so the fallback is defensive.)
-      const firstActive = view.states.find((s) => s.role === 'active');
-      toState = firstActive?.name ?? 'Todo';
-    } else {
-      // Discard prefers a state literally named "Cancelled" (case-insensitive)
-      // and falls back to the first declared `terminal` state. If neither is
-      // declared we refuse the action rather than silently deleting.
-      const terminals = view.states.filter((s) => s.role === 'terminal');
-      const cancelled = terminals.find((s) => s.name.toLowerCase() === 'cancelled');
-      const fallback = terminals[0];
-      const target = cancelled ?? fallback;
-      if (!target) {
-        return jsonResponse(res, 409, {
-          error: {
-            code: 'no_discard_target',
-            message: 'no terminal state configured to discard the proposal into',
-          },
-        });
-      }
-      toState = target.name;
-    }
-    // From-state for the move: the first declared `holding` state in
-    // declaration order. The workflow parser refuses configs without one, so a
-    // missing entry here would be a programmer error; refuse the action with a
-    // clear error rather than silently picking a wrong state. Kept in sync with
-    // `pickHoldingState` in src/issues.ts.
-    const holdingState = view.states.find((s) => s.role === 'holding');
-    if (!holdingState) {
-      return jsonResponse(res, 409, {
-        error: {
-          code: 'no_holding_state',
-          message: 'no holding state declared in workflow; cannot resolve triage from-state',
-        },
-      });
-    }
-    const holdingFromState = holdingState.name;
-    try {
-      const result = await tracker.moveIssueToState(identifier, toState, {
-        fromRoot: root,
-        fromState: holdingFromState,
-      });
-      log.info('triage action', { identifier, action, from: result.fromState, to: result.toState });
-      // Nudge the orchestrator to pick the freshly approved issue up immediately instead
-      // of waiting for the next poll tick. Best-effort: triggerRefresh is idempotent.
-      if (action === 'approve') {
-        try {
-          orch.triggerRefresh();
-        } catch {
-          /* refresh request is fire-and-forget */
-        }
-      }
-      if (isHtmx) {
-        // The triage buttons live on rows inside the Triage column of the board, and
-        // an approve move shuffles the row from Triage into the first active column.
-        // Re-rendering the whole board reflects the move in one swap (HTMX morph keeps
-        // unchanged columns stable; only the row that moved redraws).
-        const p = await gatherPartialInputs(orch, view);
-        res.statusCode = 200;
-        res.setHeader('content-type', 'text/html; charset=utf-8');
-        res.setHeader('cache-control', 'no-store');
-        res.end(renderBoardPartial(p));
-        return;
-      }
-      return jsonResponse(res, 200, {
-        identifier,
-        action,
-        from_state: result.fromState,
-        to_state: result.toState,
-      });
-    } catch (err) {
-      const code = (err as Error & { code?: string }).code ?? 'triage_failed';
-      const status = code === 'local_issue_not_found' ? 404 : 409;
-      if (isHtmx) {
-        // Re-render the board so the row that "failed" stays visible in its Triage column;
-        // the operator can retry or open the detail page. We don't surface a per-row banner
-        // for this case yet — the server log carries the error code. A more verbose UI is a
-        // follow-up if operators report needing it.
-        const p = await gatherPartialInputs(orch, view);
-        res.statusCode = 200;
-        res.setHeader('content-type', 'text/html; charset=utf-8');
-        res.setHeader('cache-control', 'no-store');
-        res.end(renderBoardPartial(p));
-        return;
-      }
-      return jsonResponse(res, status, {
-        error: { code, message: (err as Error).message },
-      });
-    }
-  }
-
-  // Read-only HTML view of one issue. Linked from the identifier on every "on disk" and
-  // triage row; renders front-matter (labels, priority, blockers, provenance) plus the
-  // Markdown body so an operator can read the full task without leaving the browser. No
-  // editing surface — actions stay on the dashboard. Source of truth is the on-disk .md
-  // file, found by walking every state directory under tracker.root for a basename match.
-  const detailMatch = /^\/issues\/([^/]+)\/?$/.exec(pathname);
-  if (detailMatch) {
-    if (method !== 'GET') return methodNotAllowed(res);
-    const root = view.trackerRoot;
-    if (!root) {
-      res.statusCode = 404;
-      res.setHeader('content-type', 'text/html; charset=utf-8');
-      res.end(renderIssueNotFoundPage('(tracker root not configured)', view));
-      return;
-    }
-    const identifier = decodeURIComponent(detailMatch[1]!);
-    const issue = await readIssueFromDisk(root, identifier);
-    if (!issue) {
-      res.statusCode = 404;
-      res.setHeader('content-type', 'text/html; charset=utf-8');
-      res.end(renderIssueNotFoundPage(identifier, view));
-      return;
-    }
-    res.statusCode = 200;
-    res.setHeader('content-type', 'text/html; charset=utf-8');
-    res.setHeader('cache-control', 'no-store');
-    res.end(renderIssueDetailPage(issue, view));
+  const reply = await mcp.handleJsonRpc(identifier, token, body);
+  if (reply === null) {
+    // JSON-RPC notification (no id) → 204 No Content
+    ctx.res.statusCode = 204;
+    ctx.res.end();
     return;
   }
-
-  const m = /^\/api\/v1\/([^/]+)$/.exec(pathname);
-  if (m) {
-    if (method !== 'GET') return methodNotAllowed(res);
-    const identifier = decodeURIComponent(m[1]!);
-    const detail = orch.detailByIdentifier(identifier);
-    if (!detail) return notFound(res, 'issue_not_found', `issue ${identifier} is not tracked`);
-    return jsonResponse(res, 200, detail);
-  }
-  notFound(res);
+  jsonResponse(ctx.res, 200, reply);
 }
+
+// Steering reply: the dashboard (or any operator with access) submits the human's
+// response to a queued request_human_steering call. The orchestrator-side runner is
+// awaiting on the registry; this POST unblocks it.
+//
+// Two callers:
+//  • Dashboard via HTMX (form-encoded body, `HX-Request: true`, same-origin). We accept
+//    only this combination for form bodies and reply with an HTML partial that swaps
+//    into #attention.
+//  • Direct API client (JSON body). Replies with a structured JSON acknowledgement.
+//
+// The form-encoded branch is gated on `HX-Request: true` and a same-origin check so a
+// simple cross-site form POST cannot inject a steering reply: form-encoded is a "simple"
+// CORS request that bypasses preflight, and the steering endpoint is unauthenticated.
+// HTMX errors land at 200 OK with an inline `.steering-error` message because HTMX's
+// default response-handling does not swap on 4xx/5xx; returning 200 keeps the operator's
+// form in sync with reality (their textarea text is preserved by hx-preserve regardless).
+async function handleSteeringReply(
+  ctx: HandlerCtx<{ kind: 'steering'; identifier: string }>,
+): Promise<void> {
+  if (ctx.method !== 'POST') return methodNotAllowed(ctx.res);
+  const mcp = ctx.opts.mcp;
+  if (!mcp) return notFound(ctx.res, 'mcp_disabled', 'steering endpoint not enabled');
+  const { identifier } = ctx.route;
+  const isHtmx = ctx.req.headers['hx-request'] === 'true';
+  const ctype = classifyContentType(ctx.req.headers['content-type']);
+  const csrf = checkSteeringCsrf(ctype, isHtmx, isSameOriginRequest(ctx.req));
+  if (!csrf.ok) {
+    return jsonResponse(ctx.res, csrf.status, {
+      error: { code: csrf.code, message: csrf.message },
+    });
+  }
+  const text = await readSteeringText(ctx, ctype);
+  if (text === null) return;
+  if (!text) {
+    return htmxOrJsonError(
+      ctx.res, isHtmx, ctx.orch, ctx.view, 400, 'bad_request',
+      'text is required and must be a non-empty string',
+    );
+  }
+  if (!mcp.submitSteeringReply(identifier, text)) {
+    return htmxOrJsonError(
+      ctx.res, isHtmx, ctx.orch, ctx.view, 409, 'no_pending_steering',
+      'no agent is awaiting steering for this issue',
+    );
+  }
+  await respondSteeringAccepted(ctx, isHtmx, identifier);
+}
+
+async function respondSteeringAccepted(
+  ctx: HandlerCtx<{ kind: 'steering'; identifier: string }>,
+  isHtmx: boolean,
+  identifier: string,
+): Promise<void> {
+  if (isHtmx) {
+    const p = await gatherPartialInputs(ctx.orch, ctx.view);
+    ctx.res.statusCode = 200;
+    ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+    ctx.res.end(renderAttentionPartial(p));
+    return;
+  }
+  jsonResponse(ctx.res, 202, { identifier, accepted_at: new Date().toISOString() });
+}
+
+// Returns null when the body read errored and a response has already been written;
+// otherwise returns the extracted text (empty string if absent/blank, caller treats
+// that as the "no text supplied" case).
+async function readSteeringText(
+  ctx: HandlerCtx<{ kind: 'steering'; identifier: string }>,
+  ctype: ReturnType<typeof classifyContentType>,
+): Promise<string | null> {
+  const isHtmx = ctx.req.headers['hx-request'] === 'true';
+  if (ctype.isFormBody) {
+    try {
+      return extractFormText(await readTextBody(ctx.req));
+    } catch (err) {
+      await htmxOrJsonError(
+        ctx.res, isHtmx, ctx.orch, ctx.view, 400, 'bad_request', (err as Error).message,
+      );
+      return null;
+    }
+  }
+  try {
+    return extractJsonText(await readJsonBody(ctx.req));
+  } catch (err) {
+    badRequest(ctx.res, (err as Error).message);
+    return null;
+  }
+}
+
+// Triage approve / discard. The dashboard renders these as buttons inside the triage
+// section; an operator clicks one and we move the issue file out of Triage/. Approve
+// sends it to the first active state (typically Todo) where the orchestrator will pick
+// it up on the next poll; discard sends it to the first terminal state that looks like a
+// cancellation (case-insensitive "Cancelled" match preferred) so the proposal is
+// archived rather than deleted — operators can still grep for what was proposed and
+// turned down.
+//
+// CSRF posture mirrors the steering-reply endpoint: form-encoded requires HX-Request
+// + same-origin; JSON requires application/json (preflight-triggering). HTMX errors
+// come back as 200 with a partial so the section doesn't go stale.
+async function handleTriage(
+  ctx: HandlerCtx<{ kind: 'triage'; identifier: string; action: 'approve' | 'discard' }>,
+): Promise<void> {
+  if (ctx.method !== 'POST') return methodNotAllowed(ctx.res);
+  const tracker = ctx.opts.tracker;
+  if (!tracker || !tracker.moveIssueToState) {
+    return notFound(ctx.res, 'tracker_no_state_transitions', 'tracker does not support state transitions');
+  }
+  const root = ctx.view.trackerRoot;
+  if (!root) return badRequest(ctx.res, 'tracker.root not configured');
+  const { identifier, action } = ctx.route;
+  const ctype = classifyContentType(ctx.req.headers['content-type']);
+  const csrf = checkTriageCsrf(ctype, ctx.req.headers['hx-request'] === 'true', isSameOriginRequest(ctx.req));
+  if (!csrf.ok) {
+    return jsonResponse(ctx.res, csrf.status, {
+      error: { code: csrf.code, message: csrf.message },
+    });
+  }
+  const transition = decideTriageTransition(action, ctx.view.states);
+  if (!transition.ok) {
+    return jsonResponse(ctx.res, transition.status, {
+      error: { code: transition.code, message: transition.message },
+    });
+  }
+  await runTriageMove(ctx, tracker, root, identifier, action, transition.toState, transition.fromState);
+}
+
+async function runTriageMove(
+  ctx: HandlerCtx<{ kind: 'triage'; identifier: string; action: 'approve' | 'discard' }>,
+  tracker: NonNullable<HttpServerOptions['tracker']>,
+  root: string,
+  identifier: string,
+  action: 'approve' | 'discard',
+  toState: string,
+  fromState: string,
+): Promise<void> {
+  const isHtmx = ctx.req.headers['hx-request'] === 'true';
+  try {
+    const result = await tracker.moveIssueToState!(identifier, toState, { fromRoot: root, fromState });
+    log.info('triage action', { identifier, action, from: result.fromState, to: result.toState });
+    // Nudge the orchestrator to pick the freshly approved issue up immediately instead
+    // of waiting for the next poll tick. Best-effort: triggerRefresh is idempotent.
+    if (action === 'approve') {
+      try { ctx.orch.triggerRefresh(); } catch { /* refresh request is fire-and-forget */ }
+    }
+    if (isHtmx) return writeBoardPartial(ctx);
+    jsonResponse(ctx.res, 200, {
+      identifier, action, from_state: result.fromState, to_state: result.toState,
+    });
+  } catch (err) {
+    const code = (err as Error & { code?: string }).code ?? 'triage_failed';
+    const status = code === 'local_issue_not_found' ? 404 : 409;
+    if (isHtmx) return writeBoardPartial(ctx);
+    jsonResponse(ctx.res, status, { error: { code, message: (err as Error).message } });
+  }
+}
+
+// Re-render the whole board after a triage move. HTMX morph keeps unchanged columns
+// stable; only the row that moved (or "failed" and stayed) redraws.
+async function writeBoardPartial(ctx: HandlerCtx<{ kind: 'triage'; identifier: string; action: 'approve' | 'discard' }>): Promise<void> {
+  const p = await gatherPartialInputs(ctx.orch, ctx.view);
+  ctx.res.statusCode = 200;
+  ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+  ctx.res.setHeader('cache-control', 'no-store');
+  ctx.res.end(renderBoardPartial(p));
+}
+
+// Read-only HTML view of one issue. Linked from the identifier on every "on disk" and
+// triage row; renders front-matter (labels, priority, blockers, provenance) plus the
+// Markdown body so an operator can read the full task without leaving the browser. No
+// editing surface — actions stay on the dashboard. Source of truth is the on-disk .md
+// file, found by walking every state directory under tracker.root for a basename match.
+async function handleDetailHtml(
+  ctx: HandlerCtx<{ kind: 'detail_html'; identifier: string }>,
+): Promise<void> {
+  if (ctx.method !== 'GET') return methodNotAllowed(ctx.res);
+  const root = ctx.view.trackerRoot;
+  if (!root) {
+    ctx.res.statusCode = 404;
+    ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+    ctx.res.end(renderIssueNotFoundPage('(tracker root not configured)', ctx.view));
+    return;
+  }
+  const { identifier } = ctx.route;
+  const issue = await readIssueFromDisk(root, identifier);
+  if (!issue) {
+    ctx.res.statusCode = 404;
+    ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+    ctx.res.end(renderIssueNotFoundPage(identifier, ctx.view));
+    return;
+  }
+  ctx.res.statusCode = 200;
+  ctx.res.setHeader('content-type', 'text/html; charset=utf-8');
+  ctx.res.setHeader('cache-control', 'no-store');
+  ctx.res.end(renderIssueDetailPage(issue, ctx.view));
+}
+
+async function handleDetailJson(
+  ctx: HandlerCtx<{ kind: 'detail_json'; identifier: string }>,
+): Promise<void> {
+  if (ctx.method !== 'GET') return methodNotAllowed(ctx.res);
+  const { identifier } = ctx.route;
+  const detail = ctx.orch.detailByIdentifier(identifier);
+  if (!detail) return notFound(ctx.res, 'issue_not_found', `issue ${identifier} is not tracked`);
+  jsonResponse(ctx.res, 200, detail);
+}
+
+async function handleNotFoundRoute(ctx: HandlerCtx<{ kind: 'not_found' }>): Promise<void> {
+  notFound(ctx.res);
+}
+
+const ROUTE_HANDLERS: RouteHandlers = {
+  dashboard: handleDashboard,
+  preview: handlePreview,
+  partial: handlePartial,
+  state: handleState,
+  refresh: handleRefresh,
+  issues: handleIssues,
+  mcp: handleMcp,
+  steering: handleSteeringReply,
+  triage: handleTriage,
+  detail_html: handleDetailHtml,
+  detail_json: handleDetailJson,
+  not_found: handleNotFoundRoute,
+};
 
 function renderIssueNotFoundPage(
   identifier: string,
