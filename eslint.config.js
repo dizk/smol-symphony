@@ -20,6 +20,7 @@ const core = [
   'src/actions/executor.ts', 'src/actions/predicates.ts', 'src/actions/templating.ts',
   'src/actions/parsing.ts', 'src/actions/cache.ts', 'src/actions/index.ts',
   'src/workflow.ts', 'src/issues.ts', 'src/prompt.ts', 'src/workspace.ts', 'src/mcp.ts',
+  'src/http-handlers.ts',
 ];
 
 export default [
