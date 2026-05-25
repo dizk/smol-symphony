@@ -13,20 +13,25 @@
 //
 // VM-name mapping (`_boot-vm` → symphony VM):
 //   `_boot-vm` argv contains the path to `~/.cache/smolvm/vms/<hash>/boot-config.json`.
-//   That file's `name` field is the VM's daemon-registered name. We only kill
-//   workers whose name starts with `symphony-`; anything else (an operator's
-//   personal VM, a sibling tool's workers) is left alone.
+//   smolvm consumes and deletes that file shortly after boot, so for a running
+//   VM it isn't present on disk. The persistent sibling `<dir>/name` (plain
+//   text = the daemon-registered VM name) is what we read instead. A
+//   `boot-config.json` fallback remains for robustness across smolvm versions
+//   and for the narrow window before the daemon removes it. We only kill
+//   workers whose resolved name starts with `symphony-`; anything else (an
+//   operator's personal VM, a sibling tool's workers) is left alone.
 //
-// Defense in depth: malformed/missing boot-config.json drops the worker from
-// consideration. The reaper would rather leak than blindly kill a process whose
-// VM name we can't confirm.
+// Defense in depth: a worker whose name can't be resolved from either source
+// drops out of the reapable set. The reaper would rather leak than blindly
+// kill a process whose VM name we can't confirm.
 
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SYMPHONY_VM_PREFIX, type SmolvmClient } from '../agent/smolvm.js';
 import { log } from '../logging.js';
-import type { ActionStatus, ResourceSnapshot } from './types.js';
+import { ResourceActionLedger } from './ledger.js';
+import type { ResourceSnapshot } from './types.js';
 
 /**
  * Source of the orchestrator's currently-intended VM set. Returned each
@@ -49,8 +54,9 @@ export interface VmResourceOptions {
   intended: IntendedVmProvider;
   /**
    * Process enumerator (overridable for tests). Returns workers whose VM name
-   * could be resolved via boot-config.json. Workers with malformed/missing
-   * config are dropped at the source.
+   * could be resolved from the persistent `<vmdir>/name` file (with a
+   * `boot-config.json` fallback). Workers with no resolvable name are dropped
+   * at the source.
    */
   listBootWorkers?: () => Promise<BootWorker[]>;
   /**
@@ -71,12 +77,60 @@ const DEFAULT_KILL_GRACE_MS = 3_000;
 const MAX_ACTION_HISTORY = 32;
 
 /**
- * Enumerate every `_boot-vm` host worker and map it to its symphony VM name
- * via the `boot-config.json` referenced in argv. Linux-only (reads /proc).
+ * Resolve a `_boot-vm` worker's VM name from its on-disk identity.
  *
- * Workers whose argv has no boot-config path, whose boot-config is missing
- * or unparseable, or whose `name` field is absent are dropped silently — the
- * reaper only acts on confidently-identified strays.
+ * The argv-referenced `boot-config.json` lives under
+ * `~/.cache/smolvm/vms/<hash>/boot-config.json`, but smolvm consumes and
+ * deletes that file shortly after the VM boots — so for a running VM it isn't
+ * present on disk. The persistent sibling file `<dir>/name` holds the
+ * daemon-registered VM name as plain text and survives the VM's lifetime.
+ *
+ * Prefer `<dir>/name`. Fall back to parsing `boot-config.json` for robustness
+ * across smolvm versions and for the narrow pre-consume window. Returns null
+ * if neither yields a non-empty string — the reaper only acts on
+ * confidently-identified strays.
+ */
+export async function resolveBootWorkerVmName(configPath: string): Promise<string | null> {
+  const dir = path.dirname(configPath);
+  try {
+    const raw = await readFile(path.join(dir, 'name'), 'utf8');
+    const name = raw.trim();
+    if (name.length > 0) return name;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // ENOENT is the expected case across smolvm versions that don't write a
+    // sibling name file; anything else is worth a debug breadcrumb.
+    if (code !== 'ENOENT') {
+      log.debug('vm reaper: name file read failed', { dir, error: (err as Error).message });
+    }
+  }
+  let body: string;
+  try {
+    body = await readFile(configPath, 'utf8');
+  } catch {
+    log.debug('vm reaper: boot-config read failed', { configPath });
+    return null;
+  }
+  let parsed: { name?: unknown };
+  try {
+    parsed = JSON.parse(body) as { name?: unknown };
+  } catch {
+    log.debug('vm reaper: boot-config malformed', { configPath });
+    return null;
+  }
+  const name = parsed.name;
+  if (typeof name !== 'string' || name.length === 0) return null;
+  return name;
+}
+
+/**
+ * Enumerate every `_boot-vm` host worker and map it to its symphony VM name
+ * via the persistent `<vmdir>/name` file (with a `boot-config.json` fallback).
+ * Linux-only (reads /proc).
+ *
+ * Workers whose argv has no boot-config path, or whose VM name can't be
+ * resolved from either source, are dropped silently — the reaper only acts on
+ * confidently-identified strays.
  */
 export async function defaultListBootWorkers(): Promise<BootWorker[]> {
   const procDir = '/proc';
@@ -101,23 +155,9 @@ export async function defaultListBootWorkers(): Promise<BootWorker[]> {
     if (!argv.some((a) => path.basename(a) === '_boot-vm')) continue;
     const configPath = argv.find((a) => a.endsWith('boot-config.json'));
     if (!configPath) continue;
-    let body: string;
-    try {
-      body = await readFile(configPath, 'utf8');
-    } catch {
-      log.debug('vm reaper: boot-config read failed', { pid, configPath });
-      continue;
-    }
-    let parsed: { name?: unknown };
-    try {
-      parsed = JSON.parse(body) as { name?: unknown };
-    } catch {
-      log.debug('vm reaper: boot-config malformed', { pid, configPath });
-      continue;
-    }
-    const name = parsed.name;
-    if (typeof name !== 'string' || name.length === 0) continue;
-    out.push({ pid, vmName: name });
+    const vmName = await resolveBootWorkerVmName(configPath);
+    if (vmName === null) continue;
+    out.push({ pid, vmName });
   }
   return out;
 }
@@ -146,7 +186,7 @@ export class VmResource {
   private readonly killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
   private readonly killGraceMs: number;
 
-  private actions: ActionStatus[] = [];
+  private readonly ledger = new ResourceActionLedger(this.id, { maxHistory: MAX_ACTION_HISTORY });
   private lastError: string | null = null;
 
   constructor(private readonly opts: VmResourceOptions) {
@@ -219,55 +259,34 @@ export class VmResource {
       ready: true,
       desired_hash: null,
       last_error: this.lastError,
-      actions: this.actions.slice(0, MAX_ACTION_HISTORY),
+      actions: this.ledger.snapshot(),
     };
   }
 
   private async destroyMachine(name: string): Promise<void> {
     const key = `destroy_machine:${name}`;
-    const startedAt = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: key,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.opts.smolvm.destroy(name);
-      this.markActionDone(key);
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(key, msg);
-      log.warn('vm reaper: destroy_machine failed', { name, error: msg });
+    const res = await this.ledger.run(key, () => this.opts.smolvm.destroy(name));
+    if (!res.ok) {
+      this.lastError = res.error;
+      log.warn('vm reaper: destroy_machine failed', { name, error: res.error });
     }
   }
 
   private async killWorker(w: BootWorker): Promise<void> {
     const key = `kill_boot_worker:${w.pid}`;
-    const startedAt = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: key,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
+    this.ledger.start(key);
     // SIGTERM. If the process is already gone (ESRCH) treat as success.
     try {
       this.killProcess(w.pid, 'SIGTERM');
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'ESRCH') {
-        this.markActionDone(key);
+        this.ledger.done(key);
         return;
       }
       const msg = (err as Error).message;
       this.lastError = msg;
-      this.markActionError(key, msg);
+      this.ledger.error(key, msg);
       log.warn('vm reaper: SIGTERM failed', { pid: w.pid, vm: w.vmName, error: msg });
       return;
     }
@@ -284,18 +303,18 @@ export class VmResource {
         // EPERM and friends — assume alive but unkillable; surface as an error.
         const msg = (err as Error).message;
         this.lastError = msg;
-        this.markActionError(key, msg);
+        this.ledger.error(key, msg);
         log.warn('vm reaper: alive-probe failed', { pid: w.pid, error: msg });
         return;
       }
     }
     if (!alive) {
-      this.markActionDone(key);
+      this.ledger.done(key);
       return;
     }
     try {
       this.killProcess(w.pid, 'SIGKILL');
-      this.markActionDone(key);
+      this.ledger.done(key);
       log.info('vm reaper: SIGKILL applied after grace', {
         pid: w.pid,
         vm: w.vmName,
@@ -304,50 +323,13 @@ export class VmResource {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'ESRCH') {
-        this.markActionDone(key);
+        this.ledger.done(key);
         return;
       }
       const msg = (err as Error).message;
       this.lastError = msg;
-      this.markActionError(key, msg);
+      this.ledger.error(key, msg);
       log.warn('vm reaper: SIGKILL failed', { pid: w.pid, vm: w.vmName, error: msg });
-    }
-  }
-
-  private pushAction(status: ActionStatus): void {
-    this.actions.unshift(status);
-    if (this.actions.length > MAX_ACTION_HISTORY * 2) {
-      this.actions.length = MAX_ACTION_HISTORY * 2;
-    }
-  }
-
-  private markActionDone(key: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date().toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = { ...this.actions[idx]!, state: 'done', finished_at: finished };
-    }
-  }
-
-  private markActionError(key: string, error: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date().toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = {
-        ...this.actions[idx]!,
-        state: 'error',
-        finished_at: finished,
-        error,
-      };
-    } else {
-      this.pushAction({
-        resource: this.id,
-        action: key,
-        state: 'error',
-        started_at: finished,
-        finished_at: finished,
-        error,
-      });
     }
   }
 }

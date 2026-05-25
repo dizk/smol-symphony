@@ -1,0 +1,56 @@
+# Smolfile — Rust starter template for smol-symphony.
+#
+# Use this when the per-issue project the orchestrator is dispatching against
+# is a Rust codebase. Point `smolvm.smolfile` in WORKFLOW.md at this path
+# (e.g. `smolvm.smolfile: ./templates/Smolfile.rust`), or copy the file to the
+# project root as `Smolfile` and adjust the `volumes` path below as noted.
+#
+# Like the canonical Node Smolfile, [dev].init runs on every machine start —
+# the reconciler bakes the resulting VM into a cached `.smolmachine` artifact
+# (`~/.cache/symphony/actions/bake/<sha256>`) once per Smolfile-content
+# change, so the apt + rustup + npm install cost is paid on first dispatch
+# (or after `symphony reconcile --force`) rather than per issue.
+#
+# Note on Node: the in-VM stdio proxy at /opt/symphony/vm-agent.mjs is a
+# Node script that `deriveAcpCommand` execs via `node`, so even a Rust-
+# flavoured VM still needs a Node runtime + the ACP adapter packages. This
+# template layers NodeSource on top of the `rust:1-bookworm` base image
+# rather than starting from `node:24-bookworm-slim` and installing rustup,
+# because the rust image already ships rustup + cargo + a recent stable
+# toolchain pinned by the image tag.
+
+image = "rust:1-bookworm"
+
+cpus = 2
+memory = 4096
+net = true
+
+[dev]
+# Mount the host scripts/ dir as /opt/symphony in the guest read-only so the
+# in-VM stdio proxy at /opt/symphony/vm-agent.mjs (referenced by
+# deriveAcpCommand) is always the same file the host has on disk — no
+# separate copy step, no drift. Path is resolved relative to *this* Smolfile;
+# `..` walks from `templates/` back up to the project root. If you copy this
+# file to the project root as `Smolfile`, change the host side to
+# `./scripts:/opt/symphony:ro` to match.
+volumes = ["../scripts:/opt/symphony:ro"]
+
+# Layer order:
+#   1. Base apt tooling (git, ripgrep, curl, build-essential — cargo needs a
+#      C linker for many crates).
+#   2. NodeSource Node.js 22.x so `node /opt/symphony/vm-agent.mjs` works and
+#      `npm install -g` can stage the ACP adapter binaries.
+#   3. A pinned-stable Rust toolchain via the image's pre-installed rustup,
+#      with clippy + rustfmt so common quality gates work out of the box.
+#   4. The same ACP-capable coding agents the canonical Node Smolfile
+#      installs — symphony's adapter registry expects to find these on $PATH
+#      inside the VM regardless of project language.
+init = [
+    "apt-get update -q",
+    "apt-get install -y --no-install-recommends git ripgrep ca-certificates curl build-essential pkg-config",
+    "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
+    "apt-get install -y --no-install-recommends nodejs",
+    "rustup toolchain install stable --profile minimal --component clippy --component rustfmt",
+    "rustup default stable",
+    "npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp opencode-ai",
+]

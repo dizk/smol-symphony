@@ -34,7 +34,8 @@ import path from 'node:path';
 import { sanitizeWorkspaceKey } from '../workspace.js';
 import { runProcess } from '../util/process.js';
 import { log } from '../logging.js';
-import type { ActionStatus, ResourceSnapshot } from './types.js';
+import { ResourceActionLedger } from './ledger.js';
+import type { ResourceSnapshot } from './types.js';
 
 /**
  * Identifiers the orchestrator wants to keep workspaces for. Returned per
@@ -268,7 +269,7 @@ export class WorkspaceResource {
   private readonly create:
     | ((identifier: string, state: string | null) => Promise<void>)
     | null;
-  private actions: ActionStatus[] = [];
+  private readonly ledger = new ResourceActionLedger(this.id, { maxHistory: MAX_ACTION_HISTORY });
   private lastError: string | null = null;
   private staleCount = 0;
   private stuckCount = 0;
@@ -448,7 +449,7 @@ export class WorkspaceResource {
       ready: true,
       desired_hash: null,
       last_error: this.lastError,
-      actions: this.actions.slice(0, MAX_ACTION_HISTORY),
+      actions: this.ledger.snapshot(),
     };
   }
 
@@ -477,48 +478,24 @@ export class WorkspaceResource {
     // remove_workspace uses) so dashboards can correlate the two
     // operations on the same workspace dir.
     const actionKey = `create_workspace:${sanitizedKey}`;
-    const startedAt = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.create(identifier, state);
+    const res = await this.ledger.run(actionKey, () => this.create!(identifier, state));
+    if (res.ok) {
       this.createdCount += 1;
-      this.markActionDone(actionKey);
       log.info('workspace reconcile: created', { identifier, state });
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(actionKey, msg);
-      log.warn('workspace reconcile: create failed', { identifier, state, error: msg });
+    } else {
+      this.lastError = res.error;
+      log.warn('workspace reconcile: create failed', { identifier, state, error: res.error });
     }
   }
 
   private async runRemove(identifier: string, reason: RemoveReason): Promise<void> {
     const actionKey = `remove_workspace:${identifier}`;
-    const startedAt = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.remove(identifier, reason);
-      this.markActionDone(actionKey);
+    const res = await this.ledger.run(actionKey, () => this.remove(identifier, reason));
+    if (res.ok) {
       log.info('workspace reconcile: removed', { identifier, reason });
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(actionKey, msg);
-      log.warn('workspace reconcile: remove failed', { identifier, reason, error: msg });
+    } else {
+      this.lastError = res.error;
+      log.warn('workspace reconcile: remove failed', { identifier, reason, error: res.error });
     }
   }
 
@@ -531,52 +508,6 @@ export class WorkspaceResource {
    * failure.
    */
   private recordMark(identifier: string, status: 'stale' | 'stuck', reason: string): void {
-    const actionKey = `mark_${status}:${identifier}`;
-    const now = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'done',
-      started_at: now,
-      finished_at: now,
-      error: reason,
-    });
-  }
-
-  private pushAction(status: ActionStatus): void {
-    this.actions.unshift(status);
-    if (this.actions.length > MAX_ACTION_HISTORY * 2) {
-      this.actions.length = MAX_ACTION_HISTORY * 2;
-    }
-  }
-
-  private markActionDone(key: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date().toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = { ...this.actions[idx]!, state: 'done', finished_at: finished };
-    }
-  }
-
-  private markActionError(key: string, error: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date().toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = {
-        ...this.actions[idx]!,
-        state: 'error',
-        finished_at: finished,
-        error,
-      };
-    } else {
-      this.pushAction({
-        resource: this.id,
-        action: key,
-        state: 'error',
-        started_at: finished,
-        finished_at: finished,
-        error,
-      });
-    }
+    this.ledger.record(`mark_${status}:${identifier}`, 'done', reason);
   }
 }

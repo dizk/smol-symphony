@@ -36,7 +36,8 @@
 
 import { log } from '../logging.js';
 import { runProcess } from '../util/process.js';
-import type { ActionStatus, ResourceSnapshot } from './types.js';
+import { ResourceActionLedger } from './ledger.js';
+import type { ResourceSnapshot } from './types.js';
 
 export type PrIntentKind = 'merge' | 'close';
 
@@ -296,14 +297,18 @@ export class PrResource {
   readonly dependsOn: string[] = [];
 
   private state = new Map<string, PerIssueState>();
-  private actions: ActionStatus[] = [];
   private lastError: string | null = null;
   private readonly now: () => number;
   private readonly actor: string;
+  private readonly ledger: ResourceActionLedger;
 
   constructor(private readonly opts: PrResourceOptions) {
     this.now = opts.now ?? (() => Date.now());
     this.actor = opts.actor ?? 'pr-autopilot';
+    this.ledger = new ResourceActionLedger(this.id, {
+      now: this.now,
+      maxHistory: MAX_ACTION_HISTORY,
+    });
   }
 
   ready(): boolean {
@@ -378,7 +383,7 @@ export class PrResource {
       ready: true,
       desired_hash: null,
       last_error: this.lastError,
-      actions: this.actions.slice(0, MAX_ACTION_HISTORY),
+      actions: this.ledger.snapshot(),
     };
   }
 
@@ -566,24 +571,17 @@ export class PrResource {
       return null;
     }
     const actionKey = `list_pr_for_branch:${intent.identifier}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(now).toISOString(),
-      finished_at: null,
-      error: null,
-    });
+    this.ledger.start(actionKey);
     try {
       const result = await this.opts.pr.listForBranch(intent.branch);
       st.prSummary = result;
       st.lastLookupAt = now;
-      this.markActionDone(actionKey);
+      this.ledger.done(actionKey);
       return result;
     } catch (err) {
       const msg = (err as Error).message;
       this.lastError = `list_pr_failed: ${msg}`;
-      this.markActionError(actionKey, msg);
+      this.ledger.error(actionKey, msg);
       return null;
     }
   }
@@ -598,14 +596,7 @@ export class PrResource {
       return st.prView;
     }
     const actionKey = `view_pr:${prNumber}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(now).toISOString(),
-      finished_at: null,
-      error: null,
-    });
+    this.ledger.start(actionKey);
     try {
       const view = await this.opts.pr.view(prNumber);
       st.prView = view;
@@ -616,12 +607,12 @@ export class PrResource {
         st.lastObservedHeadSha = view.head_ref_oid;
       }
       st.armed = view.auto_merge_armed;
-      this.markActionDone(actionKey);
+      this.ledger.done(actionKey);
       return view;
     } catch (err) {
       const msg = (err as Error).message;
       this.lastError = `view_pr_failed: ${msg}`;
-      this.markActionError(actionKey, msg);
+      this.ledger.error(actionKey, msg);
       log.warn('pr reconcile: view failed', {
         identifier,
         pr_number: prNumber,
@@ -637,18 +628,11 @@ export class PrResource {
     st: PerIssueState,
   ): Promise<RebaseOutcome> {
     const actionKey = `rebase_and_force_push:${intent.identifier}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(this.now()).toISOString(),
-      finished_at: null,
-      error: null,
-    });
+    this.ledger.start(actionKey);
     if (intent.workspace_path === null) {
       // Defensive: callers should not invoke runRebase without a workspace.
       const msg = 'rebase requested without workspace path';
-      this.markActionError(actionKey, msg);
+      this.ledger.error(actionKey, msg);
       log.warn('pr reconcile: rebase failed', {
         identifier: intent.identifier,
         stage: 'precondition',
@@ -670,7 +654,7 @@ export class PrResource {
         expectedHeadSha: view.head_ref_oid,
       });
       if (ensure.kind === 'error') {
-        this.markActionError(actionKey, ensure.diagnostic);
+        this.ledger.error(actionKey, ensure.diagnostic);
         log.warn('pr reconcile: rebase failed', {
           identifier: intent.identifier,
           stage: 'ensure_workspace',
@@ -689,7 +673,7 @@ export class PrResource {
       });
     } catch (err) {
       const msg = (err as Error).message;
-      this.markActionError(actionKey, msg);
+      this.ledger.error(actionKey, msg);
       log.warn('pr reconcile: rebase failed', {
         identifier: intent.identifier,
         stage: 'rebase_threw',
@@ -713,7 +697,7 @@ export class PrResource {
         });
       } catch (err) {
         const msg = (err as Error).message;
-        this.markActionError(actionKey, msg);
+        this.ledger.error(actionKey, msg);
         log.warn('pr reconcile: rebase failed', {
           identifier: intent.identifier,
           stage: 'push_threw',
@@ -722,7 +706,7 @@ export class PrResource {
         return { kind: 'error', diagnostic: msg };
       }
       if (push.kind === 'concurrent_push') {
-        this.markActionError(actionKey, push.diagnostic);
+        this.ledger.error(actionKey, push.diagnostic);
         log.warn('pr reconcile: rebase failed', {
           identifier: intent.identifier,
           stage: 'push_concurrent',
@@ -731,7 +715,7 @@ export class PrResource {
         return { kind: 'concurrent_push', observed_head_sha: view.head_ref_oid };
       }
       if (push.kind === 'error') {
-        this.markActionError(actionKey, push.diagnostic);
+        this.ledger.error(actionKey, push.diagnostic);
         log.warn('pr reconcile: rebase failed', {
           identifier: intent.identifier,
           stage: 'push_error',
@@ -739,7 +723,7 @@ export class PrResource {
         });
         return { kind: 'error', diagnostic: push.diagnostic };
       }
-      this.markActionDone(actionKey);
+      this.ledger.done(actionKey);
       log.info('pr reconcile: rebase+push ok', {
         identifier: intent.identifier,
         new_head_sha: rebase.new_head_sha,
@@ -763,7 +747,7 @@ export class PrResource {
         : rebase.kind === 'error'
         ? rebase.diagnostic
         : 'unknown';
-    this.markActionError(actionKey, finalDiagnostic);
+    this.ledger.error(actionKey, finalDiagnostic);
     log.warn('pr reconcile: rebase failed', {
       identifier: intent.identifier,
       stage: 'rebase_outcome',
@@ -775,26 +759,17 @@ export class PrResource {
 
   private async runArmAutoMerge(identifier: string, view: PrView): Promise<void> {
     const actionKey = `arm_auto_merge:${view.number}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(this.now()).toISOString(),
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.opts.pr.armAutoMerge(view.number, this.opts.strategy);
-      this.markActionDone(actionKey);
+    const res = await this.ledger.run(actionKey, () =>
+      this.opts.pr.armAutoMerge(view.number, this.opts.strategy),
+    );
+    if (res.ok) {
       log.info('pr reconcile: armed auto-merge', {
         identifier,
         pr_number: view.number,
         strategy: this.opts.strategy,
       });
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(actionKey, msg);
+    } else {
+      this.lastError = res.error;
     }
   }
 
@@ -804,25 +779,14 @@ export class PrResource {
     branch: string,
   ): Promise<void> {
     const actionKey = `close_pr:${view.number}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(this.now()).toISOString(),
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.opts.pr.closePr(view.number);
-      this.markActionDone(actionKey);
+    const res = await this.ledger.run(actionKey, () => this.opts.pr.closePr(view.number));
+    if (res.ok) {
       log.info('pr reconcile: closed pr', {
         identifier,
         pr_number: view.number,
       });
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(actionKey, msg);
+    } else {
+      this.lastError = res.error;
       return;
     }
     // Delete the remote branch separately. `--delete-branch` on the close
@@ -834,50 +798,26 @@ export class PrResource {
 
   private async runDeleteRemoteBranch(identifier: string, branch: string): Promise<void> {
     const actionKey = `delete_remote_branch:${branch}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(this.now()).toISOString(),
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.opts.pr.deleteRemoteBranch(branch);
-      this.markActionDone(actionKey);
-    } catch (err) {
-      const msg = (err as Error).message;
+    const res = await this.ledger.run(actionKey, () => this.opts.pr.deleteRemoteBranch(branch));
+    if (!res.ok) {
       // Remote-branch deletion is best-effort — the branch may already be
       // gone (gh exits non-zero), or the operator may have removed it. We
       // log at info, surface in last_error, and move on.
-      this.lastError = `delete_remote_branch_failed: ${msg}`;
-      this.markActionError(actionKey, msg);
+      this.lastError = `delete_remote_branch_failed: ${res.error}`;
       log.info('pr reconcile: remote branch delete failed (best-effort)', {
         identifier,
         branch,
-        error: msg,
+        error: res.error,
       });
     }
   }
 
   private async runCleanupWorkspace(identifier: string): Promise<void> {
     const actionKey = `cleanup_workspace:${identifier}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(this.now()).toISOString(),
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.opts.cleanup.removeWorkspace(identifier);
-      this.markActionDone(actionKey);
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(actionKey, msg);
-    }
+    const res = await this.ledger.run(actionKey, () =>
+      this.opts.cleanup.removeWorkspace(identifier),
+    );
+    if (!res.ok) this.lastError = res.error;
   }
 
   private async cleanupAfterMerge(intent: PrIntent, view: PrView): Promise<void> {
@@ -910,8 +850,23 @@ export class PrResource {
     const attempt = st.rebaseAttempts;
     const max = this.opts.maxRebaseAttempts;
 
-    // Per the issue contract: "rebase counter >= N → route_to_conflict_state".
-    // With max=3 the 3rd consecutive failure (attempt == max) trips the breaker.
+    // Observability: emit the counter's progress toward the breaker on every
+    // route, regardless of whether this is a route-to-implementing or a
+    // route-to-holding. The route log line that follows reports the to_state
+    // but not the attempt number — without this, reconstructing whether the
+    // breaker tripped on time requires correlating timestamps by hand.
+    log.info('pr reconcile: conflict attempt', {
+      identifier: intent.identifier,
+      attempt,
+      max,
+    });
+
+    // With `max_rebase_attempts: N`, the Nth conflict route parks the issue
+    // in the holding state. Pre-increment + `attempt >= max` means: routes 1
+    // through N-1 go to conflict_route_to, route N goes to conflict_holding_state.
+    // Both the gh-CONFLICTING and host-rebase-conflict paths in processMerge
+    // funnel through this single increment, so the counter advances on every
+    // observed conflict — no route can skip the count.
     if (attempt >= max) {
       // Circuit broken: route to the holding state if declared, else log a
       // hard error and stop attempting (the next pass will see the issue
@@ -969,36 +924,27 @@ export class PrResource {
     notes: string,
   ): Promise<void> {
     const actionKey = `route_to_conflict:${intent.identifier}:${toState.toLowerCase()}`;
-    this.pushAction({
-      resource: this.id,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: new Date(this.now()).toISOString(),
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.opts.transition.routeIssue({
+    const res = await this.ledger.run(actionKey, () =>
+      this.opts.transition.routeIssue({
         identifier: intent.identifier,
         fromState: intent.state,
         toState,
         notes,
         actor: this.actor,
-      });
-      this.markActionDone(actionKey);
+      }),
+    );
+    if (res.ok) {
       log.info('pr reconcile: routed to conflict-handling state', {
         identifier: intent.identifier,
         from_state: intent.state,
         to_state: toState,
       });
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(actionKey, msg);
+    } else {
+      this.lastError = res.error;
       log.warn('pr reconcile: conflict route failed', {
         identifier: intent.identifier,
         to_state: toState,
-        error: msg,
+        error: res.error,
       });
     }
   }
@@ -1055,45 +1001,6 @@ export class PrResource {
       );
     }
     return lines.join('\n');
-  }
-
-  // ─── ledger plumbing (same shape as VmResource / WorkspaceResource) ─────
-
-  private pushAction(status: ActionStatus): void {
-    this.actions.unshift(status);
-    if (this.actions.length > MAX_ACTION_HISTORY * 2) {
-      this.actions.length = MAX_ACTION_HISTORY * 2;
-    }
-  }
-
-  private markActionDone(key: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date(this.now()).toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = { ...this.actions[idx]!, state: 'done', finished_at: finished };
-    }
-  }
-
-  private markActionError(key: string, error: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date(this.now()).toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = {
-        ...this.actions[idx]!,
-        state: 'error',
-        finished_at: finished,
-        error,
-      };
-    } else {
-      this.pushAction({
-        resource: this.id,
-        action: key,
-        state: 'error',
-        started_at: finished,
-        finished_at: finished,
-        error,
-      });
-    }
   }
 }
 

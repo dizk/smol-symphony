@@ -21,7 +21,7 @@
 
 import { mkdir, open, readdir, readFile, rename, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { parseFrontMatter, FrontMatterError } from '../util/frontmatter.js';
 import type { Issue, BlockerRef, TrackerConfig } from '../types.js';
 import type { IssueTracker, CandidateFetchResult } from './types.js';
 import { TrackerError } from './types.js';
@@ -57,37 +57,22 @@ function asTimestamp(v: unknown): string | null {
   return null;
 }
 
+// Thin wrapper over the shared parser. Translates FrontMatterError → TrackerError
+// so the scanner's existing skip-and-log catch picks them up under the same code.
 function splitFrontMatter(text: string): { config: Record<string, unknown>; body: string } {
-  if (!text.startsWith('---')) return { config: {}, body: text.trim() };
-  const lines = text.split(/\r?\n/);
-  const isFence = (l: string | undefined) => /^---\s*$/.test(l ?? '');
-  if (!isFence(lines[0])) return { config: {}, body: text.trim() };
-  let endIdx = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (isFence(lines[i])) {
-      endIdx = i;
-      break;
-    }
-  }
-  if (endIdx < 0) return { config: {}, body: text.trim() };
-  const fmText = lines.slice(1, endIdx).join('\n').trim();
-  const body = lines.slice(endIdx + 1).join('\n').trim();
-  let parsed: unknown = {};
-  if (fmText.length > 0) {
-    try {
-      parsed = parseYaml(fmText);
-    } catch (err) {
+  let fm;
+  try {
+    fm = parseFrontMatter(text);
+  } catch (err) {
+    if (err instanceof FrontMatterError) {
       throw new TrackerError(
         'local_issue_parse_error',
-        `failed to parse front matter: ${(err as Error).message}`,
+        err.code === 'not_a_map' ? 'issue front matter must be a map' : `failed to parse front matter: ${err.message}`,
       );
     }
+    throw err;
   }
-  if (parsed === null || parsed === undefined) parsed = {};
-  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new TrackerError('local_issue_parse_error', 'issue front matter must be a map');
-  }
-  return { config: parsed as Record<string, unknown>, body };
+  return { config: fm.fields, body: fm.body };
 }
 
 export class LocalMarkdownTracker implements IssueTracker {
