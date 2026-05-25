@@ -11,7 +11,15 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { VmResource, type BootWorker, type IntendedVmProvider } from '../src/reconciler/vm.js';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  VmResource,
+  resolveBootWorkerVmName,
+  type BootWorker,
+  type IntendedVmProvider,
+} from '../src/reconciler/vm.js';
 import type { SmolvmClient } from '../src/agent/smolvm.js';
 
 // --- shared fixtures ---------------------------------------------------------
@@ -222,6 +230,92 @@ describe('VmResource reaper', () => {
     assert.deepEqual(smolvm.destroyed, [], 'dev-shell is not symphony-prefixed; left in registry');
     assert.equal(procs[0]!.alive, true, 'dev-shell process untouched');
     assert.equal(procs[1]!.alive, false, 'symphony-leak got reaped');
+  });
+
+  it('resolveBootWorkerVmName reads the persistent <dir>/name file when boot-config.json is gone', async () => {
+    // This is the running-VM shape: smolvm has consumed boot-config.json after
+    // boot, leaving only the sibling `name` file. Issue 51 — the prior
+    // implementation read boot-config.json and dropped every running VM from
+    // the reapable set; this test pins the persistent-name path.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
+    try {
+      const vmDir = path.join(root, 'abc123');
+      await mkdir(vmDir, { recursive: true });
+      await writeFile(path.join(vmDir, 'name'), 'symphony-42\n', 'utf8');
+      const configPath = path.join(vmDir, 'boot-config.json');
+      // Deliberately do NOT create boot-config.json — that mirrors the live
+      // running-VM state.
+      const resolved = await resolveBootWorkerVmName(configPath);
+      assert.equal(resolved, 'symphony-42');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveBootWorkerVmName falls back to boot-config.json when no name file is present', async () => {
+    // Older smolvm versions (pre-`name` sibling) and the narrow window before
+    // the daemon consumes boot-config.json both rely on the JSON fallback.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
+    try {
+      const vmDir = path.join(root, 'def456');
+      await mkdir(vmDir, { recursive: true });
+      const configPath = path.join(vmDir, 'boot-config.json');
+      await writeFile(configPath, JSON.stringify({ name: 'symphony-legacy' }), 'utf8');
+      const resolved = await resolveBootWorkerVmName(configPath);
+      assert.equal(resolved, 'symphony-legacy');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveBootWorkerVmName prefers <dir>/name over boot-config.json when both are present', async () => {
+    // If both exist, the persistent name file is authoritative — boot-config
+    // is what the daemon ate at boot time and may lag any subsequent rename.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
+    try {
+      const vmDir = path.join(root, 'ghi789');
+      await mkdir(vmDir, { recursive: true });
+      await writeFile(path.join(vmDir, 'name'), 'symphony-current', 'utf8');
+      const configPath = path.join(vmDir, 'boot-config.json');
+      await writeFile(configPath, JSON.stringify({ name: 'symphony-stale' }), 'utf8');
+      const resolved = await resolveBootWorkerVmName(configPath);
+      assert.equal(resolved, 'symphony-current');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveBootWorkerVmName returns null when neither source yields a name', async () => {
+    // No name file, no boot-config — the reaper drops this worker rather than
+    // killing it on a guess.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
+    try {
+      const vmDir = path.join(root, 'empty');
+      await mkdir(vmDir, { recursive: true });
+      const configPath = path.join(vmDir, 'boot-config.json');
+      const resolved = await resolveBootWorkerVmName(configPath);
+      assert.equal(resolved, null);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveBootWorkerVmName ignores an empty name file and falls back to boot-config.json', async () => {
+    // A zero-byte `name` file shouldn't be treated as a confident identity.
+    // Fall through to the JSON config so a transient write race doesn't drop
+    // the worker.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
+    try {
+      const vmDir = path.join(root, 'partial');
+      await mkdir(vmDir, { recursive: true });
+      await writeFile(path.join(vmDir, 'name'), '   \n', 'utf8');
+      const configPath = path.join(vmDir, 'boot-config.json');
+      await writeFile(configPath, JSON.stringify({ name: 'symphony-fallback' }), 'utf8');
+      const resolved = await resolveBootWorkerVmName(configPath);
+      assert.equal(resolved, 'symphony-fallback');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('snapshot reports per-action ledger and last_error', async () => {
