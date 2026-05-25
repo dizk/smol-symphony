@@ -11,9 +11,9 @@
 //
 // Invariant: dependencies point inward. domain must NOT import adapters/application/entry;
 // adapters must NOT import domain/application/entry; only application may import adapters.
-const foundation  = 'src/(types|logging)\\.ts$|src/util/[^/]+\\.ts$|src/(actions|reconciler|trackers)/types\\.ts$';
-const config      = 'src/workflow\\.ts$';
-const domain      = 'src/reconciler/(bake|vm|workspace|pr|cache)\\.ts$|src/actions/(executor|predicates|templating|parsing|cache|index)\\.ts$|src/(workspace|mcp|issues|prompt)\\.ts$';
+const foundation  = 'src/(types|logging|errors)\\.ts$|src/util/[^/]+\\.ts$|src/(actions|reconciler|trackers)/types\\.ts$';
+const config      = 'src/workflow\\.ts$|src/actions/parsing\\.ts$';
+const domain      = 'src/reconciler/(bake|vm|workspace|pr|cache)\\.ts$|src/actions/(executor|predicates|templating|cache|index)\\.ts$|src/(workspace|mcp|issues|prompt)\\.ts$';
 const adapters    = 'src/trackers/local\\.ts$|src/agent/(smolvm|adapters|acp|tool-call-summary)\\.ts$|src/(acp-bridge|runlog|memory)\\.ts$';
 const application = 'src/orchestrator\\.ts$|src/reconciler/index\\.ts$|src/agent/(runner|integration)\\.ts$';
 const entry       = 'src/(http|http-handlers)\\.ts$|src/bin/symphony\\.ts$';

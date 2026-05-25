@@ -34,13 +34,9 @@ import {
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { parseActionsBlock } from './actions/parsing.js';
 import type { WorkflowAction } from './actions/types.js';
+import { WorkflowError } from './errors.js';
 
-export class WorkflowError extends Error {
-  constructor(public code: string, message: string) {
-    super(message);
-    this.name = 'WorkflowError';
-  }
-}
+export { WorkflowError };
 
 // §4.2: split YAML front matter from prompt body. Thin wrapper over the shared
 // parser that translates FrontMatterError → WorkflowError so callers keep
