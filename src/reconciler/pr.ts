@@ -850,8 +850,23 @@ export class PrResource {
     const attempt = st.rebaseAttempts;
     const max = this.opts.maxRebaseAttempts;
 
-    // Per the issue contract: "rebase counter >= N → route_to_conflict_state".
-    // With max=3 the 3rd consecutive failure (attempt == max) trips the breaker.
+    // Observability: emit the counter's progress toward the breaker on every
+    // route, regardless of whether this is a route-to-implementing or a
+    // route-to-holding. The route log line that follows reports the to_state
+    // but not the attempt number — without this, reconstructing whether the
+    // breaker tripped on time requires correlating timestamps by hand.
+    log.info('pr reconcile: conflict attempt', {
+      identifier: intent.identifier,
+      attempt,
+      max,
+    });
+
+    // With `max_rebase_attempts: N`, the Nth conflict route parks the issue
+    // in the holding state. Pre-increment + `attempt >= max` means: routes 1
+    // through N-1 go to conflict_route_to, route N goes to conflict_holding_state.
+    // Both the gh-CONFLICTING and host-rebase-conflict paths in processMerge
+    // funnel through this single increment, so the counter advances on every
+    // observed conflict — no route can skip the count.
     if (attempt >= max) {
       // Circuit broken: route to the holding state if declared, else log a
       // hard error and stop attempting (the next pass will see the issue
