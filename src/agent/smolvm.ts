@@ -179,6 +179,16 @@ export class SmolvmClient {
   }
 
   async destroy(name: string): Promise<void> {
+    // smolvm separates a runtime axis (start/stop) from a config axis
+    // (create/delete). `machine delete -f` removes the config dir but does
+    // not stop the libkrun `_boot-vm` worker, so the worker leaks (reparented
+    // to PID 1, holding deleted-inode fds) until the host is restarted. Stop
+    // first to kill the worker, then delete to clear the registry slot.
+    //
+    // `stop()` is best-effort and already swallows failures (e.g. the VM is
+    // already stopped after a crash), so a failing stop never blocks the
+    // delete.
+    await this.stop(name);
     try {
       await this.run(['machine', 'delete', name, '-f'], { timeoutMs: 30_000 });
     } catch (err) {
