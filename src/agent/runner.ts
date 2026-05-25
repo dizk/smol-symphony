@@ -33,6 +33,7 @@ import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
 import { resolveActionsForState, resolveHooksForState } from '../workflow.js';
+import { parseFrontMatterLenient } from '../util/frontmatter.js';
 import {
   runActions,
   toActionsSnapshot,
@@ -88,22 +89,6 @@ function continuationPrompt(mcpEnabled: boolean): string {
   return mcpEnabled ? CONTINUATION_PROMPT_WITH_MCP : CONTINUATION_PROMPT_NO_MCP;
 }
 
-// Extract the body (everything after the closing YAML front-matter fence) from a tracker
-// issue file. Tolerant of malformed/missing front matter — returns the whole file in that
-// case so a hand-edited issue still produces a sensible PR body. Mirrors the parser in
-// src/trackers/local.ts; kept local to avoid widening the tracker's public surface for a
-// single one-shot read.
-function extractIssueBody(text: string): string {
-  if (!text.startsWith('---')) return text.trim();
-  const lines = text.split(/\r?\n/);
-  const isFence = (l: string | undefined): boolean => /^---\s*$/.test(l ?? '');
-  if (!isFence(lines[0])) return text.trim();
-  for (let i = 1; i < lines.length; i++) {
-    if (isFence(lines[i])) return lines.slice(i + 1).join('\n').trim();
-  }
-  return text.trim();
-}
-
 // Stage the env vars + body file the Done state's after_run hook consumes (SYMPHONY_*).
 // Reads the current issue file from <tracker_root>/<state>/<identifier>.md so any
 // transition notes appended by `symphony.transition` ride through into the PR body;
@@ -121,7 +106,7 @@ export async function buildAfterRunHookEnv(
     const issuePath = path.join(entry.tracker_root_at_dispatch, issue.state, `${ident}.md`);
     try {
       const text = await readFile(issuePath, 'utf8');
-      body = extractIssueBody(text);
+      body = parseFrontMatterLenient(text).body;
     } catch {
       // Fall back to the dispatch-time description; the hook still works, it just
       // won't see notes the agent appended during the run.

@@ -5,7 +5,7 @@ import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import chokidar from 'chokidar';
-import { parse as parseYaml } from 'yaml';
+import { parseFrontMatter, FrontMatterError } from './util/frontmatter.js';
 import type {
   ServiceConfig,
   StateConfig,
@@ -42,42 +42,21 @@ export class WorkflowError extends Error {
   }
 }
 
-// §4.2: split YAML front matter from prompt body.
+// §4.2: split YAML front matter from prompt body. Thin wrapper over the shared
+// parser that translates FrontMatterError → WorkflowError so callers keep
+// matching on the existing error codes.
 export function splitFrontMatter(text: string): { config: Record<string, unknown>; body: string } {
-  if (!text.startsWith('---')) {
-    return { config: {}, body: text.trim() };
-  }
-  const lines = text.split(/\r?\n/);
-  // First and closing fences must be exactly `---` (with optional trailing whitespace),
-  // unindented. Otherwise an indented `---` inside a multiline YAML hook script would be
-  // mistaken for the closing fence.
-  const isFence = (line: string | undefined): boolean => /^---\s*$/.test(line ?? '');
-  if (!isFence(lines[0])) {
-    return { config: {}, body: text.trim() };
-  }
-  let endIdx = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (isFence(lines[i])) {
-      endIdx = i;
-      break;
-    }
-  }
-  if (endIdx < 0) {
-    throw new WorkflowError('workflow_parse_error', 'unterminated YAML front matter');
-  }
-  const fmText = lines.slice(1, endIdx).join('\n');
-  const body = lines.slice(endIdx + 1).join('\n').trim();
-  let parsed: unknown;
+  let fm;
   try {
-    parsed = fmText.trim().length === 0 ? {} : parseYaml(fmText);
+    fm = parseFrontMatter(text);
   } catch (err) {
-    throw new WorkflowError('workflow_parse_error', `invalid YAML front matter: ${(err as Error).message}`);
+    if (err instanceof FrontMatterError) {
+      const code = err.code === 'not_a_map' ? 'workflow_front_matter_not_a_map' : 'workflow_parse_error';
+      throw new WorkflowError(code, err.message);
+    }
+    throw err;
   }
-  if (parsed === null || parsed === undefined) parsed = {};
-  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new WorkflowError('workflow_front_matter_not_a_map', 'YAML front matter must decode to a map');
-  }
-  return { config: parsed as Record<string, unknown>, body };
+  return { config: fm.fields, body: fm.body };
 }
 
 export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefinition> {
