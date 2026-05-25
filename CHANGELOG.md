@@ -20,6 +20,13 @@ hand work off between them via a single MCP call.
   alongside the per-issue JSONL run logs already in the same directory. Set
   `SYMPHONY_LOG_FILE` to override the path; set it to the empty string to
   disable the file sink (stderr remains).
+- `templates/Smolfile.rust`. A starter Smolfile for projects whose per-issue
+  VM should ship a Rust toolchain instead of the canonical Node one: bases on
+  `rust:1-bookworm` (rustup + cargo + stable, with clippy + rustfmt), layers
+  NodeSource so the in-VM proxy still has a Node runtime, and installs the
+  same ACP adapter set the root Smolfile does. Point `smolvm.smolfile` in
+  WORKFLOW.md at it, or copy it to the project root as `Smolfile` and adjust
+  the `volumes` path noted in the file header.
 - `pr_autopilot` workflow block (default off). When `enabled: true` the
   reconciler grows a `pr` resource that, on every tick, keeps each
   terminal-state issue's GitHub PR rebased on `origin/<base>`, arms

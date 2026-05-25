@@ -36,6 +36,7 @@
     "PRODUCT.md",
     "DESIGN.md",
     "Smolfile",
+    "templates/",
     "scripts/vm-agent.mjs",
     "README.md",
     "LICENSE"
