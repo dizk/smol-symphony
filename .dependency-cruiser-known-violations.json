@@ -1,0 +1,102 @@
+[
+  {
+    "type": "dependency",
+    "from": "src/runlog.ts",
+    "to": "src/workspace.ts",
+    "unresolvedTo": "./workspace.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "adapters↛inward"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "src/trackers/local.ts",
+    "to": "src/issues.ts",
+    "unresolvedTo": "../issues.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "adapters↛inward"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "src/workflow.ts",
+    "to": "src/actions/parsing.ts",
+    "unresolvedTo": "./actions/parsing.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "config↛up"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "src/workflow.ts",
+    "to": "src/agent/adapters.ts",
+    "unresolvedTo": "./agent/adapters.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "config↛up"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "src/reconciler/vm.ts",
+    "to": "src/agent/smolvm.ts",
+    "unresolvedTo": "../agent/smolvm.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "domain↛adapters"
+    }
+  },
+  {
+    "type": "cycle",
+    "from": "src/actions/parsing.ts",
+    "to": "src/workflow.ts",
+    "unresolvedTo": "../workflow.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "src/workflow.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "src/actions/parsing.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  }
+]

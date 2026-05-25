@@ -121,6 +121,30 @@ tracker:
 # rewrite: canonical workspace setup is now TypeScript-owned and runs before
 # any optional `after_create` hook (see SPEC §5.3 and WORKFLOW.template.md).
 
+# PR autopilot (issue 38). Enabled 2026-05-25 so Done-state PRs are kept rebased
+# on origin/main and GitHub auto-merge is armed once checks pass; rebase
+# conflicts route the issue back to Todo with conflict markers, and after 3
+# consecutive failures it parks in the Conflict holding state. Strategy `squash`
+# matches the repo's `NN: title (#PR)` history. Defaults below mirror symphony's
+# state names (merge=Done, close=Cancelled, conflict→Todo, holding=Conflict).
+#
+# PREREQUISITE: `gh pr merge --auto` requires at least one branch-protection
+# rule on `main`, or arming auto-merge errors. Ensure one exists in the repo's
+# GitHub settings. To disable, set `enabled: false` (the resource is then never
+# constructed and Done-state behavior reverts to the after_run PR-create hook +
+# operator merge). Note: while enabled, transitions into Done no longer fire the
+# standard terminal workspace cleanup — the pr resource owns the workspace until
+# its PR merges or closes.
+pr_autopilot:
+  enabled: true
+  merge_state: Done
+  close_state: Cancelled
+  conflict_route_to: Todo
+  conflict_holding_state: Conflict
+  max_rebase_attempts: 3
+  auto_merge_strategy: squash
+  poll_interval_ms: 30000
+
 polling:
   interval_ms: 5000
 
@@ -172,7 +196,7 @@ hooks:
   # state check to short-circuit non-terminal turns.
 
 agent:
-  max_concurrent_agents: 1
+  max_concurrent_agents: 2
   max_turns: 6
   max_retry_backoff_ms: 120000
 
@@ -265,8 +289,11 @@ Orientation:
 - This is the smol-symphony codebase. Start by reading `README.md` and
   `PRODUCT.md` if you haven't seen them. `SPEC.md` is the long-form design
   spec. `CLAUDE.md` (if present) has any standing instructions for this repo.
-- Source lives under `src/`. Tests live under `tests/`. Run `npm test` and
-  `npm run typecheck` before declaring work done.
+- Source lives under `src/`. Tests live under `tests/`. Before declaring work
+  done, run `npm run typecheck`, `npm test`, `npm run lint:arch` (import
+  direction + hexagonal layering: domain must reach infra only through injected
+  ports), and `npm run lint` (functional-core purity + imperative-shell
+  complexity budgets); all must pass.
 - You are on a per-issue branch (`agent/{{ issue.identifier }}`) checked out
   from the configured base branch. Commit your work locally. You do **not**
   have network credentials; pushing is the host's job, after the issue lands
@@ -293,8 +320,13 @@ the per-issue branch, then hand off to the reviewer.
    side of the seam: stop and put the logic in the runner/MCP layer
    instead. The issue body may sketch a shell-shaped solution; treat that
    as one option, not a directive.
-3. Make the smallest correct change. Add or update tests where the change is
-   testable. Run `npm run typecheck` and `npm test`; both must pass.
+3. Make the smallest correct change, and **keep it small**. CI enforces a
+   diff-size budget (~400 changed lines / ~12 files). If finishing this issue
+   would exceed that, or pull in work beyond the scope the issue states,
+   implement the smallest coherent slice and call `symphony.propose_issue` for
+   the remainder — do not expand this change to swallow follow-up work. Add or
+   update tests where the change is testable; `npm run typecheck`, `npm test`,
+   `npm run lint:arch`, and `npm run lint` must all pass.
 4. Commit your work to the per-issue branch with a short message.
 5. Hand off to the reviewer by calling:
 
