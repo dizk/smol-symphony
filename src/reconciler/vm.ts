@@ -30,7 +30,8 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SYMPHONY_VM_PREFIX, type SmolvmClient } from '../agent/smolvm.js';
 import { log } from '../logging.js';
-import type { ActionStatus, ResourceSnapshot } from './types.js';
+import { ResourceActionLedger } from './ledger.js';
+import type { ResourceSnapshot } from './types.js';
 
 /**
  * Source of the orchestrator's currently-intended VM set. Returned each
@@ -185,7 +186,7 @@ export class VmResource {
   private readonly killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
   private readonly killGraceMs: number;
 
-  private actions: ActionStatus[] = [];
+  private readonly ledger = new ResourceActionLedger(this.id, { maxHistory: MAX_ACTION_HISTORY });
   private lastError: string | null = null;
 
   constructor(private readonly opts: VmResourceOptions) {
@@ -258,55 +259,34 @@ export class VmResource {
       ready: true,
       desired_hash: null,
       last_error: this.lastError,
-      actions: this.actions.slice(0, MAX_ACTION_HISTORY),
+      actions: this.ledger.snapshot(),
     };
   }
 
   private async destroyMachine(name: string): Promise<void> {
     const key = `destroy_machine:${name}`;
-    const startedAt = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: key,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
-    try {
-      await this.opts.smolvm.destroy(name);
-      this.markActionDone(key);
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = msg;
-      this.markActionError(key, msg);
-      log.warn('vm reaper: destroy_machine failed', { name, error: msg });
+    const res = await this.ledger.run(key, () => this.opts.smolvm.destroy(name));
+    if (!res.ok) {
+      this.lastError = res.error;
+      log.warn('vm reaper: destroy_machine failed', { name, error: res.error });
     }
   }
 
   private async killWorker(w: BootWorker): Promise<void> {
     const key = `kill_boot_worker:${w.pid}`;
-    const startedAt = new Date().toISOString();
-    this.pushAction({
-      resource: this.id,
-      action: key,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
+    this.ledger.start(key);
     // SIGTERM. If the process is already gone (ESRCH) treat as success.
     try {
       this.killProcess(w.pid, 'SIGTERM');
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'ESRCH') {
-        this.markActionDone(key);
+        this.ledger.done(key);
         return;
       }
       const msg = (err as Error).message;
       this.lastError = msg;
-      this.markActionError(key, msg);
+      this.ledger.error(key, msg);
       log.warn('vm reaper: SIGTERM failed', { pid: w.pid, vm: w.vmName, error: msg });
       return;
     }
@@ -323,18 +303,18 @@ export class VmResource {
         // EPERM and friends — assume alive but unkillable; surface as an error.
         const msg = (err as Error).message;
         this.lastError = msg;
-        this.markActionError(key, msg);
+        this.ledger.error(key, msg);
         log.warn('vm reaper: alive-probe failed', { pid: w.pid, error: msg });
         return;
       }
     }
     if (!alive) {
-      this.markActionDone(key);
+      this.ledger.done(key);
       return;
     }
     try {
       this.killProcess(w.pid, 'SIGKILL');
-      this.markActionDone(key);
+      this.ledger.done(key);
       log.info('vm reaper: SIGKILL applied after grace', {
         pid: w.pid,
         vm: w.vmName,
@@ -343,50 +323,13 @@ export class VmResource {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'ESRCH') {
-        this.markActionDone(key);
+        this.ledger.done(key);
         return;
       }
       const msg = (err as Error).message;
       this.lastError = msg;
-      this.markActionError(key, msg);
+      this.ledger.error(key, msg);
       log.warn('vm reaper: SIGKILL failed', { pid: w.pid, vm: w.vmName, error: msg });
-    }
-  }
-
-  private pushAction(status: ActionStatus): void {
-    this.actions.unshift(status);
-    if (this.actions.length > MAX_ACTION_HISTORY * 2) {
-      this.actions.length = MAX_ACTION_HISTORY * 2;
-    }
-  }
-
-  private markActionDone(key: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date().toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = { ...this.actions[idx]!, state: 'done', finished_at: finished };
-    }
-  }
-
-  private markActionError(key: string, error: string): void {
-    const idx = this.actions.findIndex((a) => a.action === key && a.state === 'in_progress');
-    const finished = new Date().toISOString();
-    if (idx >= 0) {
-      this.actions[idx] = {
-        ...this.actions[idx]!,
-        state: 'error',
-        finished_at: finished,
-        error,
-      };
-    } else {
-      this.pushAction({
-        resource: this.id,
-        action: key,
-        state: 'error',
-        started_at: finished,
-        finished_at: finished,
-        error,
-      });
     }
   }
 }
