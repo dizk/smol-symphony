@@ -16,20 +16,6 @@
   {
     "type": "dependency",
     "from": "src/workflow.ts",
-    "to": "src/actions/parsing.ts",
-    "unresolvedTo": "./actions/parsing.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "config↛up"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "src/workflow.ts",
     "to": "src/agent/adapters.ts",
     "unresolvedTo": "./agent/adapters.js",
     "dependencyTypes": [
@@ -40,35 +26,5 @@
       "severity": "error",
       "name": "config↛up"
     }
-  },
-  {
-    "type": "cycle",
-    "from": "src/actions/parsing.ts",
-    "to": "src/workflow.ts",
-    "unresolvedTo": "../workflow.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-circular"
-    },
-    "cycle": [
-      {
-        "name": "src/workflow.ts",
-        "dependencyTypes": [
-          "local",
-          "import"
-        ]
-      },
-      {
-        "name": "src/actions/parsing.ts",
-        "dependencyTypes": [
-          "local",
-          "import"
-        ]
-      }
-    ]
   }
 ]

@@ -5,7 +5,7 @@
 // `create_pr_if_missing` (or a misspelled `kind:`) fails at workflow load
 // instead of at the first dispatch into the terminal state.
 
-import { WorkflowError } from '../workflow.js';
+import { WorkflowError } from '../errors.js';
 import type {
   ActionErrorPolicy,
   ActionPredicate,
