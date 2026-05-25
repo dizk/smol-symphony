@@ -20,9 +20,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { closeLogFile, setLogFile } from '../src/logging.js';
 import {
   GitCliPrGitApi,
   PrResource,
@@ -620,6 +622,111 @@ describe('PrResource — circuit breaker', () => {
     await res.reconcile();
     assert.equal(trCalls.length, 1, 'still no transition');
     assert.equal(res.rebaseAttemptsFor('42'), 2, 'counter clamped at max');
+  });
+
+  it('also breaks the circuit on gh-CONFLICTING-only cycles (no host rebase needed)', async () => {
+    // The existing breaker test drives the rebase-conflict path. Production
+    // log evidence for issue 54 was a PR whose mergeable=CONFLICTING was set
+    // by GitHub directly, so the resource never reached runRebase — every
+    // conflict observation came through the `view.mergeable === 'CONFLICTING'`
+    // branch of processMerge. Both branches must funnel through handleConflict's
+    // single increment; this test pins that the breaker still trips on the Nth
+    // route when the rebase path is never exercised.
+    let currentIntents: PrIntent[] = [];
+    const provider: PrIntendedProvider = { prIntended: async () => currentIntents };
+    let currentHead = 'head-1';
+    const { api, calls: apiCalls } = makePrApi({
+      view: () => makeView({ head_ref_oid: currentHead, mergeable: 'CONFLICTING' }),
+    });
+    const { git, calls: gitCalls } = makeGit({});
+    const { transition, calls: trCalls } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: provider,
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+
+    for (let round = 1; round <= 3; round += 1) {
+      currentHead = `head-${round}`;
+      currentIntents = [makeIntent()];
+      await res.reconcile();
+      currentIntents = [];
+      await res.reconcile();
+    }
+
+    assert.equal(gitCalls.rebase.length, 0, 'gh-CONFLICTING path must never invoke host rebase');
+    assert.equal(apiCalls.view.length, 3, 'one PR view per round');
+    assert.equal(trCalls.length, 3, 'exactly N routes total: max-1 to Todo + 1 to Conflict');
+    assert.equal(trCalls[0]!.toState, 'Todo');
+    assert.equal(trCalls[1]!.toState, 'Todo');
+    assert.equal(trCalls[2]!.toState, 'Conflict', 'Nth route parks in holding state, not N+1th');
+    assert.match(trCalls[2]!.notes, /circuit broken/i);
+  });
+
+  it('emits a pr reconcile: conflict attempt log line on every route with attempt + max', async () => {
+    // Acceptance criterion from issue 54: each conflict route must surface the
+    // attempt-counter through structured logs so the operator can see the
+    // breaker's progress without reconstructing the timeline by hand. Captures
+    // through the persistent file sink — the same path production logs hit.
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pr-attempt-log-'));
+    const logPath = path.join(tmpDir, 'pr.log');
+    setLogFile(logPath);
+    try {
+      let currentIntents: PrIntent[] = [];
+      const provider: PrIntendedProvider = { prIntended: async () => currentIntents };
+      let currentHead = 'head-1';
+      const { api } = makePrApi({
+        view: () => makeView({ head_ref_oid: currentHead }),
+      });
+      const { git } = makeGit({
+        rebase: { kind: 'conflict', files: ['x.ts'], diagnostic: 'boom' },
+      });
+      const { transition } = makeTransition();
+      const { cleanup } = makeCleanup();
+      const res = new PrResource({
+        intended: provider,
+        pr: api,
+        git,
+        transition,
+        cleanup,
+        strategy: 'squash',
+        maxRebaseAttempts: 3,
+        conflictRouteTo: 'Todo',
+        conflictHoldingState: 'Conflict',
+        pollIntervalMs: 0,
+      });
+
+      for (let round = 1; round <= 3; round += 1) {
+        currentHead = `head-${round}`;
+        currentIntents = [makeIntent()];
+        await res.reconcile();
+        currentIntents = [];
+        await res.reconcile();
+      }
+
+      await closeLogFile();
+      const text = readFileSync(logPath, 'utf8');
+      const attemptLines = text
+        .split('\n')
+        .filter((l) => l.includes('msg="pr reconcile: conflict attempt"'));
+      assert.equal(attemptLines.length, 3, 'one attempt log line per conflict route');
+      assert.match(attemptLines[0]!, /attempt=1 /);
+      assert.match(attemptLines[0]!, /max=3/);
+      assert.match(attemptLines[0]!, /identifier=42 /);
+      assert.match(attemptLines[1]!, /attempt=2 /);
+      assert.match(attemptLines[2]!, /attempt=3 /);
+    } finally {
+      await closeLogFile();
+      await rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
