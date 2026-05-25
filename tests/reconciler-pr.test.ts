@@ -26,6 +26,7 @@ import path from 'node:path';
 import {
   GitCliPrGitApi,
   PrResource,
+  type EnsureWorkspaceOutcome,
   type PrApi,
   type PrCleanupApi,
   type PrGitApi,
@@ -34,6 +35,7 @@ import {
   type PrSummary,
   type PrTransitionApi,
   type PrView,
+  type PrWorkspaceEnsureApi,
   type PushOutcome,
   type RebaseOutcome,
 } from '../src/reconciler/pr.js';
@@ -187,6 +189,25 @@ function makeCleanup(): { cleanup: PrCleanupApi; removed: string[] } {
       },
     },
     removed,
+  };
+}
+
+function makeWorkspaceEnsure(opts: {
+  outcome?: EnsureWorkspaceOutcome | (() => EnsureWorkspaceOutcome);
+} = {}): {
+  workspaceEnsure: PrWorkspaceEnsureApi;
+  calls: Array<{ identifier: string; workspacePath: string; branch: string; baseBranch: string; expectedHeadSha: string }>;
+} {
+  const calls: Array<{ identifier: string; workspacePath: string; branch: string; baseBranch: string; expectedHeadSha: string }> = [];
+  return {
+    workspaceEnsure: {
+      async ensureWorkspace(args) {
+        calls.push(args);
+        if (typeof opts.outcome === 'function') return opts.outcome();
+        return opts.outcome ?? { kind: 'ok' };
+      },
+    },
+    calls,
   };
 }
 
@@ -1086,6 +1107,253 @@ describe('PrResource — error surfaces', () => {
     });
     await res.reconcile();
     assert.match(res.snapshot().last_error ?? '', /tracker exploded/);
+  });
+});
+
+describe('PrResource — workspace ensure before rebase (issue 53)', () => {
+  it('calls workspaceEnsure.ensureWorkspace before rebasing when wired', async () => {
+    const intent = makeIntent();
+    const { api } = makePrApi({});
+    const { git, calls: gitCalls } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const { workspaceEnsure, calls: ensureCalls } = makeWorkspaceEnsure();
+
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      workspaceEnsure,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.equal(ensureCalls.length, 1, 'ensureWorkspace called once before the rebase');
+    assert.deepEqual(ensureCalls[0], {
+      identifier: '42',
+      workspacePath: '/tmp/ws/42',
+      branch: 'agent/42',
+      baseBranch: 'main',
+      expectedHeadSha: 'head-1',
+    });
+    assert.equal(gitCalls.rebase.length, 1, 'rebase still runs after ensureWorkspace ok');
+  });
+
+  it('surfaces ensureWorkspace errors as a rebase action error and skips rebase', async () => {
+    const intent = makeIntent();
+    const { api } = makePrApi({});
+    const { git, calls: gitCalls } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const { workspaceEnsure } = makeWorkspaceEnsure({
+      outcome: { kind: 'error', diagnostic: 'clone failed: ENOENT' },
+    });
+
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      workspaceEnsure,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.equal(gitCalls.rebase.length, 0, 'rebase skipped on ensureWorkspace error');
+    const snap = res.snapshot();
+    const rebaseAction = snap.actions.find((a) => a.action === 'rebase_and_force_push:42');
+    assert.ok(rebaseAction, 'rebase action recorded in ledger');
+    assert.equal(rebaseAction!.state, 'error');
+    assert.match(rebaseAction!.error ?? '', /clone failed: ENOENT/);
+  });
+
+  it('skips ensure when workspaceEnsure is not wired (back-compat)', async () => {
+    // Test harnesses that stub git.rebaseOnto entirely may omit workspaceEnsure;
+    // the resource must not throw or short-circuit in that case — it just runs
+    // the rebase as before.
+    const intent = makeIntent();
+    const { api } = makePrApi({});
+    const { git, calls: gitCalls } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.equal(gitCalls.rebase.length, 1, 'rebase still runs without workspaceEnsure wired');
+  });
+});
+
+describe('PrResource — rebase error observability (issue 53)', () => {
+  // Capture stderr to assert log.warn lines fire on every rebase/push error path.
+  // The logging module writes to process.stderr.write directly.
+  async function withStderrCapture<T>(fn: () => Promise<T>): Promise<{ result: T; stderr: string }> {
+    const origWrite = process.stderr.write.bind(process.stderr);
+    let captured = '';
+    // @ts-expect-error monkey-patch for capture
+    process.stderr.write = (chunk: string | Uint8Array, ...rest: unknown[]): boolean => {
+      captured += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+      // Don't forward to the real stderr — keeps the test output clean.
+      void rest;
+      return true;
+    };
+    try {
+      const result = await fn();
+      return { result, stderr: captured };
+    } finally {
+      process.stderr.write = origWrite;
+    }
+  }
+
+  it('warn-logs when rebaseOnto throws', async () => {
+    const intent = makeIntent();
+    const { api } = makePrApi({});
+    const git: PrGitApi = {
+      async rebaseOnto() {
+        throw new Error('ENOENT: no such workspace');
+      },
+      async pushForceWithLease() {
+        return { kind: 'ok' };
+      },
+    };
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+
+    const { stderr } = await withStderrCapture(async () => {
+      const res = new PrResource({
+        intended: intended([intent]),
+        pr: api,
+        git,
+        transition,
+        cleanup,
+        strategy: 'squash',
+        maxRebaseAttempts: 3,
+        conflictRouteTo: 'Todo',
+        conflictHoldingState: 'Conflict',
+        pollIntervalMs: 0,
+      });
+      await res.reconcile();
+    });
+    assert.match(stderr, /pr reconcile: rebase failed/);
+    assert.match(stderr, /rebase_threw/);
+    assert.match(stderr, /ENOENT: no such workspace/);
+  });
+
+  it('warn-logs when pushForceWithLease throws', async () => {
+    const intent = makeIntent();
+    const { api } = makePrApi({});
+    const git: PrGitApi = {
+      async rebaseOnto() {
+        return { kind: 'ok', new_head_sha: 'rebased' };
+      },
+      async pushForceWithLease() {
+        throw new Error('push transport exploded');
+      },
+    };
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+
+    const { stderr } = await withStderrCapture(async () => {
+      const res = new PrResource({
+        intended: intended([intent]),
+        pr: api,
+        git,
+        transition,
+        cleanup,
+        strategy: 'squash',
+        maxRebaseAttempts: 3,
+        conflictRouteTo: 'Todo',
+        conflictHoldingState: 'Conflict',
+        pollIntervalMs: 0,
+      });
+      await res.reconcile();
+    });
+    assert.match(stderr, /pr reconcile: rebase failed/);
+    assert.match(stderr, /push_threw/);
+    assert.match(stderr, /push transport exploded/);
+  });
+
+  it('warn-logs on push kind=error', async () => {
+    const intent = makeIntent();
+    const { api } = makePrApi({});
+    const { git } = makeGit({
+      rebase: { kind: 'ok', new_head_sha: 'rebased' },
+      push: { kind: 'error', diagnostic: 'permission denied' },
+    });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+
+    const { stderr } = await withStderrCapture(async () => {
+      const res = new PrResource({
+        intended: intended([intent]),
+        pr: api,
+        git,
+        transition,
+        cleanup,
+        strategy: 'squash',
+        maxRebaseAttempts: 3,
+        conflictRouteTo: 'Todo',
+        conflictHoldingState: 'Conflict',
+        pollIntervalMs: 0,
+      });
+      await res.reconcile();
+    });
+    assert.match(stderr, /pr reconcile: rebase failed/);
+    assert.match(stderr, /push_error/);
+    assert.match(stderr, /permission denied/);
+  });
+
+  it('warn-logs on ensureWorkspace error before the rebase even runs', async () => {
+    const intent = makeIntent();
+    const { api } = makePrApi({});
+    const { git } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const { workspaceEnsure } = makeWorkspaceEnsure({
+      outcome: { kind: 'error', diagnostic: 'recreate_failed: disk full' },
+    });
+
+    const { stderr } = await withStderrCapture(async () => {
+      const res = new PrResource({
+        intended: intended([intent]),
+        pr: api,
+        git,
+        transition,
+        cleanup,
+        workspaceEnsure,
+        strategy: 'squash',
+        maxRebaseAttempts: 3,
+        conflictRouteTo: 'Todo',
+        conflictHoldingState: 'Conflict',
+        pollIntervalMs: 0,
+      });
+      await res.reconcile();
+    });
+    assert.match(stderr, /pr reconcile: rebase failed/);
+    assert.match(stderr, /ensure_workspace/);
+    assert.match(stderr, /disk full/);
   });
 });
 

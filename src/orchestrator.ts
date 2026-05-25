@@ -40,10 +40,12 @@ import type {
   IntendedVmProvider,
   WorkspaceIntendedProvider,
   BaseRefProvider,
+  EnsureWorkspaceOutcome,
   PrIntent,
   PrIntendedProvider,
 } from './reconciler/index.js';
 import { runProcess } from './util/process.js';
+import { stat } from 'node:fs/promises';
 
 export interface Snapshot {
   generated_at: string;
@@ -1176,6 +1178,9 @@ export class Orchestrator
     // but a fresh clone would still need a separate fetch to pick it up).
     // Operators who genuinely want a recreated workspace can cancel the
     // issue (Cancelled triggers the close path + normal cleanup) and refile.
+    // The autopilot's own `ensureWorkspaceForAutopilot` (issue 53) bypasses
+    // this guard because it explicitly fetches `agent/<id>` from origin and
+    // resets the local branch to the remote tip, so no commits are lost.
     if (
       this.cfg.pr_autopilot.enabled &&
       state !== null &&
@@ -1185,6 +1190,112 @@ export class Orchestrator
     }
     const hooks = state !== null ? resolveHooksForState(this.cfg, state) : this.cfg.hooks;
     await this.workspaces.ensureFor(identifier, hooks);
+  }
+
+  /**
+   * Implements {@link PrWorkspaceEnsureApi} (issue 53). Idempotent: when the
+   * per-issue workspace already exists on disk this is a stat + ok; when it
+   * doesn't, the orchestrator materializes it on demand for the PR autopilot.
+   *
+   * Materialization is the canonical `ensureFor` (clone + branch + remote
+   * setup) followed by a fetch of the remote `agent/<id>` branch and a hard
+   * reset of the local branch to the remote tip, so the rebase that follows
+   * sees `git rev-parse HEAD == expectedHeadSha`. Without the fetch+reset
+   * the local branch would still be at the base SHA from `setupWorkspaceDir`
+   * and the rebase would trip its own concurrent-push guard.
+   *
+   * Recovery scenario: an operator enables `pr_autopilot.enabled: true`
+   * after an issue has already reached the merge state and its workspace
+   * has been reaped by the pre-autopilot terminal-cleanup rule. The
+   * autopilot inherits a non-null `workspace_path` pointing at a missing
+   * directory, the rebase throws silently in git, and the PR stalls
+   * BEHIND forever. This method recreates the dir so the autopilot can
+   * actually drive the rebase.
+   *
+   * Errors are typed (not thrown) so the PR resource can surface them in
+   * the action ledger with a concrete diagnostic.
+   */
+  async ensureWorkspaceForAutopilot(args: {
+    identifier: string;
+    workspacePath: string;
+    branch: string;
+    baseBranch: string;
+    expectedHeadSha: string;
+  }): Promise<EnsureWorkspaceOutcome> {
+    if (await this.pathIsDirectory(args.workspacePath)) {
+      return { kind: 'ok' };
+    }
+    // Pick hooks: the merge_state's hooks are the right resolution since
+    // that's the state the issue is in. Falls back to workflow-level hooks
+    // when the merge state has no per-state hooks block (the typical case).
+    const hooks = resolveHooksForState(this.cfg, this.cfg.pr_autopilot.merge_state);
+    try {
+      await this.workspaces.ensureFor(args.identifier, hooks);
+    } catch (err) {
+      const msg = (err as Error).message;
+      log.warn('pr autopilot: ensureFor failed', {
+        identifier: args.identifier,
+        workspace_path: args.workspacePath,
+        error: msg,
+      });
+      return { kind: 'error', diagnostic: `ensure_workspace_clone_failed: ${msg}` };
+    }
+    // Re-cloning lands `agent/<id>` at base; the agent's commits live on
+    // origin/<branch>. Fetch + reset so the local branch is at the remote
+    // tip (which is what the PR points at) before the rebase runs.
+    //
+    // The fetch uses an explicit `<branch>:refs/remotes/origin/<branch>`
+    // refspec so the remote-tracking ref is unconditionally created. We
+    // can't rely on the default fetch refspec's opportunistic update here:
+    // `setupWorkspaceDir` clones from the local source repo (which lacks
+    // the agent branch) and then strips + re-adds origin, leaving no
+    // `refs/remotes/origin/<branch>` ref behind. Without an explicit refspec
+    // the post-fetch `git reset --hard origin/<branch>` can fail with
+    // "Needed a single revision" on configurations where opportunistic
+    // remote-tracking updates don't kick in.
+    const fetchRes = await runProcess(
+      'git',
+      ['fetch', '--no-tags', 'origin', `${args.branch}:refs/remotes/origin/${args.branch}`],
+      { cwd: args.workspacePath },
+    );
+    if (fetchRes.exit_code !== 0) {
+      const diag = (fetchRes.stderr || fetchRes.stdout).trim();
+      log.warn('pr autopilot: fetch agent branch failed', {
+        identifier: args.identifier,
+        branch: args.branch,
+        error: diag,
+      });
+      return { kind: 'error', diagnostic: `ensure_workspace_fetch_failed: ${diag}` };
+    }
+    const resetRes = await runProcess(
+      'git',
+      ['reset', '--hard', `origin/${args.branch}`],
+      { cwd: args.workspacePath },
+    );
+    if (resetRes.exit_code !== 0) {
+      const diag = (resetRes.stderr || resetRes.stdout).trim();
+      log.warn('pr autopilot: reset to remote branch failed', {
+        identifier: args.identifier,
+        branch: args.branch,
+        error: diag,
+      });
+      return { kind: 'error', diagnostic: `ensure_workspace_reset_failed: ${diag}` };
+    }
+    log.info('pr autopilot: workspace materialized', {
+      identifier: args.identifier,
+      workspace_path: args.workspacePath,
+      branch: args.branch,
+    });
+    return { kind: 'ok' };
+  }
+
+  private async pathIsDirectory(p: string): Promise<boolean> {
+    try {
+      const st = await stat(p);
+      return st.isDirectory();
+    } catch {
+      return false;
+    }
   }
 
   /**

@@ -178,12 +178,52 @@ export interface PrCleanupApi {
   removeWorkspace(identifier: string): Promise<void>;
 }
 
+export type EnsureWorkspaceOutcome =
+  | { kind: 'ok' }
+  | { kind: 'error'; diagnostic: string };
+
+/**
+ * Idempotent materializer for the autopilot's per-issue workspace. Production
+ * wires this to a closure that re-clones the source repo, fetches the remote
+ * `agent/<id>` branch, and positions the local branch at the remote tip so
+ * the standard rebase flow can run.
+ *
+ * Why this exists: an operator who flips `pr_autopilot.enabled` true after an
+ * issue has already reached Done (and its workspace has been reaped by the
+ * pre-autopilot terminal cleanup) leaves the autopilot with a non-null
+ * `workspace_path` pointing at a missing directory. Without this seam the
+ * rebase step would throw silently in git (the directory doesn't exist) and
+ * the PR would stay BEHIND forever.
+ *
+ * The callback MUST be idempotent: the resource calls it on every rebase
+ * pass, and production typically short-circuits when the directory already
+ * exists.
+ */
+export interface PrWorkspaceEnsureApi {
+  ensureWorkspace(args: {
+    identifier: string;
+    workspacePath: string;
+    branch: string;
+    baseBranch: string;
+    expectedHeadSha: string;
+  }): Promise<EnsureWorkspaceOutcome>;
+}
+
 export interface PrResourceOptions {
   intended: PrIntendedProvider;
   pr: PrApi;
   git: PrGitApi;
   transition: PrTransitionApi;
   cleanup: PrCleanupApi;
+  /**
+   * Optional workspace materializer. When wired (production), the resource
+   * calls it before every rebase so a missing workspace (autopilot enabled
+   * after the dir was reaped, see issue 53) is re-cloned + repositioned on
+   * the remote branch tip rather than silently failing in `git rebaseOnto`.
+   * Tests that stub `git.rebaseOnto` may omit this; the resource skips the
+   * pre-rebase ensure when it's absent.
+   */
+  workspaceEnsure?: PrWorkspaceEnsureApi;
   /**
    * GitHub auto-merge strategy. Mirrors the workflow's
    * `pr_autopilot.auto_merge_strategy`; the resource doesn't hardcode 'squash'
@@ -609,7 +649,35 @@ export class PrResource {
       // Defensive: callers should not invoke runRebase without a workspace.
       const msg = 'rebase requested without workspace path';
       this.markActionError(actionKey, msg);
+      log.warn('pr reconcile: rebase failed', {
+        identifier: intent.identifier,
+        stage: 'precondition',
+        error: msg,
+      });
       return { kind: 'error', diagnostic: msg };
+    }
+    // Issue 53: re-materialize a missing workspace on demand. The autopilot
+    // owns the workspace once an issue enters merge_state; if it's been
+    // reaped (e.g. operator flipped pr_autopilot enabled after the dir was
+    // cleaned up by the pre-autopilot terminal rule), this restores it so
+    // the rebase doesn't throw silently in git.
+    if (this.opts.workspaceEnsure) {
+      const ensure = await this.opts.workspaceEnsure.ensureWorkspace({
+        identifier: intent.identifier,
+        workspacePath: intent.workspace_path,
+        branch: intent.branch,
+        baseBranch: intent.base_branch,
+        expectedHeadSha: view.head_ref_oid,
+      });
+      if (ensure.kind === 'error') {
+        this.markActionError(actionKey, ensure.diagnostic);
+        log.warn('pr reconcile: rebase failed', {
+          identifier: intent.identifier,
+          stage: 'ensure_workspace',
+          error: ensure.diagnostic,
+        });
+        return { kind: 'error', diagnostic: ensure.diagnostic };
+      }
     }
     let rebase: RebaseOutcome;
     try {
@@ -622,6 +690,11 @@ export class PrResource {
     } catch (err) {
       const msg = (err as Error).message;
       this.markActionError(actionKey, msg);
+      log.warn('pr reconcile: rebase failed', {
+        identifier: intent.identifier,
+        stage: 'rebase_threw',
+        error: msg,
+      });
       return { kind: 'error', diagnostic: msg };
     }
 
@@ -641,14 +714,29 @@ export class PrResource {
       } catch (err) {
         const msg = (err as Error).message;
         this.markActionError(actionKey, msg);
+        log.warn('pr reconcile: rebase failed', {
+          identifier: intent.identifier,
+          stage: 'push_threw',
+          error: msg,
+        });
         return { kind: 'error', diagnostic: msg };
       }
       if (push.kind === 'concurrent_push') {
         this.markActionError(actionKey, push.diagnostic);
+        log.warn('pr reconcile: rebase failed', {
+          identifier: intent.identifier,
+          stage: 'push_concurrent',
+          error: push.diagnostic,
+        });
         return { kind: 'concurrent_push', observed_head_sha: view.head_ref_oid };
       }
       if (push.kind === 'error') {
         this.markActionError(actionKey, push.diagnostic);
+        log.warn('pr reconcile: rebase failed', {
+          identifier: intent.identifier,
+          stage: 'push_error',
+          error: push.diagnostic,
+        });
         return { kind: 'error', diagnostic: push.diagnostic };
       }
       this.markActionDone(actionKey);
@@ -667,7 +755,21 @@ export class PrResource {
       st.lastViewAt = 0;
       return rebase;
     }
-    this.markActionError(actionKey, rebase.kind === 'conflict' ? 'rebase conflict' : rebase.kind === 'concurrent_push' ? 'concurrent push' : rebase.kind === 'error' ? rebase.diagnostic : 'unknown');
+    const finalDiagnostic =
+      rebase.kind === 'conflict'
+        ? 'rebase conflict'
+        : rebase.kind === 'concurrent_push'
+        ? 'concurrent push'
+        : rebase.kind === 'error'
+        ? rebase.diagnostic
+        : 'unknown';
+    this.markActionError(actionKey, finalDiagnostic);
+    log.warn('pr reconcile: rebase failed', {
+      identifier: intent.identifier,
+      stage: 'rebase_outcome',
+      outcome: rebase.kind,
+      error: finalDiagnostic,
+    });
     return rebase;
   }
 
