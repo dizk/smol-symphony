@@ -16,7 +16,7 @@
 
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import path from 'node:path';
-import { sanitizeWorkspaceKey } from './workspace.js';
+import { sanitizeWorkspaceKey } from './util/workspace-key.js';
 import { log } from './logging.js';
 
 export type RunLogChannel = 'acp' | 'stderr' | 'system' | 'hook';

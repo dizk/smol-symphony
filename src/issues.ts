@@ -8,7 +8,7 @@
 
 import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { sanitizeWorkspaceKey } from './workspace.js';
+import { sanitizeWorkspaceKey } from './util/workspace-key.js';
 import type { StateConfig } from './types.js';
 
 /**

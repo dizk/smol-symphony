@@ -14,17 +14,19 @@ import {
   type RunResult,
   type RunCapture,
 } from './util/process.js';
+import { sanitizeWorkspaceKey } from './util/workspace-key.js';
+
+// Re-exported so existing importers (agent/runner.ts, reconciler/workspace.ts, tests)
+// keep their `from '../workspace.js'` import path. The canonical definition lives in
+// the foundation layer so adapters (runlog) and other domain modules (issues) can
+// import it directly without crossing the adapters↛inward boundary.
+export { sanitizeWorkspaceKey };
 
 export class WorkspaceError extends Error {
   constructor(public code: string, message: string) {
     super(message);
     this.name = 'WorkspaceError';
   }
-}
-
-// §5.5 Invariant 3.
-export function sanitizeWorkspaceKey(identifier: string): string {
-  return identifier.replace(/[^A-Za-z0-9._-]/g, '_');
 }
 
 // §5.5 Invariant 2: workspace path MUST be contained within workspace root.
