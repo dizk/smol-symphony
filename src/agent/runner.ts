@@ -500,6 +500,7 @@ export class AgentRunner {
       followupSink: this.followupSink ?? undefined,
       runInVm: runInVm ?? undefined,
       snapshotId,
+      now: () => Date.now(),
     });
     // Surface on snapshot regardless of outcome; the dashboard shows the
     // full ledger including in-progress / error states.

@@ -27,6 +27,7 @@ import type { IssueTracker } from './trackers/types.js';
 import type { PrAutopilotConfig, RunningEntry, StateConfig } from './types.js';
 import { log } from './logging.js';
 import { writeIssueFile, pickHoldingState, NoHoldingStateError } from './issues.js';
+import { realClock, isoFromClock, type ClockNow } from './util/clock.js';
 
 const PROTOCOL_VERSION = '2025-06-18';
 
@@ -156,16 +157,22 @@ export class McpRegistry {
   // terminal-cleanup path would reap the workspace before the autopilot
   // could ever use it.
   private prAutopilot: PrAutopilotConfig | null = null;
+  // Injected wall clock. Tests pin time; production wires `Date.now` (or
+  // accepts the realClock default). Used to stamp `proposed_at` on
+  // propose_issue submissions so the core is deterministic under test.
+  private readonly now: ClockNow;
 
   constructor(
     private tracker: IssueTracker,
     opts: {
       states?: Record<string, StateConfig>;
       prAutopilot?: PrAutopilotConfig;
+      now?: ClockNow;
     } = {},
   ) {
     if (opts.states) this.states = opts.states;
     if (opts.prAutopilot) this.prAutopilot = opts.prAutopilot;
+    this.now = opts.now ?? realClock;
   }
 
   /**
@@ -652,7 +659,7 @@ export class McpRegistry {
         labels,
         extra_front_matter: {
           proposed_by: active.identifier,
-          proposed_at: new Date().toISOString(),
+          proposed_at: isoFromClock(this.now),
         },
       });
       log.info('mcp propose_issue', {

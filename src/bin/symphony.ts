@@ -238,6 +238,7 @@ async function main() {
   const mcp = new McpRegistry(tracker, {
     states: config.states,
     prAutopilot: config.pr_autopilot,
+    now: () => Date.now(),
   });
   // ACP transport. The bridge listens on a TCP port for the in-VM agent's dial-back,
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
