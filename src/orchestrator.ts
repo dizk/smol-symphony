@@ -26,6 +26,11 @@ import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
 import { resolveDispatchConfig } from './agent/runner.js';
 import { activeStateNames, terminalStateNames } from './issues.js';
+import {
+  computeEligibilityReason,
+  decideReconcileForIssue,
+  type EligibilitySnapshot,
+} from './orchestrator-decisions.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
 // snapshot endpoint can attach whatever shape a future ACP `_meta` extension produces.
@@ -406,29 +411,34 @@ export class Orchestrator
 
   /** Stall detection + tracker state refresh for running issues. */
   private async reconcile(): Promise<void> {
-    // Part A: stall detection.
-    if (this.cfg.acp.stall_timeout_ms > 0) {
-      const now = Date.now();
-      for (const [issueId, entry] of this.running) {
-        // Skip stall detection for issues awaiting human steering: the agent is
-        // intentionally paused while the human composes a reply, and the wait can
-        // legitimately exceed stall_timeout_ms. The cancel signal still applies
-        // (the runner's awaitSteeringReply respects it) for non-stall reasons like
-        // terminal-state transitions or operator-initiated cancels.
-        if (entry.steering_requested) continue;
-        const ref = entry.last_event_at ?? entry.started_at;
-        const elapsed = now - Date.parse(ref);
-        if (Number.isFinite(elapsed) && elapsed > this.cfg.acp.stall_timeout_ms) {
-          log.warn('stall detected', {
-            issue_id: issueId,
-            issue_identifier: entry.identifier,
-            elapsed_ms: elapsed,
-          });
-          this.terminateRunning(issueId, false, `stalled after ${elapsed}ms`);
-        }
+    this.detectStalls();
+    await this.refreshTrackerStates();
+  }
+
+  private detectStalls(): void {
+    if (this.cfg.acp.stall_timeout_ms <= 0) return;
+    const now = Date.now();
+    for (const [issueId, entry] of this.running) {
+      // Skip stall detection for issues awaiting human steering: the agent is
+      // intentionally paused while the human composes a reply, and the wait can
+      // legitimately exceed stall_timeout_ms. The cancel signal still applies
+      // (the runner's awaitSteeringReply respects it) for non-stall reasons like
+      // terminal-state transitions or operator-initiated cancels.
+      if (entry.steering_requested) continue;
+      const ref = entry.last_event_at ?? entry.started_at;
+      const elapsed = now - Date.parse(ref);
+      if (Number.isFinite(elapsed) && elapsed > this.cfg.acp.stall_timeout_ms) {
+        log.warn('stall detected', {
+          issue_id: issueId,
+          issue_identifier: entry.identifier,
+          elapsed_ms: elapsed,
+        });
+        this.terminateRunning(issueId, false, `stalled after ${elapsed}ms`);
       }
     }
-    // Part B: tracker state refresh.
+  }
+
+  private async refreshTrackerStates(): Promise<void> {
     const ids = [...this.running.keys()];
     if (ids.length === 0) return;
     let refreshed: Issue[];
@@ -439,36 +449,16 @@ export class Orchestrator
       return;
     }
     const byId = new Map(refreshed.map((i) => [i.id, i]));
-    const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-    const active = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-    // Look up canonical state config (declaration-cased) so the cleanup decision flows
-    // through `role` rather than a hardcoded "terminal => cleanup". Today only terminal
-    // roles trigger cleanup, but routing through `role` lets a future per-state
-    // `cleanup_workspace` flag override the policy without touching reconcile again.
-    const stateMap = this.cfg.states;
-    const stateLower = new Map<string, string>();
-    for (const name of Object.keys(stateMap)) stateLower.set(name.toLowerCase(), name);
-    const cleanupForState = (stateName: string): boolean => {
-      const canonical = stateLower.get(stateName.toLowerCase());
-      if (!canonical) return false;
-      return stateMap[canonical]!.role === 'terminal';
-    };
-    for (const id of ids) {
-      const fresh = byId.get(id);
-      if (!fresh) {
-        // Missing from tracker — non-active, no cleanup.
-        this.terminateRunning(id, false, 'tracker_state_missing');
-        continue;
-      }
-      const s = fresh.state.toLowerCase();
-      if (terminal.has(s)) {
-        this.terminateRunning(id, cleanupForState(fresh.state), 'tracker_state_terminal');
-      } else if (active.has(s)) {
-        const entry = this.running.get(id);
-        if (entry) entry.issue = fresh;
-      } else {
-        this.terminateRunning(id, false, 'tracker_state_non_active');
-      }
+    for (const id of ids) this.applyReconcileAction(id, byId.get(id));
+  }
+
+  private applyReconcileAction(id: string, fresh: Issue | undefined): void {
+    const decision = decideReconcileForIssue(fresh, this.cfg.states);
+    if (decision.kind === 'terminate') {
+      this.terminateRunning(id, decision.cleanup, decision.reason);
+    } else if (decision.kind === 'refresh' && fresh) {
+      const entry = this.running.get(id);
+      if (entry) entry.issue = fresh;
     }
   }
 
@@ -498,27 +488,17 @@ export class Orchestrator
   // form is used by the retry path so the issue's own claim/retry entry does not block
   // its own redispatch.
   private eligibilityReason(issue: Issue, ignoreOwnClaim: boolean): string | null {
-    if (!issue.id || !issue.identifier || !issue.title || !issue.state) {
-      return 'missing required issue fields';
-    }
-    const state = issue.state.toLowerCase();
-    const active = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-    const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-    if (!active.has(state) || terminal.has(state)) return 'state not active';
-    if (this.running.has(issue.id)) return 'already running';
-    if (!ignoreOwnClaim && this.claimed.has(issue.id)) return 'already claimed';
-    if (!this.hasPerStateSlot(issue.state)) return 'no per-state slot';
-    if (state === 'todo' && this.hasNonTerminalBlocker(issue)) return 'has non-terminal blocker';
-    return null;
+    return computeEligibilityReason(issue, ignoreOwnClaim, this.eligibilitySnapshot());
   }
 
-  private hasNonTerminalBlocker(issue: Issue): boolean {
-    const terminal = new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-    for (const b of issue.blocked_by) {
-      if (!b.state) return true;
-      if (!terminal.has(b.state.toLowerCase())) return true;
-    }
-    return false;
+  private eligibilitySnapshot(): EligibilitySnapshot {
+    return {
+      active: new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase())),
+      terminal: new Set(terminalStateNames(this.cfg.states).map((s) => s.toLowerCase())),
+      running: new Set(this.running.keys()),
+      claimed: this.claimed,
+      perStateSlot: (state) => this.hasPerStateSlot(state),
+    };
   }
 
   private availableGlobalSlots(): number {
