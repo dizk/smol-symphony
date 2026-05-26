@@ -24,11 +24,16 @@ import type { ResourceSnapshot } from './reconciler/index.js';
 import type { ProposeFollowupSink } from './actions/index.js';
 import type { AgentRunner } from './agent/runner.js';
 import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
-import { resolveDispatchConfig } from './agent/runner.js';
 import { activeStateNames, terminalStateNames } from './issues.js';
 import {
+  buildIssueDetailDto,
+  classifyPrIntent,
   computeEligibilityReason,
+  decideExitRetry,
   decideReconcileForIssue,
+  decideRetryAfterIneligible,
+  requiredAdapterIds,
+  resolveActorString,
   type EligibilitySnapshot,
 } from './orchestrator-decisions.js';
 
@@ -236,26 +241,24 @@ export class Orchestrator
     // `hooks:` and `actions:`. The actions list wins at runtime; this log line
     // is the operator-visible "we noticed your hooks but ignored them" signal.
     warnOnHooksAndActionsConflict(this.cfg);
-    // Fail fast when symphony will auto-stage credentials but the host file an
-    // adapter needs is missing. Per-state overrides can change the adapter for
-    // individual states (e.g. Review running on codex while Todo runs on claude),
-    // so the set of credentials symphony needs at runtime is the union of
-    // `cfg.acp.adapter` and every distinct `states.<name>.adapter`. validateDispatch
-    // already rejects unknown adapter ids and re-checks credentials in its own walk,
-    // but the orchestrator-startup probe is the operator-visible failure point:
-    // surface it the same way for every adapter, not just the workflow-level default.
-    const adapters = new Set<AcpAdapterId>();
-    if (isKnownAdapter(this.cfg.acp.adapter)) {
-      adapters.add(this.cfg.acp.adapter as AcpAdapterId);
-    }
-    for (const s of Object.values(this.cfg.states)) {
-      if (s.adapter && isKnownAdapter(s.adapter)) {
-        adapters.add(s.adapter as AcpAdapterId);
-      }
-    }
-    for (const id of adapters) {
+    await this.assertAdapterCredentials();
+    await this.runStartupReconcile();
+    this.scheduleTick(0);
+  }
+
+  /**
+   * Fail fast when an adapter symphony will dispatch to has no readable host
+   * credential. Per-state overrides can change the adapter, so the set is the
+   * union of `cfg.acp.adapter` and every distinct `states.<name>.adapter`.
+   * validateDispatch re-checks credentials in its own walk, but this is the
+   * operator-visible failure point — surface it for every adapter, not just
+   * the workflow-level default.
+   */
+  private async assertAdapterCredentials(): Promise<void> {
+    const ids = requiredAdapterIds(this.cfg, isKnownAdapter);
+    for (const id of ids) {
       try {
-        await assertHostCredentialReadable(ADAPTERS[id]);
+        await assertHostCredentialReadable(ADAPTERS[id as AcpAdapterId]);
       } catch (err) {
         log.error('startup credential check failed', {
           adapter: id,
@@ -264,29 +267,22 @@ export class Orchestrator
         throw new WorkflowError('missing_host_credential', (err as Error).message);
       }
     }
-    // Initial workspace + VM reap (issues 33, 34). The `running` map is empty
-    // at this point and the tracker has been read for terminal/active state,
-    // so the reconciler's two janitors converge to "remove anything orphaned
-    // by the previous process." Awaited so the next dispatch can't race a
-    // leftover workspace whose old HEAD doesn't match the current integration
-    // ref, or a leftover VM whose name collides with a fresh allocation.
-    // Best-effort: failures are logged inside each reaper and never abort
-    // startup.
-    if (this.reconciler) {
-      await this.reconciler.reapWorkspaces();
-      await this.reconciler.reapVms();
-    }
-    // Trigger an initial reconcile pass before dispatching. The pass returns
-    // quickly even if a bake is needed — the bake runs on a background task and
-    // dispatch is gated until ready() is true. Backstop tick keeps the loop alive
-    // for missed signals.
-    if (this.reconciler) {
-      this.reconciler.start();
-      void this.reconciler.reconcile().catch((err) =>
-        log.warn('initial reconcile pass failed', { error: (err as Error).message }),
-      );
-    }
-    this.scheduleTick(0);
+  }
+
+  /**
+   * Initial workspace + VM reap and the first reconcile pass (issues 32-34).
+   * The `running` map is empty here, so the janitors converge to "remove
+   * anything orphaned by the previous process" and the bake (if any) starts
+   * before the first dispatch.
+   */
+  private async runStartupReconcile(): Promise<void> {
+    if (!this.reconciler) return;
+    await this.reconciler.reapWorkspaces();
+    await this.reconciler.reapVms();
+    this.reconciler.start();
+    void this.reconciler.reconcile().catch((err) =>
+      log.warn('initial reconcile pass failed', { error: (err as Error).message }),
+    );
   }
 
   async stop(): Promise<void> {
@@ -354,59 +350,80 @@ export class Orchestrator
   private async tick(): Promise<void> {
     if (this.stopped) return;
     this.refreshRequested = false;
+    await this.reconcileSafely();
+    if (!this.applyDispatchValidation()) return;
+    const fetched = await this.fetchCandidatesForTick();
+    if (!fetched) return;
+    if (this.gatedOnReconciler(fetched.issues.length)) return;
+    this.dispatchSorted(this.sortForDispatch(fetched.issues), fetched.root);
+    this.scheduleTick(this.cfg.polling.interval_ms);
+  }
+
+  private async reconcileSafely(): Promise<void> {
     try {
       await this.reconcile();
     } catch (err) {
       log.warn('reconcile error', { error: (err as Error).message });
     }
+  }
+
+  /**
+   * Run dispatch validation. Returns true to continue dispatch, false when the
+   * config is invalid (the tick is rescheduled and the caller must return).
+   */
+  private applyDispatchValidation(): boolean {
     const validation = validateDispatch(this.cfg);
     if (validation) {
       this.lastValidationError = validation;
       log.warn('dispatch validation failed; skipping dispatch', { error: validation });
       this.scheduleTick(this.cfg.polling.interval_ms);
-      return;
+      return false;
     }
     this.lastValidationError = null;
+    return true;
+  }
 
-    let candidates: Issue[];
-    let snapshotTrackerRoot: string | null;
+  /**
+   * Atomic fetch: the tracker returns the issues AND the root it used during
+   * the scan. That's the snapshot we pin onto each RunningEntry, so a workflow
+   * reload that races the dispatch loop can't cause `transition` to operate
+   * against a different tracker root than where the issue lives. Returns
+   * null on tracker error (tick is rescheduled, caller must return).
+   */
+  private async fetchCandidatesForTick(): Promise<{ issues: Issue[]; root: string | null } | null> {
     try {
-      // Atomic fetch: the tracker returns the issues AND the root it used during
-      // the scan. That's the snapshot we pin onto each RunningEntry, so a workflow
-      // reload that races the dispatch loop can't cause `transition` to operate
-      // against a different tracker root than where the issue lives.
-      const result = await this.tracker.fetchCandidateIssues();
-      candidates = result.issues;
-      snapshotTrackerRoot = result.root;
+      const r = await this.tracker.fetchCandidateIssues();
+      return { issues: r.issues, root: r.root };
     } catch (err) {
       log.warn('candidate fetch failed', { error: (err as Error).message });
       this.scheduleTick(this.cfg.polling.interval_ms);
-      return;
+      return null;
     }
-    // Reconciler gate (issue 32): refuse to dispatch any issue whose prerequisites
-    // haven't converged. v1 only gates on the bake; later stages add VM/workspace
-    // lifecycle. When the gate is closed we trigger a reconcile pass (cheap when
-    // a bake is already in flight) so the loop self-corrects on the next poll
-    // instead of waiting on the slower backstop tick.
-    if (this.reconciler && !this.reconciler.dispatchReady()) {
-      log.debug('dispatch gated on reconciler', {
-        candidate_count: candidates.length,
-      });
-      void this.reconciler.reconcile().catch((err) =>
-        log.debug('gated-reconcile failed', { error: (err as Error).message }),
-      );
-      this.scheduleTick(this.cfg.polling.interval_ms);
-      return;
-    }
-    const sorted = this.sortForDispatch(candidates);
+  }
+
+  /**
+   * Reconciler gate (issue 32): refuse to dispatch any issue whose
+   * prerequisites haven't converged. When the gate is closed we kick a
+   * reconcile pass so the loop self-corrects on the next poll instead of
+   * waiting on the slower backstop tick. Returns true when dispatch must
+   * be skipped (caller must return).
+   */
+  private gatedOnReconciler(candidateCount: number): boolean {
+    if (!this.reconciler || this.reconciler.dispatchReady()) return false;
+    log.debug('dispatch gated on reconciler', { candidate_count: candidateCount });
+    void this.reconciler.reconcile().catch((err) =>
+      log.debug('gated-reconcile failed', { error: (err as Error).message }),
+    );
+    this.scheduleTick(this.cfg.polling.interval_ms);
+    return true;
+  }
+
+  private dispatchSorted(sorted: Issue[], snapshotTrackerRoot: string | null): void {
     for (const issue of sorted) {
       if (this.availableGlobalSlots() <= 0) break;
       if (!this.isEligible(issue)) continue;
-      void this.dispatchIssue(issue, null, {
-        trackerRoot: snapshotTrackerRoot,
-      });
+      void this.dispatchIssue(issue, null, { trackerRoot: snapshotTrackerRoot });
     }
-    this.scheduleTick(this.cfg.polling.interval_ms);
   }
 
   /** Stall detection + tracker state refresh for running issues. */
@@ -637,20 +654,18 @@ export class Orchestrator
     // fallback reads the live config for completeness.
     const trackerRootAtDispatch =
       snapshot?.trackerRoot ?? (this.tracker.currentRoot ? this.tracker.currentRoot() : null);
-    // Resolve "<adapter>/<model or 'default'>" at dispatch time and pin it on the
-    // entry. The MCP transition tool stamps this into the notes-block header the
-    // next agent reads in `issue.description`. resolveDispatchConfig already folds
-    // any per-state override on top of the workflow defaults; falling back to a
-    // workflow-default-only string when no states map is declared (e.g. an older
-    // test harness) keeps the field non-null without falsely advertising a
-    // per-state binding the orchestrator never saw.
-    let resolvedActor: string;
-    try {
-      const resolved = resolveDispatchConfig(this.cfg, issue.state);
-      resolvedActor = `${resolved.adapter}/${resolved.model ?? 'default'}`;
-    } catch {
-      resolvedActor = `${this.cfg.acp.adapter}/${this.cfg.acp.model ?? 'default'}`;
-    }
+    // Resolve "<adapter>/<model or 'default'>" at dispatch time and pin it on
+    // the entry. The MCP transition tool stamps this into the notes-block
+    // header the next agent reads in `issue.description`. The helper folds any
+    // per-state override on top of the workflow defaults; an unknown state
+    // falls back to workflow defaults so an older test harness without a
+    // states map still produces a non-null actor string.
+    const resolvedActor = resolveActorString(
+      this.cfg.states,
+      this.cfg.acp.adapter,
+      this.cfg.acp.model,
+      issue.state,
+    );
     const entry: RunningEntry = {
       issue_id: issue.id,
       identifier: issue.identifier,
@@ -776,105 +791,83 @@ export class Orchestrator
   private onWorkerExit(issueId: string, normal: boolean, reason: string, entry: RunningEntry): void {
     this.running.delete(issueId);
     // Issue 52: the reconciler `vm` resource is the sole owner of VM teardown.
-    // The runner no longer destroys imperatively, so every worker exit — clean
-    // or not — kicks the reaper. With `running.delete` above, the intended set
-    // excludes this issue's VM and the reaper converges it (stop+delete) in a
-    // single pass. Latency stays close to the prior eager path because the kick
-    // is unconditional; with the issue-51 `name`-file reads enumeration is cheap.
+    // Every worker exit — clean or not — kicks the reaper so the intended set
+    // (now excluding this issue) converges in a single pass.
     if (this.reconciler && !this.stopped) {
       void this.reconciler.reapVms().catch((err) =>
         log.debug('post-exit vm reap failed', { error: (err as Error).message }),
       );
     }
     const elapsedMs = Date.now() - Date.parse(entry.started_at);
-    if (Number.isFinite(elapsedMs)) {
-      this.sessionTotals.seconds_running += elapsedMs / 1000;
-    }
-    const identifier = entry.identifier;
-    const logger = withIssue({ issue_id: issueId, issue_identifier: identifier });
-
-    if (entry.cleanup_workspace_on_exit) {
-      // Workspace removal is deferred until the worker has fully unwound (including
-      // after_run hook execution) so we never delete the dir while the agent is still
-      // inside it. The before_remove hook runs inside `workspaces.remove` and is mirrored
-      // into the per-issue run log via the same HookCapture pattern as the in-attempt hooks.
-      const runLog = this.runLogs.get(issueId);
-      const capture: HookCapture | undefined = runLog
-        ? {
-            onChunk: (stream, text) =>
-              runLog.record({ channel: 'hook', hook: 'before_remove', stream, text }),
-            onResult: (r: HookResult) =>
-              runLog.record({
-                channel: 'hook',
-                hook: 'before_remove',
-                kind: 'result',
-                exit_code: r.exit_code,
-                signal: r.signal,
-                timed_out: r.timed_out,
-              }),
-          }
-        : undefined;
-      this.cleanupInFlight.add(issueId);
-      // Resolve before_remove against the issue's terminal state — that's the state the
-      // file landed in when `symphony.transition` flipped cleanup_workspace_on_exit, so a
-      // terminal-state-specific before_remove (e.g. "merge the PR, then drop the
-      // workspace") fires instead of the workflow-level fallback.
-      const removalHooks = resolveHooksForState(this.cfg, entry.issue.state);
-      this.workspaces
-        .remove(entry.identifier, removalHooks, capture)
-        .catch((err) =>
-          logger.warn('workspace removal failed', { error: (err as Error).message }),
-        )
-        .finally(() => {
-          // Issue is in a terminal state; close the log so the file handle is released.
-          // Pass `viaCleanup: true` so the close goes through even though
-          // `cleanupInFlight` is still set for this issueId — we clear it right after.
-          this.cleanupInFlight.delete(issueId);
-          this.closeRunLog(issueId, { reason: 'cleanup_on_exit' }, { viaCleanup: true });
-        });
-    }
-
+    if (Number.isFinite(elapsedMs)) this.sessionTotals.seconds_running += elapsedMs / 1000;
+    const logger = withIssue({ issue_id: issueId, issue_identifier: entry.identifier });
+    if (entry.cleanup_workspace_on_exit) this.scheduleWorkspaceCleanup(issueId, entry, logger);
     // If the service was stopped while this worker was unwinding, do not schedule
     // a new retry — that would leave a live timer behind even though stop() was called.
     if (this.stopped) {
       this.claimed.delete(issueId);
-      // stop() also closes any open run logs; do nothing more here.
       return;
     }
-
+    if (normal) this.completed.add(issueId);
+    const plan = decideExitRetry({
+      normal,
+      reason,
+      priorAttempt: entry.retry_attempt,
+      targetState: entry.issue.state,
+      continuationDelayMs: CONTINUATION_DELAY_MS,
+      failureBaseMs: FAILURE_BASE_MS,
+      maxBackoffMs: this.cfg.agent.max_retry_backoff_ms,
+    });
     if (normal) {
-      this.completed.add(issueId);
       logger.info('worker exited (normal)', { reason });
-      // entry.issue.state has been updated to the post-transition state by
-      // McpRegistry.performTransition (if the agent transitioned) and is the
-      // state the continuation will dispatch into; if the worker exited
-      // without transitioning, the state is unchanged and the continuation
-      // is a no-op poll that lands back here on the next tick.
-      this.scheduleRetry(issueId, {
-        identifier,
-        attempt: 1,
-        delayMs: CONTINUATION_DELAY_MS,
-        error: null,
-        kind: 'continuation',
-        target_state: entry.issue.state,
-      });
     } else {
-      const nextAttempt =
-        entry.retry_attempt !== null && entry.retry_attempt !== undefined ? entry.retry_attempt + 1 : 1;
-      const delayMs = Math.min(
-        FAILURE_BASE_MS * Math.pow(2, nextAttempt - 1),
-        this.cfg.agent.max_retry_backoff_ms,
-      );
-      logger.warn('worker exited (abnormal)', { reason, next_attempt: nextAttempt, delay_ms: delayMs });
-      this.scheduleRetry(issueId, {
-        identifier,
-        attempt: nextAttempt,
-        delayMs,
-        error: reason,
-        kind: 'failure',
-        target_state: entry.issue.state,
+      logger.warn('worker exited (abnormal)', {
+        reason,
+        next_attempt: plan.attempt,
+        delay_ms: plan.delayMs,
       });
     }
+    this.scheduleRetry(issueId, { identifier: entry.identifier, ...plan });
+  }
+
+  /**
+   * Workspace removal deferred until the worker has fully unwound (including
+   * after_run hook execution) so we never delete the dir while the agent is
+   * still inside it. The before_remove hook runs inside `workspaces.remove`
+   * and is mirrored into the per-issue run log. The hook is resolved against
+   * the issue's terminal state so a state-specific before_remove fires
+   * instead of the workflow-level fallback.
+   */
+  private scheduleWorkspaceCleanup(
+    issueId: string,
+    entry: RunningEntry,
+    logger: ReturnType<typeof withIssue>,
+  ): void {
+    const runLog = this.runLogs.get(issueId);
+    const capture: HookCapture | undefined = runLog
+      ? {
+          onChunk: (stream, text) =>
+            runLog.record({ channel: 'hook', hook: 'before_remove', stream, text }),
+          onResult: (r: HookResult) =>
+            runLog.record({
+              channel: 'hook',
+              hook: 'before_remove',
+              kind: 'result',
+              exit_code: r.exit_code,
+              signal: r.signal,
+              timed_out: r.timed_out,
+            }),
+        }
+      : undefined;
+    this.cleanupInFlight.add(issueId);
+    const removalHooks = resolveHooksForState(this.cfg, entry.issue.state);
+    this.workspaces
+      .remove(entry.identifier, removalHooks, capture)
+      .catch((err) => logger.warn('workspace removal failed', { error: (err as Error).message }))
+      .finally(() => {
+        this.cleanupInFlight.delete(issueId);
+        this.closeRunLog(issueId, { reason: 'cleanup_on_exit' }, { viaCleanup: true });
+      });
   }
 
   /** Retry queue. */
@@ -903,12 +896,33 @@ export class Orchestrator
     const entry = this.retryAttempts.get(issueId);
     if (!entry) return;
     this.retryAttempts.delete(issueId);
-    let candidates: Issue[];
-    let snapshotTrackerRoot: string | null;
+    const fetched = await this.fetchRetryCandidates(issueId, entry);
+    if (!fetched) return;
+    const issue = fetched.issues.find((i) => i.id === issueId);
+    if (!issue) {
+      this.releaseRetryClaim(issueId, entry.identifier, 'not_in_candidates');
+      return;
+    }
+    const reason = this.eligibilityReason(issue, true);
+    if (reason !== null) {
+      this.handleRetryIneligible(issue, entry, reason);
+      return;
+    }
+    void this.dispatchIssue(issue, entry.attempt, { trackerRoot: fetched.root });
+  }
+
+  /**
+   * Tracker poll for the retry timer. Returns the snapshot or null when the
+   * fetch failed (a failure-shaped retry is rescheduled internally so the
+   * caller can just bail).
+   */
+  private async fetchRetryCandidates(
+    issueId: string,
+    entry: RetryEntry,
+  ): Promise<{ issues: Issue[]; root: string | null } | null> {
     try {
-      const result = await this.tracker.fetchCandidateIssues();
-      candidates = result.issues;
-      snapshotTrackerRoot = result.root;
+      const r = await this.tracker.fetchCandidateIssues();
+      return { issues: r.issues, root: r.root };
     } catch (err) {
       log.debug('retry poll failed', {
         issue_id: issueId,
@@ -926,58 +940,45 @@ export class Orchestrator
         kind: 'failure',
         target_state: entry.target_state,
       });
-      return;
+      return null;
     }
-    const issue = candidates.find((i) => i.id === issueId);
-    if (!issue) {
-      this.claimed.delete(issueId);
-      log.info('retry releasing claim (not in candidates)', {
-        issue_id: issueId,
-        issue_identifier: entry.identifier,
-      });
-      this.closeRunLog(issueId, { reason: 'claim_released_not_in_candidates' });
-      return;
-    }
-    // Re-apply full candidate eligibility, ignoring this issue's own claim. This catches
-    // late-breaking issues like a new non-terminal blocker on a Todo or a state change to
-    // an inactive value that slipped past the candidate filter on edge tracker shapes.
-    const reason = this.eligibilityReason(issue, true);
-    if (reason !== null) {
-      if (reason === 'no per-state slot') {
-        // Reaching this branch means some other claim has the slot we
-        // expected. With the continuation-holds-slot rule above, that
-        // happens only when genuine contention is in play (e.g. max=2
-        // with two unrelated issues running) — never as a side effect of
-        // a tick stealing this issue's own continuation. Re-queue as a
-        // failure-shaped backoff; the orchestrator can dispatch other
-        // work during the wait.
-        this.scheduleRetry(issueId, {
-          identifier: issue.identifier,
-          attempt: entry.attempt + 1,
-          delayMs: Math.min(
-            FAILURE_BASE_MS * Math.pow(2, entry.attempt),
-            this.cfg.agent.max_retry_backoff_ms,
-          ),
-          error: 'no available orchestrator slots',
-          kind: 'failure',
-          target_state: issue.state,
-        });
-        return;
-      }
-      // For non-slot reasons (blocker, missing fields, non-active state), the right action
-      // is to release the claim rather than spin on it.
-      this.claimed.delete(issueId);
-      log.info('retry releasing claim (ineligible)', {
-        issue_id: issueId,
-        issue_identifier: entry.identifier,
-        reason,
-      });
-      this.closeRunLog(issueId, { reason: `claim_released_ineligible:${reason}` });
-      return;
-    }
-    void this.dispatchIssue(issue, entry.attempt, {
-      trackerRoot: snapshotTrackerRoot,
+  }
+
+  /**
+   * Re-applied candidate eligibility came back non-null. The pure
+   * `decideRetryAfterIneligible` picks between rescheduling (only `no
+   * per-state slot`, which is genuine contention) and releasing the claim
+   * (everything else: blocker, missing fields, non-active state).
+   */
+  private handleRetryIneligible(issue: Issue, entry: RetryEntry, reason: string): void {
+    const action = decideRetryAfterIneligible({
+      reason,
+      priorAttempt: entry.attempt,
+      targetState: issue.state,
+      failureBaseMs: FAILURE_BASE_MS,
+      maxBackoffMs: this.cfg.agent.max_retry_backoff_ms,
     });
+    if (action.kind === 'release') {
+      this.releaseRetryClaim(issue.id, entry.identifier, `ineligible:${reason}`, reason);
+      return;
+    }
+    this.scheduleRetry(issue.id, { identifier: issue.identifier, ...action.plan });
+  }
+
+  private releaseRetryClaim(
+    issueId: string,
+    identifier: string,
+    closeTag: string,
+    ineligibleReason?: string,
+  ): void {
+    this.claimed.delete(issueId);
+    log.info(
+      ineligibleReason
+        ? 'retry releasing claim (ineligible)'
+        : 'retry releasing claim (not in candidates)',
+      { issue_id: issueId, issue_identifier: identifier, ...(ineligibleReason ? { reason: ineligibleReason } : {}) },
+    );
+    this.closeRunLog(issueId, { reason: `claim_released_${closeTag}` });
   }
 
   /**
@@ -1301,26 +1302,21 @@ export class Orchestrator
    */
   async prIntended(): Promise<PrIntent[]> {
     if (!this.cfg.pr_autopilot.enabled) return [];
-    const out: PrIntent[] = [];
     const mergeState = this.cfg.pr_autopilot.merge_state;
     const closeState = this.cfg.pr_autopilot.close_state;
     const baseBranch = baseBranchName();
     const states = closeState ? [mergeState, closeState] : [mergeState];
     const issues = await this.tracker.fetchIssuesByStates(states);
-    for (const i of issues) {
-      const stateLower = i.state.toLowerCase();
-      const isMerge = stateLower === mergeState.toLowerCase();
-      const isClose = closeState !== null && stateLower === closeState.toLowerCase();
-      if (!isMerge && !isClose) continue;
-      const branch = i.branch_name && i.branch_name.length > 0 ? i.branch_name : `agent/${i.identifier}`;
-      out.push({
-        identifier: i.identifier,
-        kind: isMerge ? 'merge' : 'close',
-        state: i.state,
-        workspace_path: isMerge ? this.workspaces.workspacePathFor(i.identifier) : null,
-        branch,
-        base_branch: baseBranch,
+    const out: PrIntent[] = [];
+    for (const issue of issues) {
+      const intent = classifyPrIntent({
+        issue,
+        mergeState,
+        closeState,
+        baseBranch,
+        mergeWorkspacePath: this.workspaces.workspacePathFor(issue.identifier),
       });
+      if (intent) out.push(intent);
     }
     return out;
   }
@@ -1509,31 +1505,15 @@ export class Orchestrator
 
   /** Issue-detail view used by the HTTP /api/v1/<identifier> endpoint. */
   detailByIdentifier(identifier: string): unknown | null {
-    let entry: RunningEntry | null = null;
-    for (const e of this.running.values()) {
-      if (e.identifier === identifier) {
-        entry = e;
-        break;
-      }
-    }
-    let retry: RetryEntry | null = null;
-    for (const r of this.retryAttempts.values()) {
-      if (r.identifier === identifier) {
-        retry = r;
-        break;
-      }
-    }
-    if (!entry && !retry) return null;
-    return {
-      issue_identifier: identifier,
-      issue_id: entry?.issue_id ?? retry?.issue_id ?? null,
-      status: entry ? 'running' : 'retrying',
-      workspace: entry ? { path: entry.workspace_path } : null,
-      attempts: {
-        current_retry_attempt: retry?.attempt ?? null,
-      },
-      running: entry
+    const entry = this.findRunningByIdentifier(identifier);
+    const retry = this.findRetryByIdentifier(identifier);
+    return buildIssueDetailDto(
+      identifier,
+      entry
         ? {
+            issue_id: entry.issue_id,
+            identifier: entry.identifier,
+            workspace_path: entry.workspace_path,
             session_id: entry.session_id,
             turn_count: entry.turn_count,
             state: entry.issue.state,
@@ -1541,23 +1521,32 @@ export class Orchestrator
             last_event: entry.last_event,
             last_message: entry.last_message,
             last_event_at: entry.last_event_at,
-            tokens: {
-              input_tokens: entry.input_tokens,
-              output_tokens: entry.output_tokens,
-              total_tokens: entry.total_tokens,
-            },
+            input_tokens: entry.input_tokens,
+            output_tokens: entry.output_tokens,
+            total_tokens: entry.total_tokens,
+            recent_events: entry.recent_events,
+            last_error: entry.last_error,
           }
         : null,
-      retry: retry
+      retry
         ? {
+            issue_id: retry.issue_id,
+            identifier: retry.identifier,
             attempt: retry.attempt,
-            due_at: new Date(retry.due_at_ms).toISOString(),
+            due_at_ms: retry.due_at_ms,
             error: retry.error,
           }
         : null,
-      recent_events: entry?.recent_events ?? [],
-      last_error: entry?.last_error ?? retry?.error ?? null,
-      tracked: {},
-    };
+    );
+  }
+
+  private findRunningByIdentifier(identifier: string): RunningEntry | null {
+    for (const e of this.running.values()) if (e.identifier === identifier) return e;
+    return null;
+  }
+
+  private findRetryByIdentifier(identifier: string): RetryEntry | null {
+    for (const r of this.retryAttempts.values()) if (r.identifier === identifier) return r;
+    return null;
   }
 }
