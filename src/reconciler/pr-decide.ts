@@ -87,6 +87,16 @@ export type EnsureWorkspaceOutcome =
   | { kind: 'error'; diagnostic: string };
 
 /**
+ * Outcome of a `close_pr` apply step. `ok: false` means the gh close call
+ * surfaced an error through the ledger (no exception thrown — `runClosePr`
+ * catches and records `last_error`). Carried in the observation so the next
+ * `decidePr` call can gate `delete_remote_branch` on close success — main's
+ * `runClosePr` returned early on failure, leaving the remote branch in place
+ * under a still-open PR, and we preserve that contract here.
+ */
+export type CloseOutcome = { ok: boolean };
+
+/**
  * Read-only slice of `PerIssueState` that the pure decision needs. The shell
  * snapshots this from the live state before each `decidePr` call.
  */
@@ -120,6 +130,15 @@ export interface PrObservation {
   view: PrView | null;
   rebaseAttempted: boolean;
   rebaseOutcome: RebaseOutcome | null;
+  /**
+   * Close-path outcome tracker. `closeAttempted` flips true after the shell
+   * applies a `close_pr` effect; `closeOutcome.ok` records whether the gh
+   * close call succeeded. `decideClose` uses these to emit
+   * `delete_remote_branch` only after a successful close — matching the
+   * pre-refactor `runClosePr` behavior that returned early on failure.
+   */
+  closeAttempted: boolean;
+  closeOutcome: CloseOutcome | null;
   /**
    * Terminal-pass marker set by the shell after applying any effect that
    * means "we're done with this intent this reconcile pass" — defer on
@@ -296,11 +315,21 @@ function decideClose(obs: PrObservation): PrEffect[] {
       { kind: 'mark_completed', identifier: id },
     ];
   }
-  return [
-    { kind: 'close_pr', identifier: id, prNumber: view.number },
-    { kind: 'delete_remote_branch', identifier: id, branch: obs.intent.branch },
-    { kind: 'mark_completed', identifier: id },
-  ];
+  // Open PR: close first, then gate branch deletion on close success. A
+  // failed close leaves the PR open on origin, so deleting the remote branch
+  // would orphan it — matching main's `runClosePr` which returned early on
+  // failure. The completion latch still fires (same as main) so a transient
+  // gh outage doesn't leave the close intent looping every pass.
+  if (!obs.closeAttempted) {
+    return [{ kind: 'close_pr', identifier: id, prNumber: view.number }];
+  }
+  if (obs.closeOutcome !== null && obs.closeOutcome.ok) {
+    return [
+      { kind: 'delete_remote_branch', identifier: id, branch: obs.intent.branch },
+      { kind: 'mark_completed', identifier: id },
+    ];
+  }
+  return [{ kind: 'mark_completed', identifier: id }];
 }
 
 /**

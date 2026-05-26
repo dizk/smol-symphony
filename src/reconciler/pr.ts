@@ -430,6 +430,8 @@ export class PrResource {
       view: null,
       rebaseAttempted: false,
       rebaseOutcome: null,
+      closeAttempted: false,
+      closeOutcome: null,
       halt: false,
       config: {
         strategy: this.opts.strategy,
@@ -491,8 +493,8 @@ export class PrResource {
         return { ...obs, cache: this.cacheView(st) };
       }
       case 'close_pr': {
-        await this.runClosePr(eff.identifier, eff.prNumber);
-        return obs;
+        const ok = await this.runClosePr(eff.identifier, eff.prNumber);
+        return { ...obs, closeAttempted: true, closeOutcome: { ok } };
       }
       case 'delete_remote_branch': {
         await this.runDeleteRemoteBranch(eff.identifier, eff.branch);
@@ -799,14 +801,15 @@ export class PrResource {
     }
   }
 
-  private async runClosePr(identifier: string, prNumber: number): Promise<void> {
+  private async runClosePr(identifier: string, prNumber: number): Promise<boolean> {
     const actionKey = `close_pr:${prNumber}`;
     const res = await this.ledger.run(actionKey, () => this.opts.pr.closePr(prNumber));
     if (res.ok) {
       log.info('pr reconcile: closed pr', { identifier, pr_number: prNumber });
-    } else {
-      this.lastError = res.error;
+      return true;
     }
+    this.lastError = res.error;
+    return false;
   }
 
   private async runDeleteRemoteBranch(identifier: string, branch: string): Promise<void> {
