@@ -22,7 +22,6 @@ import path from 'node:path';
 import { runProcess, type RunResult } from '../util/process.js';
 import type {
   ActionContext,
-  ActionErrorPolicy,
   ActionOutcome,
   ActionStatus,
   ActionState,
@@ -37,7 +36,6 @@ import type {
   RunInVmAction,
   WorkflowAction,
 } from './types.js';
-import { renderTemplate, renderTree, TemplateError } from './templating.js';
 import { evaluatePredicate } from './predicates.js';
 import {
   computeCacheHash,
@@ -46,12 +44,11 @@ import {
   runInVmCacheRoot,
   writeCache,
 } from './cache.js';
+import { planActions, type Effect } from './effects.js';
 import type { HookCapture } from '../workspace.js';
 import { log } from '../logging.js';
 import { realClock, isoFromClock, type ClockNow } from '../util/clock.js';
 
-const DEFAULT_RETRY_COUNT = 3;
-const DEFAULT_RETRY_BACKOFF_MS = 1_000;
 const MAX_ACTION_HISTORY = 16;
 
 export interface ProposeFollowupSink {
@@ -159,6 +156,14 @@ export async function runActions(
   actions: readonly WorkflowAction[],
   opts: ActionExecutorOptions,
 ): Promise<ActionExecResult> {
+  return runEffects(planActions(actions, opts.ctx), opts);
+}
+
+/** Drive planned `Effect`s. IO half of the planActions/runEffects split. */
+export async function runEffects(
+  effects: readonly Effect[],
+  opts: ActionExecutorOptions,
+): Promise<ActionExecResult> {
   const now = opts.now ?? realClock;
   const iso = () => isoFromClock(now);
   const ledger: ActionStatus[] = [];
@@ -172,157 +177,117 @@ export async function runActions(
   };
 
   let routeTo: string | null = null;
-  let aborted = false;
   let abortReason: string | null = null;
-
-  for (let i = 0; i < actions.length; i++) {
-    if (aborted) break;
-    const action = actions[i]!;
-    const actionKey = actionSnapshotKey(action, i);
-    const startedAt = iso();
-    push({
-      resource: opts.snapshotId,
-      action: actionKey,
-      state: 'in_progress',
-      started_at: startedAt,
-      finished_at: null,
-      error: null,
-    });
-
-    // Render the action's string-typed fields once up front. We re-render on
-    // retry to be robust to context mutations during the retry window, but in
-    // practice the ActionContext is built once per cleanup pass.
-    let rendered: WorkflowAction;
-    try {
-      rendered = renderTree(action, opts.ctx);
-    } catch (err) {
-      const msg = err instanceof TemplateError ? err.message : (err as Error).message;
-      upd(actionKey, { state: 'error', finished_at: iso(), error: msg });
-      log.warn('action template render failed', {
-        action: actionKey,
-        error: msg,
-      });
-      aborted = true;
-      abortReason = msg;
+  for (const effect of effects) {
+    const step = await runOneEffect(effect, opts, push, upd, iso);
+    if (step.route_to) routeTo = step.route_to;
+    if (step.aborted) {
+      abortReason = step.reason;
       break;
     }
-
-    // Conditional `if:`. A false predicate marks the action done with a
-    // "skipped (if=false)" reason so the snapshot/log shows why nothing
-    // happened. We re-use the `done` state because there's no "skipped"
-    // ActionState; the run log captures the discriminator.
-    let shouldRun: boolean;
-    try {
-      shouldRun = await evaluatePredicate(rendered.if, opts.ctx, opts.workspacePath);
-    } catch (err) {
-      const msg = (err as Error).message;
-      upd(actionKey, { state: 'error', finished_at: iso(), error: msg });
-      aborted = true;
-      abortReason = msg;
-      break;
-    }
-    if (!shouldRun) {
-      upd(actionKey, { state: 'done', finished_at: iso() });
-      opts.capture?.onChunk?.('stdout', `[action ${actionKey}] skipped (if=false)\n`);
-      log.debug('action skipped', { action: actionKey, reason: 'if=false' });
-      continue;
-    }
-
-    // Retry loop. Default policy: 3 retries with exponential backoff starting
-    // at 1s, then `abort`. The on_error.then field overrides the default.
-    const policy = effectivePolicy(action.on_error);
-    let attempt = 0;
-    let outcome: ActionOutcome | null = null;
-    while (true) {
-      outcome = await applyAction(rendered, opts).catch((err): ActionOutcome => ({
-        ok: false,
-        reason: (err as Error).message,
-        route_to: null,
-      }));
-      if (outcome.ok) break;
-      // Routed failure (e.g. merge conflict) — short-circuit the retry loop;
-      // the route_to value will be returned to the runner.
-      if (outcome.route_to) break;
-      if (attempt >= policy.retry.count) break;
-      const backoff = policy.retry.backoff_ms * Math.pow(2, attempt);
-      opts.capture?.onChunk?.(
-        'stderr',
-        `[action ${actionKey}] attempt ${attempt + 1} failed: ${outcome.reason ?? 'unknown'}; retrying in ${backoff}ms\n`,
-      );
-      log.warn('action retrying', {
-        action: actionKey,
-        attempt: attempt + 1,
-        next_backoff_ms: backoff,
-        error: outcome.reason,
-      });
-      await delay(backoff);
-      attempt++;
-    }
-
-    if (outcome.ok) {
-      const note = outcome.cache_hit ? ' (cache hit)' : '';
-      upd(actionKey, { state: 'done', finished_at: iso() });
-      opts.capture?.onChunk?.('stdout', `[action ${actionKey}] ok${note}\n`);
-      continue;
-    }
-
-    // Failure path. Two routes:
-    //   1. action-typed routing (merge's on_conflict route_to fired by the
-    //      executor): outcome.route_to is set.
-    //   2. policy-typed routing (on_error.then.route_to): convert here.
-    let route: string | null = outcome.route_to;
-    if (!route && typeof policy.then === 'object' && policy.then.route_to) {
-      route = policy.then.route_to;
-    }
-    upd(actionKey, {
-      state: 'error',
-      finished_at: iso(),
-      error: outcome.reason ?? 'unknown',
-    });
-    opts.capture?.onChunk?.(
-      'stderr',
-      `[action ${actionKey}] failed: ${outcome.reason ?? 'unknown'}${route ? `; routing to ${route}` : ''}\n`,
-    );
-    log.warn('action failed', {
-      action: actionKey,
-      reason: outcome.reason,
-      route_to: route,
-    });
-    if (route) {
-      routeTo = route;
-      aborted = true;
-      abortReason = outcome.reason ?? 'unknown';
-      break;
-    }
-    // No route; abort the cleanup actions list. (Default `then: "abort"`.)
-    aborted = true;
-    abortReason = outcome.reason ?? 'unknown';
   }
-
   return {
-    ok: !aborted,
+    ok: abortReason === null,
     reason: abortReason,
     route_to: routeTo,
     actions: ledger.slice(0, MAX_ACTION_HISTORY),
   };
 }
 
-function effectivePolicy(p: ActionErrorPolicy | undefined): {
-  retry: { count: number; backoff_ms: number };
-  then: 'abort' | { route_to: string };
-} {
-  return {
-    retry: {
-      count: p?.retry?.count ?? DEFAULT_RETRY_COUNT,
-      backoff_ms: p?.retry?.backoff_ms ?? DEFAULT_RETRY_BACKOFF_MS,
-    },
-    then: p?.then ?? 'abort',
-  };
+type EffectStep = { aborted: boolean; route_to: string | null; reason: string | null };
+
+async function runOneEffect(
+  effect: Effect,
+  opts: ActionExecutorOptions,
+  push: (s: ActionStatus) => void,
+  upd: (key: string, next: Partial<ActionStatus>) => void,
+  iso: () => string,
+): Promise<EffectStep> {
+  const actionKey = effect.snapshotKey;
+  push({
+    resource: opts.snapshotId,
+    action: actionKey,
+    state: 'in_progress',
+    started_at: iso(),
+    finished_at: null,
+    error: null,
+  });
+  if (effect.kind === 'render_failed') {
+    upd(actionKey, { state: 'error', finished_at: iso(), error: effect.error });
+    log.warn('action template render failed', { action: actionKey, error: effect.error });
+    return { aborted: true, route_to: null, reason: effect.error };
+  }
+  const { rendered, predicate, policy } = effect;
+  let shouldRun: boolean;
+  try {
+    shouldRun = await evaluatePredicate(predicate, opts.ctx, opts.workspacePath);
+  } catch (err) {
+    const msg = (err as Error).message;
+    upd(actionKey, { state: 'error', finished_at: iso(), error: msg });
+    return { aborted: true, route_to: null, reason: msg };
+  }
+  if (!shouldRun) {
+    upd(actionKey, { state: 'done', finished_at: iso() });
+    opts.capture?.onChunk?.('stdout', `[action ${actionKey}] skipped (if=false)\n`);
+    log.debug('action skipped', { action: actionKey, reason: 'if=false' });
+    return { aborted: false, route_to: null, reason: null };
+  }
+  const outcome = await runWithRetry(rendered, actionKey, policy, opts);
+  return finalizeOutcome(actionKey, outcome, policy, opts, upd, iso);
 }
 
-function actionSnapshotKey(action: WorkflowAction, idx: number): string {
-  if (action.name && action.name.length > 0) return `${action.kind}:${action.name}`;
-  return `${action.kind}:#${idx}`;
+async function runWithRetry(
+  rendered: WorkflowAction,
+  actionKey: string,
+  policy: { retry: { count: number; backoff_ms: number } },
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
+  let attempt = 0;
+  while (true) {
+    const outcome = await applyAction(rendered, opts).catch((err): ActionOutcome => ({
+      ok: false,
+      reason: (err as Error).message,
+      route_to: null,
+    }));
+    if (outcome.ok || outcome.route_to) return outcome;
+    if (attempt >= policy.retry.count) return outcome;
+    const backoff = policy.retry.backoff_ms * Math.pow(2, attempt);
+    opts.capture?.onChunk?.(
+      'stderr',
+      `[action ${actionKey}] attempt ${attempt + 1} failed: ${outcome.reason ?? 'unknown'}; retrying in ${backoff}ms\n`,
+    );
+    log.warn('action retrying', {
+      action: actionKey,
+      attempt: attempt + 1,
+      next_backoff_ms: backoff,
+      error: outcome.reason,
+    });
+    await delay(backoff);
+    attempt++;
+  }
+}
+
+function finalizeOutcome(
+  actionKey: string,
+  outcome: ActionOutcome,
+  policy: { then: 'abort' | { route_to: string } },
+  opts: ActionExecutorOptions,
+  upd: (key: string, next: Partial<ActionStatus>) => void,
+  iso: () => string,
+): EffectStep {
+  if (outcome.ok) {
+    const note = outcome.cache_hit ? ' (cache hit)' : '';
+    upd(actionKey, { state: 'done', finished_at: iso() });
+    opts.capture?.onChunk?.('stdout', `[action ${actionKey}] ok${note}\n`);
+    return { aborted: false, route_to: null, reason: null };
+  }
+  const route = outcome.route_to ?? (typeof policy.then === 'object' ? policy.then.route_to : null);
+  const reason = outcome.reason ?? 'unknown';
+  const suffix = route ? `; routing to ${route}` : '';
+  upd(actionKey, { state: 'error', finished_at: iso(), error: reason });
+  opts.capture?.onChunk?.('stderr', `[action ${actionKey}] failed: ${reason}${suffix}\n`);
+  log.warn('action failed', { action: actionKey, reason, route_to: route });
+  return { aborted: true, route_to: route, reason };
 }
 
 // ===== Per-kind appliers ==================================================
