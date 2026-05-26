@@ -31,7 +31,7 @@
 
 import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { sanitizeWorkspaceKey } from '../workspace.js';
+import { sanitizeWorkspaceKey } from '../util/workspace-key.js';
 import { runProcess } from '../util/process.js';
 import { log } from '../logging.js';
 import { ResourceActionLedger } from './ledger.js';

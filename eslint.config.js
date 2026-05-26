@@ -11,7 +11,7 @@ const shell = [
   // adapters (IO wrappers — should stay thin too)
   'src/trackers/local.ts', 'src/agent/smolvm.ts', 'src/agent/adapters.ts', 'src/agent/acp.ts',
   'src/agent/tool-call-summary.ts', 'src/acp-bridge.ts', 'src/runlog.ts', 'src/memory.ts',
-  'src/reconciler/bake.ts', 'src/workflow-loader.ts',
+  'src/reconciler/bake.ts', 'src/workflow-loader.ts', 'src/workspace.ts',
   // entry
   'src/http.ts', 'src/http-disk.ts', 'src/bin/symphony.ts',
 ];
@@ -21,7 +21,7 @@ const core = [
   'src/reconciler/cache.ts',
   'src/actions/effects.ts', 'src/actions/predicates.ts', 'src/actions/templating.ts',
   'src/actions/parsing.ts', 'src/actions/cache.ts', 'src/actions/index.ts',
-  'src/workflow.ts', 'src/issues.ts', 'src/prompt.ts', 'src/workspace.ts', 'src/mcp.ts',
+  'src/workflow.ts', 'src/issues.ts', 'src/prompt.ts', 'src/mcp.ts',
   'src/http-handlers.ts',
 ];
 

@@ -45,7 +45,7 @@ import {
   writeCache,
 } from './cache.js';
 import { planActions, type Effect } from './effects.js';
-import type { HookCapture } from '../workspace.js';
+import type { HookCapture } from '../workspace-types.js';
 import { log } from '../logging.js';
 import { realClock, isoFromClock, type ClockNow } from '../util/clock.js';
 
