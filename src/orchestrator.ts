@@ -1113,6 +1113,7 @@ export class Orchestrator
       description: input.description ?? '',
       priority: input.priority ?? null,
       labels: input.labels ?? [],
+      now: () => Date.now(),
       extra_front_matter: {
         proposed_by: input.parent_identifier,
         proposed_at: new Date().toISOString(),

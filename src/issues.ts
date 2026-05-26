@@ -9,6 +9,7 @@
 import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sanitizeWorkspaceKey } from './util/workspace-key.js';
+import { realClock, isoFromClock } from './util/clock.js';
 import type { StateConfig } from './types.js';
 
 /**
@@ -115,6 +116,13 @@ export interface WriteIssueFileInput {
    * dashboard and in the file itself.
    */
   extra_front_matter?: Record<string, string | number | boolean>;
+  /**
+   * Injected clock for the `created_at` / `updated_at` stamps. Defaults to
+   * `realClock` so callers that don't care about determinism keep working;
+   * the orchestrator and MCP wire `() => Date.now()` explicitly so the
+   * functional-core lint rule sees no `new Date()` in this file.
+   */
+  now?: () => number;
 }
 
 export interface WriteIssueFileResult {
@@ -156,7 +164,7 @@ export async function writeIssueFile(input: WriteIssueFileInput): Promise<WriteI
     ident = String(n);
     filePath = path.join(stateDir, `${ident}.md`);
   }
-  const now = new Date().toISOString();
+  const now = isoFromClock(input.now ?? realClock);
   const fm: Record<string, unknown> = {
     id: ident,
     identifier: ident,
