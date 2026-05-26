@@ -39,6 +39,23 @@ import { runProcess } from '../util/process.js';
 import { ResourceActionLedger } from './ledger.js';
 import type { ResourceSnapshot } from './types.js';
 
+/**
+ * True iff a rebase is paused mid-flight in `workspacePath`. Git sets the
+ * `REBASE_HEAD` ref while a rebase (either backend) is stopped on conflicts and
+ * clears it on continue/abort, so `git rev-parse --verify --quiet REBASE_HEAD`
+ * is a locale-independent probe. Done via the git port's shell-out rather than
+ * stat()ing `.git/rebase-merge|rebase-apply`, keeping core free of direct fs
+ * IO (FC/IS purity). Issue 55.
+ */
+async function rebaseInProgress(workspacePath: string, timeoutMs: number | undefined): Promise<boolean> {
+  const r = await runShell(
+    'git',
+    ['rev-parse', '--verify', '--quiet', 'REBASE_HEAD'],
+    { cwd: workspacePath, timeoutMs },
+  );
+  return r.exit === 0 && r.stdout.trim().length > 0;
+}
+
 export type PrIntentKind = 'merge' | 'close';
 
 /**
@@ -482,18 +499,19 @@ export class PrResource {
       return;
     }
 
-    // 5) Conflict path. `mergeable: CONFLICTING` means GitHub already
-    //    computed the merge conflict against the base; no need to attempt
-    //    a host-side rebase first.
-    if (view.mergeable === 'CONFLICTING') {
-      await this.handleConflict(intent, view, /*conflictFiles*/ null);
-      return;
-    }
-
-    // 6) Rebase path. v1 attempts a host-side rebase only when the workspace
-    //    is on disk. Without it (workspace was reaped or the autopilot was
-    //    enabled mid-flight) we surface an informational annotation and let
-    //    GitHub's auto-merge be the only gate.
+    // 5) Rebase path. Always attempt the host-side rebase when we have a
+    //    workspace, even when gh reports `mergeable: CONFLICTING` — running
+    //    the rebase leaves merge markers and `.git/rebase-merge` on disk
+    //    so the agent dispatched into the routed-back state has a concrete
+    //    conflict to resolve in-tree (no network fetch needed inside the
+    //    VM). Without this, a CONFLICTING-on-first-encounter reroute would
+    //    hand the agent a clean workspace and they'd have no actionable
+    //    conflict to chase. Issue 55.
+    //
+    //    When there's no workspace to drive from (autopilot enabled
+    //    mid-flight and the dir was already reaped), fall back below to the
+    //    textual-notes route on CONFLICTING. Arming auto-merge runs after,
+    //    on MERGEABLE/UNKNOWN.
     if (intent.workspace_path !== null) {
       const rebase = await this.runRebase(intent, view, st);
       if (rebase.kind === 'conflict') {
@@ -501,7 +519,9 @@ export class PrResource {
         return;
       }
       if (rebase.kind === 'concurrent_push') {
-        // Defer: someone else has the lease.
+        // Defer: someone else has the lease (or an in-progress rebase is
+        // mid-resolution — see GitCliPrGitApi.rebaseOnto's rebase-in-progress
+        // guard).
         st.lastObservedHeadSha = rebase.observed_head_sha;
         return;
       }
@@ -515,6 +535,9 @@ export class PrResource {
         // failure that bumped it. (No-op when count is already 0.)
         st.rebaseAttempts = 0;
       }
+    } else if (view.mergeable === 'CONFLICTING') {
+      await this.handleConflict(intent, view, /*conflictFiles*/ null);
+      return;
     }
 
     // 7) Arm auto-merge once the PR is in a sane state. gh re-arms cleanly
@@ -1171,9 +1194,7 @@ export class GitCliPrGitApi implements PrGitApi {
     baseBranch: string;
     expectedHeadSha: string;
   }): Promise<RebaseOutcome> {
-    // 1. Ensure HEAD matches the expected SHA (concurrent push guard at the
-    //    local level — if some other actor committed locally we don't want
-    //    to clobber it).
+    // 1. Read the workspace's local HEAD up front.
     const head = await runShell(
       'git',
       ['rev-parse', 'HEAD'],
@@ -1183,10 +1204,15 @@ export class GitCliPrGitApi implements PrGitApi {
       return { kind: 'error', diagnostic: `rev-parse HEAD failed: ${head.stderr.trim()}` };
     }
     const localHead = head.stdout.trim();
-    if (localHead !== args.expectedHeadSha) {
+    // 2. If a rebase is already in progress (markers on disk in
+    //    `.git/rebase-merge` / `.git/rebase-apply`), the agent we routed
+    //    the conflict to is still resolving it. Bail without touching the
+    //    workspace — finishing or aborting the rebase here would clobber
+    //    exactly the state the agent is working on. Issue 55.
+    if (await rebaseInProgress(args.workspacePath, this.opts.timeoutMs)) {
       return { kind: 'concurrent_push', observed_head_sha: localHead };
     }
-    // 2. Fetch the base ref so origin/<base> is current.
+    // 3. Fetch the base ref so origin/<base> is current.
     const fetch = await runShell(
       'git',
       ['fetch', '--no-tags', this.remote, args.baseBranch],
@@ -1195,7 +1221,31 @@ export class GitCliPrGitApi implements PrGitApi {
     if (fetch.exit !== 0) {
       return { kind: 'error', diagnostic: `git fetch failed: ${fetch.stderr.trim()}` };
     }
-    // 3. Rebase.
+    // 4. If local HEAD has diverged from the SHA we last saw on the PR,
+    //    either an agent finished resolving a rebase in-tree (and the
+    //    workspace is now on top of `origin/<base>`) or some unrelated
+    //    local mutation happened. Distinguish via ancestry:
+    //
+    //      - `origin/<base>` is an ancestor of localHead → agent rebased.
+    //        Return ok so the caller force-with-leases the resolved branch.
+    //        Issue 55 — without this the conflict-routed agent could resolve
+    //        but the autopilot would forever return concurrent_push and the
+    //        PR would never flip CONFLICTING → MERGEABLE.
+    //      - Otherwise → unexpected local divergence. Return concurrent_push
+    //        so the autopilot defers rather than clobbering work it can't
+    //        explain.
+    if (localHead !== args.expectedHeadSha) {
+      const isAncestor = await runShell(
+        'git',
+        ['merge-base', '--is-ancestor', `${this.remote}/${args.baseBranch}`, localHead],
+        { cwd: args.workspacePath, timeoutMs: this.opts.timeoutMs },
+      );
+      if (isAncestor.exit === 0) {
+        return { kind: 'ok', new_head_sha: localHead };
+      }
+      return { kind: 'concurrent_push', observed_head_sha: localHead };
+    }
+    // 5. localHead === expectedHeadSha; run the rebase normally.
     const rebase = await runShell(
       'git',
       ['rebase', `${this.remote}/${args.baseBranch}`],
@@ -1224,7 +1274,7 @@ export class GitCliPrGitApi implements PrGitApi {
         diagnostic: `${rebase.stdout.trim()}\n${rebase.stderr.trim()}`.trim(),
       };
     }
-    // 4. New HEAD after rebase.
+    // 6. New HEAD after rebase.
     const newHead = await runShell('git', ['rev-parse', 'HEAD'], {
       cwd: args.workspacePath,
       timeoutMs: this.opts.timeoutMs,

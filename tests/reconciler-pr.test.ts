@@ -358,8 +358,48 @@ describe('PrResource — rebase conflict routing', () => {
     assert.equal(call.actor, 'pr-autopilot');
   });
 
-  it('also routes on gh-reported mergeable=CONFLICTING without attempting a host rebase', async () => {
+  it('attempts the host-side rebase even when gh already reports CONFLICTING so markers land on disk for the routed agent', async () => {
+    // Issue 55: previously the autopilot short-circuited when gh reported
+    // CONFLICTING and routed without ever running git, which left the
+    // routed agent looking at a clean workspace with no conflict to chase.
+    // Now we always run the rebase when there's a workspace to drive from,
+    // so the rebase markers + `.git/rebase-merge` end up on disk and the
+    // agent dispatched into the routed-back state can `git rebase --continue`.
     const intent = makeIntent();
+    const { api } = makePrApi({ view: makeView({ mergeable: 'CONFLICTING' }) });
+    const { git, calls: gitCalls } = makeGit({
+      rebase: { kind: 'conflict', files: ['src/foo.ts'], diagnostic: 'CONFLICT (content): Merge conflict in src/foo.ts' },
+    });
+    const { transition, calls: trCalls } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.equal(gitCalls.rebase.length, 1, 'rebase attempted even when gh reports CONFLICTING');
+    assert.equal(trCalls.length, 1);
+    assert.equal(trCalls[0]!.toState, 'Todo');
+    // Notes should mention the in-progress rebase + concrete file list (the
+    // conflict outcome from the rebase, not the null fallback).
+    assert.match(trCalls[0]!.notes, /rebase is left IN PROGRESS/);
+    assert.match(trCalls[0]!.notes, /src\/foo\.ts/);
+  });
+
+  it('falls back to textual-notes-only routing when CONFLICTING and there is no workspace', async () => {
+    // No workspace = autopilot was enabled mid-flight and the dir was
+    // already reaped. We can't drive a rebase, so route with the textual
+    // fallback notes.
+    const intent = makeIntent({ workspace_path: null });
     const { api } = makePrApi({ view: makeView({ mergeable: 'CONFLICTING' }) });
     const { git, calls: gitCalls } = makeGit({});
     const { transition, calls: trCalls } = makeTransition();
@@ -378,9 +418,10 @@ describe('PrResource — rebase conflict routing', () => {
     });
     await res.reconcile();
 
-    assert.equal(gitCalls.rebase.length, 0, 'no host-side rebase when gh already reports CONFLICTING');
+    assert.equal(gitCalls.rebase.length, 0, 'cannot run rebase without a workspace');
     assert.equal(trCalls.length, 1);
     assert.equal(trCalls[0]!.toState, 'Todo');
+    assert.match(trCalls[0]!.notes, /CONFLICTING/);
   });
 
   it('records the routing action in the ledger', async () => {
@@ -656,7 +697,9 @@ describe('PrResource — circuit breaker', () => {
 
     for (let round = 1; round <= 3; round += 1) {
       currentHead = `head-${round}`;
-      currentIntents = [makeIntent()];
+      // No workspace → the resource can't host-rebase, so every conflict must
+      // come through processMerge's `view.mergeable === 'CONFLICTING'` branch.
+      currentIntents = [makeIntent({ workspace_path: null })];
       await res.reconcile();
       currentIntents = [];
       await res.reconcile();
@@ -1587,7 +1630,10 @@ describe('GitCliPrGitApi — real git', () => {
     }
   });
 
-  it('returns concurrent_push when local HEAD diverges from expectedHeadSha', async () => {
+  it('returns concurrent_push when local HEAD diverges and is NOT rebased on origin/<base>', async () => {
+    // Setup: feature branch's HEAD is on an orphan commit that has no
+    // ancestor relationship to origin/main, so the "is ancestor" check
+    // fails and we treat the divergence as an unexpected local mutation.
     const baseRemote = await mkdtemp(path.join(os.tmpdir(), 'pr-git-remote-'));
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'pr-git-ws-'));
     try {
@@ -1608,9 +1654,11 @@ describe('GitCliPrGitApi — real git', () => {
       await gitOk(workspace, ['clone', baseRemote, '.']);
       await gitOk(workspace, ['config', 'user.name', 'test']);
       await gitOk(workspace, ['config', 'user.email', 'test@example.com']);
-      await gitOk(workspace, ['checkout', '-b', 'agent/42']);
-      await runStep(workspace, 'sh', ['-c', 'echo feature > file.txt']);
-      await gitOk(workspace, ['commit', '-am', 'feature']);
+      // Create an orphan branch (no ancestor of main) and land HEAD there.
+      await gitOk(workspace, ['checkout', '--orphan', 'agent/42']);
+      await runStep(workspace, 'sh', ['-c', 'echo unrelated > unrelated.txt']);
+      await gitOk(workspace, ['add', 'unrelated.txt']);
+      await gitOk(workspace, ['commit', '-m', 'unrelated orphan']);
       const realHead = await gitOk(workspace, ['rev-parse', 'HEAD']);
 
       const git = new GitCliPrGitApi({ timeoutMs: 30_000 });
@@ -1625,6 +1673,155 @@ describe('GitCliPrGitApi — real git', () => {
       if (outcome.kind === 'concurrent_push') {
         assert.equal(outcome.observed_head_sha, realHead);
       }
+    } finally {
+      await rm(baseRemote, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('returns ok with the local HEAD when the branch is already rebased on origin/<base> (issue 55)', async () => {
+    // Models the conflict-resolve-and-push flow: the autopilot routed a
+    // CONFLICTING PR back to Todo with the rebase in progress; the agent
+    // resolved the conflicts in-tree and `git rebase --continue`-d the
+    // sequence; the local branch is now on top of origin/main but the
+    // remote still has the pre-rebase SHA. The autopilot's next pass must
+    // detect this as "ready to push" rather than the historical
+    // concurrent_push bail.
+    const baseRemote = await mkdtemp(path.join(os.tmpdir(), 'pr-git-remote-'));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'pr-git-ws-'));
+    try {
+      await gitOk(baseRemote, ['init', '--bare', '-b', 'main']);
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'pr-git-seed-'));
+      try {
+        await gitOk(seed, ['init', '-b', 'main']);
+        await gitOk(seed, ['config', 'user.name', 'test']);
+        await gitOk(seed, ['config', 'user.email', 'test@example.com']);
+        await runStep(seed, 'sh', ['-c', 'echo seed > file.txt']);
+        await gitOk(seed, ['add', 'file.txt']);
+        await gitOk(seed, ['commit', '-m', 'seed']);
+        await gitOk(seed, ['remote', 'add', 'origin', baseRemote]);
+        await gitOk(seed, ['push', 'origin', 'main']);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+
+      // Advance main on the remote with a new commit (the "base advance" the
+      // agent had to rebase past).
+      const mainAdvance = await mkdtemp(path.join(os.tmpdir(), 'pr-git-main-'));
+      try {
+        await gitOk(mainAdvance, ['clone', baseRemote, '.']);
+        await gitOk(mainAdvance, ['config', 'user.name', 'test']);
+        await gitOk(mainAdvance, ['config', 'user.email', 'test@example.com']);
+        await runStep(mainAdvance, 'sh', ['-c', 'echo "main advance" > advance.txt']);
+        await gitOk(mainAdvance, ['add', 'advance.txt']);
+        await gitOk(mainAdvance, ['commit', '-m', 'advance']);
+        await gitOk(mainAdvance, ['push', 'origin', 'main']);
+      } finally {
+        await rm(mainAdvance, { recursive: true, force: true });
+      }
+
+      await gitOk(workspace, ['clone', baseRemote, '.']);
+      await gitOk(workspace, ['config', 'user.name', 'test']);
+      await gitOk(workspace, ['config', 'user.email', 'test@example.com']);
+      // Cut agent/42 from the latest main (simulating the agent having
+      // already rebased onto the new main tip in-workspace).
+      await gitOk(workspace, ['checkout', '-b', 'agent/42']);
+      await runStep(workspace, 'sh', ['-c', 'echo feature > file.txt']);
+      await gitOk(workspace, ['commit', '-am', 'feature on top of advanced main']);
+      const localHead = await gitOk(workspace, ['rev-parse', 'HEAD']);
+
+      const git = new GitCliPrGitApi({ timeoutMs: 30_000 });
+      const outcome = await git.rebaseOnto({
+        workspacePath: workspace,
+        branch: 'agent/42',
+        baseBranch: 'main',
+        // The autopilot's lastObserved SHA on the remote — a pre-rebase
+        // dummy that doesn't match the now-rebased localHead.
+        expectedHeadSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      });
+
+      assert.equal(
+        outcome.kind,
+        'ok',
+        `expected ok (already-rebased-locally fast path), got ${JSON.stringify(outcome)}`,
+      );
+      if (outcome.kind === 'ok') {
+        assert.equal(outcome.new_head_sha, localHead);
+      }
+    } finally {
+      await rm(baseRemote, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('returns concurrent_push when a rebase is already in progress on disk (issue 55)', async () => {
+    // The conflict-routed agent's workspace inherits .git/rebase-merge from
+    // the autopilot's failed rebase. The autopilot must NOT touch the
+    // workspace while the agent is mid-resolution: finishing or aborting
+    // the rebase here would clobber exactly the state the agent is
+    // resolving. Detected by the rebase-in-progress check.
+    const baseRemote = await mkdtemp(path.join(os.tmpdir(), 'pr-git-remote-'));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'pr-git-ws-'));
+    try {
+      await gitOk(baseRemote, ['init', '--bare', '-b', 'main']);
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'pr-git-seed-'));
+      try {
+        await gitOk(seed, ['init', '-b', 'main']);
+        await gitOk(seed, ['config', 'user.name', 'test']);
+        await gitOk(seed, ['config', 'user.email', 'test@example.com']);
+        await runStep(seed, 'sh', ['-c', 'echo "line one\nline two\nline three" > file.txt']);
+        await gitOk(seed, ['add', 'file.txt']);
+        await gitOk(seed, ['commit', '-m', 'seed']);
+        await gitOk(seed, ['remote', 'add', 'origin', baseRemote]);
+        await gitOk(seed, ['push', 'origin', 'main']);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+      await gitOk(workspace, ['clone', baseRemote, '.']);
+      await gitOk(workspace, ['config', 'user.name', 'test']);
+      await gitOk(workspace, ['config', 'user.email', 'test@example.com']);
+      await gitOk(workspace, ['checkout', '-b', 'agent/42']);
+      await runStep(workspace, 'sh', ['-c', 'echo "line one\nFEATURE\nline three" > file.txt']);
+      await gitOk(workspace, ['commit', '-am', 'feature']);
+      const featureHead = await gitOk(workspace, ['rev-parse', 'HEAD']);
+
+      // Advance main with a conflicting change so the first rebase attempt
+      // wedges into rebase-in-progress.
+      const main = await mkdtemp(path.join(os.tmpdir(), 'pr-git-main-'));
+      try {
+        await gitOk(main, ['clone', baseRemote, '.']);
+        await gitOk(main, ['config', 'user.name', 'test']);
+        await gitOk(main, ['config', 'user.email', 'test@example.com']);
+        await runStep(main, 'sh', ['-c', 'echo "line one\nMAIN\nline three" > file.txt']);
+        await gitOk(main, ['commit', '-am', 'main change']);
+        await gitOk(main, ['push', 'origin', 'main']);
+      } finally {
+        await rm(main, { recursive: true, force: true });
+      }
+
+      const git = new GitCliPrGitApi({ timeoutMs: 30_000 });
+      // First call lands the rebase in conflict / in-progress.
+      const first = await git.rebaseOnto({
+        workspacePath: workspace,
+        branch: 'agent/42',
+        baseBranch: 'main',
+        expectedHeadSha: featureHead,
+      });
+      assert.equal(first.kind, 'conflict');
+
+      // Second call must observe the in-progress rebase and bail without
+      // running git rebase or git fetch again.
+      const second = await git.rebaseOnto({
+        workspacePath: workspace,
+        branch: 'agent/42',
+        baseBranch: 'main',
+        expectedHeadSha: featureHead,
+      });
+      assert.equal(
+        second.kind,
+        'concurrent_push',
+        `expected concurrent_push (rebase in progress guard), got ${JSON.stringify(second)}`,
+      );
     } finally {
       await rm(baseRemote, { recursive: true, force: true });
       await rm(workspace, { recursive: true, force: true });
