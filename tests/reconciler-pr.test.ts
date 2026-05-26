@@ -697,7 +697,9 @@ describe('PrResource — circuit breaker', () => {
 
     for (let round = 1; round <= 3; round += 1) {
       currentHead = `head-${round}`;
-      currentIntents = [makeIntent()];
+      // No workspace → the resource can't host-rebase, so every conflict must
+      // come through processMerge's `view.mergeable === 'CONFLICTING'` branch.
+      currentIntents = [makeIntent({ workspace_path: null })];
       await res.reconcile();
       currentIntents = [];
       await res.reconcile();

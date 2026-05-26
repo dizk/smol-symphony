@@ -34,29 +34,26 @@
 // All git + GH I/O is behind injectable callbacks. Production wires real
 // shell-outs; tests pass synchronous stubs.
 
-import { stat } from 'node:fs/promises';
-import path from 'node:path';
 import { log } from '../logging.js';
 import { runProcess } from '../util/process.js';
 import { ResourceActionLedger } from './ledger.js';
 import type { ResourceSnapshot } from './types.js';
 
 /**
- * True iff `<workspacePath>/.git/rebase-merge` or `.git/rebase-apply` exists
- * as a directory. Git creates either depending on whether the rebase used
- * merge (`-m`) or am (default for `rebase --apply`) backend; testing both
- * keeps the check robust across git versions. Issue 55.
+ * True iff a rebase is paused mid-flight in `workspacePath`. Git sets the
+ * `REBASE_HEAD` ref while a rebase (either backend) is stopped on conflicts and
+ * clears it on continue/abort, so `git rev-parse --verify --quiet REBASE_HEAD`
+ * is a locale-independent probe. Done via the git port's shell-out rather than
+ * stat()ing `.git/rebase-merge|rebase-apply`, keeping core free of direct fs
+ * IO (FC/IS purity). Issue 55.
  */
-async function rebaseInProgress(workspacePath: string): Promise<boolean> {
-  for (const dir of ['.git/rebase-merge', '.git/rebase-apply']) {
-    try {
-      const st = await stat(path.join(workspacePath, dir));
-      if (st.isDirectory()) return true;
-    } catch {
-      // ENOENT / permission / etc — treat as "not in progress."
-    }
-  }
-  return false;
+async function rebaseInProgress(workspacePath: string, timeoutMs: number | undefined): Promise<boolean> {
+  const r = await runShell(
+    'git',
+    ['rev-parse', '--verify', '--quiet', 'REBASE_HEAD'],
+    { cwd: workspacePath, timeoutMs },
+  );
+  return r.exit === 0 && r.stdout.trim().length > 0;
 }
 
 export type PrIntentKind = 'merge' | 'close';
@@ -1212,7 +1209,7 @@ export class GitCliPrGitApi implements PrGitApi {
     //    the conflict to is still resolving it. Bail without touching the
     //    workspace — finishing or aborting the rebase here would clobber
     //    exactly the state the agent is working on. Issue 55.
-    if (await rebaseInProgress(args.workspacePath)) {
+    if (await rebaseInProgress(args.workspacePath, this.opts.timeoutMs)) {
       return { kind: 'concurrent_push', observed_head_sha: localHead };
     }
     // 3. Fetch the base ref so origin/<base> is current.
