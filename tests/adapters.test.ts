@@ -294,6 +294,45 @@ describe('stageCredential', () => {
     }
   });
 
+  it('strips the OAuth refreshToken from the claude credential before staging (issue 77)', async () => {
+    // The host token rotates on use; if a VM kept the refreshToken it could refresh
+    // (and thus rotate) the shared token, invalidating the host's copy and forcing a
+    // host /login. Stage access-token-only; the access token is re-staged each attempt.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-'));
+    const fakeHome = path.join(tmp, 'home');
+    const ws = path.join(tmp, 'ws');
+    await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+    await mkdir(path.join(ws, '.git'), { recursive: true });
+    await writeFile(
+      path.join(fakeHome, '.claude', '.credentials.json'),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'sk-ant-oat01-keep',
+          refreshToken: 'sk-ant-ort01-secret',
+          expiresAt: 123,
+          scopes: ['x'],
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    const origHome = os.homedir;
+    (os as { homedir: () => string }).homedir = () => fakeHome;
+    try {
+      const staged = await stageCredential(ws, ADAPTERS.claude);
+      const text = await readFile(staged.absPath, 'utf8');
+      assert.ok(!text.includes('ort01'), 'no refresh-token material may reach the staged file');
+      const body = JSON.parse(text);
+      assert.equal(body.claudeAiOauth.refreshToken, undefined, 'refreshToken stripped');
+      assert.equal(body.claudeAiOauth.accessToken, 'sk-ant-oat01-keep', 'accessToken preserved');
+      assert.equal(body.claudeAiOauth.expiresAt, 123, 'expiresAt preserved');
+      assert.deepEqual(body.claudeAiOauth.scopes, ['x'], 'unrelated fields preserved');
+    } finally {
+      (os as { homedir: () => string }).homedir = origHome;
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
   it('stages at .symphony-runtime/ when the workspace has no git and no ancestor git', async () => {
     // No git anywhere — workspace-root staging is fine.
     const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-'));

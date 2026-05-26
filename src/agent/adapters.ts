@@ -20,7 +20,7 @@
 // file is never exposed via a bind mount.
 
 import { constants as fsConstants } from 'node:fs';
-import { access, copyFile, mkdir, chmod, lstat, rm, realpath, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, chmod, lstat, readFile, rm, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   HOST_CREDENTIAL_PATHS,
@@ -76,6 +76,15 @@ export interface AdapterProfile {
   /** Absolute path inside the VM where the adapter expects to find the credential. */
   guestCredentialPath: string;
   /**
+   * JSON property names to strip from the credential (recursively, at any depth)
+   * before staging it into the VM. For OAuth adapters this drops the long-lived
+   * `refreshToken` so an in-VM agent cannot refresh — and thereby rotate — the
+   * host's shared token, which would invalidate the host's own copy and force a
+   * host `/login`. When set, the credential is parsed, stripped, and re-written
+   * instead of byte-copied. See issue 77 (credential rotation poisoning).
+   */
+  stripCredentialFields?: readonly string[];
+  /**
    * ACP adapter launch command, split into argv. Each token is shell-quoted before
    * being emitted into the `bash -lc` string, so future profiles with multi-token
    * commands (e.g. `['opencode', 'acp']`) compose without shell-injection risk.
@@ -103,6 +112,11 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     id: 'claude',
     hostCredentialPath: HOST_CREDENTIAL_PATHS.claude,
     guestCredentialPath: '/root/.claude/.credentials.json',
+    // Strip the OAuth refresh token before the credential enters the VM. OAuth
+    // refresh tokens rotate on use; if a VM agent refreshes the shared token it
+    // invalidates the host's copy and forces a host `/login`. The VM only needs
+    // the (short-lived) access token, re-staged each attempt. Issue 77.
+    stripCredentialFields: ['refreshToken'],
     binary: ['claude-agent-acp'],
     // claude-agent-acp reads ANTHROPIC_MODEL on startup (see acp-agent.js getAvailableModels:
     // ANTHROPIC_MODEL > settings.model > default). The adapter resolves aliases like
@@ -212,6 +226,54 @@ export async function assertHostCredentialReadable(profile: AdapterProfile): Pro
  *      NOT touch whatever the symlink resolved to, since that file is by
  *      definition attacker-chosen.
  */
+/**
+ * Deep-copy `value`, dropping every property named in `fields` at any depth. Used to
+ * remove secrets (the OAuth `refreshToken`) from a credential before it is staged into
+ * a VM, without disturbing the rest of the credential shape. Issue 77.
+ */
+function stripJsonFields(value: unknown, fields: readonly string[]): unknown {
+  if (Array.isArray(value)) return value.map((v) => stripJsonFields(v, fields));
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (fields.includes(k)) continue;
+      out[k] = stripJsonFields(v, fields);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Materialize the credential at `dst` (0600). Adapters with `stripCredentialFields`
+ * get a parsed-and-stripped JSON copy (secrets like `refreshToken` removed); everything
+ * else, and any non-JSON credential, is byte-copied. `flag: 'wx'` / COPYFILE_EXCL give
+ * the same exclusive-create race protection; the caller's realpath check still applies.
+ * Issue 77.
+ */
+async function writeStagedCredential(
+  src: string,
+  dst: string,
+  profile: AdapterProfile,
+): Promise<void> {
+  const strip = profile.stripCredentialFields;
+  let sanitized: string | null = null;
+  if (strip && strip.length > 0) {
+    const raw = await readFile(src, 'utf8');
+    try {
+      sanitized = JSON.stringify(stripJsonFields(JSON.parse(raw), strip));
+    } catch {
+      sanitized = null; // not JSON (e.g. a test fixture) — fall back to a raw copy
+    }
+  }
+  if (sanitized !== null) {
+    await writeFile(dst, sanitized, { mode: 0o600, flag: 'wx' });
+  } else {
+    await copyFile(src, dst, fsConstants.COPYFILE_EXCL);
+  }
+  await chmod(dst, 0o600);
+}
+
 export async function stageCredential(
   workspacePath: string,
   profile: AdapterProfile,
@@ -224,8 +286,7 @@ export async function stageCredential(
 
   const dst = path.join(credsDir, profile.id);
   await rm(dst, { force: true, recursive: false });
-  await copyFile(src, dst, fsConstants.COPYFILE_EXCL);
-  await chmod(dst, 0o600);
+  await writeStagedCredential(src, dst, profile);
 
   const expectedReal = path.join(
     await realpath(workspacePath),
