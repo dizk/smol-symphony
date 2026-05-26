@@ -104,20 +104,9 @@ export interface ActionExecutorOptions {
    * across hook-era and action-era runs.
    */
   capture?: HookCapture;
-  /**
-   * Content-hash cache for `run_in_vm` results. Production wires
-   * `realRunInVmCacheStore` (bound to `~/.cache/symphony`); tests bind a
-   * tmp dir via `makeRunInVmCacheStore(<tmp>)`. When absent, `run_in_vm`
-   * actions still execute but skip the cache layer entirely — no read, no
-   * write. Optional because most action kinds don't touch the cache;
-   * declaring it required would force every test to wire it.
-   */
+  /** Content-hash cache for `run_in_vm` results; absent ⇒ skip cache. */
   runInVmCache?: RunInVmCacheStore;
-  /**
-   * IO seam for `branch_exists` / `file_present`. Production wires
-   * `realPredicateEnv` (`util/predicate-env.ts`); when absent, string-shape
-   * predicates still work — only the IO shapes throw a diagnostic error.
-   */
+  /** IO seam for `branch_exists` / `file_present`; absent ⇒ those shapes throw. */
   predicateEnv?: PredicateEnv;
   /** Required for `propose_followup`. */
   followupSink?: ProposeFollowupSink;
@@ -547,10 +536,7 @@ async function applyRunInVm(
 ): Promise<ActionOutcome> {
   const env = action.env ?? {};
   const cache = opts.runInVmCache;
-  // Hash + read are gated on a wired cache store. When the runner (or a
-  // test) didn't pass one, fall through to execution every time — caching
-  // is an optimization, not a correctness requirement, and a missing store
-  // means "no cache for this run".
+  // No store wired ⇒ skip cache entirely; caching is an optimization, not correctness.
   const hash = cache ? await cache.hashKey({ workspacePath: opts.workspacePath, cmd: action.cmd, env }) : null;
   if (cache && hash) {
     const cached = await cache.read(action.name, hash);
@@ -611,8 +597,7 @@ async function applyRunInVm(
     finished_at: isoFromClock(opts.now ?? realClock),
   };
   if (res.exit_code === 0) {
-    // Cache successes only; see comment above the read branch. Skip the
-    // write when no store is wired — same gate as the read above.
+    // Cache successes only; see comment above the read branch.
     if (cache && hash) {
       await cache.write(action.name, hash, result).catch((err) =>
         log.warn('run_in_vm cache write failed', { name: action.name, hash, error: (err as Error).message }),

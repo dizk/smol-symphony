@@ -5,11 +5,7 @@
 // without pulling node child_process into pure-data import sites.
 //
 // The `run_in_vm` cache adapter lives at `./cache.ts` and is NOT re-exported
-// here: that file is classified as an adapter in `.dependency-cruiser.cjs`,
-// and `./index.ts` is domain — re-exporting would re-introduce the
-// domain↛adapters violation the executor's port injection was meant to
-// close. Application/entry callers (runner, CLI, tests) import from
-// `./cache.js` directly.
+// here (domain↛adapters): runner/CLI/tests import from `./cache.js` directly.
 
 export * from './types.js';
 export { parseActionsBlock } from './parsing.js';

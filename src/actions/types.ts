@@ -27,27 +27,19 @@ export type ActionPredicate =
   | { file_present: string }
   | null;
 
-/**
- * IO seam for `if:` predicate evaluation. The pure evaluator probes the
- * workspace through this port; the runner wires the production impl.
- */
+/** IO seam for `if: branch_exists` / `if: file_present`; runner wires the real impl. */
 export interface PredicateEnv {
   branchExists(ref: string, workspacePath: string): Promise<boolean>;
   pathExists(abs: string): Promise<boolean>;
 }
 
-/**
- * Cache key for a `run_in_vm` action. The store's `hashKey` derives a stable
- * digest from the workspace tree + cmd argv + env map; identical tuples hit
- * the same cache entry regardless of insertion order on the env keys.
- */
+/** Cache key for a `run_in_vm` action; env-key-insertion-order-stable. */
 export interface RunInVmCacheKey {
   workspacePath: string;
   cmd: string[];
   env: Record<string, string>;
 }
 
-/** Cached result of a successful `run_in_vm` execution. */
 export interface RunInVmCachedResult {
   exit_code: number;
   stdout: string;
@@ -55,19 +47,10 @@ export interface RunInVmCachedResult {
   finished_at: string;
 }
 
-/**
- * IO seam for the `run_in_vm` content-hash cache. The pure executor (domain)
- * receives this through `ActionExecutorOptions`; production wires
- * `realRunInVmCacheStore` from the adapter `./cache.ts`. Declared here so
- * both the consumer and the adapter can reference it without the executor
- * having to import a concrete `node:fs` / `runProcess` adapter.
- */
+/** IO seam for the `run_in_vm` content-hash cache; runner wires `realRunInVmCacheStore`. */
 export interface RunInVmCacheStore {
-  /** Hash the (workspace, cmd, env) tuple. */
   hashKey(key: RunInVmCacheKey): Promise<string>;
-  /** Return a prior successful result if one exists under (name, hash). */
   read(name: string, hash: string): Promise<RunInVmCachedResult | null>;
-  /** Persist a successful result under (name, hash). Best-effort on failure. */
   write(name: string, hash: string, result: RunInVmCachedResult): Promise<void>;
 }
 

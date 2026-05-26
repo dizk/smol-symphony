@@ -3,8 +3,8 @@
 // Three predicate shapes — env-var-truthy, branch-exists, file-present.
 // These are the three predicates the hook shell actually exercised across
 // today's WORKFLOW.md; the issue body explicitly caps the predicate set
-// there: "If users want more, they've outgrown declarative." The two IO
-// shapes reach the world through an injected `PredicateEnv`.
+// there: "If users want more, they've outgrown declarative." The IO shapes
+// reach the world through an injected `PredicateEnv`.
 
 import path from 'node:path';
 import type { ActionContext, ActionPredicate, PredicateEnv } from './types.js';
@@ -12,13 +12,9 @@ import { renderTemplate } from './templating.js';
 
 /**
  * Evaluate a predicate against the context. `null`/undefined → always true
- * (no `if:` → run unconditionally).
- *
- * The string form `"$var"` is a truthiness check on the named context field
- * — `if: $repo` matches the issue body's example exactly. A bare literal
- * (`if: yes`) is treated as truthy; the literal-false case `if: ""` /
- * `if: null` falls through to "always". `env` is required iff the predicate
- * is `branch_exists` / `file_present`; pure string predicates ignore it.
+ * (no `if:` → run unconditionally). String form `"$var"` is a truthiness
+ * check on the named context field. `env` is required for `branch_exists` /
+ * `file_present`; pure string predicates ignore it.
  */
 export async function evaluatePredicate(
   predicate: ActionPredicate | undefined,

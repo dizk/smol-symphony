@@ -1,11 +1,7 @@
 // Content-hash cache for run_in_vm actions (issue 36 AC4).
 //
-// Adapter for the `RunInVmCacheStore` port declared in `./types.ts`. The
-// pure executor in `./executor.ts` consumes the port; production wires
-// `realRunInVmCacheStore` (this file's default export) into runActions.
-// Classified as an adapter in `.dependency-cruiser.cjs` because everything
-// below the port is fs/git IO (node:crypto, node:fs/promises, runProcess);
-// the eslint shell-budget list mirrors `bake.ts` / `predicate-env.ts`.
+// Adapter for the `RunInVmCacheStore` port declared in `./types.ts`; the
+// pure executor consumes the port and the runner wires `realRunInVmCacheStore`.
 //
 // Cache layout:
 //   <cacheRoot>/actions/run_in_vm/<name>/<sha256(workspace_tree ⊕ cmd ⊕ env)>/result.json
@@ -30,13 +26,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { actionCacheDir, defaultCacheRoot } from '../reconciler/cache.js';
 import { runProcess } from '../util/process.js';
-import type {
-  RunInVmCacheKey,
-  RunInVmCachedResult,
-  RunInVmCacheStore,
-} from './types.js';
-
-export type { RunInVmCacheKey, RunInVmCachedResult, RunInVmCacheStore } from './types.js';
+import type { RunInVmCacheKey, RunInVmCachedResult, RunInVmCacheStore } from './types.js';
 
 export const RUN_IN_VM_CACHE_KIND = 'run_in_vm';
 
@@ -76,49 +66,44 @@ export async function computeCacheHash(key: RunInVmCacheKey): Promise<string> {
  * Returns `'no-git'` when the workspace is not a git repo so the cache key
  * still computes; the cmd/env contribution still differentiates calls.
  */
+// eslint-disable-next-line max-statements -- workspace hash inlined for clarity; splitting helped no reader.
 async function workspaceTreeHash(workspacePath: string): Promise<string> {
   const lsZ = await runGitCapture(
     ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
     workspacePath,
   );
   if (lsZ === null) return 'no-git';
-  // -z output: NUL-separated paths, possibly with a trailing NUL. A path
-  // can appear in both --cached and --others (a freshly added but git-add'd
-  // file may show up in both lists depending on git's index state); dedupe
-  // and sort so the hash is order-stable.
-  const unique = Array.from(new Set(lsZ.split('\0').filter((p) => p.length > 0))).sort();
+  // -z output: NUL-separated paths, possibly with a trailing NUL.
+  const paths = lsZ.split('\0').filter((p) => p.length > 0);
+  // A path can appear in both --cached and --others (a freshly added but
+  // git-add'd file may show up in both lists depending on git's index
+  // state); dedupe and sort so the hash is order-stable.
+  const unique = Array.from(new Set(paths)).sort();
   const h = createHash('sha256');
   for (const rel of unique) {
-    await mixFileIntoHash(h, workspacePath, rel);
-  }
-  return h.digest('hex');
-}
-
-// Read one workspace file and fold its contents (or a deletion/error marker)
-// into the running hash. Split out so `workspaceTreeHash` stays under the
-// shell-tier statement budget.
-async function mixFileIntoHash(h: ReturnType<typeof createHash>, workspacePath: string, rel: string): Promise<void> {
-  const abs = path.join(workspacePath, rel);
-  let buf: Buffer;
-  try {
-    buf = await readFile(abs);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // ENOENT: tracked file deleted in worktree; record deletion so the cache
-    // key differs from "file still present." EISDIR / other errors: record
-    // as an error marker so we don't silently bucket two distinguishable
-    // states together.
-    h.update(code === 'ENOENT' ? 'D\0' : 'E\0');
+    const abs = path.join(workspacePath, rel);
+    let buf: Buffer;
+    try {
+      buf = await readFile(abs);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // ENOENT: tracked file deleted in worktree; record deletion so the
+      // cache key differs from "file still present." EISDIR / other errors:
+      // record as an error marker so we don't silently bucket two
+      // distinguishable states together.
+      h.update(code === 'ENOENT' ? 'D\0' : 'E\0');
+      h.update(rel);
+      h.update('\0');
+      continue;
+    }
+    h.update('F\0');
     h.update(rel);
     h.update('\0');
-    return;
+    h.update(buf.length.toString(10));
+    h.update('\0');
+    h.update(buf);
   }
-  h.update('F\0');
-  h.update(rel);
-  h.update('\0');
-  h.update(buf.length.toString(10));
-  h.update('\0');
-  h.update(buf);
+  return h.digest('hex');
 }
 
 // Thin shape adapter: workspace-tree hashing wants `stdout | null` (null on
@@ -221,19 +206,7 @@ export function runInVmCacheRoot(): string {
   return defaultCacheRoot();
 }
 
-/**
- * Drop every cache entry for a named `run_in_vm` action. Used by
- * `symphony rerun --check=<name>`: the next dispatch into the state hosting
- * the check sees an empty cache namespace and re-executes, while every
- * other check's entries stay in place.
- *
- * No workspace argument: the cache is namespaced by action name on disk
- * (`<root>/actions/run_in_vm/<name>/<hash>/`), so invalidation is a
- * namespace-directory drop, not a hash lookup. This is the layout fix for
- * the rerun CLI — the CLI has no per-issue workspace to hash against, and
- * the per-execution hash is workspace-dependent, so any hash-keyed
- * invalidation would miss the entry the per-issue execution actually wrote.
- */
+/** CLI shape: drop every cache entry for a named `run_in_vm` action. */
 export async function invalidateRunInVmByName(
   action: { name: string },
   cacheRoot?: string,
@@ -241,12 +214,7 @@ export async function invalidateRunInVmByName(
   await invalidateCacheByName(cacheRoot ?? runInVmCacheRoot(), action.name);
 }
 
-/**
- * Bind a `RunInVmCacheStore` to a specific on-disk cacheRoot. The runner
- * uses `runInVmCacheRoot()`; tests pin a tmp dir. The store hands the
- * executor the port shape (`hashKey`/`read`/`write`) while keeping cacheRoot
- * a construction-time detail of the adapter.
- */
+/** Bind the cache adapter to a specific on-disk cacheRoot. */
 export function makeRunInVmCacheStore(cacheRoot: string): RunInVmCacheStore {
   return {
     hashKey: computeCacheHash,
@@ -255,10 +223,5 @@ export function makeRunInVmCacheStore(cacheRoot: string): RunInVmCacheStore {
   };
 }
 
-/**
- * Production implementation of the `RunInVmCacheStore` port. The runner
- * (application layer) passes this into `runActions` so the pure executor
- * never imports the IO half. Tests substitute their own via
- * `makeRunInVmCacheStore(<tmp>)`.
- */
+/** Production cache store, wired by the runner into runActions. */
 export const realRunInVmCacheStore: RunInVmCacheStore = makeRunInVmCacheStore(runInVmCacheRoot());

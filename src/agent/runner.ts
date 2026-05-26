@@ -97,8 +97,7 @@ function continuationPrompt(mcpEnabled: boolean): string {
   return mcpEnabled ? CONTINUATION_PROMPT_WITH_MCP : CONTINUATION_PROMPT_NO_MCP;
 }
 
-// PredicateEnv impl for `if: branch_exists` / `if: file_present`. Defined in
-// the composition root so the pure evaluator stays in core.
+// Production PredicateEnv; defined in the composition root so the pure evaluator stays in core.
 const realPredicateEnv: PredicateEnv = {
   async branchExists(ref, workspacePath) {
     const r = await runProcess(
