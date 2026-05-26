@@ -16,7 +16,7 @@ const config      = 'src/workflow\.ts$|src/actions/parsing\.ts$';
 const domain      = 'src/reconciler/(vm|workspace|pr)\.ts$|src/actions/(executor|predicates|templating|cache|index)\.ts$|src/(workspace|mcp|issues|prompt)\.ts$';
 const adapters    = 'src/trackers/local\.ts$|src/agent/(smolvm|adapters|acp|tool-call-summary)\.ts$|src/(acp-bridge|runlog|memory)\.ts$|src/reconciler/bake\.ts$';
 const application = 'src/orchestrator\\.ts$|src/reconciler/index\\.ts$|src/agent/(runner|integration)\\.ts$';
-const entry       = 'src/(http|http-handlers)\\.ts$|src/bin/symphony\\.ts$';
+const entry       = 'src/(http|http-handlers|http-disk)\\.ts$|src/bin/symphony\\.ts$';
 const any = (...xs) => xs.join('|');
 
 module.exports = {

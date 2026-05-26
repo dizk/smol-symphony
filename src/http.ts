@@ -3,9 +3,8 @@
 // needed.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { parseFrontMatterLenient } from './util/frontmatter.js';
 import type { Orchestrator } from './orchestrator.js';
 import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
@@ -26,6 +25,12 @@ import {
   decideCreateIssue,
   decideTriageTransition,
 } from './http-handlers.js';
+import {
+  type DiskIssue,
+  type DiskIssueDetail,
+  listIssuesFromDisk,
+  readIssueFromDisk,
+} from './http-disk.js';
 
 // Re-export so existing imports of StateView (e.g. src/bin/symphony.ts uses the same
 // shape via `getTrackerView`) and any future consumer of the public surface continue
@@ -149,156 +154,6 @@ async function readTextBody(req: IncomingMessage, maxBytes = 1_000_000): Promise
   });
 }
 
-// Browse current issues directly from disk so the UI can show items that are neither
-// currently running nor in the retry queue. Triage entries additionally surface the
-// `proposed_by` / `proposed_at` front-matter so the dashboard can show provenance for
-// agent-authored proposals — fields are optional and null for hand-written issues.
-async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
-  identifier: string;
-  state: string;
-  title: string;
-  proposed_by: string | null;
-  proposed_at: string | null;
-}>> {
-  const out: Array<{
-    identifier: string;
-    state: string;
-    title: string;
-    proposed_by: string | null;
-    proposed_at: string | null;
-  }> = [];
-  let entries: string[];
-  try {
-    entries = await readdir(trackerRoot);
-  } catch {
-    return out;
-  }
-  for (const stateDir of entries) {
-    const dirPath = path.join(trackerRoot, stateDir);
-    let st;
-    try {
-      st = await stat(dirPath);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    let files: string[];
-    try {
-      files = await readdir(dirPath);
-    } catch {
-      continue;
-    }
-    for (const f of files) {
-      if (!f.endsWith('.md')) continue;
-      const filePath = path.join(dirPath, f);
-      let text: string;
-      try {
-        text = await readFile(filePath, 'utf8');
-      } catch {
-        continue;
-      }
-      const { fields } = parseFrontMatterLenient(text);
-      const title = asString(fields['title']) ?? f.slice(0, -3);
-      const proposed_by = asString(fields['proposed_by']);
-      const proposed_at = asString(fields['proposed_at']);
-      // Prefer the front-matter `identifier:` when set so the dashboard reports the
-      // same identifier the orchestrator dispatches under (LocalMarkdownTracker's
-      // normalize() at src/trackers/local.ts uses `fm.identifier ?? filename`).
-      // Without this, an issue whose front-matter identifier differs from its
-      // filename loses its overlaid running/retrying/awaiting state on the board
-      // and its ticker jump-link points at a missing #row anchor.
-      const fmIdent = asString(fields['identifier']);
-      const identifier = fmIdent && fmIdent.length > 0 ? fmIdent : f.slice(0, -3);
-      out.push({ identifier, state: stateDir, title, proposed_by, proposed_at });
-    }
-  }
-  out.sort((a, b) => a.identifier.localeCompare(b.identifier));
-  return out;
-}
-
-// Read a single issue file by basename identifier. Walks every state directory under the
-// tracker root because the on-disk listing and the dashboard refer to issues by their
-// filename stem; the state is implied by which directory the file is in. Returns null
-// when no .md file matches. Uses the real YAML parser (matches the local tracker) so a
-// detail page sees the same labels / priority / blockers the orchestrator does.
-interface DiskIssueDetail {
-  identifier: string;
-  state: string;
-  filePath: string;
-  frontMatter: Record<string, unknown>;
-  body: string;
-}
-
-async function readIssueFromDisk(
-  trackerRoot: string,
-  identifier: string,
-): Promise<DiskIssueDetail | null> {
-  let entries: string[];
-  try {
-    entries = await readdir(trackerRoot);
-  } catch {
-    return null;
-  }
-  // Fast path: filename stem matches. Common case where the operator never set
-  // a front-matter identifier and the file is just `<identifier>.md`.
-  const target = `${identifier}.md`;
-  for (const stateDir of entries) {
-    const dirPath = path.join(trackerRoot, stateDir);
-    let st;
-    try {
-      st = await stat(dirPath);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    const filePath = path.join(dirPath, target);
-    let text: string;
-    try {
-      text = await readFile(filePath, 'utf8');
-    } catch {
-      continue;
-    }
-    const { fields, body } = parseFrontMatterLenient(text);
-    return { identifier, state: stateDir, filePath, frontMatter: fields, body };
-  }
-  // Fallback: scan every .md file in every state directory and match by the
-  // front-matter `identifier:` field. Handles the case where the orchestrator
-  // dispatches under a front-matter identifier that differs from the filename
-  // stem — same resolution the tracker uses in normalize() (`fm.identifier ??
-  // filename`). Slower (reads every issue file) but only on the not-found path,
-  // and only for trackers that actually exercise the override.
-  for (const stateDir of entries) {
-    const dirPath = path.join(trackerRoot, stateDir);
-    let st;
-    try {
-      st = await stat(dirPath);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    let files: string[];
-    try {
-      files = await readdir(dirPath);
-    } catch {
-      continue;
-    }
-    for (const f of files) {
-      if (!f.endsWith('.md')) continue;
-      const filePath = path.join(dirPath, f);
-      let text: string;
-      try {
-        text = await readFile(filePath, 'utf8');
-      } catch {
-        continue;
-      }
-      const { fields, body } = parseFrontMatterLenient(text);
-      if (asString(fields['identifier']) !== identifier) continue;
-      return { identifier, state: stateDir, filePath, frontMatter: fields, body };
-    }
-  }
-  return null;
-}
-
 async function gatherPartialInputs(
   orch: Orchestrator,
   view: {
@@ -338,13 +193,6 @@ async function gatherPartialInputs(
 type Snapshot = ReturnType<Orchestrator['snapshot']>;
 type RunningRow = Snapshot['running'][number];
 type RetryRow = Snapshot['retrying'][number];
-type DiskIssue = {
-  identifier: string;
-  state: string;
-  title: string;
-  proposed_by: string | null;
-  proposed_at: string | null;
-};
 
 interface PartialInputs {
   workflowName: string;
