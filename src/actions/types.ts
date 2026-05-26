@@ -28,6 +28,41 @@ export type ActionPredicate =
   | null;
 
 /**
+ * Cache key for a `run_in_vm` action. The store's `hashKey` derives a stable
+ * digest from the workspace tree + cmd argv + env map; identical tuples hit
+ * the same cache entry regardless of insertion order on the env keys.
+ */
+export interface RunInVmCacheKey {
+  workspacePath: string;
+  cmd: string[];
+  env: Record<string, string>;
+}
+
+/** Cached result of a successful `run_in_vm` execution. */
+export interface RunInVmCachedResult {
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  finished_at: string;
+}
+
+/**
+ * IO seam for the `run_in_vm` content-hash cache. The pure executor (domain)
+ * receives this through `ActionExecutorOptions`; production wires
+ * `realRunInVmCacheStore` from the adapter `./cache.ts`. Declared here so
+ * both the consumer and the adapter can reference it without the executor
+ * having to import a concrete `node:fs` / `runProcess` adapter.
+ */
+export interface RunInVmCacheStore {
+  /** Hash the (workspace, cmd, env) tuple. */
+  hashKey(key: RunInVmCacheKey): Promise<string>;
+  /** Return a prior successful result if one exists under (name, hash). */
+  read(name: string, hash: string): Promise<RunInVmCachedResult | null>;
+  /** Persist a successful result under (name, hash). Best-effort on failure. */
+  write(name: string, hash: string, result: RunInVmCachedResult): Promise<void>;
+}
+
+/**
  * Per-action error policy. Defaults: retry 3 times with exponential backoff
  * starting at 1s, then abort the run. `then: "route_to"` reroutes the issue
  * into a declared state (used by `merge`'s on_conflict).

@@ -28,7 +28,7 @@ import { existsSync } from 'node:fs';
 import { parseCli } from './cli-args.js';
 import { loadWorkflow, buildServiceConfig, watchWorkflow } from '../workflow.js';
 import { scaffoldWorkflow, ScaffoldError } from '../scaffold.js';
-import { invalidateRunInVmByName } from '../actions/index.js';
+import { invalidateRunInVmByName } from '../actions/cache.js';
 import type { RunInVmAction, WorkflowAction } from '../actions/index.js';
 import { LocalMarkdownTracker } from '../trackers/local.js';
 import { WorkspaceManager } from '../workspace.js';

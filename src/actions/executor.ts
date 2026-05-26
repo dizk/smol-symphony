@@ -35,17 +35,11 @@ import type {
   ProposeFollowupAction,
   PushBranchAction,
   RunInVmAction,
+  RunInVmCacheStore,
   WorkflowAction,
 } from './types.js';
 import { renderTemplate, renderTree, TemplateError } from './templating.js';
 import { evaluatePredicate } from './predicates.js';
-import {
-  computeCacheHash,
-  invalidateCacheByName,
-  readCache,
-  runInVmCacheRoot,
-  writeCache,
-} from './cache.js';
 import type { HookCapture } from '../workspace.js';
 import { log } from '../logging.js';
 import { realClock, isoFromClock, type ClockNow } from '../util/clock.js';
@@ -109,8 +103,15 @@ export interface ActionExecutorOptions {
    * across hook-era and action-era runs.
    */
   capture?: HookCapture;
-  /** Override for tests; production uses `~/.cache/symphony`. */
-  cacheRoot?: string;
+  /**
+   * Content-hash cache for `run_in_vm` results. Production wires
+   * `realRunInVmCacheStore` (bound to `~/.cache/symphony`); tests bind a
+   * tmp dir via `makeRunInVmCacheStore(<tmp>)`. When absent, `run_in_vm`
+   * actions still execute but skip the cache layer entirely — no read, no
+   * write. Optional because most action kinds don't touch the cache;
+   * declaring it required would force every test to wire it.
+   */
+  runInVmCache?: RunInVmCacheStore;
   /** Required for `propose_followup`. */
   followupSink?: ProposeFollowupSink;
   /**
@@ -213,7 +214,11 @@ export async function runActions(
     // ActionState; the run log captures the discriminator.
     let shouldRun: boolean;
     try {
-      shouldRun = await evaluatePredicate(rendered.if, opts.ctx, opts.workspacePath);
+      shouldRun = await evaluatePredicate(
+        rendered.if,
+        opts.ctx,
+        opts.workspacePath,
+      );
     } catch (err) {
       const msg = (err as Error).message;
       upd(actionKey, { state: 'error', finished_at: iso(), error: msg });
@@ -532,21 +537,27 @@ async function applyRunInVm(
   action: RunInVmAction,
   opts: ActionExecutorOptions,
 ): Promise<ActionOutcome> {
-  const cacheRoot = opts.cacheRoot ?? runInVmCacheRoot();
   const env = action.env ?? {};
-  const hash = await computeCacheHash({ workspacePath: opts.workspacePath, cmd: action.cmd, env });
-  const cached = await readCache(cacheRoot, action.name, hash);
-  if (cached && cached.exit_code === 0) {
-    // Cache hits only on prior success: "Did `npm test` already pass against
-    // this tree hash?" The issue body's framing matches Bazel's semantics —
-    // failures are transient (flaky test, network blip) and must not gate
-    // a fresh execution. The retry policy + per-attempt re-execution work
-    // together to give the in-process retry window a real chance.
-    opts.capture?.onChunk?.(
-      'stdout',
-      `[run_in_vm ${action.name}] cache hit (hash=${hash.slice(0, 12)}…); skipping execution\n`,
-    );
-    return { ok: true, reason: null, route_to: null, cache_hit: true };
+  const cache = opts.runInVmCache;
+  // Hash + read are gated on a wired cache store. When the runner (or a
+  // test) didn't pass one, fall through to execution every time — caching
+  // is an optimization, not a correctness requirement, and a missing store
+  // means "no cache for this run".
+  const hash = cache ? await cache.hashKey({ workspacePath: opts.workspacePath, cmd: action.cmd, env }) : null;
+  if (cache && hash) {
+    const cached = await cache.read(action.name, hash);
+    if (cached && cached.exit_code === 0) {
+      // Cache hits only on prior success: "Did `npm test` already pass against
+      // this tree hash?" The issue body's framing matches Bazel's semantics —
+      // failures are transient (flaky test, network blip) and must not gate
+      // a fresh execution. The retry policy + per-attempt re-execution work
+      // together to give the in-process retry window a real chance.
+      opts.capture?.onChunk?.(
+        'stdout',
+        `[run_in_vm ${action.name}] cache hit (hash=${hash.slice(0, 12)}…); skipping execution\n`,
+      );
+      return { ok: true, reason: null, route_to: null, cache_hit: true };
+    }
   }
   // The only escape hatch for arbitrary commands runs inside the per-issue
   // VM (the sandbox the agent was just running in). When no `runInVm`
@@ -592,10 +603,13 @@ async function applyRunInVm(
     finished_at: isoFromClock(opts.now ?? realClock),
   };
   if (res.exit_code === 0) {
-    // Cache successes only; see comment above the readCache branch.
-    await writeCache(cacheRoot, action.name, hash, result).catch((err) =>
-      log.warn('run_in_vm cache write failed', { name: action.name, hash, error: (err as Error).message }),
-    );
+    // Cache successes only; see comment above the read branch. Skip the
+    // write when no store is wired — same gate as the read above.
+    if (cache && hash) {
+      await cache.write(action.name, hash, result).catch((err) =>
+        log.warn('run_in_vm cache write failed', { name: action.name, hash, error: (err as Error).message }),
+      );
+    }
     return { ok: true, reason: null, route_to: null };
   }
   return {
@@ -699,28 +713,6 @@ function runCommand(
     timeoutMs: extra.timeoutMs ?? opts.defaultCommandTimeoutMs ?? 300_000,
     capture: silent ? undefined : opts.capture,
   });
-}
-
-// ===== Cache invalidation by name (rerun CLI) =============================
-
-/**
- * Drop every cache entry for a named `run_in_vm` action. Used by
- * `symphony rerun --check=<name>`: the next dispatch into the state hosting
- * the check sees an empty cache namespace and re-executes, while every
- * other check's entries stay in place.
- *
- * No workspace argument: the cache is namespaced by action name on disk
- * (`<root>/actions/run_in_vm/<name>/<hash>/`), so invalidation is a
- * namespace-directory drop, not a hash lookup. This is the layout fix for
- * the rerun CLI — the CLI has no per-issue workspace to hash against, and
- * the per-execution hash is workspace-dependent, so any hash-keyed
- * invalidation would miss the entry the per-issue execution actually wrote.
- */
-export async function invalidateRunInVmByName(
-  action: RunInVmAction,
-  cacheRoot?: string,
-): Promise<void> {
-  await invalidateCacheByName(cacheRoot ?? runInVmCacheRoot(), action.name);
 }
 
 /**

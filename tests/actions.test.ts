@@ -20,17 +20,20 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  computeCacheHash,
   hostRunInVm,
   parseActionsBlock,
   renderTemplate,
   runActions,
   TemplateError,
-  invalidateRunInVmByName,
   type ActionContext,
   type RunInVmExecutor,
   type WorkflowAction,
 } from '../src/actions/index.js';
+import {
+  computeCacheHash,
+  invalidateRunInVmByName,
+  makeRunInVmCacheStore,
+} from '../src/actions/cache.js';
 import { findHooksAndActionsConflicts, buildServiceConfig } from '../src/workflow.js';
 
 // ----- Helpers ---------------------------------------------------------------
@@ -477,11 +480,12 @@ describe('action: run_in_vm cache hit/miss', () => {
         name: 'count',
         cmd: ['sh', '-c', `echo run >> "${counterPath}"; exit 0`],
       };
+      const cache = makeRunInVmCacheStore(cacheRoot);
       const r1 = await runActions([action], {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       assert.equal(r1.ok, true);
@@ -489,7 +493,7 @@ describe('action: run_in_vm cache hit/miss', () => {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       assert.equal(r2.ok, true);
@@ -501,7 +505,7 @@ describe('action: run_in_vm cache hit/miss', () => {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       assert.equal(r3.ok, true);
@@ -547,11 +551,12 @@ describe('action: run_in_vm cache hit/miss', () => {
         name: 'count-edit',
         cmd: ['sh', '-c', `echo run >> "${counterPath}"; exit 0`],
       };
+      const cache = makeRunInVmCacheStore(cacheRoot);
       await runActions([action], {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       // Edit README.md (tracked) without committing. The OLD HEAD-tree hash
@@ -561,7 +566,7 @@ describe('action: run_in_vm cache hit/miss', () => {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       const lines = (await readFile(counterPath, 'utf8')).trim().split('\n').length;
@@ -591,11 +596,12 @@ describe('action: run_in_vm cache hit/miss', () => {
         name: 'count-untracked',
         cmd: ['sh', '-c', `echo run >> "${counterPath}"; exit 0`],
       };
+      const cache = makeRunInVmCacheStore(cacheRoot);
       await runActions([action], {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       // Drop a brand-new untracked file (not in .gitignore — source
@@ -607,7 +613,7 @@ describe('action: run_in_vm cache hit/miss', () => {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       const lines = (await readFile(counterPath, 'utf8')).trim().split('\n').length;
@@ -690,7 +696,7 @@ describe('action retry-on-error policy', () => {
           workspacePath: ws,
           ctx,
           snapshotId: 'actions:Review',
-          cacheRoot,
+          runInVmCache: makeRunInVmCacheStore(cacheRoot),
           runInVm: hostRunInVm,
         });
         assert.equal(r.ok, false);
@@ -727,6 +733,7 @@ describe('action `if:` predicate', () => {
       await rm(wsParent, { recursive: true, force: true });
     }
   });
+
 });
 
 // ----- Deprecation detection ------------------------------------------------
@@ -788,7 +795,7 @@ describe('run_in_vm cache layout', () => {
           workspacePath: ws,
           ctx,
           snapshotId: 'actions:Review',
-          cacheRoot,
+          runInVmCache: makeRunInVmCacheStore(cacheRoot),
           runInVm: hostRunInVm,
         },
       );
@@ -848,11 +855,12 @@ describe('invalidateRunInVmByName (rerun CLI shape)', () => {
         name: 'integration-build',
         cmd: ['sh', '-c', `echo run >> "${counterPath}"; exit 0`],
       };
+      const cache = makeRunInVmCacheStore(cacheRoot);
       await runActions([action], {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       // Sanity: a second run inside the same divergent workspace cache-hits.
@@ -860,7 +868,7 @@ describe('invalidateRunInVmByName (rerun CLI shape)', () => {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       assert.equal(
@@ -877,7 +885,7 @@ describe('invalidateRunInVmByName (rerun CLI shape)', () => {
         workspacePath: ws,
         ctx,
         snapshotId: 'actions:Review',
-        cacheRoot,
+        runInVmCache: cache,
         runInVm: hostRunInVm,
       });
       assert.equal(
@@ -905,7 +913,6 @@ describe('run_in_vm requires a wired VM runner', () => {
   it('fails with "no VM runner wired" when runInVm is not supplied', async () => {
     const source = await makeSourceRepo();
     const { wsParent, ws } = await makeWorkspace(source, '42');
-    const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
     try {
       const ctx = baseContext(ws, '42');
       const sideEffect = path.join(ws, '.should-not-exist');
@@ -923,7 +930,7 @@ describe('run_in_vm requires a wired VM runner', () => {
             on_error: { retry: { count: 0, backoff_ms: 1 } },
           },
         ],
-        { workspacePath: ws, ctx, snapshotId: 'actions:Review', cacheRoot },
+        { workspacePath: ws, ctx, snapshotId: 'actions:Review' },
       );
       assert.equal(r.ok, false);
       assert.match(String(r.reason), /no VM runner wired/);
@@ -932,14 +939,12 @@ describe('run_in_vm requires a wired VM runner', () => {
     } finally {
       await rm(source, { recursive: true, force: true });
       await rm(wsParent, { recursive: true, force: true });
-      await rm(cacheRoot, { recursive: true, force: true });
     }
   });
 
   it('routes run_in_vm through the wired RunInVmExecutor, not a host fork', async () => {
     const source = await makeSourceRepo();
     const { wsParent, ws } = await makeWorkspace(source, '42');
-    const cacheRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cache-'));
     const seen: Array<{ name: string; cmd: string[]; workdir: string }> = [];
     const fakeRunner: RunInVmExecutor = async (input) => {
       seen.push({ name: input.name, cmd: input.cmd, workdir: input.workdir });
@@ -954,7 +959,6 @@ describe('run_in_vm requires a wired VM runner', () => {
           workspacePath: ws,
           ctx,
           snapshotId: 'actions:Review',
-          cacheRoot,
           runInVm: fakeRunner,
         },
       );
@@ -966,7 +970,6 @@ describe('run_in_vm requires a wired VM runner', () => {
     } finally {
       await rm(source, { recursive: true, force: true });
       await rm(wsParent, { recursive: true, force: true });
-      await rm(cacheRoot, { recursive: true, force: true });
     }
   });
 });
