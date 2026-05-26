@@ -101,138 +101,167 @@ function trimDiagnostic(out: string, err: string, limit = 4096): string {
 export async function performIntegrationMerge(
   opts: IntegrationMergeOptions,
 ): Promise<IntegrationMergeResult> {
-  const branch = `agent/${opts.identifier}`;
-  const integration = opts.integrationBranch;
-  const base = opts.baseBranch;
-  const remoteName = opts.remote.kind === 'origin' ? 'origin' : LOCAL_REMOTE_NAME;
-  const remoteKindForResult: 'origin' | 'local' = opts.remote.kind === 'origin' ? 'origin' : 'local';
+  const ctx = mergeContext(opts);
 
   // Local mode: stage a temporary remote pointing at the source repo. The after_create
   // hook deliberately strips all named remotes in local mode so the in-VM agent has no
   // network targets; we re-introduce one only for the duration of this host-side merge.
   if (opts.remote.kind === 'local') {
-    // Remove any leftover stale remote of this name (e.g. from a prior aborted merge).
-    await runGit(['remote', 'remove', remoteName], opts).catch(() => undefined);
-    const addRes = await runGit(['remote', 'add', remoteName, opts.remote.sourceRepo], opts);
-    if (!gitOk(addRes)) {
-      return failure('other', `failed to add temp remote ${remoteName}: ${trimDiagnostic(addRes.stdout, addRes.stderr)}`);
-    }
+    const staged = await stageLocalRemote(opts, ctx);
+    if (staged) return staged;
   }
 
   try {
-    // Fetch the integration branch. A non-zero exit code can mean either "transport
-    // error" or "no such ref" depending on the remote; we then try to fetch base
-    // separately so a missing integration branch (first-run case) is recoverable.
-    const fetchIntegration = await runGit(
-      ['fetch', '--no-tags', remoteName, integration],
-      opts,
-    );
-    let integrationOnRemote = gitOk(fetchIntegration);
+    const checkout = await fetchAndCheckoutIntegration(opts, ctx);
+    if (checkout) return checkout;
 
-    // Always make sure base is fetched too — we need it as the seed source if integration
-    // is missing, and even on the happy path the merge-base resolution benefits from a
-    // fresh view of the remote base.
-    const fetchBase = await runGit(['fetch', '--no-tags', remoteName, base], opts);
-    if (!gitOk(fetchBase) && !integrationOnRemote) {
-      return failure(
-        'other',
-        `failed to fetch base "${base}" from ${remoteName}: ${trimDiagnostic(fetchBase.stdout, fetchBase.stderr)}`,
-      );
-    }
+    const merge = await mergeAgentBranch(opts, ctx);
+    if (merge) return merge;
 
-    if (integrationOnRemote) {
-      const co = await runGit(
-        ['checkout', '-B', integration, `${remoteName}/${integration}`],
-        opts,
-      );
-      if (!gitOk(co)) {
-        return failure(
-          'other',
-          `failed to checkout integration: ${trimDiagnostic(co.stdout, co.stderr)}`,
-        );
-      }
-    } else {
-      // Seed integration from base. -B creates or resets the local branch atomically.
-      const seed = await runGit(
-        ['checkout', '-B', integration, `${remoteName}/${base}`],
-        opts,
-      );
-      if (!gitOk(seed)) {
-        return failure(
-          'other',
-          `failed to seed integration from base: ${trimDiagnostic(seed.stdout, seed.stderr)}`,
-        );
-      }
-    }
+    const push = await pushIntegration(opts, ctx);
+    if (push) return push;
 
-    const mergeMsg = `Merge ${branch} into ${integration}`;
-    const mergeRes = await runGit(
-      ['merge', '--no-ff', '--no-edit', '-m', mergeMsg, branch],
-      opts,
-    );
-    if (!gitOk(mergeRes)) {
-      // Abort the merge to leave the working tree clean. Best-effort: if abort fails the
-      // workspace is preserved anyway (cleanup_workspace_on_exit=false in the reroute),
-      // so an operator can finish unwinding it by hand.
-      await runGit(['merge', '--abort'], opts).catch(() => undefined);
-      // Switch back to the agent branch so the workspace looks normal to anyone who pokes
-      // at it later. Tolerate failure: the conflict diagnostic is what matters.
-      await runGit(['checkout', branch], opts).catch(() => undefined);
-      return failure(
-        'conflict',
-        `merge of ${branch} into ${integration} failed: ${trimDiagnostic(mergeRes.stdout, mergeRes.stderr)}`,
-      );
-    }
-
-    const pushRes = await runGit(['push', remoteName, integration], opts);
-    if (!gitOk(pushRes)) {
-      // Switch back to the agent branch before returning so the workspace HEAD is
-      // predictable for the Conflict-state operator. The merge commit stays on the local
-      // integration branch in case the operator wants to inspect or replay it.
-      await runGit(['checkout', branch], opts).catch(() => undefined);
-      return failure(
-        'push_refused',
-        `push of ${integration} to ${remoteName} refused: ${trimDiagnostic(pushRes.stdout, pushRes.stderr)}`,
-      );
-    }
-
-    // Switch back to the agent branch so the Done after_run hook (push + gh pr create)
-    // operates on a HEAD it expects.
-    const backRes = await runGit(['checkout', branch], opts);
-    if (!gitOk(backRes)) {
-      // The merge + push succeeded — log the inconsistency but don't fail the whole
-      // operation. The agent's branch is still pushable from this state.
-      log.warn('integration: checkout-back-to-agent-branch failed after successful merge', {
-        identifier: opts.identifier,
-        branch,
-        stderr: backRes.stderr.slice(0, 500),
-      });
-    }
+    await checkoutBackToAgent(opts, ctx);
 
     return {
       ok: true,
-      integrationBranch: integration,
-      remote: remoteKindForResult,
+      integrationBranch: ctx.integration,
+      remote: ctx.remoteKindForResult,
       merged_at: new Date().toISOString(),
     };
   } finally {
     if (opts.remote.kind === 'local') {
-      await runGit(['remote', 'remove', remoteName], opts).catch(() => undefined);
+      await runGit(['remote', 'remove', ctx.remoteName], opts).catch(() => undefined);
     }
   }
+}
 
-  function failure(
-    reason: IntegrationMergeFail['reason'],
-    diagnostic: string,
-  ): IntegrationMergeFail {
-    return {
-      ok: false,
-      reason,
-      diagnostic,
-      integrationBranch: integration,
-      remote: remoteKindForResult,
-    };
+interface MergeCtx {
+  branch: string;
+  integration: string;
+  base: string;
+  remoteName: string;
+  remoteKindForResult: 'origin' | 'local';
+}
+
+function mergeContext(opts: IntegrationMergeOptions): MergeCtx {
+  const remoteName = opts.remote.kind === 'origin' ? 'origin' : LOCAL_REMOTE_NAME;
+  return {
+    branch: `agent/${opts.identifier}`,
+    integration: opts.integrationBranch,
+    base: opts.baseBranch,
+    remoteName,
+    remoteKindForResult: opts.remote.kind === 'origin' ? 'origin' : 'local',
+  };
+}
+
+function failure(
+  ctx: MergeCtx,
+  reason: IntegrationMergeFail['reason'],
+  diagnostic: string,
+): IntegrationMergeFail {
+  return {
+    ok: false,
+    reason,
+    diagnostic,
+    integrationBranch: ctx.integration,
+    remote: ctx.remoteKindForResult,
+  };
+}
+
+async function stageLocalRemote(
+  opts: IntegrationMergeOptions,
+  ctx: MergeCtx,
+): Promise<IntegrationMergeFail | null> {
+  if (opts.remote.kind !== 'local') return null;
+  // Remove any leftover stale remote of this name (e.g. from a prior aborted merge).
+  await runGit(['remote', 'remove', ctx.remoteName], opts).catch(() => undefined);
+  const addRes = await runGit(['remote', 'add', ctx.remoteName, opts.remote.sourceRepo], opts);
+  if (!gitOk(addRes)) {
+    return failure(ctx, 'other', `failed to add temp remote ${ctx.remoteName}: ${trimDiagnostic(addRes.stdout, addRes.stderr)}`);
   }
+  return null;
+}
+
+async function fetchAndCheckoutIntegration(
+  opts: IntegrationMergeOptions,
+  ctx: MergeCtx,
+): Promise<IntegrationMergeFail | null> {
+  // Fetch the integration branch. A non-zero exit code can mean either "transport
+  // error" or "no such ref" depending on the remote; we then try to fetch base
+  // separately so a missing integration branch (first-run case) is recoverable.
+  const fetchIntegration = await runGit(['fetch', '--no-tags', ctx.remoteName, ctx.integration], opts);
+  const integrationOnRemote = gitOk(fetchIntegration);
+
+  // Always make sure base is fetched too — we need it as the seed source if integration
+  // is missing, and even on the happy path the merge-base resolution benefits from a
+  // fresh view of the remote base.
+  const fetchBase = await runGit(['fetch', '--no-tags', ctx.remoteName, ctx.base], opts);
+  if (!gitOk(fetchBase) && !integrationOnRemote) {
+    return failure(ctx, 'other', `failed to fetch base "${ctx.base}" from ${ctx.remoteName}: ${trimDiagnostic(fetchBase.stdout, fetchBase.stderr)}`);
+  }
+
+  const ref = integrationOnRemote ? `${ctx.remoteName}/${ctx.integration}` : `${ctx.remoteName}/${ctx.base}`;
+  const co = await runGit(['checkout', '-B', ctx.integration, ref], opts);
+  if (!gitOk(co)) {
+    const msg = integrationOnRemote
+      ? `failed to checkout integration: ${trimDiagnostic(co.stdout, co.stderr)}`
+      : `failed to seed integration from base: ${trimDiagnostic(co.stdout, co.stderr)}`;
+    return failure(ctx, 'other', msg);
+  }
+  return null;
+}
+
+async function mergeAgentBranch(
+  opts: IntegrationMergeOptions,
+  ctx: MergeCtx,
+): Promise<IntegrationMergeFail | null> {
+  const mergeMsg = `Merge ${ctx.branch} into ${ctx.integration}`;
+  const mergeRes = await runGit(['merge', '--no-ff', '--no-edit', '-m', mergeMsg, ctx.branch], opts);
+  if (gitOk(mergeRes)) return null;
+  // Abort the merge to leave the working tree clean. Best-effort: if abort fails the
+  // workspace is preserved anyway (cleanup_workspace_on_exit=false in the reroute),
+  // so an operator can finish unwinding it by hand.
+  await runGit(['merge', '--abort'], opts).catch(() => undefined);
+  // Switch back to the agent branch so the workspace looks normal to anyone who pokes
+  // at it later. Tolerate failure: the conflict diagnostic is what matters.
+  await runGit(['checkout', ctx.branch], opts).catch(() => undefined);
+  return failure(
+    ctx,
+    'conflict',
+    `merge of ${ctx.branch} into ${ctx.integration} failed: ${trimDiagnostic(mergeRes.stdout, mergeRes.stderr)}`,
+  );
+}
+
+async function pushIntegration(
+  opts: IntegrationMergeOptions,
+  ctx: MergeCtx,
+): Promise<IntegrationMergeFail | null> {
+  const pushRes = await runGit(['push', ctx.remoteName, ctx.integration], opts);
+  if (gitOk(pushRes)) return null;
+  // Switch back to the agent branch before returning so the workspace HEAD is
+  // predictable for the Conflict-state operator. The merge commit stays on the local
+  // integration branch in case the operator wants to inspect or replay it.
+  await runGit(['checkout', ctx.branch], opts).catch(() => undefined);
+  return failure(
+    ctx,
+    'push_refused',
+    `push of ${ctx.integration} to ${ctx.remoteName} refused: ${trimDiagnostic(pushRes.stdout, pushRes.stderr)}`,
+  );
+}
+
+async function checkoutBackToAgent(opts: IntegrationMergeOptions, ctx: MergeCtx): Promise<void> {
+  // Switch back to the agent branch so the Done after_run hook (push + gh pr create)
+  // operates on a HEAD it expects.
+  const backRes = await runGit(['checkout', ctx.branch], opts);
+  if (gitOk(backRes)) return;
+  // The merge + push succeeded — log the inconsistency but don't fail the whole
+  // operation. The agent's branch is still pushable from this state.
+  log.warn('integration: checkout-back-to-agent-branch failed after successful merge', {
+    identifier: opts.identifier,
+    branch: ctx.branch,
+    stderr: backRes.stderr.slice(0, 500),
+  });
 }
 
 /**

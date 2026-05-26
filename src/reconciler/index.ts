@@ -89,15 +89,15 @@ export class Reconciler {
   // (the production path — bin/symphony.ts builds the Reconciler before the
   // Orchestrator, then plugs the Orchestrator in as the intended-VM source).
   private vm: VmResource | null = null;
-  private readonly smolvm: SmolvmClient | null;
-  private readonly vmListBootWorkers?: () => Promise<BootWorker[]>;
-  private readonly vmKillProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
-  private readonly vmKillGraceMs?: number;
+  private smolvm: SmolvmClient | null = null;
+  private vmListBootWorkers?: () => Promise<BootWorker[]>;
+  private vmKillProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  private vmKillGraceMs?: number;
   // Workspace janitor (issue 34). Constructed when an intended-set provider is
   // wired; without one there's no desired set to compare against, so the
   // resource is null and the reconcile pass skips it.
   private workspace: WorkspaceResource | null = null;
-  private readonly workspaceInspect?: WorkspaceResourceOptions['inspect'];
+  private workspaceInspect?: WorkspaceResourceOptions['inspect'];
   private workspaceRemove?: WorkspaceResourceOptions['remove'];
   private workspaceCreate?: WorkspaceResourceOptions['create'];
   private workspaceBaseRef?: BaseRefProvider;
@@ -128,6 +128,13 @@ export class Reconciler {
       smolvm: cfg.smolvm,
       executor: this.bakeExecutor,
     });
+    this.initVm(opts);
+    this.initWorkspace(opts);
+    this.initPrProviders(opts);
+    this.pr = this.buildPrResource();
+  }
+
+  private initVm(opts: ReconcilerOptions): void {
     this.smolvm = opts.smolvm ?? null;
     this.vmListBootWorkers = opts.listBootWorkers;
     this.vmKillProcess = opts.killProcess;
@@ -141,6 +148,9 @@ export class Reconciler {
         killGraceMs: this.vmKillGraceMs,
       });
     }
+  }
+
+  private initWorkspace(opts: ReconcilerOptions): void {
     this.workspaceInspect = opts.workspaceInspect;
     this.workspaceRemove = opts.workspaceRemove;
     this.workspaceCreate = opts.workspaceCreate;
@@ -149,13 +159,15 @@ export class Reconciler {
       this.workspaceIntended = opts.workspaceIntendedProvider;
       this.workspace = this.buildWorkspaceResource();
     }
+  }
+
+  private initPrProviders(opts: ReconcilerOptions): void {
     if (opts.prIntendedProvider) this.prIntended = opts.prIntendedProvider;
     if (opts.prApi) this.prApi = opts.prApi;
     if (opts.prGit) this.prGit = opts.prGit;
     if (opts.prTransition) this.prTransition = opts.prTransition;
     if (opts.prCleanup) this.prCleanup = opts.prCleanup;
     if (opts.prWorkspaceEnsure) this.prWorkspaceEnsure = opts.prWorkspaceEnsure;
-    this.pr = this.buildPrResource();
   }
 
   /**

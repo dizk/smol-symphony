@@ -106,6 +106,10 @@ function extractTextContent(content: unknown): string {
   return '';
 }
 
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
 // Transform that hands each newline-delimited frame to `onLine` while passing the raw bytes
 // through to downstream consumers unchanged. Used to tap the ACP JSON-RPC transport in both
 // directions for the per-issue JSONL run log. Buffering lives in `_transform`; a final flush
@@ -188,31 +192,31 @@ function recordAcpFrame(
 // walk arrays and plain objects only; primitives other than strings are skipped, and we
 // guard against cycles even though ACP frames shouldn't contain them.
 function redactBearerTokens(value: unknown, seen = new WeakSet<object>()): void {
+  if (!value || typeof value !== 'object') return;
+  if (seen.has(value as object)) return;
+  seen.add(value as object);
   if (Array.isArray(value)) {
-    if (seen.has(value)) return;
-    seen.add(value);
     for (let i = 0; i < value.length; i++) {
-      const v = value[i];
-      if (typeof v === 'string') {
-        if (v.startsWith('Bearer ')) value[i] = 'Bearer <redacted>';
-      } else if (v && typeof v === 'object') {
-        redactBearerTokens(v, seen);
-      }
+      const redacted = redactedBearer(value[i]);
+      if (redacted !== undefined) value[i] = redacted;
+      else redactBearerTokens(value[i], seen);
     }
     return;
   }
-  if (value && typeof value === 'object') {
-    if (seen.has(value as object)) return;
-    seen.add(value as object);
-    for (const k of Object.keys(value as Record<string, unknown>)) {
-      const v = (value as Record<string, unknown>)[k];
-      if (typeof v === 'string') {
-        if (v.startsWith('Bearer ')) (value as Record<string, unknown>)[k] = 'Bearer <redacted>';
-      } else if (v && typeof v === 'object') {
-        redactBearerTokens(v, seen);
-      }
-    }
+  const obj = value as Record<string, unknown>;
+  for (const k of Object.keys(obj)) {
+    const redacted = redactedBearer(obj[k]);
+    if (redacted !== undefined) obj[k] = redacted;
+    else redactBearerTokens(obj[k], seen);
   }
+}
+
+// Returns the redacted replacement when `v` is a Bearer-token string, else
+// undefined. Non-string and non-Bearer values fall through so the caller can
+// decide whether to recurse.
+function redactedBearer(v: unknown): string | undefined {
+  if (typeof v === 'string' && v.startsWith('Bearer ')) return 'Bearer <redacted>';
+  return undefined;
 }
 
 // One open ACP session bound to a single child process. The adapter is expected to be
@@ -306,44 +310,43 @@ export class AcpClient {
   private onSessionUpdate(params: SessionNotification): void {
     const update = params.update as { sessionUpdate: string } & Record<string, unknown>;
     switch (update.sessionUpdate) {
-      case 'agent_message_chunk': {
-        const text = extractTextContent(update.content);
-        if (text) {
-          this.lastAssistantText += text;
-          this.emit('agent_message_chunk', text.length > 80 ? text.slice(0, 80) + '…' : text);
-        }
-        return;
-      }
-      case 'agent_thought_chunk': {
-        const text = extractTextContent(update.content);
-        if (text) this.emit('agent_thought_chunk', text.length > 80 ? text.slice(0, 80) + '…' : text);
-        return;
-      }
-      case 'tool_call': {
-        this.emit('tool_call', summarizeToolCall(update));
-        return;
-      }
-      case 'tool_call_update': {
-        this.emit('tool_call_update', summarizeToolCallUpdate(update));
-        return;
-      }
-      case 'plan': {
-        this.emit('plan', summarize(update.entries ?? update));
-        return;
-      }
-      case 'usage_update': {
-        // ACP usage is "context-window used / size", not cumulative I/O tokens. We map it
-        // into total_tokens so the existing orchestrator accounting stays meaningful; the
-        // I/O split is recorded as zero because ACP does not expose it.
-        const used = Number((update as Record<string, unknown>).used ?? 0);
-        const size = Number((update as Record<string, unknown>).size ?? 0);
-        this.opts.onTokenUsage({ input_tokens: 0, output_tokens: 0, total_tokens: used });
-        this.emit('usage_update', `used=${used}/${size}`);
-        return;
-      }
+      case 'agent_message_chunk':
+        return this.onAgentMessageChunk(update);
+      case 'agent_thought_chunk':
+        return this.onAgentThoughtChunk(update);
+      case 'tool_call':
+        return this.emit('tool_call', summarizeToolCall(update));
+      case 'tool_call_update':
+        return this.emit('tool_call_update', summarizeToolCallUpdate(update));
+      case 'plan':
+        return this.emit('plan', summarize(update.entries ?? update));
+      case 'usage_update':
+        return this.onUsageUpdate(update);
       default:
-        this.emit('session_update', `${update.sessionUpdate}: ${summarize(update)}`);
+        return this.emit('session_update', `${update.sessionUpdate}: ${summarize(update)}`);
     }
+  }
+
+  private onAgentMessageChunk(update: Record<string, unknown>): void {
+    const text = extractTextContent(update.content);
+    if (!text) return;
+    this.lastAssistantText += text;
+    this.emit('agent_message_chunk', truncate(text, 80));
+  }
+
+  private onAgentThoughtChunk(update: Record<string, unknown>): void {
+    const text = extractTextContent(update.content);
+    if (text) this.emit('agent_thought_chunk', truncate(text, 80));
+  }
+
+  // ACP usage is "context-window used / size", not cumulative I/O tokens. We map it
+  // into total_tokens so the existing orchestrator accounting stays meaningful; the
+  // I/O split is recorded as zero because ACP does not expose it.
+  private onUsageUpdate(update: Record<string, unknown>): void {
+    const used = Number(update.used ?? 0);
+    const size = Number(update.size ?? 0);
+    this.opts.onTokenUsage({ input_tokens: 0, output_tokens: 0, total_tokens: used });
+    this.emit('usage_update', `used=${used}/${size}`);
   }
 
   private onPermissionRequest(params: RequestPermissionRequest): RequestPermissionResponse {
