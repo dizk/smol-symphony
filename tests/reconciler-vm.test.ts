@@ -16,10 +16,12 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   VmResource,
-  resolveBootWorkerVmName,
+  decideVm,
   type BootWorker,
   type IntendedVmProvider,
+  type VmEffect,
 } from '../src/reconciler/vm.js';
+import { resolveBootWorkerVmName } from '../src/reconciler/index.js';
 import type { SmolvmClient } from '../src/agent/smolvm.js';
 
 // --- shared fixtures ---------------------------------------------------------
@@ -346,5 +348,53 @@ describe('VmResource reaper', () => {
     assert.equal(errAction!.state, 'error');
     assert.match(errAction!.error!, /synthetic destroy failure/);
     assert.match(snap.last_error!, /synthetic destroy failure/);
+  });
+});
+
+// Pure `decideVm` tests (issue 69). The class-level tests above exercise the
+// shell loop end-to-end; these pin the pure decision in isolation.
+describe('decideVm (pure)', () => {
+  const w = (pid: number, vmName: string): BootWorker => ({ pid, vmName });
+
+  it('empty observed state → no effects', () => {
+    assert.deepEqual(
+      decideVm({ intended: new Set(), registry: [], workers: [] }),
+      [],
+    );
+  });
+
+  it('non-symphony registry entries and workers are left untouched', () => {
+    // The reaper owns only the `symphony-` namespace; an operator's personal
+    // VM or sibling tool's worker must never appear in the effect list.
+    assert.deepEqual(
+      decideVm({
+        intended: new Set(),
+        registry: ['dev-shell', 'operator-vm'],
+        workers: [w(1, 'dev-shell')],
+      }),
+      [],
+    );
+  });
+
+  it('mixed: stray registry + stray worker + intended match → only the strays', () => {
+    const effects = decideVm({
+      intended: new Set(['symphony-keep']),
+      registry: ['symphony-keep', 'symphony-stale'],
+      workers: [w(101, 'symphony-keep'), w(202, 'symphony-orphan')],
+    });
+    const expected: VmEffect[] = [
+      { kind: 'destroy_machine', vm_name: 'symphony-stale' },
+      { kind: 'kill_boot_worker', pid: 202, vm_name: 'symphony-orphan' },
+    ];
+    assert.deepEqual(effects, expected);
+  });
+
+  it('is pure: same input → same output, no input mutation', () => {
+    const intended = new Set(['symphony-keep']);
+    const observed = { intended, registry: ['symphony-stale'], workers: [w(1, 'symphony-orphan')] };
+    const first = decideVm(observed);
+    const second = decideVm(observed);
+    assert.deepEqual(first, second);
+    assert.equal(intended.size, 1, 'intended set unchanged');
   });
 });
