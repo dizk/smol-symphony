@@ -13,7 +13,7 @@ const shell = [
   'src/agent/tool-call-summary.ts', 'src/acp-bridge.ts', 'src/runlog.ts', 'src/memory.ts',
   'src/reconciler/bake.ts', 'src/workflow-loader.ts',
   // entry
-  'src/http.ts', 'src/bin/symphony.ts',
+  'src/http.ts', 'src/http-disk.ts', 'src/bin/symphony.ts',
 ];
 
 const core = [
