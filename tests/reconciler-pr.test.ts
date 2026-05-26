@@ -26,7 +26,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { closeLogFile, setLogFile } from '../src/logging.js';
 import {
-  GitCliPrGitApi,
   PrResource,
   type EnsureWorkspaceOutcome,
   type PrApi,
@@ -41,6 +40,7 @@ import {
   type PushOutcome,
   type RebaseOutcome,
 } from '../src/reconciler/pr.js';
+import { GitCliPrGitApi } from '../src/reconciler/pr-adapters.js';
 
 // ── shared fixtures ─────────────────────────────────────────────────────────
 
