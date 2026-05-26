@@ -48,8 +48,13 @@ import {
   performIntegrationMerge,
   resolveIntegrationRemote,
   routeIntegrationFailureToConflict,
-  shouldMergeForState,
 } from './integration.js';
+import {
+  decideAttemptOutcome,
+  decideCleanupExecution,
+  shouldRunIntegrationMerge,
+  shouldStageAfterRunEnv,
+} from './runner-decisions.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { RunLog } from '../runlog.js';
 import type { HookCapture, HookResult } from '../workspace.js';
@@ -929,12 +934,14 @@ export class AgentRunner {
       // becomes a no-op in that branch.
       let integrationFailed = false;
       const integrationCfg = this.cfg.integration;
-      if (
-        runningEntry &&
-        runningEntry.transitioned &&
-        integrationCfg.merge_on_states.length > 0 &&
-        shouldMergeForState(cleanupState, integrationCfg.merge_on_states)
-      ) {
+      const integrationGated =
+        runningEntry !== undefined &&
+        shouldRunIntegrationMerge({
+          transitioned: runningEntry.transitioned,
+          cleanupState,
+          mergeOnStates: integrationCfg.merge_on_states,
+        });
+      if (integrationGated && runningEntry) {
         const remote = resolveIntegrationRemote(workspace.path);
         runLog?.system('integration_merge_started', {
           identifier: runningEntry.identifier,
@@ -980,17 +987,26 @@ export class AgentRunner {
       }
       const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
       const cleanupActions = resolveActionsForState(this.cfg, cleanupState);
+      const cleanupExec = decideCleanupExecution({
+        integrationFailed,
+        hasRunningEntry: runningEntry !== undefined,
+        actionsLength: cleanupActions?.length ?? 0,
+        hasAfterRunHook: Boolean(cleanupHooks.after_run),
+      });
       // Stage SYMPHONY_* env vars + a temp body file once. Both the legacy
       // after_run shell and the typed-action executor consume the same values
       // (the action templating context derives from this map); building it
       // once avoids two redundant tracker reads on the Done state's transition.
       let extraEnv: Record<string, string> | undefined;
       let extraEnvCleanup: (() => Promise<void>) | null = null;
-      const needsStaging =
-        !integrationFailed &&
-        runningEntry &&
-        ((cleanupActions && cleanupActions.length > 0) || cleanupHooks.after_run);
-      if (needsStaging) {
+      if (
+        shouldStageAfterRunEnv({
+          integrationFailed,
+          hasRunningEntry: runningEntry !== undefined,
+          actionsLength: cleanupActions?.length ?? 0,
+          hasAfterRunHook: Boolean(cleanupHooks.after_run),
+        })
+      ) {
         try {
           const staged = await buildAfterRunHookEnv(runningEntry!);
           extraEnv = staged.env;
@@ -1002,46 +1018,38 @@ export class AgentRunner {
         }
       }
       try {
-        if (!integrationFailed) {
-          // Per-state `actions:` block wins over `hooks.after_run` (issue 36
-          // AC2; deprecation warning fires once at orchestrator startup). When
-          // both are declared we silently skip the after_run hook here — the
-          // warning at startup is the documented surface.
-          if (cleanupActions && cleanupActions.length > 0 && runningEntry) {
-            // run_in_vm goes through the per-issue VM's exec channel (same
-            // sandbox the agent ran in). Build the closure here so the
-            // executor never has to know about smolvm; ordering inside
-            // cleanup() guarantees the VM is still alive at this point —
-            // VM destroy is the very last step below. We only wire the
-            // closure when bring-up succeeded; the `if (vmReady)` guard
-            // mirrors the destroy guard.
-            const runInVm: RunInVmExecutor | undefined = vmReady
-              ? this.buildVmRunInVm(vmName, runLog)
-              : undefined;
-            const actionResult = await this.runStateActions(
-              cleanupState,
-              cleanupActions,
-              runningEntry,
-              workspace.path,
-              extraEnv,
-              hookCapture('actions'),
-              runInVm,
-            );
-            if (!actionResult.ok && !actionResult.route_to) {
-              // Non-routed failure — propagate out of cleanup so runAttempt
-              // returns ok:false. Routed failures (merge on_conflict) are
-              // intentionally handled as the agent's work succeeding; the
-              // tracker has already moved the issue to the conflict state.
-              nonRoutedActionFailureReason = actionResult.reason ?? 'unknown';
-            }
-          } else {
-            await this.workspaces.runAfterRunBestEffort(
-              workspace.path,
-              cleanupHooks,
-              hookCapture('after_run'),
-              extraEnv,
-            );
+        // Per-state `actions:` block wins over `hooks.after_run` (issue 36
+        // AC2; deprecation warning fires once at orchestrator startup).
+        // `cleanupExec` collapses the integration/actions/hook branching into
+        // a single decision the shell switches on.
+        if (cleanupExec === 'actions' && runningEntry && cleanupActions) {
+          // run_in_vm goes through the per-issue VM's exec channel (same
+          // sandbox the agent ran in). Ordering inside cleanup() guarantees
+          // the VM is still alive at this point — VM destroy is the very
+          // last step below. We only wire the closure when bring-up
+          // succeeded; the `if (vmReady)` guard mirrors the destroy guard.
+          const runInVm: RunInVmExecutor | undefined = vmReady
+            ? this.buildVmRunInVm(vmName, runLog)
+            : undefined;
+          const actionResult = await this.runStateActions(
+            cleanupState,
+            cleanupActions,
+            runningEntry,
+            workspace.path,
+            extraEnv,
+            hookCapture('actions'),
+            runInVm,
+          );
+          if (!actionResult.ok && !actionResult.route_to) {
+            nonRoutedActionFailureReason = actionResult.reason ?? 'unknown';
           }
+        } else if (cleanupExec === 'hook') {
+          await this.workspaces.runAfterRunBestEffort(
+            workspace.path,
+            cleanupHooks,
+            hookCapture('after_run'),
+            extraEnv,
+          );
         }
       } finally {
         if (extraEnvCleanup) await extraEnvCleanup();
@@ -1340,23 +1348,18 @@ export class AgentRunner {
 
     clearInterval(cancelCheckTimer);
     await cleanup(lastReason);
-    if (agentFailure) {
-      return { ok: false, reason: agentFailure, threadId: sessionId, turnsCompleted };
-    }
-    if (nonRoutedActionFailureReason !== null) {
-      // Cleanup ran the state's typed actions and at least one action
-      // failed without a `route_to`. Terminal-state cleanup (push the
-      // branch, open the PR, run CI checks) is part of the attempt's
-      // success contract — failing silently was the prior bug. We surface
-      // the failure as attempt failure so the orchestrator's retry /
-      // dashboard path can react instead of marking the issue done.
-      return {
-        ok: false,
-        reason: `state action failed: ${nonRoutedActionFailureReason}`,
-        threadId: sessionId,
-        turnsCompleted,
-      };
-    }
-    return { ok: true, reason: lastReason, threadId: sessionId, turnsCompleted };
+    // `decideAttemptOutcome` collapses the three failure channels (agent
+    // turn failure, non-routed terminal-action failure during cleanup, and
+    // graceful break) into the single RunAttemptResult shape. agentFailure
+    // wins; then nonRoutedActionFailureReason (a failed push / pr-create
+    // must surface so the orchestrator retries instead of marking done);
+    // otherwise the loop's break reason is success.
+    return decideAttemptOutcome({
+      agentFailure,
+      nonRoutedActionFailureReason,
+      lastReason,
+      sessionId,
+      turnsCompleted,
+    });
   }
 }
