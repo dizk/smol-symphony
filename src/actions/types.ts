@@ -28,6 +28,15 @@ export type ActionPredicate =
   | null;
 
 /**
+ * IO seam for `if:` predicate evaluation. The pure evaluator probes the
+ * workspace through this port; the runner wires the production impl.
+ */
+export interface PredicateEnv {
+  branchExists(ref: string, workspacePath: string): Promise<boolean>;
+  pathExists(abs: string): Promise<boolean>;
+}
+
+/**
  * Cache key for a `run_in_vm` action. The store's `hashKey` derives a stable
  * digest from the workspace tree + cmd argv + env map; identical tuples hit
  * the same cache entry regardless of insertion order on the env keys.

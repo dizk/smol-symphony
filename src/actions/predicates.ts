@@ -3,13 +3,12 @@
 // Three predicate shapes — env-var-truthy, branch-exists, file-present.
 // These are the three predicates the hook shell actually exercised across
 // today's WORKFLOW.md; the issue body explicitly caps the predicate set
-// there: "If users want more, they've outgrown declarative."
+// there: "If users want more, they've outgrown declarative." The two IO
+// shapes reach the world through an injected `PredicateEnv`.
 
-import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { ActionContext, ActionPredicate } from './types.js';
+import type { ActionContext, ActionPredicate, PredicateEnv } from './types.js';
 import { renderTemplate } from './templating.js';
-import { runProcess } from '../util/process.js';
 
 /**
  * Evaluate a predicate against the context. `null`/undefined → always true
@@ -18,12 +17,14 @@ import { runProcess } from '../util/process.js';
  * The string form `"$var"` is a truthiness check on the named context field
  * — `if: $repo` matches the issue body's example exactly. A bare literal
  * (`if: yes`) is treated as truthy; the literal-false case `if: ""` /
- * `if: null` falls through to "always".
+ * `if: null` falls through to "always". `env` is required iff the predicate
+ * is `branch_exists` / `file_present`; pure string predicates ignore it.
  */
 export async function evaluatePredicate(
   predicate: ActionPredicate | undefined,
   ctx: ActionContext,
   workspacePath: string,
+  env?: PredicateEnv,
 ): Promise<boolean> {
   if (predicate === null || predicate === undefined) return true;
   if (typeof predicate === 'string') {
@@ -38,26 +39,15 @@ export async function evaluatePredicate(
   if ('branch_exists' in predicate) {
     const ref = renderTemplate(predicate.branch_exists, ctx).trim();
     if (ref.length === 0) return false;
-    return runGitSilent(['rev-parse', '--verify', '--quiet', `refs/heads/${ref}`], workspacePath);
+    if (!env) throw new Error('evaluatePredicate: branch_exists requires an injected PredicateEnv');
+    return env.branchExists(ref, workspacePath);
   }
   if ('file_present' in predicate) {
     const file = renderTemplate(predicate.file_present, ctx).trim();
     if (file.length === 0) return false;
     const abs = path.isAbsolute(file) ? file : path.join(workspacePath, file);
-    try {
-      const st = await stat(abs);
-      return st.isFile() || st.isDirectory();
-    } catch {
-      return false;
-    }
+    if (!env) throw new Error('evaluatePredicate: file_present requires an injected PredicateEnv');
+    return env.pathExists(abs);
   }
   return false;
-}
-
-// Thin shape adapter over runProcess: predicates only care about exit==0.
-// The underlying invocation already uses `--verify --quiet` so neither stream
-// should produce meaningful output; the tiny default clamp is plenty.
-async function runGitSilent(args: string[], cwd: string): Promise<boolean> {
-  const r = await runProcess('git', args, { cwd, appendErrorToStderr: false });
-  return r.exit_code === 0;
 }

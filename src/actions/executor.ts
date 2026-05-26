@@ -33,6 +33,7 @@ import type {
   CheckoutAction,
   MergeAction,
   ProposeFollowupAction,
+  PredicateEnv,
   PushBranchAction,
   RunInVmAction,
   RunInVmCacheStore,
@@ -112,6 +113,12 @@ export interface ActionExecutorOptions {
    * declaring it required would force every test to wire it.
    */
   runInVmCache?: RunInVmCacheStore;
+  /**
+   * IO seam for `branch_exists` / `file_present`. Production wires
+   * `realPredicateEnv` (`util/predicate-env.ts`); when absent, string-shape
+   * predicates still work — only the IO shapes throw a diagnostic error.
+   */
+  predicateEnv?: PredicateEnv;
   /** Required for `propose_followup`. */
   followupSink?: ProposeFollowupSink;
   /**
@@ -218,6 +225,7 @@ export async function runActions(
         rendered.if,
         opts.ctx,
         opts.workspacePath,
+        opts.predicateEnv,
       );
     } catch (err) {
       const msg = (err as Error).message;

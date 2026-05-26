@@ -26,6 +26,7 @@ import {
   runActions,
   TemplateError,
   type ActionContext,
+  type PredicateEnv,
   type RunInVmExecutor,
   type WorkflowAction,
 } from '../src/actions/index.js';
@@ -734,6 +735,26 @@ describe('action `if:` predicate', () => {
     }
   });
 
+  it('routes branch_exists / file_present through the injected PredicateEnv', async () => {
+    const ctx = baseContext('/ws', '42');
+    const seen: string[] = [];
+    const stub: PredicateEnv = {
+      async branchExists(ref) { seen.push(`b:${ref}`); return false; },
+      async pathExists(abs) { seen.push(`p:${abs}`); return false; },
+    };
+    // Both predicates evaluate to false → action skipped (no IO, no failure).
+    const r = await runActions(
+      [
+        { kind: 'checkout', ref: '$branch', if: { branch_exists: '$branch' } },
+        { kind: 'checkout', ref: 'main', if: { file_present: 'no.md' } },
+      ],
+      { workspacePath: '/ws', ctx, snapshotId: 'actions:T', predicateEnv: stub },
+    );
+    assert.deepEqual(seen, ['b:agent/42', 'p:/ws/no.md']);
+    assert.equal(r.ok, true);
+    assert.equal(r.actions[0]!.state, 'done');
+    assert.equal(r.actions[1]!.state, 'done');
+  });
 });
 
 // ----- Deprecation detection ------------------------------------------------

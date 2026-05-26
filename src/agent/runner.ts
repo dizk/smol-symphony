@@ -4,7 +4,7 @@
 // the VM at the same absolute path so cwd values are consistent.
 
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type {
@@ -39,11 +39,13 @@ import {
   toActionsSnapshot,
   type ActionContext,
   type ActionExecResult,
+  type PredicateEnv,
   type ProposeFollowupSink,
   type RunInVmExecutor,
   type WorkflowAction,
 } from '../actions/index.js';
 import { realRunInVmCacheStore } from '../actions/cache.js';
+import { runProcess } from '../util/process.js';
 import type { ResourceSnapshot } from '../reconciler/index.js';
 import {
   performIntegrationMerge,
@@ -94,6 +96,27 @@ const CONTINUATION_PROMPT_NO_MCP =
 function continuationPrompt(mcpEnabled: boolean): string {
   return mcpEnabled ? CONTINUATION_PROMPT_WITH_MCP : CONTINUATION_PROMPT_NO_MCP;
 }
+
+// PredicateEnv impl for `if: branch_exists` / `if: file_present`. Defined in
+// the composition root so the pure evaluator stays in core.
+const realPredicateEnv: PredicateEnv = {
+  async branchExists(ref, workspacePath) {
+    const r = await runProcess(
+      'git',
+      ['rev-parse', '--verify', '--quiet', `refs/heads/${ref}`],
+      { cwd: workspacePath, appendErrorToStderr: false },
+    );
+    return r.exit_code === 0;
+  },
+  async pathExists(abs) {
+    try {
+      const st = await stat(abs);
+      return st.isFile() || st.isDirectory();
+    } catch {
+      return false;
+    }
+  },
+};
 
 // Stage the env vars + body file the Done state's after_run hook consumes (SYMPHONY_*).
 // Reads the current issue file from <tracker_root>/<state>/<identifier>.md so any
@@ -506,6 +529,7 @@ export class AgentRunner {
       followupSink: this.followupSink ?? undefined,
       runInVm: runInVm ?? undefined,
       runInVmCache: realRunInVmCacheStore,
+      predicateEnv: realPredicateEnv,
       snapshotId,
       now: () => Date.now(),
     });

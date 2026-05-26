@@ -21,13 +21,12 @@
 // non-SSE subset). We implement only the subset our tools need: initialize, tools/list,
 // tools/call, plus a polite notifications/initialized acknowledgement.
 
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { Buffer } from 'node:buffer';
 import type { IssueTracker } from './trackers/types.js';
 import type { PrAutopilotConfig, RunningEntry, StateConfig } from './types.js';
 import { log } from './logging.js';
 import { writeIssueFile, pickHoldingState, NoHoldingStateError } from './issues.js';
 import { realClock, isoFromClock, type ClockNow } from './util/clock.js';
+import { newToken, constantTimeEqual } from './util/crypto.js';
 
 const PROTOCOL_VERSION = '2025-06-18';
 
@@ -214,7 +213,7 @@ export class McpRegistry {
    * agent's MCP server config via ACP's session/new mcpServers field.
    */
   activate(entry: RunningEntry): string {
-    const token = randomBytes(24).toString('base64url');
+    const token = newToken();
     entry.mcp_token = token;
     entry.transitioned = false;
     entry.steering_requested = false;
@@ -316,7 +315,7 @@ export class McpRegistry {
     if (!active) {
       return makeError(getId(body), -32001, 'issue not active');
     }
-    if (!constantTimeStringEqual(active.token, token)) {
+    if (!constantTimeEqual(active.token, token)) {
       return makeError(getId(body), -32002, 'invalid token');
     }
     if (!isRpcRequest(body)) {
@@ -698,27 +697,8 @@ export class McpRegistry {
   /** Snapshot of currently active issues, used by HTTP for routing lookups. */
   isActive(identifier: string, token: string): boolean {
     const active = this.byIdentifier.get(identifier);
-    return !!active && constantTimeStringEqual(active.token, token);
+    return !!active && constantTimeEqual(active.token, token);
   }
-}
-
-/**
- * Constant-time string comparison for secrets. Uses crypto.timingSafeEqual on
- * equal-length buffers; rejects different-length inputs (the registry only ever
- * issues fixed-width base64url tokens, so a length mismatch is unconditionally
- * a wrong-token signal and the early exit doesn't leak per-byte timing).
- *
- * We compare BYTE lengths after UTF-8 encoding, not JS string `.length` (which
- * counts UTF-16 code units). An attacker-supplied non-ASCII token can match the
- * real token's code-unit count while encoding to a different byte length; passing
- * those buffers to timingSafeEqual would throw `Input buffers must have the same
- * byte length`, surfacing as an HTTP 500 instead of a clean wrong-token rejection.
- */
-function constantTimeStringEqual(a: string, b: string): boolean {
-  const aBuf = Buffer.from(a, 'utf8');
-  const bBuf = Buffer.from(b, 'utf8');
-  if (aBuf.length !== bBuf.length) return false;
-  return timingSafeEqual(aBuf, bBuf);
 }
 
 function getId(body: unknown): string | number | null {
