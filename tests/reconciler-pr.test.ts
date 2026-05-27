@@ -48,6 +48,7 @@ function makeView(over: Partial<PrView> = {}): PrView {
     url: 'https://example.test/pr/7',
     state: 'OPEN',
     mergeable: 'MERGEABLE',
+    merge_state_status: 'CLEAN',
     base_ref_name: 'main',
     base_ref_oid: 'base-oid',
     head_ref_name: 'agent/42',
@@ -66,6 +67,7 @@ interface PrApiCalls {
   list: string[];
   view: number[];
   arm: Array<{ pr: number; strategy: string }>;
+  updateBranch: number[];
   close: number[];
   deleteBranch: string[];
 }
@@ -75,6 +77,7 @@ function makePrApi(opts: {
   view?: PrView | (() => PrView);
   viewSequence?: PrView[];
   armThrows?: Error;
+  updateBranchThrows?: Error;
   closeThrows?: Error;
   deleteThrows?: Error;
 }): { api: PrApi; calls: PrApiCalls } {
@@ -82,6 +85,7 @@ function makePrApi(opts: {
     list: [],
     view: [],
     arm: [],
+    updateBranch: [],
     close: [],
     deleteBranch: [],
   };
@@ -104,6 +108,10 @@ function makePrApi(opts: {
     async armAutoMerge(pr, strategy) {
       calls.arm.push({ pr, strategy });
       if (opts.armThrows) throw opts.armThrows;
+    },
+    async updateBranch(pr) {
+      calls.updateBranch.push(pr);
+      if (opts.updateBranchThrows) throw opts.updateBranchThrows;
     },
     async closePr(pr) {
       calls.close.push(pr);
@@ -168,6 +176,7 @@ describe('PrResource — mergeable PR happy path', () => {
     assert.deepEqual(apiCalls.list, ['agent/42']);
     assert.deepEqual(apiCalls.view, [7]);
     assert.deepEqual(apiCalls.arm, [{ pr: 7, strategy: 'squash' }]);
+    assert.equal(apiCalls.updateBranch.length, 0, 'CLEAN PRs do not get update-branch');
     assert.equal(trCalls.length, 0);
     assert.equal(removed.length, 0);
 
@@ -387,7 +396,184 @@ describe('PrResource — UNKNOWN mergeable', () => {
     await res.reconcile();
 
     assert.equal(apiCalls.arm.length, 0, 'no arm on UNKNOWN');
+    assert.equal(apiCalls.updateBranch.length, 0, 'no update-branch on UNKNOWN');
     assert.equal(trCalls.length, 0, 'no route on UNKNOWN');
+  });
+});
+
+describe('PrResource — MERGEABLE + BEHIND advances the branch', () => {
+  it('issues `gh pr update-branch` when MERGEABLE+BEHIND, even after auto-merge is armed', async () => {
+    // The stuck-armed scenario from issue 105: mergeable=MERGEABLE,
+    // mergeStateStatus=BEHIND, auto_merge_armed=true. Without
+    // update-branch the PR sits forever — branch protection blocks the
+    // armed merge until the branch catches up.
+    const intent = makeIntent();
+    const { api, calls: apiCalls } = makePrApi({
+      view: makeView({ merge_state_status: 'BEHIND', auto_merge_armed: true }),
+    });
+    const { transition, calls: trCalls } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      conflictRouteTo: 'Todo',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.deepEqual(apiCalls.updateBranch, [7]);
+    assert.equal(apiCalls.arm.length, 0, 'already armed by GitHub; do not re-arm');
+    assert.equal(trCalls.length, 0, 'BEHIND is not a conflict route');
+
+    const snap = res.snapshot();
+    const upd = snap.actions.find((a) => a.action === 'update_branch:7');
+    assert.ok(upd, 'update_branch in ledger');
+    assert.equal(upd!.state, 'done');
+  });
+
+  it('arms auto-merge AND advances the branch on first pass when MERGEABLE+BEHIND and not yet armed', async () => {
+    const intent = makeIntent();
+    const { api, calls: apiCalls } = makePrApi({
+      view: makeView({ merge_state_status: 'BEHIND', auto_merge_armed: false }),
+    });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      conflictRouteTo: 'Todo',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.deepEqual(apiCalls.arm, [{ pr: 7, strategy: 'squash' }]);
+    assert.deepEqual(apiCalls.updateBranch, [7]);
+  });
+
+  it('does not re-issue update-branch within a single pass (cached view still reads BEHIND)', async () => {
+    // The decide-then-apply loop in pr.ts runs decidePr again after each
+    // effect batch; the per-PR poll TTL only throttles between reconcile
+    // passes. The update_branch handler must halt the pass so we don't
+    // hammer gh until the loop iteration cap is reached.
+    const intent = makeIntent();
+    const { api, calls: apiCalls } = makePrApi({
+      view: makeView({ merge_state_status: 'BEHIND', auto_merge_armed: true }),
+    });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      conflictRouteTo: 'Todo',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+    assert.equal(apiCalls.updateBranch.length, 1);
+  });
+
+  it('does NOT emit update_branch on MERGEABLE+CLEAN (arms only, today\'s behavior)', async () => {
+    const intent = makeIntent();
+    const { api, calls: apiCalls } = makePrApi({
+      view: makeView({ merge_state_status: 'CLEAN' }),
+    });
+    const { transition, calls: trCalls } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      conflictRouteTo: 'Todo',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.deepEqual(apiCalls.arm, [{ pr: 7, strategy: 'squash' }]);
+    assert.equal(apiCalls.updateBranch.length, 0);
+    assert.equal(trCalls.length, 0);
+  });
+
+  it('does NOT emit update_branch on MERGEABLE+BLOCKED (e.g. required reviews pending)', async () => {
+    // BLOCKED means branch protection is blocking on something other than
+    // staleness (failing checks, missing reviews). update-branch wouldn't
+    // unblock it; the armed auto-merge waits for the gate to lift.
+    const intent = makeIntent();
+    const { api, calls: apiCalls } = makePrApi({
+      view: makeView({ merge_state_status: 'BLOCKED', auto_merge_armed: true }),
+    });
+    const { transition, calls: trCalls } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      conflictRouteTo: 'Todo',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.equal(apiCalls.updateBranch.length, 0);
+    assert.equal(apiCalls.arm.length, 0, 'already armed; do nothing');
+    assert.equal(trCalls.length, 0);
+  });
+
+  it('CONFLICTING still routes back to implementing — BEHIND does not displace the conflict path', async () => {
+    // Sanity that the new BEHIND branch is gated by mergeable=MERGEABLE,
+    // not reached for CONFLICTING views even if mergeStateStatus is BEHIND.
+    const intent = makeIntent();
+    const { api, calls: apiCalls } = makePrApi({
+      view: makeView({ mergeable: 'CONFLICTING', merge_state_status: 'DIRTY' }),
+    });
+    const { transition, calls: trCalls } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      conflictRouteTo: 'Todo',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+
+    assert.equal(apiCalls.updateBranch.length, 0);
+    assert.equal(apiCalls.arm.length, 0);
+    assert.equal(trCalls.length, 1);
+    assert.equal(trCalls[0]!.toState, 'Todo');
+  });
+
+  it('records update_branch errors in last_error without crashing the pass', async () => {
+    const intent = makeIntent();
+    const { api } = makePrApi({
+      view: makeView({ merge_state_status: 'BEHIND', auto_merge_armed: true }),
+      updateBranchThrows: new Error('gh pr update-branch 422: not authorized'),
+    });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      conflictRouteTo: 'Todo',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+    assert.match(res.snapshot().last_error ?? '', /update-branch 422/);
   });
 });
 
