@@ -8,6 +8,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type {
+  HooksConfig,
   Issue,
   RunningEntry,
   RuntimeEvent,
@@ -17,7 +18,7 @@ import type {
 import type { IssueTracker } from '../trackers/types.js';
 import { WorkspaceManager, sanitizeWorkspaceKey } from '../workspace.js';
 import { renderPrompt } from '../prompt.js';
-import { SmolvmClient, SYMPHONY_VM_PREFIX } from './smolvm.js';
+import { SmolvmClient, SYMPHONY_VM_PREFIX, type VmMount } from './smolvm.js';
 import { AcpClient } from './acp.js';
 import {
   ADAPTERS,
@@ -290,6 +291,25 @@ export interface BakedArtifactProvider {
 export interface ActionSnapshotSink {
   recordActionResult(id: string, snapshot: ResourceSnapshot): void;
 }
+
+/**
+ * Result of `AgentRunner.bringUpVmAndExec` — either a fully wired exec session
+ * (VM up, bridge registration in flight, agent stderr tap attached), or a
+ * structured failure reason the caller bubbles back to runAttempt. The success
+ * shape carries `vmReady: true` as a literal so cleanup paths in `runAttempt`
+ * can treat the bring-up as a precondition check without an extra runtime
+ * flag — the false branch returns early before reaching that cleanup.
+ */
+type BringUpVmAndExecResult =
+  | {
+      ok: true;
+      vmName: string;
+      vmReady: true;
+      bridgeReg: ReturnType<AcpBridge['register']>;
+      execStream: ReturnType<SmolvmClient['execInteractive']>;
+      acpReachUrl: string;
+    }
+  | { ok: false; reason: string };
 
 export class AgentRunner {
   constructor(
@@ -571,6 +591,269 @@ export class AgentRunner {
     entry.issue.state = targetState;
   }
 
+  /**
+   * Compose the bind-mount list passed to `smolvm.ensureRunning` for one attempt:
+   * the workspace at the same host path, then every `cfg.smolvm.volumes` entry,
+   * then any eval/debug read-only mounts the resolved state opted into. The
+   * workspace mount must come first — smolvm picks a stable id from the list
+   * order for per-VM mount slots.
+   */
+  private composeVmMounts(workspacePath: string, resolved: ResolvedDispatchConfig): VmMount[] {
+    const mounts: VmMount[] = [{ host: workspacePath, guest: workspacePath, readonly: false }];
+    for (const v of this.cfg.smolvm.volumes) {
+      mounts.push({ host: v.host, guest: v.guest, readonly: v.readonly });
+    }
+    for (const m of buildEvalModeMounts(this.cfg, resolved)) {
+      mounts.push(m);
+    }
+    return mounts;
+  }
+
+  /**
+   * Snapshot the host env vars listed in `cfg.smolvm.forward_env`. Empty strings
+   * are dropped so the VM doesn't see surprising `KEY=""` entries; missing vars
+   * are simply absent.
+   */
+  private composeForwardEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const k of this.cfg.smolvm.forward_env) {
+      const v = process.env[k];
+      if (v && v.length > 0) env[k] = v;
+    }
+    return env;
+  }
+
+  /**
+   * Resolve which of smolvm's three source options to pass to ensureRunning.
+   * When the reconciler has a ready baked artifact (issue 32), `from` wins and
+   * the per-start `[dev].init` cost is skipped; otherwise fall back to whichever
+   * of `smolvm.{from,smolfile,image}` the config declares.
+   */
+  private selectVmSource(): { from: string | null; smolfile: string | null; image: string | null } {
+    const bakedFrom = this.bakedArtifacts?.artifactPath() ?? null;
+    if (bakedFrom !== null) {
+      return { from: bakedFrom, smolfile: null, image: null };
+    }
+    return {
+      from: this.cfg.smolvm.from,
+      smolfile: this.cfg.smolvm.smolfile,
+      image: this.cfg.smolvm.image,
+    };
+  }
+
+  /**
+   * VM bring-up + bridge register + exec spawn for one attempt. Owns the
+   * mount/env composition, the smolvm.ensureRunning call, the bridge
+   * registration, the in-VM agent exec spawn, and the always-on stderr tap
+   * that funnels adapter stderr into the run log + runtime event ring. On any
+   * failure the workspace's `after_run` hook is fired best-effort against
+   * `initialHooks` so callers don't have to thread that detail; the runner
+   * returns straight to its outer error path.
+   *
+   * The TCP bridge check + `acpReachUrl` derivation live here too — both are
+   * preconditions for spawning the in-VM agent, and the URL is returned for
+   * the connect-handshake logger downstream. Bring-up happens BEFORE register
+   * so a failure between ensureRunning and register doesn't crash on an
+   * unhandled rejection from `bridgeReg.accepted` (the awaiter isn't wired
+   * until the connect phase further down in runAttempt).
+   */
+  private async bringUpVmAndExec(
+    issue: Issue,
+    workspacePath: string,
+    resolved: ResolvedDispatchConfig,
+    adapterBin: string,
+    effectiveAdapterArgs: string[],
+    effectiveAcpCommand: string,
+    runtimeEnv: Record<string, string>,
+    initialHooks: HooksConfig,
+    hookCapture: (hook: string) => HookCapture | undefined,
+    runLog: RunLog | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<BringUpVmAndExecResult> {
+    // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
+    // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
+    if (!this.acpBridge) {
+      logger.error('acp bridge is not configured', {});
+      return { ok: false, reason: 'acp bridge unavailable' };
+    }
+    const acpReachUrl =
+      this.cfg.acp.bridge.reach_url ??
+      `tcp://${this.cfg.acp.bridge.reach_host}:${this.acpBridge.port() ?? this.cfg.acp.bridge.bind_port}`;
+    const vmName = this.vmNameFor(issue);
+    const mounts = this.composeVmMounts(workspacePath, resolved);
+    const env = this.composeForwardEnv();
+    const source = this.selectVmSource();
+    // ensureRunning can fail after `machine create` succeeded but before `machine start`
+    // — leaving a halted VM behind. Teardown is the reconciler `vm` resource's job
+    // (issue 52): on return, the orchestrator drops this issue from `running`, so the
+    // reaper sees the half-created VM as a stray and destroys it on the next kick
+    // (fired from `onWorkerExit`).
+    try {
+      await this.smolvm.ensureRunning(vmName, {
+        image: source.image,
+        from: source.from,
+        smolfile: source.smolfile,
+        cpus: this.cfg.smolvm.cpus,
+        memMib: this.cfg.smolvm.mem_mib,
+        net: this.cfg.smolvm.net,
+        mounts,
+        env,
+        workdir: workspacePath,
+        sshAgent: false,
+      });
+    } catch (err) {
+      return await this.failBringUpWithHook(
+        'smolvm bring-up',
+        'smolvm bring-up error',
+        err,
+        workspacePath,
+        initialHooks,
+        hookCapture,
+        logger,
+      );
+    }
+
+    // VM is up — now register with the bridge. The .accepted promise will get its
+    // rejection handler attached when the caller Promise.races against it; that
+    // continuation is created within the same synchronous block so no failure path
+    // between here and there can crash on an unhandled rejection.
+    //
+    // register() throws synchronously if the bridge has already been stopped (e.g. a
+    // SIGTERM landed between ensureRunning resolving and this line). The VM is up at
+    // that point, so we must tear it down via the reconciler `vm` resource (issue 52)
+    // — the cleanup closure that handles post-handshake failures isn't built yet.
+    let bridgeReg: ReturnType<AcpBridge['register']>;
+    try {
+      bridgeReg = this.acpBridge.register(issue.id, issue.identifier);
+    } catch (err) {
+      return await this.failBringUpWithHook(
+        'acp bridge register',
+        'acp bridge register failed',
+        err,
+        workspacePath,
+        initialHooks,
+        hookCapture,
+        logger,
+      );
+    }
+
+    const execStream = this.spawnVmAgentExec({
+      vmName,
+      workspacePath,
+      effectiveAcpCommand,
+      acpReachUrl,
+      bridgeToken: bridgeReg.token,
+      adapterBin,
+      effectiveAdapterArgs,
+      runtimeEnv,
+      issueId: issue.id,
+      runLog,
+      logger,
+    });
+    return { ok: true, vmName, vmReady: true, bridgeReg, execStream, acpReachUrl };
+  }
+
+  /**
+   * Spawn the in-VM agent exec channel and wire its stderr tap. We do NOT use
+   * `execStream.stdin/.stdout` for ACP frames anymore — those flow over the
+   * bridge socket once the in-VM agent dials back. The exec channel just
+   * carries diagnostic stderr (vm-agent's own logs + the inherited adapter
+   * stderr) and acts as a process tether so the orchestrator can kill the
+   * in-VM agent by closing the exec.
+   *
+   * The in-VM proxy (`vm-agent.mjs`) reads `SYMPHONY_ACP_*` + `SYMPHONY_ADAPTER_*`
+   * to know where to dial back and what adapter to spawn. The bearer token is
+   * a per-dispatch secret so it cannot survive the attempt; visible via `ps`
+   * on the host but the host is trusted.
+   */
+  private spawnVmAgentExec(opts: {
+    vmName: string;
+    workspacePath: string;
+    effectiveAcpCommand: string;
+    acpReachUrl: string;
+    bridgeToken: string;
+    adapterBin: string;
+    effectiveAdapterArgs: string[];
+    runtimeEnv: Record<string, string>;
+    issueId: string;
+    runLog: RunLog | undefined;
+    logger: ReturnType<typeof withIssue>;
+  }): ReturnType<SmolvmClient['execInteractive']> {
+    const execStream = this.smolvm.execInteractive(opts.vmName, {
+      command: [this.cfg.acp.shell, '-lc', opts.effectiveAcpCommand],
+      workdir: opts.workspacePath,
+      env: {
+        SYMPHONY_ACP_URL: opts.acpReachUrl,
+        SYMPHONY_ACP_TOKEN: opts.bridgeToken,
+        SYMPHONY_ADAPTER_BIN: opts.adapterBin,
+        SYMPHONY_ADAPTER_ARGS: JSON.stringify(opts.effectiveAdapterArgs),
+        ...opts.runtimeEnv,
+      },
+      timeoutMs: null,
+    });
+    execStream.stdin.end();
+    this.attachAgentStderrTap(execStream, opts.issueId, opts.runLog, opts.logger);
+    return execStream;
+  }
+
+  /**
+   * Shared failure path for `bringUpVmAndExec`: log the underlying error, fire
+   * the dispatch state's `after_run` hook best-effort (so operator scripts that
+   * tear down auxiliary state still run), then return the failure shape the
+   * caller bubbles back to runAttempt.
+   */
+  private async failBringUpWithHook(
+    label: string,
+    reason: string,
+    err: unknown,
+    workspacePath: string,
+    initialHooks: HooksConfig,
+    hookCapture: (hook: string) => HookCapture | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<{ ok: false; reason: string }> {
+    logger.error(`${label} failed`, { error: (err as Error).message });
+    await this.workspaces.runAfterRunBestEffort(
+      workspacePath,
+      initialHooks,
+      hookCapture('after_run'),
+    );
+    return { ok: false, reason };
+  }
+
+  /**
+   * Attach the always-on stderr tap to a freshly-spawned exec stream. Wired up
+   * BEFORE the caller awaits the bridge handshake so any pre-connect crash
+   * (vm-agent missing, malformed env, adapter that exits during startup) lands
+   * in the per-issue run log and the orchestrator's event ring. AcpClient does
+   * not read stderr; this is the single, always-on source. The same listener
+   * stays attached for the duration of the attempt and continues capturing
+   * post-connect stderr (e.g. claude-agent-acp warnings).
+   */
+  private attachAgentStderrTap(
+    execStream: ReturnType<SmolvmClient['execInteractive']>,
+    issueId: string,
+    runLog: RunLog | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): void {
+    execStream.stderr.setEncoding('utf8');
+    execStream.stderr.on('data', (chunk: string) => {
+      // Always mirror the raw chunk into the run log so the evaluator sees adapter output
+      // byte-for-byte, even if it is only whitespace.
+      runLog?.record({ channel: 'stderr', text: chunk });
+      const text = chunk.trim();
+      if (text.length === 0) return;
+      // Truncate the symphony log line so a chatty adapter (claude-agent-acp's "No
+      // onPostToolUseHook found …" warnings, for example) doesn't dominate the host
+      // stderr stream; the run log keeps the full text above.
+      this.events.onRuntimeEvent(issueId, {
+        at: new Date().toISOString(),
+        event: 'agent_stderr',
+        message: text.length > 240 ? text.slice(0, 240) + '…' : text,
+      });
+      logger.info('agent stderr', { text: text.slice(0, 500) });
+    });
+  }
+
   async runAttempt(
     issue: Issue,
     attempt: number | null,
@@ -723,160 +1006,23 @@ export class AgentRunner {
     const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, runtimeExtraFiles);
     const effectiveAdapterArgs = [...adapterArgs, ...runtimeArgs];
 
-    // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
-    // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
-    if (!this.acpBridge) {
-      logger.error('acp bridge is not configured', {});
-      return { ok: false, reason: 'acp bridge unavailable', threadId: null, turnsCompleted: 0 };
+    const broughtUp = await this.bringUpVmAndExec(
+      issue,
+      workspace.path,
+      resolved,
+      adapterBin,
+      effectiveAdapterArgs,
+      effectiveAcpCommand,
+      runtimeEnv,
+      initialHooks,
+      hookCapture,
+      runLog,
+      logger,
+    );
+    if (!broughtUp.ok) {
+      return { ok: false, reason: broughtUp.reason, threadId: null, turnsCompleted: 0 };
     }
-    const acpReachUrl =
-      this.cfg.acp.bridge.reach_url ??
-      `tcp://${this.cfg.acp.bridge.reach_host}:${this.acpBridge.port() ?? this.cfg.acp.bridge.bind_port}`;
-
-    const vmName = this.vmNameFor(issue);
-    const mounts = [
-      { host: workspace.path, guest: workspace.path, readonly: false },
-    ];
-    for (const v of this.cfg.smolvm.volumes) {
-      mounts.push({ host: v.host, guest: v.guest, readonly: v.readonly });
-    }
-    // Eval/debug mode (issue 40): when the resolved state opts in, mount the
-    // tracker root + logs root read-only so an in-VM agent can inspect every
-    // issue file and the per-issue JSONL transcripts. Skipped silently when
-    // the state did not opt in; the mount list grows by at most two slots
-    // here (smolvm's per-VM mount cap is small but the workspace itself only
-    // takes one slot, so the two extras fit comfortably).
-    for (const m of buildEvalModeMounts(this.cfg, resolved)) {
-      mounts.push(m);
-    }
-    const env: Record<string, string> = {};
-    for (const k of this.cfg.smolvm.forward_env) {
-      const v = process.env[k];
-      if (v && v.length > 0) env[k] = v;
-    }
-
-    // Bring up the VM BEFORE registering with the ACP bridge. If we registered first and
-    // ensureRunning then threw, the catch path would call `bridgeReg.cancel(...)` which
-    // synchronously rejects the registration's `accepted` promise — and at that point no
-    // .catch handler is attached yet (the awaiter is wired further below). The resulting
-    // unhandled-rejection crashes the orchestrator (Node ≥ 15 default). Registering after
-    // a successful bring-up makes the cancel path moot for that early failure.
-    let vmReady = false;
-    // Issue 32: when the reconciler has a ready baked artifact, dispatch uses
-    // `--from <cache_path>` so the per-start [dev].init cost is paid once at bake
-    // time instead of on every dispatch. Falls back to the static `smolvm.{from,
-    // smolfile,image}` config when no bake is ready (only relevant for harnesses
-    // that don't wire a reconciler; production dispatch is gated by the
-    // orchestrator on `reconciler.dispatchReady()` and reaches here only when
-    // a bake is ready or no Smolfile is configured).
-    const bakedFrom = this.bakedArtifacts?.artifactPath() ?? null;
-    const vmFrom = bakedFrom ?? this.cfg.smolvm.from;
-    const vmSmolfile = bakedFrom ? null : this.cfg.smolvm.smolfile;
-    const vmImage = bakedFrom ? null : this.cfg.smolvm.image;
-    try {
-      await this.smolvm.ensureRunning(vmName, {
-        image: vmImage,
-        from: vmFrom,
-        smolfile: vmSmolfile,
-        cpus: this.cfg.smolvm.cpus,
-        memMib: this.cfg.smolvm.mem_mib,
-        net: this.cfg.smolvm.net,
-        mounts,
-        env,
-        workdir: workspace.path,
-        sshAgent: false,
-      });
-      vmReady = true;
-    } catch (err) {
-      logger.error('smolvm bring-up failed', { error: (err as Error).message });
-      // ensureRunning can fail after `machine create` succeeded but before `machine start`
-      // — leaving a halted VM behind. Teardown is the reconciler `vm` resource's job
-      // (issue 52): on return, the orchestrator drops this issue from `running`, so the
-      // reaper sees the half-created VM as a stray and destroys it on the next kick
-      // (fired from `onWorkerExit`).
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        initialHooks,
-        hookCapture('after_run'),
-      );
-      return { ok: false, reason: 'smolvm bring-up error', threadId: null, turnsCompleted: 0 };
-    }
-
-    // VM is up — now register with the bridge. The .accepted promise will get its
-    // rejection handler attached when we Promise.race against it below; that
-    // continuation is created within the same synchronous block so no failure path
-    // between here and there can crash on an unhandled rejection.
-    //
-    // register() throws synchronously if the bridge has already been stopped (e.g. a
-    // SIGTERM landed between ensureRunning resolving and this line). The VM is up at
-    // that point, so we must tear it down here — the cleanup closure that handles
-    // post-handshake failures isn't built yet.
-    let bridgeReg: ReturnType<AcpBridge['register']>;
-    try {
-      bridgeReg = this.acpBridge.register(issue.id, issue.identifier);
-    } catch (err) {
-      logger.error('acp bridge register failed', { error: (err as Error).message });
-      // VM is live but the bridge is gone; teardown belongs to the reconciler `vm`
-      // resource (issue 52). Returning here drops the running entry, and the reaper
-      // kick in `onWorkerExit` converges the now-orphaned VM.
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        initialHooks,
-        hookCapture('after_run'),
-      );
-      return {
-        ok: false,
-        reason: 'acp bridge register failed',
-        threadId: null,
-        turnsCompleted: 0,
-      };
-    }
-
-    const execStream = this.smolvm.execInteractive(vmName, {
-      command: [this.cfg.acp.shell, '-lc', effectiveAcpCommand],
-      workdir: workspace.path,
-      // The in-VM proxy (`vm-agent.mjs`) reads these to know where to dial back and what
-      // adapter to spawn. The bearer token is a per-dispatch secret so it cannot survive
-      // the attempt; visible via `ps` on the host but the host is trusted.
-      env: {
-        SYMPHONY_ACP_URL: acpReachUrl,
-        SYMPHONY_ACP_TOKEN: bridgeReg.token,
-        SYMPHONY_ADAPTER_BIN: adapterBin,
-        SYMPHONY_ADAPTER_ARGS: JSON.stringify(effectiveAdapterArgs),
-        ...runtimeEnv,
-      },
-      timeoutMs: null,
-    });
-
-    // We do NOT use execStream.stdin/.stdout for ACP frames anymore — those flow over the
-    // bridge socket once the in-VM agent dials back. The exec channel just carries
-    // diagnostic stderr (vm-agent's own logs + the inherited adapter stderr) and acts as
-    // a process tether so we can kill the in-VM agent by closing the exec.
-    execStream.stdin.end();
-
-    // Attach the stderr tap NOW — before we await the bridge handshake — so any
-    // pre-connect crash (vm-agent missing, malformed env, adapter that exits during
-    // startup) lands in the per-issue run log and the orchestrator's event ring. AcpClient
-    // no longer reads stderr; this is the single, always-on source. The same listener
-    // stays attached for the duration of the attempt and continues capturing post-connect
-    // stderr (e.g. claude-agent-acp warnings).
-    execStream.stderr.setEncoding('utf8');
-    execStream.stderr.on('data', (chunk: string) => {
-      // Always mirror the raw chunk into the run log so the evaluator sees adapter output
-      // byte-for-byte, even if it is only whitespace.
-      runLog?.record({ channel: 'stderr', text: chunk });
-      const text = chunk.trim();
-      if (text.length === 0) return;
-      // Push into the orchestrator's per-issue ring + symphony log. Truncate the symphony
-      // log line so a chatty adapter (claude-agent-acp's "No onPostToolUseHook found …"
-      // warnings, for example) doesn't dominate the host stderr stream.
-      this.events.onRuntimeEvent(issue.id, {
-        at: new Date().toISOString(),
-        event: 'agent_stderr',
-        message: text.length > 240 ? text.slice(0, 240) + '…' : text,
-      });
-      logger.info('agent stderr', { text: text.slice(0, 500) });
-    });
+    const { vmName, vmReady, bridgeReg, execStream, acpReachUrl } = broughtUp;
 
     // The socket the bridge accepts becomes AcpClient's stdin AND stdout. We keep a
     // reference so cleanup can close it even on partial failure.
