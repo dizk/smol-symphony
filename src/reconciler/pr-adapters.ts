@@ -8,7 +8,14 @@
 // `domain ← adapters` invariant holds at runtime.
 
 import { runProcess } from '../util/process.js';
-import type { PrApi, PrMergeable, PrState, PrSummary, PrView } from './pr.js';
+import type {
+  PrApi,
+  PrMergeable,
+  PrMergeStateStatus,
+  PrState,
+  PrSummary,
+  PrView,
+} from './pr.js';
 
 interface ShellResult {
   exit: number;
@@ -76,7 +83,7 @@ export class GhCliPrApi implements PrApi {
         'view',
         String(prNumber),
         '--json',
-        'number,url,state,mergeable,baseRefName,baseRefOid,headRefName,headRefOid,reviewDecision,autoMergeRequest',
+        'number,url,state,mergeable,mergeStateStatus,baseRefName,baseRefOid,headRefName,headRefOid,reviewDecision,autoMergeRequest',
       ],
       this.opts,
     );
@@ -96,6 +103,17 @@ export class GhCliPrApi implements PrApi {
     );
     if (res.exit !== 0) {
       throw new Error(`gh pr merge --auto failed (exit ${res.exit}): ${res.stderr.trim()}`);
+    }
+  }
+
+  async updateBranch(prNumber: number): Promise<void> {
+    const res = await runShell(
+      'gh',
+      ['pr', 'update-branch', String(prNumber)],
+      this.opts,
+    );
+    if (res.exit !== 0) {
+      throw new Error(`gh pr update-branch failed (exit ${res.exit}): ${res.stderr.trim()}`);
     }
   }
 
@@ -135,6 +153,7 @@ function parseGhPrView(prNumber: number, stdout: string): PrView {
     url: typeof parsed.url === 'string' ? parsed.url : '',
     state: normalizeState(parsed.state),
     mergeable: normalizeMergeable(parsed.mergeable),
+    merge_state_status: normalizeMergeStateStatus(parsed.mergeStateStatus),
     base_ref_name: typeof parsed.baseRefName === 'string' ? parsed.baseRefName : '',
     base_ref_oid: typeof parsed.baseRefOid === 'string' ? parsed.baseRefOid : null,
     head_ref_name: typeof parsed.headRefName === 'string' ? parsed.headRefName : '',
@@ -153,6 +172,21 @@ function normalizeState(raw: unknown): PrState {
 }
 function normalizeMergeable(raw: unknown): PrMergeable {
   if (raw === 'MERGEABLE' || raw === 'CONFLICTING' || raw === 'UNKNOWN') return raw;
+  return 'UNKNOWN';
+}
+function normalizeMergeStateStatus(raw: unknown): PrMergeStateStatus {
+  if (
+    raw === 'BEHIND' ||
+    raw === 'BLOCKED' ||
+    raw === 'CLEAN' ||
+    raw === 'DIRTY' ||
+    raw === 'DRAFT' ||
+    raw === 'HAS_HOOKS' ||
+    raw === 'UNKNOWN' ||
+    raw === 'UNSTABLE'
+  ) {
+    return raw;
+  }
   return 'UNKNOWN';
 }
 function normalizeReviewDecision(raw: unknown): PrView['review_decision'] {

@@ -49,6 +49,22 @@ export interface PrSummary {
 
 export type PrState = 'OPEN' | 'CLOSED' | 'MERGED';
 export type PrMergeable = 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+/**
+ * GitHub's `mergeStateStatus` enum. `mergeable` only tells us whether the diffs
+ * conflict textually; `merge_state_status` is the richer "can this PR actually
+ * merge right now?" signal — in particular it surfaces `BEHIND` (branch
+ * protection requires up-to-date, base has moved without producing a textual
+ * conflict), which `mergeable: MERGEABLE` hides. See issue 105.
+ */
+export type PrMergeStateStatus =
+  | 'BEHIND'
+  | 'BLOCKED'
+  | 'CLEAN'
+  | 'DIRTY'
+  | 'DRAFT'
+  | 'HAS_HOOKS'
+  | 'UNKNOWN'
+  | 'UNSTABLE';
 
 /**
  * Per-PR view as reported by `gh pr view <#> --json ...`. Only the fields the
@@ -59,6 +75,7 @@ export interface PrView {
   url: string;
   state: PrState;
   mergeable: PrMergeable;
+  merge_state_status: PrMergeStateStatus;
   base_ref_name: string;
   base_ref_oid: string | null;
   head_ref_name: string;
@@ -142,6 +159,7 @@ export type PrEffect =
       prNumber: number;
       strategy: 'squash' | 'merge' | 'rebase';
     }
+  | { kind: 'update_branch'; identifier: string; prNumber: number }
   | { kind: 'close_pr'; identifier: string; prNumber: number }
   | { kind: 'delete_remote_branch'; identifier: string; branch: string }
   | { kind: 'cleanup_workspace'; identifier: string }
@@ -219,6 +237,16 @@ export function decidePr(obs: PrObservation): PrEffect[] {
         strategy: obs.config.strategy,
       },
     ];
+  }
+  // Armed but BEHIND: branch protection's "require branches up to date" rule
+  // blocks the auto-merge until the branch catches up to base. The diffs
+  // don't textually conflict (mergeable=MERGEABLE), so the CONFLICTING route
+  // never fires — without an explicit nudge the PR sits armed-and-stuck
+  // forever. Advance the branch via `gh pr update-branch`; once the head
+  // moves, head_ref_oid changes (update_observed_head absorbs it) and the
+  // status leaves BEHIND, so the effect stops firing. See issue 105.
+  if (view.merge_state_status === 'BEHIND') {
+    return [{ kind: 'update_branch', identifier: id, prNumber: view.number }];
   }
   return [];
 }

@@ -52,6 +52,7 @@ export type {
   PrIntent,
   PrIntentKind,
   PrMergeable,
+  PrMergeStateStatus,
   PrState,
   PrSummary,
   PrView,
@@ -82,6 +83,14 @@ export interface PrApi {
   view(prNumber: number): Promise<PrView>;
   /** Arm GitHub's auto-merge. Idempotent — gh re-arms cleanly. */
   armAutoMerge(prNumber: number, strategy: 'squash' | 'merge' | 'rebase'): Promise<void>;
+  /**
+   * Advance a stale PR branch onto its base (`gh pr update-branch`). Used when
+   * GitHub reports `MERGEABLE` but `mergeStateStatus: BEHIND` — branch
+   * protection's "require up-to-date" rule blocks the armed auto-merge until
+   * the branch catches up, and the diffs don't textually conflict so the
+   * CONFLICTING agent-rebase path never fires. See issue 105.
+   */
+  updateBranch(prNumber: number): Promise<void>;
   /** Close a PR without merging. */
   closePr(prNumber: number): Promise<void>;
   /** Delete a remote branch (best-effort; gh exits non-zero if already gone). */
@@ -370,6 +379,14 @@ export class PrResource {
         st.armed = true;
         return { ...obs, cache: this.cacheView(st) };
       }
+      case 'update_branch': {
+        await this.runUpdateBranch(eff.identifier, eff.prNumber);
+        // Halt the pass: the cached view still reads BEHIND so re-deciding
+        // would re-emit the effect every iteration. The per-PR poll TTL
+        // throttles the next `view()` call, by which point gh has refreshed
+        // mergeStateStatus (or the head_ref_oid moved). See issue 105.
+        return { ...obs, halt: true };
+      }
       case 'close_pr': {
         const ok = await this.runClosePr(eff.identifier, eff.prNumber);
         return { ...obs, closeAttempted: true, closeOutcome: { ok } };
@@ -491,6 +508,19 @@ export class PrResource {
         identifier,
         pr_number: prNumber,
         strategy,
+      });
+    } else {
+      this.lastError = res.error;
+    }
+  }
+
+  private async runUpdateBranch(identifier: string, prNumber: number): Promise<void> {
+    const actionKey = `update_branch:${prNumber}`;
+    const res = await this.ledger.run(actionKey, () => this.opts.pr.updateBranch(prNumber));
+    if (res.ok) {
+      log.info('pr reconcile: updated branch onto base', {
+        identifier,
+        pr_number: prNumber,
       });
     } else {
       this.lastError = res.error;
