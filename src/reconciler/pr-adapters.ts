@@ -119,21 +119,7 @@ export class GhCliPrApi implements PrApi {
     } catch (err) {
       throw new Error(`gh pr view returned non-JSON: ${(err as Error).message}`);
     }
-    return {
-      number: typeof parsed.number === 'number' ? parsed.number : prNumber,
-      url: typeof parsed.url === 'string' ? parsed.url : '',
-      state: normalizeState(parsed.state),
-      mergeable: normalizeMergeable(parsed.mergeable),
-      base_ref_name: typeof parsed.baseRefName === 'string' ? parsed.baseRefName : '',
-      base_ref_oid: typeof parsed.baseRefOid === 'string' ? parsed.baseRefOid : null,
-      head_ref_name: typeof parsed.headRefName === 'string' ? parsed.headRefName : '',
-      head_ref_oid: typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '',
-      review_decision: normalizeReviewDecision(parsed.reviewDecision),
-      auto_merge_armed:
-        parsed.autoMergeRequest !== null &&
-        parsed.autoMergeRequest !== undefined &&
-        typeof parsed.autoMergeRequest === 'object',
-    };
+    return parseGhPrView(prNumber, parsed);
   }
 
   async armAutoMerge(prNumber: number, strategy: 'squash' | 'merge' | 'rebase'): Promise<void> {
@@ -185,6 +171,29 @@ function normalizeReviewDecision(raw: unknown): PrView['review_decision'] {
   if (raw === 'APPROVED' || raw === 'CHANGES_REQUESTED' || raw === 'REVIEW_REQUIRED') return raw;
   return null;
 }
+function pickString(raw: unknown, fallback: string): string {
+  return typeof raw === 'string' ? raw : fallback;
+}
+function pickStringOrNull(raw: unknown): string | null {
+  return typeof raw === 'string' ? raw : null;
+}
+function parseGhPrView(prNumber: number, parsed: Record<string, unknown>): PrView {
+  return {
+    number: typeof parsed.number === 'number' ? parsed.number : prNumber,
+    url: pickString(parsed.url, ''),
+    state: normalizeState(parsed.state),
+    mergeable: normalizeMergeable(parsed.mergeable),
+    base_ref_name: pickString(parsed.baseRefName, ''),
+    base_ref_oid: pickStringOrNull(parsed.baseRefOid),
+    head_ref_name: pickString(parsed.headRefName, ''),
+    head_ref_oid: pickString(parsed.headRefOid, ''),
+    review_decision: normalizeReviewDecision(parsed.reviewDecision),
+    auto_merge_armed:
+      parsed.autoMergeRequest !== null &&
+      parsed.autoMergeRequest !== undefined &&
+      typeof parsed.autoMergeRequest === 'object',
+  };
+}
 
 /** Default production PrGitApi backed by `git` shelled out in the workspace. */
 export class GitCliPrGitApi implements PrGitApi {
@@ -200,95 +209,110 @@ export class GitCliPrGitApi implements PrGitApi {
     baseBranch: string;
     expectedHeadSha: string;
   }): Promise<RebaseOutcome> {
-    // 1. Read the workspace's local HEAD up front.
-    const head = await runShell(
-      'git',
-      ['rev-parse', 'HEAD'],
-      { cwd: args.workspacePath, timeoutMs: this.opts.timeoutMs },
-    );
+    const head = await this.readHead(args.workspacePath);
+    if (head.kind === 'error') return head;
+    // A rebase already in progress means the conflict-routed agent is still
+    // resolving it; finishing or aborting here would clobber that work. Bail
+    // without touching the workspace. Issue 55.
+    if (await rebaseInProgress(args.workspacePath, this.opts.timeoutMs)) {
+      return { kind: 'concurrent_push', observed_head_sha: head.sha };
+    }
+    const fetchErr = await this.fetchBase(args.workspacePath, args.baseBranch);
+    if (fetchErr) return fetchErr;
+    if (head.sha !== args.expectedHeadSha) {
+      return this.classifyLocalDivergence(args.workspacePath, args.baseBranch, head.sha);
+    }
+    return this.runRebase(args.workspacePath, args.baseBranch);
+  }
+
+  private async readHead(
+    workspacePath: string,
+  ): Promise<{ kind: 'ok'; sha: string } | (RebaseOutcome & { kind: 'error' })> {
+    const head = await runShell('git', ['rev-parse', 'HEAD'], {
+      cwd: workspacePath,
+      timeoutMs: this.opts.timeoutMs,
+    });
     if (head.exit !== 0) {
       return { kind: 'error', diagnostic: `rev-parse HEAD failed: ${head.stderr.trim()}` };
     }
-    const localHead = head.stdout.trim();
-    // 2. If a rebase is already in progress (markers on disk in
-    //    `.git/rebase-merge` / `.git/rebase-apply`), the agent we routed
-    //    the conflict to is still resolving it. Bail without touching the
-    //    workspace — finishing or aborting the rebase here would clobber
-    //    exactly the state the agent is working on. Issue 55.
-    if (await rebaseInProgress(args.workspacePath, this.opts.timeoutMs)) {
-      return { kind: 'concurrent_push', observed_head_sha: localHead };
-    }
-    // 3. Fetch the base ref so origin/<base> is current.
-    const fetch = await runShell(
-      'git',
-      ['fetch', '--no-tags', this.remote, args.baseBranch],
-      { cwd: args.workspacePath, timeoutMs: this.opts.timeoutMs },
-    );
+    return { kind: 'ok', sha: head.stdout.trim() };
+  }
+
+  private async fetchBase(
+    workspacePath: string,
+    baseBranch: string,
+  ): Promise<(RebaseOutcome & { kind: 'error' }) | null> {
+    const fetch = await runShell('git', ['fetch', '--no-tags', this.remote, baseBranch], {
+      cwd: workspacePath,
+      timeoutMs: this.opts.timeoutMs,
+    });
     if (fetch.exit !== 0) {
       return { kind: 'error', diagnostic: `git fetch failed: ${fetch.stderr.trim()}` };
     }
-    // 4. If local HEAD has diverged from the SHA we last saw on the PR,
-    //    either an agent finished resolving a rebase in-tree (and the
-    //    workspace is now on top of `origin/<base>`) or some unrelated
-    //    local mutation happened. Distinguish via ancestry:
-    //
-    //      - `origin/<base>` is an ancestor of localHead → agent rebased.
-    //        Return ok so the caller force-with-leases the resolved branch.
-    //        Issue 55 — without this the conflict-routed agent could resolve
-    //        but the autopilot would forever return concurrent_push and the
-    //        PR would never flip CONFLICTING → MERGEABLE.
-    //      - Otherwise → unexpected local divergence. Return concurrent_push
-    //        so the autopilot defers rather than clobbering work it can't
-    //        explain.
-    if (localHead !== args.expectedHeadSha) {
-      const isAncestor = await runShell(
-        'git',
-        ['merge-base', '--is-ancestor', `${this.remote}/${args.baseBranch}`, localHead],
-        { cwd: args.workspacePath, timeoutMs: this.opts.timeoutMs },
-      );
-      if (isAncestor.exit === 0) {
-        return { kind: 'ok', new_head_sha: localHead };
-      }
-      return { kind: 'concurrent_push', observed_head_sha: localHead };
-    }
-    // 5. localHead === expectedHeadSha; run the rebase normally.
-    const rebase = await runShell(
+    return null;
+  }
+
+  // localHead has diverged from the SHA the autopilot last saw on the PR.
+  // Distinguish via ancestry: if origin/<base> is an ancestor of localHead the
+  // conflict-routed agent already rebased — return ok so the caller pushes the
+  // resolved branch. Otherwise treat as unexpected local mutation and defer.
+  // Issue 55.
+  private async classifyLocalDivergence(
+    workspacePath: string,
+    baseBranch: string,
+    localHead: string,
+  ): Promise<RebaseOutcome> {
+    const isAncestor = await runShell(
       'git',
-      ['rebase', `${this.remote}/${args.baseBranch}`],
-      { cwd: args.workspacePath, timeoutMs: this.opts.timeoutMs },
+      ['merge-base', '--is-ancestor', `${this.remote}/${baseBranch}`, localHead],
+      { cwd: workspacePath, timeoutMs: this.opts.timeoutMs },
     );
-    if (rebase.exit !== 0) {
-      // Collect the conflicted files for the notes block.
-      const conflicts = await runShell(
-        'git',
-        ['diff', '--name-only', '--diff-filter=U'],
-        { cwd: args.workspacePath, timeoutMs: this.opts.timeoutMs },
-      );
-      const files = conflicts.stdout
-        .split('\n')
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
-      // Leave the rebase IN PROGRESS — the agent picking up the conflict-routed
-      // issue inherits the working tree with conflict markers in place and the
-      // .git/rebase-* state on disk, so they can resolve in-tree and
-      // `git rebase --continue` rather than starting over. Running
-      // `git rebase --abort` here would discard exactly the state the routed
-      // agent is supposed to resolve.
-      return {
-        kind: 'conflict',
-        files,
-        diagnostic: `${rebase.stdout.trim()}\n${rebase.stderr.trim()}`.trim(),
-      };
+    if (isAncestor.exit === 0) {
+      return { kind: 'ok', new_head_sha: localHead };
     }
-    // 6. New HEAD after rebase.
+    return { kind: 'concurrent_push', observed_head_sha: localHead };
+  }
+
+  private async runRebase(workspacePath: string, baseBranch: string): Promise<RebaseOutcome> {
+    const rebase = await runShell('git', ['rebase', `${this.remote}/${baseBranch}`], {
+      cwd: workspacePath,
+      timeoutMs: this.opts.timeoutMs,
+    });
+    if (rebase.exit !== 0) {
+      return this.collectRebaseConflict(workspacePath, rebase);
+    }
     const newHead = await runShell('git', ['rev-parse', 'HEAD'], {
-      cwd: args.workspacePath,
+      cwd: workspacePath,
       timeoutMs: this.opts.timeoutMs,
     });
     if (newHead.exit !== 0) {
       return { kind: 'error', diagnostic: `post-rebase rev-parse failed: ${newHead.stderr.trim()}` };
     }
     return { kind: 'ok', new_head_sha: newHead.stdout.trim() };
+  }
+
+  // Leave the rebase IN PROGRESS — the conflict-routed agent inherits the
+  // working tree with conflict markers and .git/rebase-* state, so they can
+  // resolve in-tree and `git rebase --continue` rather than starting over.
+  // Running `git rebase --abort` here would discard exactly the state the
+  // routed agent is supposed to resolve.
+  private async collectRebaseConflict(
+    workspacePath: string,
+    rebase: ShellResult,
+  ): Promise<RebaseOutcome> {
+    const conflicts = await runShell('git', ['diff', '--name-only', '--diff-filter=U'], {
+      cwd: workspacePath,
+      timeoutMs: this.opts.timeoutMs,
+    });
+    const files = conflicts.stdout
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    return {
+      kind: 'conflict',
+      files,
+      diagnostic: `${rebase.stdout.trim()}\n${rebase.stderr.trim()}`.trim(),
+    };
   }
 
   async pushForceWithLease(args: {
