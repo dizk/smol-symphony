@@ -326,14 +326,67 @@ async function applyPushBranch(
   opts: ActionExecutorOptions,
 ): Promise<ActionOutcome> {
   const res = await runCommand('git', ['push', '-u', action.remote, action.ref], opts);
-  if (res.exit_code !== 0) {
+  if (res.exit_code === 0) return { ok: true, reason: null, route_to: null };
+  // Non-fast-forward retry. When the autopilot routes a CONFLICTING PR back
+  // to the implementing state and the agent resolves the rebase in-tree,
+  // local `agent/<id>` has new SHAs while the remote is still at the
+  // pre-rebase tip. The plain push then rejects NFF. Mirror the autopilot's
+  // pushForceWithLease (src/reconciler/pr-adapters.ts) lease-anchor pattern:
+  // freshly fetch the remote ref, pin the lease to its just-observed SHA,
+  // and retry. The lease keeps the action safe under a true concurrent
+  // push — the lease would mismatch and git rejects again.
+  if (!isNonFastForward(res)) {
     return {
       ok: false,
       reason: `git push ${action.remote} ${action.ref} exited ${res.exit_code}: ${diagnostic(res)}`,
       route_to: null,
     };
   }
+  const fetch = await runCommand(
+    'git',
+    ['fetch', '--no-tags', action.remote, action.ref],
+    opts,
+  );
+  if (fetch.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `git push ${action.remote} ${action.ref} rejected non-fast-forward; fetch failed: ${diagnostic(fetch)}`,
+      route_to: null,
+    };
+  }
+  const remoteTrackingRef = `refs/remotes/${action.remote}/${action.ref}`;
+  const revParse = await runCommand('git', ['rev-parse', remoteTrackingRef], opts, /*silent*/ true);
+  if (revParse.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `git push ${action.remote} ${action.ref} rejected non-fast-forward; could not resolve ${remoteTrackingRef}: ${diagnostic(revParse)}`,
+      route_to: null,
+    };
+  }
+  const remoteSha = revParse.stdout.trim();
+  const retry = await runCommand(
+    'git',
+    [
+      'push',
+      '-u',
+      `--force-with-lease=${action.ref}:${remoteSha}`,
+      action.remote,
+      action.ref,
+    ],
+    opts,
+  );
+  if (retry.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `git push --force-with-lease ${action.remote} ${action.ref} exited ${retry.exit_code}: ${diagnostic(retry)}`,
+      route_to: null,
+    };
+  }
   return { ok: true, reason: null, route_to: null };
+}
+
+function isNonFastForward(res: { stdout: string; stderr: string }): boolean {
+  return /non-fast-forward/i.test(`${res.stdout}\n${res.stderr}`);
 }
 
 async function applyCreatePrIfMissing(
