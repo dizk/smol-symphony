@@ -255,6 +255,76 @@ describe('action: push_branch happy path', () => {
       await rm(wsParent, { recursive: true, force: true });
     }
   });
+
+  it('retries with --force-with-lease when the plain push is rejected non-fast-forward', async () => {
+    // Mirrors the issue 56 scenario: the autopilot routed a CONFLICTING PR
+    // back to implementing, the agent rebased the local branch in-tree, so
+    // local agent/<id> has new SHAs while origin/agent/<id> still points at
+    // the pre-rebase tip. Without retry the action surfaces a transient
+    // failure even though the autopilot will eventually flip the remote.
+    const source = await makeSourceRepo();
+    const bare = await makeBareRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42', { remote: { name: 'origin', url: bare } });
+    try {
+      // Seed remote agent/42 with commit A.
+      await writeFile(path.join(ws, 'a.txt'), 'A\n', 'utf8');
+      await git(['add', '.'], ws);
+      await git(['commit', '-m', 'A'], ws);
+      await git(['push', '-u', 'origin', 'agent/42'], ws);
+      const shaA = await git(['rev-parse', 'HEAD'], ws);
+
+      // Rewrite local history: reset back to base, commit B. Local and
+      // remote now share base but diverge — plain push will reject NFF.
+      await git(['reset', '--hard', 'HEAD~1'], ws);
+      await writeFile(path.join(ws, 'b.txt'), 'B\n', 'utf8');
+      await git(['add', '.'], ws);
+      await git(['commit', '-m', 'B'], ws);
+      const shaB = await git(['rev-parse', 'HEAD'], ws);
+      assert.notEqual(shaA, shaB);
+
+      const ctx = baseContext(ws, '42');
+      const result = await runActions(
+        [{ kind: 'push_branch', remote: 'origin', ref: '$branch' }],
+        { workspacePath: ws, ctx, snapshotId: 'actions:Done' },
+      );
+      assert.equal(result.ok, true);
+      assert.equal(result.actions[0]!.state, 'done');
+      // Remote now points at the rebased local SHA.
+      const remoteSha = await git(['rev-parse', 'agent/42'], bare);
+      assert.equal(remoteSha, shaB);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(bare, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+    }
+  });
+
+  it('does not retry with force when the push fails for an unrelated reason', async () => {
+    // Auth / network / missing-remote failures must not be papered over with
+    // force-with-lease — only non-fast-forward rejections trigger the retry.
+    const source = await makeSourceRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42', {
+      remote: { name: 'origin', url: '/nonexistent/symphony-issue-56-bare' },
+    });
+    try {
+      await writeFile(path.join(ws, 'note.md'), 'work\n', 'utf8');
+      await git(['add', '.'], ws);
+      await git(['commit', '-m', 'wip'], ws);
+      const ctx = baseContext(ws, '42');
+      const result = await runActions(
+        [{ kind: 'push_branch', remote: 'origin', ref: '$branch' }],
+        { workspacePath: ws, ctx, snapshotId: 'actions:Done' },
+      );
+      assert.equal(result.ok, false);
+      // The diagnostic must surface the original push failure, not a
+      // force-with-lease diagnostic — proving we never reached the retry.
+      assert.match(result.reason ?? '', /git push origin/);
+      assert.doesNotMatch(result.reason ?? '', /force-with-lease/);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('action: create_pr_if_missing happy path', () => {
