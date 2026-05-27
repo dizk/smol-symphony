@@ -196,7 +196,12 @@ hooks:
   # state check to short-circuit non-terminal turns.
 
 agent:
-  max_concurrent_agents: 2
+  # SERIALIZED to 1 (2026-05-27) to stop the FC/IS burn-down conflict storm:
+  # every burn-down PR edits the same policy files (package.json --max-warnings
+  # ratchet, .dependency-cruiser.cjs, eslint.config.js), so any two in flight
+  # conflict by construction and loop Done->Conflict. Serial dispatch makes each
+  # PR rebase on the prior merge. Revert to 2 once the arch-burndown queue drains.
+  max_concurrent_agents: 1
   max_turns: 6
   max_retry_backoff_ms: 120000
 
@@ -320,13 +325,17 @@ the per-issue branch, then hand off to the reviewer.
    side of the seam: stop and put the logic in the runner/MCP layer
    instead. The issue body may sketch a shell-shaped solution; treat that
    as one option, not a directive.
-3. Make the smallest correct change, and **keep it small**. CI enforces a
-   diff-size budget (~400 changed lines / ~12 files). If finishing this issue
-   would exceed that, or pull in work beyond the scope the issue states,
-   implement the smallest coherent slice and call `symphony.propose_issue` for
-   the remainder — do not expand this change to swallow follow-up work. Add or
-   update tests where the change is testable; `npm run typecheck`, `npm test`,
-   `npm run lint:arch`, and `npm run lint` must all pass.
+3. Make the smallest correct change for the issue's stated scope, and keep it
+   focused. If you notice work beyond what the issue states, call
+   `symphony.propose_issue` for it rather than expanding this change to swallow
+   follow-up work. Add or update tests where the change is testable. Before
+   handing off, run `npm run typecheck`, `npm test`, `npm run lint:arch`, and
+   `npm run lint` — all must pass.
+   **Do NOT edit the `--max-warnings` ratchet in `package.json`** — leave that line
+   exactly as-is. It is tightened in one pass at the end of the burn-down. Your change
+   only needs to keep `npm run lint` green at the *current* ratchet (it will, as long
+   as you reduce or hold the warning count). Lowering it yourself just collides with
+   every other in-flight issue's `package.json` and forces manual conflict resolution.
 4. Commit your work to the per-issue branch with a short message.
 5. Hand off to the reviewer by calling:
 
