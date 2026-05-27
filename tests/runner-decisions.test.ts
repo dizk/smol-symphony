@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   decideAttemptOutcome,
   decideCleanupExecution,
+  decideTurnContinuation,
   shouldRunIntegrationMerge,
   shouldStageAfterRunEnv,
 } from '../src/agent/runner-decisions.js';
@@ -143,6 +144,72 @@ describe('decideAttemptOutcome', () => {
     assert.deepEqual(
       decideAttemptOutcome({ ...base, agentFailure: null, nonRoutedActionFailureReason: null }),
       { ok: true, reason: 'max_turns_reached', threadId: 's-1', turnsCompleted: 3 },
+    );
+  });
+});
+
+describe('decideTurnContinuation', () => {
+  const base = {
+    cancelled: false,
+    transitioned: false,
+    steeringRequested: false,
+    issueStillPresent: true,
+    issueStillActive: true,
+    autonomousTurns: 0,
+    maxTurns: 5,
+  };
+
+  it('cancellation wins over every other signal', () => {
+    assert.deepEqual(
+      decideTurnContinuation({ ...base, cancelled: true, transitioned: true }),
+      { kind: 'break', reason: 'cancelled_by_reconciliation' },
+    );
+  });
+
+  it('transitioned breaks before steering or tracker checks fire', () => {
+    assert.deepEqual(
+      decideTurnContinuation({
+        ...base,
+        transitioned: true,
+        steeringRequested: true,
+        issueStillPresent: false,
+      }),
+      { kind: 'break', reason: 'agent_transitioned' },
+    );
+  });
+
+  it('steering pauses the loop (no break, no continue)', () => {
+    assert.deepEqual(
+      decideTurnContinuation({ ...base, steeringRequested: true }),
+      { kind: 'await_steering' },
+    );
+  });
+
+  it('missing tracker entry breaks with issue_no_longer_present', () => {
+    assert.deepEqual(
+      decideTurnContinuation({ ...base, issueStillPresent: false }),
+      { kind: 'break', reason: 'issue_no_longer_present' },
+    );
+  });
+
+  it('non-active state breaks with issue_no_longer_active', () => {
+    assert.deepEqual(
+      decideTurnContinuation({ ...base, issueStillActive: false }),
+      { kind: 'break', reason: 'issue_no_longer_active' },
+    );
+  });
+
+  it('max_turns boundary breaks with max_turns_reached', () => {
+    assert.deepEqual(
+      decideTurnContinuation({ ...base, autonomousTurns: 5, maxTurns: 5 }),
+      { kind: 'break', reason: 'max_turns_reached' },
+    );
+  });
+
+  it('otherwise continues into another autonomous turn', () => {
+    assert.deepEqual(
+      decideTurnContinuation({ ...base, autonomousTurns: 2, maxTurns: 5 }),
+      { kind: 'continue' },
     );
   });
 });

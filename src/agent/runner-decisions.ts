@@ -92,3 +92,34 @@ export function decideAttemptOutcome(input: AttemptOutcomeInput): AttemptOutcome
     turnsCompleted: input.turnsCompleted,
   };
 }
+
+/**
+ * Classify the post-end_turn flow when the loop should consider whether to do
+ * another autonomous iteration. Pure decision over the snapshot the loop has
+ * after refreshing tracker state. Reasons mirror the strings the runner sets
+ * into `lastReason` so the AttemptOutcome reason field stays unchanged.
+ */
+export interface TurnContinuationInput {
+  cancelled: boolean;
+  transitioned: boolean;
+  steeringRequested: boolean;
+  issueStillPresent: boolean;
+  issueStillActive: boolean;
+  autonomousTurns: number;
+  maxTurns: number;
+}
+
+export type TurnContinuation =
+  | { kind: 'continue' }
+  | { kind: 'await_steering' }
+  | { kind: 'break'; reason: string };
+
+export function decideTurnContinuation(input: TurnContinuationInput): TurnContinuation {
+  if (input.cancelled) return { kind: 'break', reason: 'cancelled_by_reconciliation' };
+  if (input.transitioned) return { kind: 'break', reason: 'agent_transitioned' };
+  if (input.steeringRequested) return { kind: 'await_steering' };
+  if (!input.issueStillPresent) return { kind: 'break', reason: 'issue_no_longer_present' };
+  if (!input.issueStillActive) return { kind: 'break', reason: 'issue_no_longer_active' };
+  if (input.autonomousTurns >= input.maxTurns) return { kind: 'break', reason: 'max_turns_reached' };
+  return { kind: 'continue' };
+}
