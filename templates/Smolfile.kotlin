@@ -1,0 +1,71 @@
+# Smolfile — Kotlin / Gradle starter template for smol-symphony.
+#
+# Use this when the per-issue project the orchestrator is dispatching against
+# is a Kotlin (or any JVM-on-Gradle) codebase. Point `smolvm.smolfile` in
+# WORKFLOW.md at this path (e.g. `smolvm.smolfile: ./templates/Smolfile.kotlin`),
+# or copy the file to the project root as `Smolfile` and adjust the `volumes`
+# path below as noted.
+#
+# Like the canonical Node Smolfile, [dev].init runs on every machine start —
+# the reconciler bakes the resulting VM into a cached `.smolmachine` artifact
+# (`~/.cache/symphony/actions/bake/<sha256>`) once per Smolfile-content
+# change, so the apt + npm install + Gradle warm cost is paid on first
+# dispatch (or after `symphony reconcile --force`) rather than per issue.
+#
+# Note on Node: the in-VM stdio proxy at /opt/symphony/vm-agent.mjs is a
+# Node script that `deriveAcpCommand` execs via `node`, so even a JVM-
+# flavoured VM still needs a Node runtime + the ACP adapter packages. This
+# template layers NodeSource on top of the `eclipse-temurin:21-jdk` base
+# image rather than starting from `node:24-bookworm-slim` and installing a
+# JDK, because the Temurin image already ships a tested Adoptium JDK 21
+# with `JAVA_HOME` and `java` on `PATH` so a project-checked-in `gradlew`
+# wrapper works on first invocation.
+
+image = "eclipse-temurin:21-jdk-noble"
+
+cpus = 2
+memory = 4096
+net = true
+
+[dev]
+# Mount the host scripts/ dir as /opt/symphony in the guest read-only so the
+# in-VM stdio proxy at /opt/symphony/vm-agent.mjs (referenced by
+# deriveAcpCommand) is always the same file the host has on disk — no
+# separate copy step, no drift. Path is resolved relative to *this* Smolfile;
+# `..` walks from `templates/` back up to the project root. If you copy this
+# file to the project root as `Smolfile`, change the host side to
+# `./scripts:/opt/symphony:ro` to match.
+#
+# Tip: to avoid re-downloading the Gradle distribution + dependency graph on
+# every per-issue VM, add a persistent host-side cache mount, e.g.
+#   volumes = ["../scripts:/opt/symphony:ro", "~/.gradle:/root/.gradle"]
+# The bake step seeds /root/.gradle inside the cached `.smolmachine`, so a
+# fresh VM already has the Gradle distribution; the host mount additionally
+# lets dependency jars resolved by per-issue builds persist back to the
+# host. WORKFLOW.md's `smolvm.volumes` is the alternative surface if you
+# prefer to keep the cache mount out of the Smolfile.
+volumes = ["../scripts:/opt/symphony:ro"]
+
+# Layer order:
+#   1. Base apt tooling (git, ripgrep, curl, unzip — Gradle's distribution
+#      ships as a zip, and the wrapper extracts it via `unzip`).
+#   2. NodeSource Node.js 22.x so `node /opt/symphony/vm-agent.mjs` works and
+#      `npm install -g` can stage the ACP adapter binaries.
+#   3. A system Gradle install pinned to a recent stable release. Projects
+#      that ship a `gradlew` wrapper will still download the wrapper's
+#      pinned Gradle version on first invocation, but this gives wrapper-
+#      less projects a working `gradle` on `$PATH` and warms the JVM /
+#      Gradle daemon caches inside the baked image via `gradle --version`.
+#   4. The same ACP-capable coding agents the canonical Node Smolfile
+#      installs — symphony's adapter registry expects to find these on $PATH
+#      inside the VM regardless of project language.
+init = [
+    "apt-get update -q",
+    "apt-get install -y --no-install-recommends git ripgrep ca-certificates curl unzip",
+    "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
+    "apt-get install -y --no-install-recommends nodejs",
+    "curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.10.2-bin.zip",
+    "unzip -q /tmp/gradle.zip -d /opt && ln -s /opt/gradle-8.10.2/bin/gradle /usr/local/bin/gradle && rm /tmp/gradle.zip",
+    "gradle --version",
+    "npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp opencode-ai",
+]
