@@ -8,6 +8,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type {
+  HooksConfig,
   Issue,
   RunningEntry,
   RuntimeEvent,
@@ -26,8 +27,10 @@ import {
   stageCredential,
   stageRuntimeFile,
   type AcpAdapterId,
+  type AdapterProfile,
   type ExtraGuestFile,
   type ModelInjection,
+  type StagedCredentialPaths,
 } from './adapters.js';
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
@@ -571,6 +574,108 @@ export class AgentRunner {
     entry.issue.state = targetState;
   }
 
+  /**
+   * Stage the adapter credential, apply model/effort injections, and derive the
+   * in-VM launch command for this attempt. Extracted from runAttempt to keep the
+   * imperative shell's complexity budget under control (issue 90); behaviour is
+   * identical to the inline block it replaced.
+   *
+   * On staging failure the workspace's `after_run` hook fires best-effort and a
+   * typed failure shape is returned so the caller can map it to the right
+   * RunAttemptResult reason without re-deriving the cleanup.
+   */
+  private async prepareAdapterRuntime(
+    workspacePath: string,
+    resolved: ResolvedDispatchConfig,
+    initialHooks: HooksConfig,
+    hookCapture: (hook: string) => HookCapture | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<
+    | {
+        ok: true;
+        profile: AdapterProfile;
+        staged: StagedCredentialPaths;
+        adapterBin: string;
+        effectiveAdapterArgs: string[];
+        effectiveAcpCommand: string;
+        runtimeEnv: Record<string, string>;
+      }
+    | { ok: false; reason: string }
+  > {
+    const profile = ADAPTERS[resolved.adapter];
+    let staged: StagedCredentialPaths;
+    try {
+      staged = await stageCredential(workspacePath, profile);
+    } catch (err) {
+      logger.error('credential staging failed', {
+        adapter: profile.id,
+        error: (err as Error).message,
+      });
+      await this.workspaces.runAfterRunBestEffort(
+        workspacePath,
+        initialHooks,
+        hookCapture('after_run'),
+      );
+      return { ok: false, reason: 'credential staging error' };
+    }
+    const adapterBin = profile.binary[0]!;
+    const adapterArgs = profile.binary.slice(1);
+    // Apply the resolved model / effort selections (if any) to the adapter via its
+    // profile-specific mechanisms: env var for claude-agent-acp's ANTHROPIC_MODEL, extra
+    // argv for codex-acp's `-c model=...`, staged file for claude-agent-acp's
+    // settings.json (effortLevel lives there). The injections compose along three
+    // orthogonal channels — env, extraArgs, stagedFiles — so codex (argv-based) and
+    // claude (env + file-based) coexist without per-adapter branching here.
+    const runtimeEnv: Record<string, string> = {};
+    const runtimeArgs: string[] = [];
+    const runtimeExtraFiles: ExtraGuestFile[] = [];
+    const applyInjection = async (inj: ModelInjection): Promise<void> => {
+      if (inj.env) {
+        for (const [k, v] of Object.entries(inj.env)) runtimeEnv[k] = v;
+      }
+      if (inj.extraArgs) runtimeArgs.push(...inj.extraArgs);
+      if (inj.stagedFiles) {
+        for (const f of inj.stagedFiles) {
+          const stagedFile = await stageRuntimeFile(workspacePath, f.stagedName, f.content);
+          runtimeExtraFiles.push({
+            stagedRelPath: stagedFile.relPath,
+            guestPath: f.guestPath,
+          });
+        }
+      }
+    };
+    try {
+      if (resolved.model) {
+        await applyInjection(profile.modelInjection(resolved.model));
+      }
+      if (resolved.effort && profile.effortInjection) {
+        await applyInjection(profile.effortInjection(resolved.effort));
+      }
+    } catch (err) {
+      logger.error('runtime injection staging failed', {
+        adapter: profile.id,
+        error: (err as Error).message,
+      });
+      await this.workspaces.runAfterRunBestEffort(
+        workspacePath,
+        this.cfg.hooks,
+        hookCapture('after_run'),
+      );
+      return { ok: false, reason: 'runtime injection staging error' };
+    }
+    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, runtimeExtraFiles);
+    const effectiveAdapterArgs = [...adapterArgs, ...runtimeArgs];
+    return {
+      ok: true,
+      profile,
+      staged,
+      adapterBin,
+      effectiveAdapterArgs,
+      effectiveAcpCommand,
+      runtimeEnv,
+    };
+  }
+
   async runAttempt(
     issue: Issue,
     attempt: number | null,
@@ -651,77 +756,19 @@ export class AgentRunner {
     // launch shape: scrub the in-VM credential dir, stage the host credential into the
     // workspace, exec the in-VM proxy at /opt/symphony/vm-agent.mjs. The proxy reads its
     // config (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from env, dials the
-    // host's bridge, and spawns the adapter. The adapter id was already validated up
-    // top via `resolved` (which folds in any per-state override); the branches below are
-    // pure data binding off the resolved profile.
-    const profile = ADAPTERS[resolved.adapter];
-    let staged;
-    try {
-      staged = await stageCredential(workspace.path, profile);
-    } catch (err) {
-      logger.error('credential staging failed', {
-        adapter: profile.id,
-        error: (err as Error).message,
-      });
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        initialHooks,
-        hookCapture('after_run'),
-      );
-      return { ok: false, reason: 'credential staging error', threadId: null, turnsCompleted: 0 };
+    // host's bridge, and spawns the adapter. Delegated to prepareAdapterRuntime so the
+    // staging + injection + command-derivation branching lives outside runAttempt.
+    const adapterRuntime = await this.prepareAdapterRuntime(
+      workspace.path,
+      resolved,
+      initialHooks,
+      hookCapture,
+      logger,
+    );
+    if (!adapterRuntime.ok) {
+      return { ok: false, reason: adapterRuntime.reason, threadId: null, turnsCompleted: 0 };
     }
-    const adapterBin = profile.binary[0]!;
-    const adapterArgs = profile.binary.slice(1);
-    // Apply the resolved model / effort selections (if any) to the adapter via its
-    // profile-specific mechanisms: env var for claude-agent-acp's ANTHROPIC_MODEL, extra
-    // argv for codex-acp's `-c model=...`, staged file for claude-agent-acp's
-    // settings.json (effortLevel lives there). The injections compose along three
-    // orthogonal channels — env, extraArgs, stagedFiles — so codex (argv-based) and
-    // claude (env + file-based) coexist without per-adapter branching here.
-    const runtimeEnv: Record<string, string> = {};
-    const runtimeArgs: string[] = [];
-    const runtimeExtraFiles: ExtraGuestFile[] = [];
-    const applyInjection = async (inj: ModelInjection): Promise<void> => {
-      if (inj.env) {
-        for (const [k, v] of Object.entries(inj.env)) runtimeEnv[k] = v;
-      }
-      if (inj.extraArgs) runtimeArgs.push(...inj.extraArgs);
-      if (inj.stagedFiles) {
-        for (const f of inj.stagedFiles) {
-          const stagedFile = await stageRuntimeFile(workspace.path, f.stagedName, f.content);
-          runtimeExtraFiles.push({
-            stagedRelPath: stagedFile.relPath,
-            guestPath: f.guestPath,
-          });
-        }
-      }
-    };
-    try {
-      if (resolved.model) {
-        await applyInjection(profile.modelInjection(resolved.model));
-      }
-      if (resolved.effort && profile.effortInjection) {
-        await applyInjection(profile.effortInjection(resolved.effort));
-      }
-    } catch (err) {
-      logger.error('runtime injection staging failed', {
-        adapter: profile.id,
-        error: (err as Error).message,
-      });
-      await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
-        this.cfg.hooks,
-        hookCapture('after_run'),
-      );
-      return {
-        ok: false,
-        reason: 'runtime injection staging error',
-        threadId: null,
-        turnsCompleted: 0,
-      };
-    }
-    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, runtimeExtraFiles);
-    const effectiveAdapterArgs = [...adapterArgs, ...runtimeArgs];
+    const { adapterBin, effectiveAdapterArgs, effectiveAcpCommand, runtimeEnv } = adapterRuntime;
 
     // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
     // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
