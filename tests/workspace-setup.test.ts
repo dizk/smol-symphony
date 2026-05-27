@@ -15,11 +15,16 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { fetchBaseInWorkspace, setupWorkspaceDir, resolveSetupOptions } from '../src/workspace.js';
+import {
+  fetchBaseInWorkspace,
+  restorePushedBranch,
+  setupWorkspaceDir,
+  resolveSetupOptions,
+} from '../src/workspace.js';
 
 interface GitResult {
   exit: number;
@@ -265,6 +270,112 @@ describe('fetchBaseInWorkspace (issue 101)', () => {
       assert.match(result.diagnostic ?? '', /couldn't find remote ref|fatal/i);
     } finally {
       await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('restorePushedBranch', () => {
+  it('restores an existing remote per-issue branch so a re-dispatch continues the pushed work', async () => {
+    // The bug this closes: on a re-dispatch the workspace was re-cloned and the
+    // per-issue branch cut fresh off base, orphaning the already-pushed
+    // `agent/<id>` commits. Here the remote already has agent/77 with distinct
+    // work; restore must land HEAD on it (not re-cut from base).
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-ws-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      let agentSha = '';
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-seed-'));
+      try {
+        await git(['init', '-b', 'main'], seed);
+        await git(['config', 'user.name', 'test'], seed);
+        await git(['config', 'user.email', 'test@example.com'], seed);
+        await writeFile(path.join(seed, 'a.txt'), 'base\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'base'], seed);
+        await git(['remote', 'add', 'origin', bareRemote], seed);
+        await git(['push', 'origin', 'main'], seed);
+        await git(['checkout', '-b', 'agent/77'], seed);
+        await writeFile(path.join(seed, 'work.txt'), 'pushed work\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'agent work'], seed);
+        await git(['push', 'origin', 'agent/77'], seed);
+        agentSha = await git(['rev-parse', 'HEAD'], seed);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+
+      // Fresh workspace clone lands on main with no local agent/77.
+      const wsPath = path.join(wsRoot, '77');
+      await mkdir(wsPath, { recursive: true });
+      await git(['clone', bareRemote, '.'], wsPath);
+      await git(['config', 'user.name', 'symphony-agent'], wsPath);
+      await git(['config', 'user.email', 'agent@symphony.local'], wsPath);
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'main');
+
+      const restored = await restorePushedBranch(wsPath, 'agent/77');
+      assert.equal(restored, true);
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'agent/77');
+      assert.equal(
+        await git(['rev-parse', 'HEAD'], wsPath),
+        agentSha,
+        'HEAD restored to the pushed remote tip, not re-cut from base',
+      );
+      assert.equal(await readFile(path.join(wsPath, 'work.txt'), 'utf8'), 'pushed work\n');
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('returns false (caller cuts a fresh branch) when no such branch exists on the remote', async () => {
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-none-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-none-ws-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-none-seed-'));
+      try {
+        await git(['init', '-b', 'main'], seed);
+        await git(['config', 'user.name', 'test'], seed);
+        await git(['config', 'user.email', 'test@example.com'], seed);
+        await writeFile(path.join(seed, 'a.txt'), 'base\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'base'], seed);
+        await git(['remote', 'add', 'origin', bareRemote], seed);
+        await git(['push', 'origin', 'main'], seed);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+      const wsPath = path.join(wsRoot, '88');
+      await mkdir(wsPath, { recursive: true });
+      await git(['clone', bareRemote, '.'], wsPath);
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'main');
+
+      const restored = await restorePushedBranch(wsPath, 'agent/88');
+      assert.equal(restored, false);
+      // HEAD unchanged — the caller cuts the fresh branch off base.
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'main');
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('returns false in local-only mode (no origin remote)', async () => {
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-local-ws-'));
+    const wsPath = path.join(wsRoot, '99');
+    try {
+      await mkdir(wsPath, { recursive: true });
+      await git(['init', '-b', 'main'], wsPath);
+      await git(['config', 'user.name', 'test'], wsPath);
+      await git(['config', 'user.email', 'test@example.com'], wsPath);
+      await writeFile(path.join(wsPath, 'a.txt'), 'base\n');
+      await git(['add', '.'], wsPath);
+      await git(['commit', '-m', 'base'], wsPath);
+      const restored = await restorePushedBranch(wsPath, 'agent/99');
+      assert.equal(restored, false);
+    } finally {
       await rm(wsRoot, { recursive: true, force: true });
     }
   });

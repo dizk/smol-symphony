@@ -247,9 +247,57 @@ export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise
     workspacePath,
   );
 
-  // 6. Cut the per-issue branch off base. After this HEAD is `branch`, ready
-  //    for the dispatched agent to commit against.
+  // 6. Land HEAD on the per-issue branch. When the branch already exists on
+  //    `origin` (a re-dispatch after the PR autopilot routes a conflicting issue
+  //    back to the implementing state, or any prior push), restore it so the
+  //    agent's already-pushed work is carried forward and rebased onto the fresh
+  //    base — rather than cutting a new branch off base and orphaning that work.
+  //    Only the issue's first dispatch (no remote branch yet) takes the
+  //    fresh-cut path. See `restorePushedBranch` for the loop this closes.
+  if (await restorePushedBranch(workspacePath, branch)) return;
   await runGitExpect(['checkout', '-b', branch], workspacePath);
+}
+
+/**
+ * Restore an already-pushed per-issue branch into a freshly-cloned workspace, so
+ * a re-dispatch continues from the work that was pushed instead of discarding it.
+ * Returns true when `origin/<branch>` existed and HEAD now sits on a local
+ * `<branch>` at the fetched remote tip; false when there is no `origin`
+ * (local-only mode) or no such remote branch yet (the issue's first dispatch), in
+ * which case the caller cuts a fresh branch off base.
+ *
+ * The dispatched agent rebases this restored branch onto the freshly-fetched base
+ * (`fetchBaseInWorkspace` + the Todo prompt's `git rebase origin/<base>`), so a
+ * stale-based restored branch is carried forward and any conflicts resolved as
+ * part of the normal flow. Without this restore, every re-dispatch cut a
+ * brand-new branch off base and orphaned the pushed `agent/<id>` commits: a
+ * bounced issue redid all its work from scratch and its remote branch never
+ * advanced past the first push, so the PR stayed CONFLICTING and the autopilot
+ * re-routed it forever — a non-converging Done→conflict→reroute→redo loop.
+ *
+ * Network git calls run with `GIT_TERMINAL_PROMPT=0` so an unreachable or
+ * unauthenticated origin fails fast (and the caller falls back to a fresh branch)
+ * instead of blocking on a credential prompt.
+ */
+export async function restorePushedBranch(
+  workspacePath: string,
+  branch: string,
+): Promise<boolean> {
+  const noPrompt = { cwd: workspacePath, env: { GIT_TERMINAL_PROMPT: '0' } };
+  const remoteCheck = await runProcess('git', ['remote', 'get-url', 'origin'], {
+    cwd: workspacePath,
+  });
+  if (remoteCheck.exit_code !== 0) return false;
+  const exists = await runProcess(
+    'git',
+    ['ls-remote', '--exit-code', '--heads', 'origin', branch],
+    noPrompt,
+  );
+  if (exists.exit_code !== 0) return false;
+  const fetched = await runProcess('git', ['fetch', '--no-tags', 'origin', branch], noPrompt);
+  if (fetched.exit_code !== 0) return false;
+  await runGitExpect(['checkout', '-b', branch, 'FETCH_HEAD'], workspacePath);
+  return true;
 }
 
 /**
