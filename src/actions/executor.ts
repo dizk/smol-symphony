@@ -313,6 +313,17 @@ function finalizeOutcome(
     opts.capture?.onChunk?.('stdout', `[action ${actionKey}] ok${note}\n`);
     return { aborted: false, route_to: null, reason: null };
   }
+  return finalizeFailure(actionKey, outcome, policy, opts, upd, iso);
+}
+
+function finalizeFailure(
+  actionKey: string,
+  outcome: ActionOutcome,
+  policy: { then: 'abort' | { route_to: string } },
+  opts: ActionExecutorOptions,
+  upd: (key: string, next: Partial<ActionStatus>) => void,
+  iso: () => string,
+): EffectStep {
   const route = outcome.route_to ?? (typeof policy.then === 'object' ? policy.then.route_to : null);
   const reason = outcome.reason ?? 'unknown';
   const suffix = route ? `; routing to ${route}` : '';
@@ -585,47 +596,66 @@ async function applyRunInVm(
   const cacheRoot = opts.cacheRoot ?? runInVmCacheRoot();
   const env = action.env ?? {};
   const hash = await computeCacheHash({ workspacePath: opts.workspacePath, cmd: action.cmd, env });
-  const cached = await readCache(cacheRoot, action.name, hash);
-  if (cached && cached.exit_code === 0) {
-    // Cache hits only on prior success: "Did `npm test` already pass against
-    // this tree hash?" The issue body's framing matches Bazel's semantics —
-    // failures are transient (flaky test, network blip) and must not gate
-    // a fresh execution. The retry policy + per-attempt re-execution work
-    // together to give the in-process retry window a real chance.
-    opts.capture?.onChunk?.(
-      'stdout',
-      `[run_in_vm ${action.name}] cache hit (hash=${hash.slice(0, 12)}…); skipping execution\n`,
-    );
-    return { ok: true, reason: null, route_to: null, cache_hit: true };
-  }
+  const hit = await tryRunInVmCacheHit(action, cacheRoot, hash, opts);
+  if (hit) return hit;
   // The only escape hatch for arbitrary commands runs inside the per-issue
   // VM (the sandbox the agent was just running in). When no `runInVm`
   // closure is wired, fail loudly rather than fall back to host spawn —
   // dropping the sandbox boundary for the one surface that can carry
   // arbitrary commands is exactly the regression issue 36's typed-action
   // design exists to prevent.
-  if (!opts.runInVm) {
+  const runner = opts.runInVm;
+  if (!runner) {
     return {
       ok: false,
       reason: `run_in_vm "${action.name}" failed: no VM runner wired`,
       route_to: null,
     };
   }
+  return executeRunInVm(action, env, cacheRoot, hash, runner, opts);
+}
+
+async function tryRunInVmCacheHit(
+  action: RunInVmAction,
+  cacheRoot: string,
+  hash: string,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome | null> {
+  const cached = await readCache(cacheRoot, action.name, hash);
+  // Cache hits only on prior success: "Did `npm test` already pass against
+  // this tree hash?" The issue body's framing matches Bazel's semantics —
+  // failures are transient (flaky test, network blip) and must not gate
+  // a fresh execution. The retry policy + per-attempt re-execution work
+  // together to give the in-process retry window a real chance.
+  if (!cached || cached.exit_code !== 0) return null;
+  opts.capture?.onChunk?.(
+    'stdout',
+    `[run_in_vm ${action.name}] cache hit (hash=${hash.slice(0, 12)}…); skipping execution\n`,
+  );
+  return { ok: true, reason: null, route_to: null, cache_hit: true };
+}
+
+async function executeRunInVm(
+  action: RunInVmAction,
+  env: Record<string, string>,
+  cacheRoot: string,
+  hash: string,
+  runner: RunInVmExecutor,
+  opts: ActionExecutorOptions,
+): Promise<ActionOutcome> {
   const timeoutMs = (action.timeout ?? Math.ceil((opts.defaultCommandTimeoutMs ?? 300_000) / 1000)) * 1000;
-  const onStdout = (chunk: string): void => {
-    opts.capture?.onChunk?.('stdout', chunk);
-  };
-  const onStderr = (chunk: string): void => {
-    opts.capture?.onChunk?.('stderr', chunk);
-  };
-  const res = await opts.runInVm({
+  const res = await runner({
     name: action.name,
     cmd: action.cmd,
     env,
     workdir: opts.workspacePath,
     timeoutMs,
-    onStdout,
-    onStderr,
+    onStdout: (chunk): void => {
+      opts.capture?.onChunk?.('stdout', chunk);
+    },
+    onStderr: (chunk): void => {
+      opts.capture?.onChunk?.('stderr', chunk);
+    },
   });
   opts.capture?.onResult?.({
     ran: true,
@@ -635,24 +665,24 @@ async function applyRunInVm(
     stdout: res.stdout,
     stderr: res.stderr,
   });
+  if (res.exit_code !== 0) {
+    return {
+      ok: false,
+      reason: `run_in_vm "${action.name}" exit=${res.exit_code}: ${diagnostic(res)}`,
+      route_to: null,
+    };
+  }
+  // Cache successes only; see the comment in `tryRunInVmCacheHit`.
   const result = {
     exit_code: res.exit_code ?? -1,
     stdout: res.stdout,
     stderr: res.stderr,
     finished_at: isoFromClock(opts.now ?? realClock),
   };
-  if (res.exit_code === 0) {
-    // Cache successes only; see comment above the readCache branch.
-    await writeCache(cacheRoot, action.name, hash, result).catch((err) =>
-      log.warn('run_in_vm cache write failed', { name: action.name, hash, error: (err as Error).message }),
-    );
-    return { ok: true, reason: null, route_to: null };
-  }
-  return {
-    ok: false,
-    reason: `run_in_vm "${action.name}" exit=${res.exit_code}: ${diagnostic(res)}`,
-    route_to: null,
-  };
+  await writeCache(cacheRoot, action.name, hash, result).catch((err) =>
+    log.warn('run_in_vm cache write failed', { name: action.name, hash, error: (err as Error).message }),
+  );
+  return { ok: true, reason: null, route_to: null };
 }
 
 /**
