@@ -46,15 +46,21 @@ import {
 import { defaultPredicateEnv } from '../actions/predicate-env.js';
 import type { ResourceSnapshot } from '../reconciler/index.js';
 import {
+  classifyTurnOutcome,
   decideAttemptOutcome,
   decideCleanupExecution,
+  decideTurnContinuation,
+  deriveActionContext,
+  selectPromptKind,
   shouldStageAfterRunEnv,
 } from './runner-decisions.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { RunLog } from '../runlog.js';
 import type { HookCapture, HookResult } from '../workspace.js';
-import type { AcpBridge } from '../acp-bridge.js';
+import type { AcpBridge, AcpBridgeRegistration } from '../acp-bridge.js';
 import type { Socket } from 'node:net';
+import type { ExecStream } from './smolvm-port.js';
+import type { AdapterProfile } from './adapters.js';
 
 export interface AgentRunnerEvents {
   onSessionStarted?: (info: {
@@ -353,36 +359,25 @@ export class AgentRunner {
 
   /**
    * Resolve the action templating context from the staged `extraEnv` map and
-   * the running entry. The context fields mirror the SYMPHONY_* env names so
-   * a Done state that previously read `$SYMPHONY_BRANCH` from the hook env
-   * now reads `$branch` from the action template namespace.
+   * the running entry. Pass-through to the pure `deriveActionContext` helper
+   * so the env fallback chain stays out of the imperative-shell complexity
+   * budget; the shell only adapts `RunningEntry` → the helper's input shape
+   * and feeds `process.env.SYMPHONY_REPO`.
    */
   private buildActionContext(
     entry: RunningEntry,
     workspacePath: string,
     extraEnv: Record<string, string> | undefined,
   ): ActionContext {
-    const branch = extraEnv?.SYMPHONY_BRANCH ?? `agent/${entry.identifier}`;
-    const baseBranch = extraEnv?.SYMPHONY_BASE_BRANCH ?? 'main';
-    const prTitle =
-      extraEnv?.SYMPHONY_PR_TITLE ??
-      (entry.issue.title.trim().length > 0
-        ? `${entry.issue.id}: ${entry.issue.title.trim()}`
-        : entry.issue.id);
-    const prBodyFile = extraEnv?.SYMPHONY_PR_BODY_FILE ?? '';
-    return {
+    return deriveActionContext({
       identifier: entry.identifier,
-      workspace: workspacePath,
-      branch,
-      base_branch: baseBranch,
-      issue_title: entry.issue.title ?? '',
-      issue_body: entry.issue.description ?? '',
-      repo: process.env.SYMPHONY_REPO && process.env.SYMPHONY_REPO.length > 0
-        ? process.env.SYMPHONY_REPO
-        : null,
-      pr_title: prTitle,
-      pr_body_file: prBodyFile,
-    };
+      workspacePath,
+      issueId: entry.issue.id,
+      issueTitle: entry.issue.title ?? '',
+      issueDescription: entry.issue.description,
+      repoEnv: process.env.SYMPHONY_REPO,
+      extraEnv,
+    });
   }
 
   /**
@@ -573,6 +568,69 @@ export class AgentRunner {
   }
 
   /**
+   * Stage the SYMPHONY_* env + temp body file for the post-attempt
+   * actions/hook, if the gate says one will read it. Returns the env map
+   * (or undefined) plus a cleanup closure the caller MUST run; on staging
+   * failure the closure is a no-op and the warning is logged here so the
+   * shell stays under budget.
+   */
+  private async stageCleanupEnv(
+    decisionInput: { hasRunningEntry: boolean; actionsLength: number; hasAfterRunHook: boolean },
+    runningEntry: RunningEntry | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<{ extraEnv: Record<string, string> | undefined; cleanup: () => Promise<void> }> {
+    const noop = async (): Promise<void> => undefined;
+    if (!shouldStageAfterRunEnv(decisionInput)) return { extraEnv: undefined, cleanup: noop };
+    try {
+      const built = await buildAfterRunHookEnv(runningEntry!);
+      return { extraEnv: built.env, cleanup: built.cleanup };
+    } catch (err) {
+      logger.warn('after_run env staging failed; running hook without SYMPHONY_PR_* vars', {
+        error: (err as Error).message,
+      });
+      return { extraEnv: undefined, cleanup: noop };
+    }
+  }
+
+  /**
+   * Run the per-state `actions:` block (issue 36 AC2 — wins over `hooks.after_run`).
+   * Returns the non-routed action failure reason, or null when the actions
+   * succeeded or reroute fired (routed failures are intentional — the agent's
+   * work is done; the issue lives on in the routed state).
+   */
+  private async executeCleanupActions(
+    cleanupState: string,
+    cleanupActions: readonly WorkflowAction[],
+    runningEntry: RunningEntry,
+    workspacePath: string,
+    vmReady: boolean,
+    vmName: string,
+    extraEnv: Record<string, string> | undefined,
+    hookCapture: (hook: string) => HookCapture | undefined,
+    runLog: RunLog | undefined,
+  ): Promise<string | null> {
+    // run_in_vm goes through the per-issue VM's exec channel. The VM is still
+    // alive here — destroy is deferred to the reconciler after runAttempt
+    // returns. The `vmReady` guard mirrors the bring-up gate.
+    const runInVm: RunInVmExecutor | undefined = vmReady
+      ? this.buildVmRunInVm(vmName, runLog)
+      : undefined;
+    const actionResult = await this.runStateActions(
+      cleanupState,
+      cleanupActions,
+      runningEntry,
+      workspacePath,
+      extraEnv,
+      hookCapture('actions'),
+      runInVm,
+    );
+    if (!actionResult.ok && !actionResult.route_to) {
+      return actionResult.reason ?? 'unknown';
+    }
+    return null;
+  }
+
+  /**
    * Cleanup: dispatch the per-state `actions:` block or the legacy
    * `hooks.after_run` shell, gated on `decideCleanupExecution`. Stages the
    * SYMPHONY_* env vars + temp body file once for whichever branch runs and
@@ -599,56 +657,46 @@ export class AgentRunner {
       hasAfterRunHook: Boolean(cleanupHooks.after_run),
     };
     const cleanupExec = decideCleanupExecution(decisionInput);
-    let extraEnv: Record<string, string> | undefined,
-      extraEnvCleanup: (() => Promise<void>) | null = null;
-    if (shouldStageAfterRunEnv(decisionInput)) {
-      try {
-        ({ env: extraEnv, cleanup: extraEnvCleanup } = await buildAfterRunHookEnv(
-          runningEntry!,
-        ));
-      } catch (err) {
-        logger.warn('after_run env staging failed; running hook without SYMPHONY_PR_* vars', {
-          error: (err as Error).message,
-        });
-      }
-    }
-    let nonRoutedActionFailureReason: string | null = null;
+    const staged = await this.stageCleanupEnv(decisionInput, runningEntry, logger);
     try {
-      // Per-state `actions:` block wins over `hooks.after_run` (issue 36
-      // AC2). decideCleanupExecution guarantees runningEntry + non-empty
-      // cleanupActions when it returns 'actions', so the `!`s are sound.
+      // decideCleanupExecution guarantees runningEntry + non-empty cleanupActions
+      // when it returns 'actions', so the `!`s are sound.
       if (cleanupExec === 'actions') {
-        // run_in_vm goes through the per-issue VM's exec channel. The VM is
-        // still alive here — destroy is deferred to the reconciler after
-        // runAttempt returns. The `vmReady` guard mirrors the bring-up gate.
-        const runInVm: RunInVmExecutor | undefined = vmReady
-          ? this.buildVmRunInVm(vmName, runLog)
-          : undefined;
-        const actionResult = await this.runStateActions(
+        return await this.executeCleanupActions(
           cleanupState,
           cleanupActions!,
           runningEntry!,
           workspacePath,
-          extraEnv,
-          hookCapture('actions'),
-          runInVm,
+          vmReady,
+          vmName,
+          staged.extraEnv,
+          hookCapture,
+          runLog,
         );
-        if (!actionResult.ok && !actionResult.route_to) {
-          nonRoutedActionFailureReason = actionResult.reason ?? 'unknown';
-        }
-      } else if (cleanupExec === 'hook') {
+      }
+      if (cleanupExec === 'hook') {
         await this.workspaces.runAfterRunBestEffort(
           workspacePath,
           cleanupHooks,
           hookCapture('after_run'),
-          extraEnv,
+          staged.extraEnv,
         );
       }
+      return null;
     } finally {
-      if (extraEnvCleanup) await extraEnvCleanup();
+      await staged.cleanup();
     }
-    return nonRoutedActionFailureReason;
   }
+
+  /**
+   * Per-attempt context assembled once the VM is up and the bridge is registered.
+   * Everything `tearDownSession` needs to unwind cleanly lives here so post-VM
+   * failure paths share one teardown contract. `acpSocket` is `null` until the
+   * in-VM agent dials back; teardown checks for null before destroying.
+   */
+  private static readonly STDERR_RING_LIMIT = 240;
+  private static readonly STDERR_LOG_LIMIT = 500;
+  private static readonly STEERING_PREVIEW_LIMIT = 240;
 
   async runAttempt(
     issue: Issue,
@@ -658,10 +706,109 @@ export class AgentRunner {
     runLog?: RunLog,
   ): Promise<RunAttemptResult> {
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
-    // Resolve adapter/model/max_turns once for this attempt against the issue's current
-    // state. Every downstream read in this method goes through `resolved`, not the live
-    // `this.cfg.acp.*` / `this.cfg.agent.max_turns` — that way a workflow reload between
-    // here and the final loop iteration cannot redirect the adapter or change the budget.
+    try {
+      return await this.runAttemptCore(issue, attempt, cancelSignal, runningEntry, runLog, logger);
+    } catch (err) {
+      if (err instanceof PhaseFailure) return err.attemptResult;
+      throw err;
+    }
+  }
+
+  /**
+   * Phase pipeline that backs `runAttempt`. Each `unwrap(...)` either yields
+   * the phase's success value or throws `PhaseFailure` (caught by `runAttempt`
+   * and converted to a `RunAttemptResult`). This keeps the orchestrator under
+   * the imperative-shell budget while preserving the strict ordering of the
+   * original 535-line method.
+   */
+  private async runAttemptCore(
+    issue: Issue,
+    attempt: number | null,
+    cancelSignal: { cancelled: boolean },
+    runningEntry: RunningEntry | undefined,
+    runLog: RunLog | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<RunAttemptResult> {
+    const resolved = this.unwrap(this.resolveAttemptDispatch(issue, logger));
+    const hookCapture = this.makeHookCapture(runLog);
+    const initialHooks = resolveHooksForState(this.cfg, issue.state);
+    const ws = this.unwrap(
+      await this.setupWorkspace(issue, initialHooks, hookCapture, runLog, logger),
+    );
+    const adapter = this.unwrap(
+      await this.prepareAdapterRuntime(ws.workspace.path, resolved, initialHooks, hookCapture, logger),
+    );
+    const bridge = this.unwrap(this.validateAcpBridge(logger));
+    const vm = this.unwrap(
+      await this.bringUpVmAndExec({
+        issue,
+        resolved,
+        workspacePath: ws.workspace.path,
+        adapter,
+        acpReachUrl: bridge.acpReachUrl,
+        initialHooks,
+        hookCapture,
+        runLog,
+        logger,
+      }),
+    );
+    const ctx: SessionContext = {
+      issue,
+      runningEntry,
+      workspacePath: ws.workspace.path,
+      vmName: vm.vmName,
+      vmReady: true,
+      bridgeReg: vm.bridgeReg,
+      execStream: vm.execStream,
+      acpSocket: null,
+      hookCapture,
+      runLog,
+      logger,
+    };
+    const session = this.unwrap(
+      await this.connectBridgeAndInitSession({
+        ctx,
+        resolved,
+        cancelSignal,
+        acpReachUrl: bridge.acpReachUrl,
+      }),
+    );
+    const activeStates = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
+    const loopRes = await this.runTurnLoop({
+      ctx,
+      client: session.client,
+      resolved,
+      cancelSignal,
+      attempt,
+      activeStates,
+    });
+    clearInterval(session.cancelCheckTimer);
+    const tearReason = loopRes.kind === 'mid_failure' ? loopRes.cleanupReason : loopRes.lastReason;
+    const nonRouted = await this.tearDownSession(ctx, tearReason);
+    return composeAttemptResult({ loopRes, sessionId: session.sessionId, nonRouted });
+  }
+
+  /** Convert a PhaseResult into either the success value or a thrown PhaseFailure. */
+  private unwrap<T>(res: PhaseResult<T>): T {
+    if (!res.ok) throw new PhaseFailure(res.result);
+    return res.value;
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 1: dispatch resolution
+  // -------------------------------------------------------------------------
+
+  /**
+   * Pin adapter/model/max_turns once at attempt start. Every downstream read
+   * goes through `resolved`, not the live `this.cfg.acp.*` — that way a
+   * workflow reload mid-attempt cannot redirect the adapter or change the
+   * budget. Fails fast on unknown adapter (defense in depth — validateDispatch
+   * + per-state validation should have caught it earlier).
+   */
+  private resolveAttemptDispatch(
+    issue: Issue,
+    logger: ReturnType<typeof withIssue>,
+  ): PhaseResult<ResolvedDispatchConfig> {
     let resolved: ResolvedDispatchConfig;
     try {
       resolved = resolveDispatchConfig(this.cfg, issue.state);
@@ -670,27 +817,31 @@ export class AgentRunner {
         error: (err as Error).message,
         state: issue.state,
       });
-      return {
-        ok: false,
-        reason: 'dispatch resolution error',
-        threadId: null,
-        turnsCompleted: 0,
-      };
+      return failPhase('dispatch resolution error');
     }
     if (!isKnownAdapter(resolved.adapter)) {
-      // Defense in depth: validateDispatch + per-state validation should have caught
-      // this. The state name is in the error so an operator who sees this in the logs
-      // can spot a typo in their per-state adapter override.
       logger.error('unknown acp adapter for state', {
         adapter: resolved.adapter,
         state: issue.state,
       });
-      return { ok: false, reason: 'unknown acp adapter', threadId: null, turnsCompleted: 0 };
+      return failPhase('unknown acp adapter');
     }
-    const hookCapture = (hook: string): HookCapture | undefined =>
+    return { ok: true, value: resolved };
+  }
+
+  /**
+   * Build the per-issue hook capture closure used by every workspace hook
+   * invocation in this attempt. Returns `undefined` when no run log was
+   * provided (production always wires one in; tests may not).
+   */
+  private makeHookCapture(
+    runLog: RunLog | undefined,
+  ): (hook: string) => HookCapture | undefined {
+    return (hook: string): HookCapture | undefined =>
       runLog
         ? {
-            onChunk: (stream, text) => runLog.record({ channel: 'hook', hook, stream, text }),
+            onChunk: (stream, text) =>
+              runLog.record({ channel: 'hook', hook, stream, text }),
             onResult: (r: HookResult) =>
               runLog.record({
                 channel: 'hook',
@@ -702,11 +853,19 @@ export class AgentRunner {
               }),
           }
         : undefined;
-    // Resolve hooks against the dispatch-time state. after_create only fires when the
-    // workspace is created (i.e. the first attempt against an issue), so this state is
-    // also the one whose after_create runs. before_run uses the same state — runAttempt
-    // runs once per attempt and the issue hasn't moved between dispatchIssue and here.
-    const initialHooks = resolveHooksForState(this.cfg, issue.state);
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2: workspace setup (ensureFor + base fetch + before_run)
+  // -------------------------------------------------------------------------
+
+  private async setupWorkspace(
+    issue: Issue,
+    initialHooks: ReturnType<typeof resolveHooksForState>,
+    hookCapture: (h: string) => HookCapture | undefined,
+    runLog: RunLog | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<{ workspace: Awaited<ReturnType<WorkspaceManager['ensureFor']>> }>> {
     let workspace: Awaited<ReturnType<WorkspaceManager['ensureFor']>>;
     try {
       workspace = await this.workspaces.ensureFor(
@@ -716,24 +875,34 @@ export class AgentRunner {
       );
     } catch (err) {
       logger.error('workspace error', { error: (err as Error).message });
-      return { ok: false, reason: 'workspace error', threadId: null, turnsCompleted: 0 };
+      return failPhase('workspace error');
     }
+    const fetchRes = await this.fetchBaseBranch(workspace.path, runLog, logger);
+    if (!fetchRes.ok) return fetchRes;
+    try {
+      await this.workspaces.runBeforeRun(workspace.path, initialHooks, hookCapture('before_run'));
+    } catch (err) {
+      logger.error('before_run hook failed', { error: (err as Error).message });
+      return failPhase('before_run hook error');
+    }
+    return { ok: true, value: { workspace } };
+  }
 
-    // Issue 101: a fresh `origin/<base>` is a dispatch precondition. The
-    // host fetches it before every dispatch (fresh OR re-dispatch) so the
-    // agent's first step (per the Todo prompt) — `git rebase origin/<base>`
-    // — runs against a current ref. The in-VM agent has no network
-    // credentials, so the host owns this. If the fetch fails when an
-    // `origin` is configured (auth, network, missing ref) we abort the
-    // attempt rather than launching the agent against a stale base; doing
-    // otherwise reproduces exactly the stale-base behavior this refactor
-    // eliminates. Skipped cleanly in local-only mode (no `origin`
-    // configured) — the source repo's local `<base>` is the only truth.
-    const baseBranch =
-      process.env.SYMPHONY_BASE_BRANCH && process.env.SYMPHONY_BASE_BRANCH.length > 0
-        ? process.env.SYMPHONY_BASE_BRANCH
-        : 'main';
-    const fetchResult = await fetchBaseInWorkspace(workspace.path, baseBranch);
+  /**
+   * Issue 101: a fresh `origin/<base>` is a dispatch precondition. The host
+   * fetches it before every dispatch (fresh OR re-dispatch) so the agent's
+   * first step — `git rebase origin/<base>` — runs against a current ref.
+   * Skipped cleanly in local-only mode (no `origin` configured) — the source
+   * repo's local `<base>` is the only truth there.
+   */
+  private async fetchBaseBranch(
+    workspacePath: string,
+    runLog: RunLog | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<void>> {
+    const envBase = process.env.SYMPHONY_BASE_BRANCH;
+    const baseBranch = envBase && envBase.length > 0 ? envBase : 'main';
+    const fetchResult = await fetchBaseInWorkspace(workspacePath, baseBranch);
     if (!fetchResult.ok) {
       logger.error('pre-dispatch base fetch failed; aborting attempt', {
         base_branch: baseBranch,
@@ -743,322 +912,460 @@ export class AgentRunner {
         base_branch: baseBranch,
         error: fetchResult.diagnostic,
       });
-      return {
-        ok: false,
-        reason: 'pre-dispatch base fetch failed',
-        threadId: null,
-        turnsCompleted: 0,
-      };
+      return failPhase('pre-dispatch base fetch failed');
     }
     if (!fetchResult.skipped) {
       runLog?.system('pre_dispatch_base_fetch_ok', { base_branch: baseBranch });
     }
+    return { ok: true, value: undefined };
+  }
 
-    try {
-      await this.workspaces.runBeforeRun(workspace.path, initialHooks, hookCapture('before_run'));
-    } catch (err) {
-      logger.error('before_run hook failed', { error: (err as Error).message });
-      return { ok: false, reason: 'before_run hook error', threadId: null, turnsCompleted: 0 };
-    }
+  // -------------------------------------------------------------------------
+  // Phase 3: adapter runtime preparation (credentials + injections)
+  // -------------------------------------------------------------------------
 
-    // Resolve adapter launch. Under the TCP bridge architecture there is exactly one
-    // launch shape: scrub the in-VM credential dir, stage the host credential into the
-    // workspace, exec the in-VM proxy at /opt/symphony/vm-agent.mjs. The proxy reads its
-    // config (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from env, dials the
-    // host's bridge, and spawns the adapter. The adapter id was already validated up
-    // top via `resolved` (which folds in any per-state override); the branches below are
-    // pure data binding off the resolved profile.
+  /**
+   * Stage the credential, apply model/effort runtime injections, and derive
+   * the final ACP launch command. Behavior-preserving quirk: the
+   * runtime-injection failure path falls back to `this.cfg.hooks` (workflow
+   * level) instead of `initialHooks` (per-state) for `after_run`. The
+   * credential-staging failure path uses `initialHooks` like every other
+   * pre-handshake failure.
+   */
+  private async prepareAdapterRuntime(
+    workspacePath: string,
+    resolved: ResolvedDispatchConfig,
+    initialHooks: ReturnType<typeof resolveHooksForState>,
+    hookCapture: (h: string) => HookCapture | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<AdapterRuntime>> {
     const profile = ADAPTERS[resolved.adapter];
-    let staged;
+    let staged: Awaited<ReturnType<typeof stageCredential>>;
     try {
-      staged = await stageCredential(workspace.path, profile);
+      staged = await stageCredential(workspacePath, profile);
     } catch (err) {
       logger.error('credential staging failed', {
         adapter: profile.id,
         error: (err as Error).message,
       });
       await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
+        workspacePath,
         initialHooks,
         hookCapture('after_run'),
       );
-      return { ok: false, reason: 'credential staging error', threadId: null, turnsCompleted: 0 };
+      return failPhase('credential staging error');
     }
-    const adapterBin = profile.binary[0]!;
-    const adapterArgs = profile.binary.slice(1);
-    // Apply the resolved model / effort selections (if any) to the adapter via its
-    // profile-specific mechanisms: env var for claude-agent-acp's ANTHROPIC_MODEL, extra
-    // argv for codex-acp's `-c model=...`, staged file for claude-agent-acp's
-    // settings.json (effortLevel lives there). The injections compose along three
-    // orthogonal channels — env, extraArgs, stagedFiles — so codex (argv-based) and
-    // claude (env + file-based) coexist without per-adapter branching here.
-    const runtimeEnv: Record<string, string> = {};
-    const runtimeArgs: string[] = [];
-    const runtimeExtraFiles: ExtraGuestFile[] = [];
-    const applyInjection = async (inj: ModelInjection): Promise<void> => {
-      if (inj.env) {
-        for (const [k, v] of Object.entries(inj.env)) runtimeEnv[k] = v;
-      }
-      if (inj.extraArgs) runtimeArgs.push(...inj.extraArgs);
-      if (inj.stagedFiles) {
-        for (const f of inj.stagedFiles) {
-          const stagedFile = await stageRuntimeFile(workspace.path, f.stagedName, f.content);
-          runtimeExtraFiles.push({
-            stagedRelPath: stagedFile.relPath,
-            guestPath: f.guestPath,
-          });
-        }
-      }
-    };
+    let injected: { runtimeEnv: Record<string, string>; runtimeArgs: string[]; runtimeExtraFiles: ExtraGuestFile[] };
     try {
-      if (resolved.model) {
-        await applyInjection(profile.modelInjection(resolved.model));
-      }
-      if (resolved.effort && profile.effortInjection) {
-        await applyInjection(profile.effortInjection(resolved.effort));
-      }
+      injected = await this.applyRuntimeInjections(workspacePath, profile, resolved);
     } catch (err) {
       logger.error('runtime injection staging failed', {
         adapter: profile.id,
         error: (err as Error).message,
       });
+      // `this.cfg.hooks` (not `initialHooks`) is intentional — preserves the
+      // prior contract on this specific failure path. See issue 103 brief.
       await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
+        workspacePath,
         this.cfg.hooks,
         hookCapture('after_run'),
       );
-      return {
-        ok: false,
-        reason: 'runtime injection staging error',
-        threadId: null,
-        turnsCompleted: 0,
-      };
+      return failPhase('runtime injection staging error');
     }
-    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, runtimeExtraFiles);
-    const effectiveAdapterArgs = [...adapterArgs, ...runtimeArgs];
+    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, injected.runtimeExtraFiles);
+    const adapterBin = profile.binary[0]!;
+    const adapterArgs = profile.binary.slice(1);
+    return {
+      ok: true,
+      value: {
+        profile,
+        adapterBin,
+        effectiveAcpCommand,
+        effectiveAdapterArgs: [...adapterArgs, ...injected.runtimeArgs],
+        runtimeEnv: injected.runtimeEnv,
+      },
+    };
+  }
 
-    // The TCP bridge is mandatory. Without it there's no transport for ACP frames; we
-    // would be back to the smolvm-exec stdio path the bridge replaced. Fail fast.
+  /**
+   * Compose the model + effort injections through the three orthogonal
+   * channels the adapter profile declares: env vars (claude-agent-acp's
+   * ANTHROPIC_MODEL), extra argv (codex-acp's `-c model=...`), and staged
+   * files (claude-agent-acp's settings.json for `effortLevel`).
+   */
+  private async applyRuntimeInjections(
+    workspacePath: string,
+    profile: AdapterProfile,
+    resolved: ResolvedDispatchConfig,
+  ): Promise<{
+    runtimeEnv: Record<string, string>;
+    runtimeArgs: string[];
+    runtimeExtraFiles: ExtraGuestFile[];
+  }> {
+    const acc = { runtimeEnv: {} as Record<string, string>, runtimeArgs: [] as string[], runtimeExtraFiles: [] as ExtraGuestFile[] };
+    if (resolved.model) {
+      await this.applyModelInjection(workspacePath, profile.modelInjection(resolved.model), acc);
+    }
+    if (resolved.effort && profile.effortInjection) {
+      await this.applyModelInjection(workspacePath, profile.effortInjection(resolved.effort), acc);
+    }
+    return acc;
+  }
+
+  /** Fold one injection into the accumulator (env / args / staged files). */
+  private async applyModelInjection(
+    workspacePath: string,
+    inj: ModelInjection,
+    acc: {
+      runtimeEnv: Record<string, string>;
+      runtimeArgs: string[];
+      runtimeExtraFiles: ExtraGuestFile[];
+    },
+  ): Promise<void> {
+    if (inj.env) {
+      for (const [k, v] of Object.entries(inj.env)) acc.runtimeEnv[k] = v;
+    }
+    if (inj.extraArgs) acc.runtimeArgs.push(...inj.extraArgs);
+    if (inj.stagedFiles) {
+      for (const f of inj.stagedFiles) {
+        const stagedFile = await stageRuntimeFile(workspacePath, f.stagedName, f.content);
+        acc.runtimeExtraFiles.push({ stagedRelPath: stagedFile.relPath, guestPath: f.guestPath });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 4: bridge presence + reach URL
+  // -------------------------------------------------------------------------
+
+  /**
+   * The TCP bridge is mandatory — without it there is no transport for ACP
+   * frames. Returns the reach URL the in-VM agent will dial back to,
+   * preferring the explicit `reach_url` override over the host/port derived
+   * from the bridge's bound port.
+   */
+  private validateAcpBridge(
+    logger: ReturnType<typeof withIssue>,
+  ): PhaseResult<{ acpReachUrl: string }> {
     if (!this.acpBridge) {
       logger.error('acp bridge is not configured', {});
-      return { ok: false, reason: 'acp bridge unavailable', threadId: null, turnsCompleted: 0 };
+      return failPhase('acp bridge unavailable');
     }
+    const port = this.acpBridge.port() ?? this.cfg.acp.bridge.bind_port;
     const acpReachUrl =
-      this.cfg.acp.bridge.reach_url ??
-      `tcp://${this.cfg.acp.bridge.reach_host}:${this.acpBridge.port() ?? this.cfg.acp.bridge.bind_port}`;
+      this.cfg.acp.bridge.reach_url ?? `tcp://${this.cfg.acp.bridge.reach_host}:${port}`;
+    return { ok: true, value: { acpReachUrl } };
+  }
 
-    const vmName = this.vmNameFor(issue);
-    const mounts = [
-      { host: workspace.path, guest: workspace.path, readonly: false },
+  // -------------------------------------------------------------------------
+  // Phase 5: VM bring-up + bridge register + exec stream
+  // -------------------------------------------------------------------------
+
+  /**
+   * Bring up the per-issue VM, register with the ACP bridge, and start the
+   * in-VM proxy via smolvm exec. VM start happens BEFORE bridge register so a
+   * `register()` synchronous throw cannot leave us with a half-staged
+   * registration whose `accepted` promise has no `.catch` attached yet
+   * (Node ≥ 15 crashes on unhandled rejections).
+   */
+  private async bringUpVmAndExec(args: {
+    issue: Issue;
+    resolved: ResolvedDispatchConfig;
+    workspacePath: string;
+    adapter: AdapterRuntime;
+    acpReachUrl: string;
+    initialHooks: ReturnType<typeof resolveHooksForState>;
+    hookCapture: (h: string) => HookCapture | undefined;
+    runLog: RunLog | undefined;
+    logger: ReturnType<typeof withIssue>;
+  }): Promise<PhaseResult<VmExecHandle>> {
+    const vmName = this.vmNameFor(args.issue);
+    const startInputs = this.buildVmStartInputs(args.workspacePath, args.resolved);
+    const startRes = await this.startVmOrFail(
+      vmName,
+      startInputs,
+      args.workspacePath,
+      args.initialHooks,
+      args.hookCapture,
+      args.logger,
+    );
+    if (!startRes.ok) return startRes;
+    const regRes = await this.registerBridgeOrFail(
+      args.issue,
+      args.workspacePath,
+      args.initialHooks,
+      args.hookCapture,
+      args.logger,
+    );
+    if (!regRes.ok) return regRes;
+    const execStream = this.launchExecStream(
+      vmName,
+      args.workspacePath,
+      regRes.value.bridgeReg,
+      args.acpReachUrl,
+      args.adapter,
+    );
+    this.attachStderrTap(execStream, args.issue, args.runLog, args.logger);
+    return { ok: true, value: { vmName, execStream, bridgeReg: regRes.value.bridgeReg } };
+  }
+
+  /**
+   * Compose the VM bring-up arguments. Splits assembly into three pure
+   * sub-helpers (mounts, env, source config) so each stays under budget;
+   * `bakedFrom` (issue 32) gates source selection — when a baked artifact
+   * is ready the runner passes `--from <path>` and skips the per-start
+   * `[dev].init` cost.
+   */
+  private buildVmStartInputs(
+    workspacePath: string,
+    resolved: ResolvedDispatchConfig,
+  ): VmStartInputs {
+    const bakedFrom = this.bakedArtifacts?.artifactPath() ?? null;
+    return {
+      mounts: this.buildVmMounts(workspacePath, resolved),
+      env: this.buildForwardedEnv(),
+      ...this.buildVmSourceConfig(bakedFrom),
+    };
+  }
+
+  private buildVmMounts(
+    workspacePath: string,
+    resolved: ResolvedDispatchConfig,
+  ): Array<{ host: string; guest: string; readonly: boolean }> {
+    const mounts: Array<{ host: string; guest: string; readonly: boolean }> = [
+      { host: workspacePath, guest: workspacePath, readonly: false },
     ];
     for (const v of this.cfg.smolvm.volumes) {
       mounts.push({ host: v.host, guest: v.guest, readonly: v.readonly });
     }
-    // Eval/debug mode (issue 40): when the resolved state opts in, mount the
-    // tracker root + logs root read-only so an in-VM agent can inspect every
-    // issue file and the per-issue JSONL transcripts. Skipped silently when
-    // the state did not opt in; the mount list grows by at most two slots
-    // here (smolvm's per-VM mount cap is small but the workspace itself only
-    // takes one slot, so the two extras fit comfortably).
     for (const m of buildEvalModeMounts(this.cfg, resolved)) {
       mounts.push(m);
     }
+    return mounts;
+  }
+
+  private buildForwardedEnv(): Record<string, string> {
     const env: Record<string, string> = {};
     for (const k of this.cfg.smolvm.forward_env) {
       const v = process.env[k];
       if (v && v.length > 0) env[k] = v;
     }
+    return env;
+  }
 
-    // Bring up the VM BEFORE registering with the ACP bridge. If we registered first and
-    // ensureRunning then threw, the catch path would call `bridgeReg.cancel(...)` which
-    // synchronously rejects the registration's `accepted` promise — and at that point no
-    // .catch handler is attached yet (the awaiter is wired further below). The resulting
-    // unhandled-rejection crashes the orchestrator (Node ≥ 15 default). Registering after
-    // a successful bring-up makes the cancel path moot for that early failure.
-    let vmReady = false;
-    // Issue 32: when the reconciler has a ready baked artifact, dispatch uses
-    // `--from <cache_path>` so the per-start [dev].init cost is paid once at bake
-    // time instead of on every dispatch. Falls back to the static `smolvm.{from,
-    // smolfile,image}` config when no bake is ready (only relevant for harnesses
-    // that don't wire a reconciler; production dispatch is gated by the
-    // orchestrator on `reconciler.dispatchReady()` and reaches here only when
-    // a bake is ready or no Smolfile is configured).
-    const bakedFrom = this.bakedArtifacts?.artifactPath() ?? null;
-    const vmFrom = bakedFrom ?? this.cfg.smolvm.from;
-    const vmSmolfile = bakedFrom ? null : this.cfg.smolvm.smolfile;
-    const vmImage = bakedFrom ? null : this.cfg.smolvm.image;
+  private buildVmSourceConfig(
+    bakedFrom: string | null,
+  ): { vmFrom: string | null; vmSmolfile: string | null; vmImage: string | null } {
+    return {
+      vmFrom: bakedFrom ?? this.cfg.smolvm.from,
+      vmSmolfile: bakedFrom ? null : this.cfg.smolvm.smolfile,
+      vmImage: bakedFrom ? null : this.cfg.smolvm.image,
+    };
+  }
+
+  private async startVmOrFail(
+    vmName: string,
+    inputs: VmStartInputs,
+    workspacePath: string,
+    initialHooks: ReturnType<typeof resolveHooksForState>,
+    hookCapture: (h: string) => HookCapture | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<void>> {
     try {
       await this.smolvm.ensureRunning(vmName, {
-        image: vmImage,
-        from: vmFrom,
-        smolfile: vmSmolfile,
+        image: inputs.vmImage,
+        from: inputs.vmFrom,
+        smolfile: inputs.vmSmolfile,
         cpus: this.cfg.smolvm.cpus,
         memMib: this.cfg.smolvm.mem_mib,
         net: this.cfg.smolvm.net,
-        mounts,
-        env,
-        workdir: workspace.path,
+        mounts: inputs.mounts,
+        env: inputs.env,
+        workdir: workspacePath,
         sshAgent: false,
       });
-      vmReady = true;
+      return { ok: true, value: undefined };
     } catch (err) {
       logger.error('smolvm bring-up failed', { error: (err as Error).message });
-      // ensureRunning can fail after `machine create` succeeded but before `machine start`
-      // — leaving a halted VM behind. Teardown is the reconciler `vm` resource's job
-      // (issue 52): on return, the orchestrator drops this issue from `running`, so the
-      // reaper sees the half-created VM as a stray and destroys it on the next kick
-      // (fired from `onWorkerExit`).
+      // ensureRunning can fail after `machine create` succeeded — teardown is
+      // the reconciler `vm` resource's job (issue 52). Returning here drops
+      // the running entry; the reaper kick in `onWorkerExit` converges the
+      // now-orphan VM.
       await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
+        workspacePath,
         initialHooks,
         hookCapture('after_run'),
       );
-      return { ok: false, reason: 'smolvm bring-up error', threadId: null, turnsCompleted: 0 };
+      return failPhase('smolvm bring-up error');
     }
+  }
 
-    // VM is up — now register with the bridge. The .accepted promise will get its
-    // rejection handler attached when we Promise.race against it below; that
-    // continuation is created within the same synchronous block so no failure path
-    // between here and there can crash on an unhandled rejection.
-    //
-    // register() throws synchronously if the bridge has already been stopped (e.g. a
-    // SIGTERM landed between ensureRunning resolving and this line). The VM is up at
-    // that point, so we must tear it down here — the cleanup closure that handles
-    // post-handshake failures isn't built yet.
-    let bridgeReg: ReturnType<AcpBridge['register']>;
+  private async registerBridgeOrFail(
+    issue: Issue,
+    workspacePath: string,
+    initialHooks: ReturnType<typeof resolveHooksForState>,
+    hookCapture: (h: string) => HookCapture | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<{ bridgeReg: AcpBridgeRegistration }>> {
     try {
-      bridgeReg = this.acpBridge.register(issue.id, issue.identifier);
+      const bridgeReg = this.acpBridge!.register(issue.id, issue.identifier);
+      return { ok: true, value: { bridgeReg } };
     } catch (err) {
       logger.error('acp bridge register failed', { error: (err as Error).message });
-      // VM is live but the bridge is gone; teardown belongs to the reconciler `vm`
-      // resource (issue 52). Returning here drops the running entry, and the reaper
-      // kick in `onWorkerExit` converges the now-orphaned VM.
+      // VM is live but the bridge is gone; teardown is the reconciler `vm`
+      // resource's job. Await after_run so the failure path preserves the
+      // pre-refactor ordering — the attempt does not return (and the worker
+      // lifecycle does not advance) until cleanup hooks have run.
       await this.workspaces.runAfterRunBestEffort(
-        workspace.path,
+        workspacePath,
         initialHooks,
         hookCapture('after_run'),
       );
-      return {
-        ok: false,
-        reason: 'acp bridge register failed',
-        threadId: null,
-        turnsCompleted: 0,
-      };
+      return failPhase('acp bridge register failed');
     }
+  }
 
+  private launchExecStream(
+    vmName: string,
+    workspacePath: string,
+    bridgeReg: AcpBridgeRegistration,
+    acpReachUrl: string,
+    adapter: AdapterRuntime,
+  ): ExecStream {
     const execStream = this.smolvm.execInteractive(vmName, {
-      command: [this.cfg.acp.shell, '-lc', effectiveAcpCommand],
-      workdir: workspace.path,
-      // The in-VM proxy (`vm-agent.mjs`) reads these to know where to dial back and what
-      // adapter to spawn. The bearer token is a per-dispatch secret so it cannot survive
-      // the attempt; visible via `ps` on the host but the host is trusted.
+      command: [this.cfg.acp.shell, '-lc', adapter.effectiveAcpCommand],
+      workdir: workspacePath,
+      // The in-VM proxy (`vm-agent.mjs`) reads these to know where to dial back
+      // and what adapter to spawn. The bearer token is a per-dispatch secret;
+      // visible via `ps` on the host but the host is trusted.
       env: {
         SYMPHONY_ACP_URL: acpReachUrl,
         SYMPHONY_ACP_TOKEN: bridgeReg.token,
-        SYMPHONY_ADAPTER_BIN: adapterBin,
-        SYMPHONY_ADAPTER_ARGS: JSON.stringify(effectiveAdapterArgs),
-        ...runtimeEnv,
+        SYMPHONY_ADAPTER_BIN: adapter.adapterBin,
+        SYMPHONY_ADAPTER_ARGS: JSON.stringify(adapter.effectiveAdapterArgs),
+        ...adapter.runtimeEnv,
       },
       timeoutMs: null,
     });
-
-    // We do NOT use execStream.stdin/.stdout for ACP frames anymore — those flow over the
-    // bridge socket once the in-VM agent dials back. The exec channel just carries
-    // diagnostic stderr (vm-agent's own logs + the inherited adapter stderr) and acts as
-    // a process tether so we can kill the in-VM agent by closing the exec.
+    // ACP frames flow over the bridge socket, not the exec stdio. The exec
+    // channel just carries diagnostic stderr and acts as a process tether.
     execStream.stdin.end();
+    return execStream;
+  }
 
-    // Attach the stderr tap NOW — before we await the bridge handshake — so any
-    // pre-connect crash (vm-agent missing, malformed env, adapter that exits during
-    // startup) lands in the per-issue run log and the orchestrator's event ring. AcpClient
-    // no longer reads stderr; this is the single, always-on source. The same listener
-    // stays attached for the duration of the attempt and continues capturing post-connect
-    // stderr (e.g. claude-agent-acp warnings).
+  /**
+   * Attach the stderr tap BEFORE the bridge handshake so any pre-connect
+   * crash (vm-agent missing, malformed env, adapter that exits during
+   * startup) still lands in the per-issue run log and the orchestrator's
+   * event ring.
+   */
+  private attachStderrTap(
+    execStream: ExecStream,
+    issue: Issue,
+    runLog: RunLog | undefined,
+    logger: ReturnType<typeof withIssue>,
+  ): void {
     execStream.stderr.setEncoding('utf8');
     execStream.stderr.on('data', (chunk: string) => {
-      // Always mirror the raw chunk into the run log so the evaluator sees adapter output
-      // byte-for-byte, even if it is only whitespace.
       runLog?.record({ channel: 'stderr', text: chunk });
       const text = chunk.trim();
       if (text.length === 0) return;
-      // Push into the orchestrator's per-issue ring + symphony log. Truncate the symphony
-      // log line so a chatty adapter (claude-agent-acp's "No onPostToolUseHook found …"
-      // warnings, for example) doesn't dominate the host stderr stream.
+      const truncated =
+        text.length > AgentRunner.STDERR_RING_LIMIT
+          ? text.slice(0, AgentRunner.STDERR_RING_LIMIT) + '…'
+          : text;
       this.events.onRuntimeEvent(issue.id, {
         at: new Date().toISOString(),
         event: 'agent_stderr',
-        message: text.length > 240 ? text.slice(0, 240) + '…' : text,
+        message: truncated,
       });
-      logger.info('agent stderr', { text: text.slice(0, 500) });
+      logger.info('agent stderr', { text: text.slice(0, AgentRunner.STDERR_LOG_LIMIT) });
     });
+  }
 
-    // The socket the bridge accepts becomes AcpClient's stdin AND stdout. We keep a
-    // reference so cleanup can close it even on partial failure.
-    let acpSocket: Socket | null = null;
+  // -------------------------------------------------------------------------
+  // Phase 6: bridge connect + MCP setup + AcpClient + initSession
+  // -------------------------------------------------------------------------
 
-    // Captured by `cleanup` when a non-routed action failure happens during
-    // the terminal `actions:` pass. The final return below treats this as
-    // attempt failure so the orchestrator retries (or otherwise surfaces it)
-    // instead of marking the issue "done" while its push/PR-create never
-    // landed. Routed failures (merge → conflict state) intentionally do NOT
-    // set this — the agent's work succeeded; the issue lives on in the
-    // conflict state. Only failures with no `route_to` propagate.
-    let nonRoutedActionFailureReason: string | null = null;
+  private async connectBridgeAndInitSession(args: {
+    ctx: SessionContext;
+    resolved: ResolvedDispatchConfig;
+    cancelSignal: { cancelled: boolean };
+    acpReachUrl: string;
+  }): Promise<PhaseResult<{
+    client: AcpClient;
+    sessionId: string;
+    cancelCheckTimer: ReturnType<typeof setInterval>;
+  }>> {
+    const connRes = await this.waitForBridgeAccept(args.ctx, args.acpReachUrl);
+    if (!connRes.ok) {
+      await this.tearDownSession(args.ctx, 'acp_bridge_connect_failed');
+      return connRes;
+    }
+    args.ctx.acpSocket = connRes.value.acpSocket;
+    const clientRef: { current: AcpClient | null } = { current: null };
+    const cancelCheckTimer = this.startCancelTimer(args.ctx, args.cancelSignal, clientRef);
+    const mcpRes = this.setupMcpForAttempt(args.ctx);
+    if (!mcpRes.ok) {
+      await this.cancelAndTearDown(args.ctx, cancelCheckTimer, mcpRes.cleanupReason);
+      return { ok: false, result: mcpRes.result };
+    }
+    const client = this.buildAcpClient(args.ctx, mcpRes.value.mcpServers);
+    clientRef.current = client;
+    const sessRes = await this.initAcpSession(args.ctx, client, args.resolved);
+    if (!sessRes.ok) {
+      await this.cancelAndTearDown(args.ctx, cancelCheckTimer, 'init_failed');
+      return sessRes;
+    }
+    this.emitSessionStarted(args.ctx, sessRes.value.sessionId);
+    return { ok: true, value: { client, sessionId: sessRes.value.sessionId, cancelCheckTimer } };
+  }
 
-    const cleanup = async (reason: string) => {
-      // Cancel the bridge registration if the in-VM agent never connected. Idempotent on
-      // success (already-resolved registrations ignore cancel).
-      bridgeReg.cancel(reason);
-      try {
-        if (acpSocket && !acpSocket.destroyed) acpSocket.destroy();
-      } catch {
-        /* ignore */
-      }
-      try {
-        execStream.kill();
-      } catch {
-        /* ignore */
-      }
-      try {
-        await execStream.exit;
-      } catch {
-        /* ignore */
-      }
-      if (this.mcp && runningEntry) {
-        this.mcp.deactivate(runningEntry.identifier);
-      }
-      logger.debug('agent runner cleanup', { reason });
-      // Per-state `actions:` block or legacy `hooks.after_run`, gated on
-      // `decideCleanupExecution`. Captures any non-routed action failure so
-      // the orchestrator surfaces it instead of marking the attempt
-      // successful while the push/PR-create never landed.
-      nonRoutedActionFailureReason = await this.runCleanupActionsOrHook(
-        issue,
-        resolveCleanupState(issue, runningEntry),
-        runningEntry,
-        workspace.path,
-        vmReady,
-        vmName,
-        hookCapture,
-        runLog,
-      );
-      // Per the agreed lifecycle, every attempt gets a fresh VM. Teardown is the
-      // reconciler `vm` resource's job (issue 52): the runner only mutates desired
-      // state. By the time this `cleanup()` returns, `runAttempt` returns to the
-      // orchestrator, which deletes the running entry and kicks the reaper —
-      // converging the now-orphan VM in one tick.
-      if (vmReady) {
-        runLog?.system('vm_teardown_deferred', { vm: vmName, reason });
-      }
-    };
+  private async cancelAndTearDown(
+    ctx: SessionContext,
+    timer: ReturnType<typeof setInterval>,
+    reason: string,
+  ): Promise<void> {
+    clearInterval(timer);
+    await this.tearDownSession(ctx, reason);
+  }
 
-    // Wait for the in-VM agent to dial back and authenticate. We bound this with a config
-    // timeout because a stuck VM or misconfigured `reach_host` would otherwise hang the
-    // attempt until the orchestrator's stall timer fires much later. The exec process's
-    // stderr is captured separately so failures surface there for debugging.
+  private buildAcpClient(ctx: SessionContext, mcpServers: McpServer[]): AcpClient {
+    return new AcpClient({
+      stdin: ctx.acpSocket!,
+      stdout: ctx.acpSocket!,
+      stderr: ctx.execStream.stderr,
+      cwd: ctx.workspacePath,
+      readTimeoutMs: this.cfg.acp.read_timeout_ms,
+      promptTimeoutMs: this.cfg.acp.prompt_timeout_ms,
+      onEvent: (event) => this.events.onRuntimeEvent(ctx.issue.id, event),
+      onTokenUsage: (u) => this.events.onTokenUsage(ctx.issue.id, u),
+      mcpServers,
+      runLog: ctx.runLog,
+    });
+  }
+
+  private emitSessionStarted(ctx: SessionContext, sessionId: string): void {
+    this.events.onSessionStarted?.({
+      issueId: ctx.issue.id,
+      sessionId,
+      threadId: sessionId,
+      pid: ctx.execStream.pid ? String(ctx.execStream.pid) : null,
+    });
+  }
+
+  /**
+   * Race the bridge handshake against a configured connect timeout. A stuck
+   * VM or misconfigured `reach_host` would otherwise hang the attempt until
+   * the orchestrator's stall timer fires much later.
+   */
+  private async waitForBridgeAccept(
+    ctx: SessionContext,
+    acpReachUrl: string,
+  ): Promise<PhaseResult<{ acpSocket: Socket }>> {
     try {
-      acpSocket = await Promise.race([
-        bridgeReg.accepted,
+      const acpSocket = await Promise.race([
+        ctx.bridgeReg.accepted,
         new Promise<Socket>((_, reject) =>
           setTimeout(
             () => reject(new Error('acp bridge: in-VM agent did not connect in time')),
@@ -1066,288 +1373,509 @@ export class AgentRunner {
           ),
         ),
       ]);
-      runLog?.system('acp_bridge_connected', { reach_url: acpReachUrl });
+      ctx.runLog?.system('acp_bridge_connected', { reach_url: acpReachUrl });
+      return { ok: true, value: { acpSocket } };
     } catch (err) {
-      logger.error('acp bridge connect timeout', { error: (err as Error).message });
-      runLog?.system('acp_bridge_failed', { error: (err as Error).message });
-      await cleanup('acp_bridge_connect_failed');
-      return { ok: false, reason: 'acp bridge connect failed', threadId: null, turnsCompleted: 0 };
+      ctx.logger.error('acp bridge connect timeout', { error: (err as Error).message });
+      ctx.runLog?.system('acp_bridge_failed', { error: (err as Error).message });
+      return failPhase('acp bridge connect failed');
     }
+  }
 
-    // Cancellation tear-down. Three things have to happen for the runner to actually
-    // unwind a stuck `client.runPrompt()`:
-    //   1. `client.cancel()` — sends `session/cancel` over ACP. The polite path; the
-    //      adapter SHOULD respond to the in-flight `session/prompt` with
-    //      `stop_reason: cancelled`. In practice the adapter often goes silent (e.g.
-    //      after the model has emitted its final text and called `transition`).
-    //   2. `client.forceClose()` — explicitly ends the LineTap streams the SDK is reading
-    //      from. This makes the SDK's `receive()` reader loop observe `done` and call its
-    //      internal `close()`, which rejects every pending request including the in-flight
-    //      `session/prompt`. Without this, the runner stays parked in `runPrompt()` for
-    //      the full `prompt_timeout_ms` (30 min) even after the transport is gone.
-    //   3. `execStream.kill()` + `acpSocket.destroy()` — terminate the host-side
-    //      `smolvm machine exec` and the TCP bridge connection. The kill does NOT
-    //      propagate into the VM (the in-VM adapter keeps running until VM destroy in
-    //      cleanup()), but breaking the socket lets the bridge entry be reclaimed and
-    //      surfaces the close as `'close'` on the socket (a belt-and-braces second
-    //      trigger for `handleTransportClose` if `forceClose` somehow didn't fire).
-    const onCancel = () => {
-      if (cancelSignal.cancelled) {
-        client.cancel().catch(() => undefined);
-        client.forceClose('cancel_requested');
-        execStream.kill();
-        if (acpSocket && !acpSocket.destroyed) {
-          try {
-            acpSocket.destroy();
-          } catch {
-            /* idempotent on already-destroyed socket */
-          }
-        }
+  /**
+   * Start the periodic cancel check. The polite path is `client.cancel()`
+   * (session/cancel over ACP); the belt-and-braces path is `forceClose()` to
+   * unwind a stuck `runPrompt()` plus `execStream.kill()` and socket destroy
+   * to break the transport. `clientRef.current` may briefly be null between
+   * timer start and AcpClient construction; the `?.` keeps that race safe.
+   */
+  private startCancelTimer(
+    ctx: SessionContext,
+    cancelSignal: { cancelled: boolean },
+    clientRef: { current: AcpClient | null },
+  ): ReturnType<typeof setInterval> {
+    const onCancel = (): void => {
+      if (!cancelSignal.cancelled) return;
+      const c = clientRef.current;
+      c?.cancel().catch(() => undefined);
+      c?.forceClose('cancel_requested');
+      try { ctx.execStream.kill(); } catch { /* idempotent */ }
+      if (ctx.acpSocket && !ctx.acpSocket.destroyed) {
+        try { ctx.acpSocket.destroy(); } catch { /* idempotent */ }
       }
     };
-    const cancelCheckTimer = setInterval(onCancel, 500);
+    return setInterval(onCancel, 500);
+  }
 
-    // Register with the MCP registry so the agent's tool calls can be routed back.
-    // MCP is required for symphony operations: `transition` is the only way for the
-    // agent to signal completion (or hand off to another state), and
-    // request_human_steering is the only way to defer to a human. If we can't construct
-    // a reachable URL — no bound HTTP port and no explicit override — we abort the
-    // attempt rather than dispatch a tool-less agent.
+  /**
+   * Wire the MCP registry servers list for AcpClient. MCP is mandatory for
+   * symphony operations (`transition`, `request_human_steering`); fail fast
+   * if the registry or the reachable URL is missing.
+   */
+  private setupMcpForAttempt(
+    ctx: SessionContext,
+  ): { ok: true; value: { mcpServers: McpServer[] } } | { ok: false; result: RunAttemptResult; cleanupReason: string } {
     const mcpServers: McpServer[] = [];
-    if (this.cfg.mcp.enabled && runningEntry) {
-      if (!this.mcp) {
-        clearInterval(cancelCheckTimer);
-        await cleanup('mcp_registry_unavailable');
-        logger.error('mcp is required but no registry is wired into the runner', {});
-        return {
-          ok: false,
-          reason: 'mcp required but registry unavailable',
-          threadId: null,
-          turnsCompleted: 0,
-        };
-      }
-      const url = this.mcp.buildUrl(runningEntry.identifier, {
+    if (!this.cfg.mcp.enabled || !ctx.runningEntry) {
+      return { ok: true, value: { mcpServers } };
+    }
+    if (!this.mcp) {
+      ctx.logger.error('mcp is required but no registry is wired into the runner', {});
+      return {
+        ok: false,
+        result: { ok: false, reason: 'mcp required but registry unavailable', threadId: null, turnsCompleted: 0 },
+        cleanupReason: 'mcp_registry_unavailable',
+      };
+    }
+    const url = this.mcp.buildUrl(ctx.runningEntry.identifier, {
+      host: this.cfg.mcp.host,
+      explicit_host_url: this.cfg.mcp.explicit_host_url,
+    });
+    if (!url) {
+      ctx.logger.error('mcp is required but no reachable URL is configured', {
         host: this.cfg.mcp.host,
         explicit_host_url: this.cfg.mcp.explicit_host_url,
       });
-      if (!url) {
-        clearInterval(cancelCheckTimer);
-        await cleanup('mcp_url_unavailable');
-        logger.error('mcp is required but no reachable URL is configured', {
-          host: this.cfg.mcp.host,
-          explicit_host_url: this.cfg.mcp.explicit_host_url,
-        });
-        return {
+      return {
+        ok: false,
+        result: {
           ok: false,
           reason: 'mcp required but URL unavailable (start the HTTP server or set mcp.host_url)',
           threadId: null,
           turnsCompleted: 0,
-        };
-      }
-      const token = this.mcp.activate(runningEntry);
-      mcpServers.push({
-        type: 'http',
-        name: 'symphony',
-        url,
-        headers: [{ name: 'Authorization', value: `Bearer ${token}` }],
-      });
-      logger.debug('mcp registered', { url });
+        },
+        cleanupReason: 'mcp_url_unavailable',
+      };
     }
-
-    // ACP transport: bridge socket for stdin AND stdout (writes go through the same
-    // socket the in-VM agent reads from; reads come from the socket the agent writes to).
-    // Adapter stderr still flows via the smolvm-exec stderr channel (vm-agent inherits
-    // stderr from its parent, which is the smolvm exec), so symphony's LineTap on
-    // execStream.stderr keeps the per-issue JSONL log full-fidelity for stderr.
-    const client = new AcpClient({
-      stdin: acpSocket,
-      stdout: acpSocket,
-      stderr: execStream.stderr,
-      cwd: workspace.path,
-      readTimeoutMs: this.cfg.acp.read_timeout_ms,
-      promptTimeoutMs: this.cfg.acp.prompt_timeout_ms,
-      onEvent: (event) => this.events.onRuntimeEvent(issue.id, event),
-      onTokenUsage: (u) => this.events.onTokenUsage(issue.id, u),
-      mcpServers,
-      runLog,
+    const token = this.mcp.activate(ctx.runningEntry);
+    mcpServers.push({
+      type: 'http',
+      name: 'symphony',
+      url,
+      headers: [{ name: 'Authorization', value: `Bearer ${token}` }],
     });
+    ctx.logger.debug('mcp registered', { url });
+    return { ok: true, value: { mcpServers } };
+  }
 
-    let sessionId: string;
+  private async initAcpSession(
+    ctx: SessionContext,
+    client: AcpClient,
+    resolved: ResolvedDispatchConfig,
+  ): Promise<PhaseResult<{ sessionId: string }>> {
     try {
       const sess = await client.initSession();
-      sessionId = sess.sessionId;
+      return { ok: true, value: { sessionId: sess.sessionId } };
     } catch (err) {
-      clearInterval(cancelCheckTimer);
-      logger.error('acp init failed', {
+      ctx.logger.error('acp init failed', {
         error: (err as Error).message,
         adapter: resolved.adapter,
       });
-      this.events.onRuntimeEvent(issue.id, {
+      this.events.onRuntimeEvent(ctx.issue.id, {
         at: new Date().toISOString(),
         event: 'startup_failed',
         message: (err as Error).message,
       });
-      await cleanup('init_failed');
-      return { ok: false, reason: 'agent session startup error', threadId: null, turnsCompleted: 0 };
+      return failPhase('agent session startup error');
     }
-
-    this.events.onSessionStarted?.({
-      issueId: issue.id,
-      sessionId,
-      threadId: sessionId,
-      pid: execStream.pid ? String(execStream.pid) : null,
-    });
-
-    let turnsCompleted = 0;
-    let autonomousTurns = 0;
-    let lastReason = 'unknown';
-    let agentFailure: string | null = null;
-    let currentIssue = issue;
-    let pendingSteering: { question: string; context: string | null; reply: string } | null = null;
-    let firstTurn = true;
-    const activeStates = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-
-    // Decoupled from max_turns: the loop runs as long as the agent keeps engaging. Only
-    // autonomous turns (turns without a pending human reply) count against max_turns.
-    // Turns driven by a human steering reply run free; the human is in the loop and can
-    // stop work at any time by walking away or by giving an instruction that ends in
-    // a `transition` call.
-    while (true) {
-      if (cancelSignal.cancelled) {
-        lastReason = 'cancelled_by_reconciliation';
-        break;
-      }
-      let prompt: string;
-      const isSteeringReply = pendingSteering !== null;
-      try {
-        if (pendingSteering) {
-          prompt = buildSteeringReplyPrompt(
-            pendingSteering.question,
-            pendingSteering.context,
-            pendingSteering.reply,
-          );
-          pendingSteering = null;
-        } else if (firstTurn) {
-          prompt = await renderPrompt({
-            template: this.workflow.prompt_template,
-            issue: currentIssue,
-            attempt: attempt === null ? null : attempt,
-          });
-        } else {
-          prompt = continuationPrompt(this.cfg.mcp.enabled);
-        }
-      } catch (err) {
-        clearInterval(cancelCheckTimer);
-        logger.error('prompt rendering failed', { error: (err as Error).message });
-        await cleanup('prompt_error');
-        return { ok: false, reason: 'prompt error', threadId: sessionId, turnsCompleted };
-      }
-      firstTurn = false;
-
-      // Label is the 1-based ordinal of the turn about to run, counting every turn
-      // (autonomous + steering reply), so the running snapshot never shows duplicate
-      // turn_count values across a steering boundary.
-      this.events.onTurn(issue.id, turnsCompleted + 1);
-      const outcome = await client.runPrompt(prompt);
-
-      if (outcome.reason !== 'end_turn') {
-        // `transitioned` is authoritative: if the agent called symphony.transition
-        // mid-turn, reconcile may have tripped cancelSignal before the prompt
-        // returned. The work is done regardless of how the prompt ended; honor that.
-        if (runningEntry?.transitioned) {
-          lastReason = 'agent_transitioned';
-          break;
-        }
-        lastReason = outcome.reason;
-        agentFailure = `agent turn ${outcome.reason}: ${outcome.message}`;
-        break;
-      }
-      turnsCompleted++;
-
-      // Count this completed turn against max_turns iff it was an autonomous turn (i.e.
-      // not itself a reply to a human steering message). Steering-reply turns are free.
-      // Steering-REQUEST turns (autonomous turns that called request_human_steering)
-      // still count: the agent did autonomous work before deferring to a human.
-      if (!isSteeringReply) {
-        autonomousTurns++;
-      }
-
-      // Tool-driven exits: the MCP handler has already done the work; we just read the flag.
-      if (runningEntry?.transitioned) {
-        lastReason = 'agent_transitioned';
-        break;
-      }
-
-      // Steering: pause the autonomous loop and wait for a human reply. The wait does not
-      // count against max_turns; cancellation breaks us out via the registry's cancel-aware
-      // resolver. The next iteration uses the steering-reply prompt.
-      if (runningEntry?.steering_requested && this.mcp) {
-        const question = runningEntry.steering_question ?? '';
-        const ctx = runningEntry.steering_context;
-        this.events.onRuntimeEvent(issue.id, {
-          at: new Date().toISOString(),
-          event: 'awaiting_human_steering',
-          message: question.length > 240 ? question.slice(0, 240) + '…' : question,
-        });
-        const reply = await this.mcp.awaitSteeringReply(issue.identifier, cancelSignal);
-        if (reply === null) {
-          lastReason = 'cancelled_while_awaiting_steering';
-          break;
-        }
-        runningEntry.steering_requested = false;
-        runningEntry.steering_question = null;
-        runningEntry.steering_context = null;
-        pendingSteering = { question, context: ctx, reply };
-        this.events.onRuntimeEvent(issue.id, {
-          at: new Date().toISOString(),
-          event: 'human_steering_received',
-          message: reply.length > 240 ? reply.slice(0, 240) + '…' : reply,
-        });
-        continue;
-      }
-
-      // Autonomous turn finished without a tool-driven exit. Refresh tracker state and
-      // decide whether to continue.
-      let refreshed: Issue[];
-      try {
-        refreshed = await this.tracker.fetchIssueStatesByIds([issue.id]);
-      } catch (err) {
-        clearInterval(cancelCheckTimer);
-        logger.error('issue state refresh failed', { error: (err as Error).message });
-        await cleanup('issue_state_refresh_failed');
-        return { ok: false, reason: 'issue state refresh error', threadId: sessionId, turnsCompleted };
-      }
-      const found = refreshed[0];
-      if (!found) {
-        lastReason = 'issue_no_longer_present';
-        break;
-      }
-      currentIssue = found;
-      if (!activeStates.has(found.state.toLowerCase())) {
-        lastReason = 'issue_no_longer_active';
-        break;
-      }
-      if (autonomousTurns >= resolved.max_turns) {
-        lastReason = 'max_turns_reached';
-        break;
-      }
-      await delay(25);
-    }
-
-    clearInterval(cancelCheckTimer);
-    await cleanup(lastReason);
-    // `decideAttemptOutcome` collapses the three failure channels (agent
-    // turn failure, non-routed terminal-action failure during cleanup, and
-    // graceful break) into the single RunAttemptResult shape. agentFailure
-    // wins; then nonRoutedActionFailureReason (a failed push / pr-create
-    // must surface so the orchestrator retries instead of marking done);
-    // otherwise the loop's break reason is success.
-    return decideAttemptOutcome({
-      agentFailure,
-      nonRoutedActionFailureReason,
-      lastReason,
-      sessionId,
-      turnsCompleted,
-    });
   }
+
+  // -------------------------------------------------------------------------
+  // Phase 7: autonomous turn loop
+  // -------------------------------------------------------------------------
+
+  /**
+   * Drive the ACP loop. Runs as long as the agent keeps engaging — only
+   * autonomous turns count against max_turns; steering-reply turns are free
+   * because the human is in the loop.
+   */
+  private async runTurnLoop(args: {
+    ctx: SessionContext;
+    client: AcpClient;
+    resolved: ResolvedDispatchConfig;
+    cancelSignal: { cancelled: boolean };
+    attempt: number | null;
+    activeStates: ReadonlySet<string>;
+  }): Promise<TurnLoopResult> {
+    const state: TurnLoopState = {
+      turnsCompleted: 0,
+      autonomousTurns: 0,
+      lastReason: 'unknown',
+      agentFailure: null,
+      currentIssue: args.ctx.issue,
+      pendingSteering: null,
+      firstTurn: true,
+    };
+    while (true) {
+      const iter = await this.runTurnIteration({ ...args, state });
+      if (iter.kind === 'mid_failure') {
+        return { kind: 'mid_failure', publicReason: iter.publicReason, cleanupReason: iter.cleanupReason, turnsCompleted: state.turnsCompleted };
+      }
+      if (iter.kind === 'break') break;
+    }
+    return { kind: 'done', lastReason: state.lastReason, agentFailure: state.agentFailure, turnsCompleted: state.turnsCompleted };
+  }
+
+  private async runTurnIteration(args: {
+    ctx: SessionContext;
+    client: AcpClient;
+    resolved: ResolvedDispatchConfig;
+    cancelSignal: { cancelled: boolean };
+    attempt: number | null;
+    activeStates: ReadonlySet<string>;
+    state: TurnLoopState;
+  }): Promise<IterationResult> {
+    const { ctx, client, resolved, cancelSignal, attempt, activeStates, state } = args;
+    if (cancelSignal.cancelled) {
+      state.lastReason = 'cancelled_by_reconciliation';
+      return { kind: 'break' };
+    }
+    const promptRes = await this.prepareTurnPrompt(state, attempt, ctx.logger);
+    if (promptRes.kind === 'mid_failure') return promptRes;
+    const isSteeringReply = state.pendingSteering !== null;
+    state.pendingSteering = null;
+    state.firstTurn = false;
+    this.events.onTurn(ctx.issue.id, state.turnsCompleted + 1);
+    const outcome = await client.runPrompt(promptRes.prompt);
+    const turnRes = this.applyTurnOutcome(state, outcome, ctx.runningEntry, isSteeringReply);
+    if (turnRes.kind === 'break') return turnRes;
+    return await this.handlePostTurnFlow({ ctx, cancelSignal, activeStates, resolved, state });
+  }
+
+  private async prepareTurnPrompt(
+    state: TurnLoopState,
+    attempt: number | null,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<{ kind: 'ok'; prompt: string } | { kind: 'mid_failure'; publicReason: string; cleanupReason: string }> {
+    try {
+      const prompt = await this.composeTurnPrompt(state, attempt);
+      return { kind: 'ok', prompt };
+    } catch (err) {
+      logger.error('prompt rendering failed', { error: (err as Error).message });
+      return { kind: 'mid_failure', publicReason: 'prompt error', cleanupReason: 'prompt_error' };
+    }
+  }
+
+  /**
+   * Render the prompt for the next iteration via the pure `selectPromptKind`
+   * helper. Steering replies trump everything (the human is in the loop);
+   * the first turn gets the full template; later autonomous turns get the
+   * bare continuation prompt.
+   */
+  private async composeTurnPrompt(state: TurnLoopState, attempt: number | null): Promise<string> {
+    const kind = selectPromptKind({
+      pendingSteering: state.pendingSteering !== null,
+      firstTurn: state.firstTurn,
+    });
+    if (kind === 'steering') {
+      const ps = state.pendingSteering!;
+      return buildSteeringReplyPrompt(ps.question, ps.context, ps.reply);
+    }
+    if (kind === 'initial') {
+      return renderPrompt({
+        template: this.workflow.prompt_template,
+        issue: state.currentIssue,
+        attempt,
+      });
+    }
+    return continuationPrompt(this.cfg.mcp.enabled);
+  }
+
+  /**
+   * Classify the runPrompt outcome (delegated to pure `classifyTurnOutcome`)
+   * and update the turn counters. Returns the next loop control: `break`
+   * collapses agent failure / agent_transitioned into a single break signal
+   * with state already populated; `continue` falls through to post-turn flow.
+   */
+  private applyTurnOutcome(
+    state: TurnLoopState,
+    outcome: { reason: string; message: string },
+    runningEntry: RunningEntry | undefined,
+    isSteeringReply: boolean,
+  ): { kind: 'break' } | { kind: 'continue' } {
+    const cls = classifyTurnOutcome({
+      outcomeReason: outcome.reason,
+      outcomeMessage: outcome.message,
+      transitioned: runningEntry?.transitioned === true,
+    });
+    if (cls.kind === 'agent_failure') {
+      state.agentFailure = cls.agentFailure;
+      state.lastReason = cls.reason;
+      return { kind: 'break' };
+    }
+    if (cls.kind === 'agent_transitioned') {
+      state.lastReason = 'agent_transitioned';
+      return { kind: 'break' };
+    }
+    state.turnsCompleted++;
+    if (!isSteeringReply) state.autonomousTurns++;
+    return { kind: 'continue' };
+  }
+
+  /**
+   * Post-turn flow: tool-driven exit > steering pause > tracker refresh +
+   * continuation decision. The tracker-refresh branch is in its own helper
+   * so the orchestrator stays under the shell complexity / statement budget;
+   * the pure `decideTurnContinuation` and `handleSteeringRequest` carry the
+   * decision-heavy work.
+   */
+  private async handlePostTurnFlow(args: {
+    ctx: SessionContext;
+    cancelSignal: { cancelled: boolean };
+    activeStates: ReadonlySet<string>;
+    resolved: ResolvedDispatchConfig;
+    state: TurnLoopState;
+  }): Promise<IterationResult> {
+    const { ctx, cancelSignal, activeStates, resolved, state } = args;
+    if (ctx.runningEntry?.transitioned) {
+      state.lastReason = 'agent_transitioned';
+      return { kind: 'break' };
+    }
+    if (ctx.runningEntry?.steering_requested && this.mcp) {
+      return await this.handleSteeringBranch(ctx, ctx.runningEntry, cancelSignal, state);
+    }
+    return await this.refreshAndDecideContinuation({ ctx, activeStates, resolved, state });
+  }
+
+  private async handleSteeringBranch(
+    ctx: SessionContext,
+    entry: RunningEntry,
+    cancelSignal: { cancelled: boolean },
+    state: TurnLoopState,
+  ): Promise<IterationResult> {
+    const steer = await this.handleSteeringRequest(ctx, entry, cancelSignal);
+    if (steer.kind === 'cancelled') {
+      state.lastReason = 'cancelled_while_awaiting_steering';
+      return { kind: 'break' };
+    }
+    state.pendingSteering = steer.pendingSteering;
+    return { kind: 'continue' };
+  }
+
+  private async refreshAndDecideContinuation(args: {
+    ctx: SessionContext;
+    activeStates: ReadonlySet<string>;
+    resolved: ResolvedDispatchConfig;
+    state: TurnLoopState;
+  }): Promise<IterationResult> {
+    const { ctx, activeStates, resolved, state } = args;
+    let refreshed: Issue[];
+    try {
+      refreshed = await this.tracker.fetchIssueStatesByIds([ctx.issue.id]);
+    } catch (err) {
+      ctx.logger.error('issue state refresh failed', { error: (err as Error).message });
+      return { kind: 'mid_failure', publicReason: 'issue state refresh error', cleanupReason: 'issue_state_refresh_failed' };
+    }
+    const found = refreshed[0] ?? null;
+    const cont = decideTurnContinuation({
+      refreshedIssue: found,
+      activeStates,
+      autonomousTurns: state.autonomousTurns,
+      maxTurns: resolved.max_turns,
+    });
+    if (cont.kind === 'break') {
+      if (found) state.currentIssue = found;
+      state.lastReason = cont.reason;
+      return { kind: 'break' };
+    }
+    state.currentIssue = found!;
+    await delay(25);
+    return { kind: 'continue' };
+  }
+
+  /**
+   * Park the autonomous loop on a pending steering request. The wait does
+   * not count against max_turns; cancellation breaks via the registry's
+   * cancel-aware resolver (which resolves null when `cancelSignal.cancelled`
+   * flips).
+   */
+  private async handleSteeringRequest(
+    ctx: SessionContext,
+    entry: RunningEntry,
+    cancelSignal: { cancelled: boolean },
+  ): Promise<
+    | { kind: 'cancelled' }
+    | { kind: 'received'; pendingSteering: { question: string; context: string | null; reply: string } }
+  > {
+    const question = entry.steering_question ?? '';
+    const context = entry.steering_context;
+    const limit = AgentRunner.STEERING_PREVIEW_LIMIT;
+    this.events.onRuntimeEvent(ctx.issue.id, {
+      at: new Date().toISOString(),
+      event: 'awaiting_human_steering',
+      message: question.length > limit ? question.slice(0, limit) + '…' : question,
+    });
+    const reply = await this.mcp!.awaitSteeringReply(ctx.issue.identifier, cancelSignal);
+    if (reply === null) return { kind: 'cancelled' };
+    entry.steering_requested = false;
+    entry.steering_question = null;
+    entry.steering_context = null;
+    this.events.onRuntimeEvent(ctx.issue.id, {
+      at: new Date().toISOString(),
+      event: 'human_steering_received',
+      message: reply.length > limit ? reply.slice(0, limit) + '…' : reply,
+    });
+    return { kind: 'received', pendingSteering: { question, context, reply } };
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 8: session teardown (consolidates the old `cleanup(reason)` closure)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Unwind a session: cancel the bridge registration, destroy the socket and
+   * kill the exec, deactivate MCP, run the per-state `actions:` block or
+   * legacy `hooks.after_run`, and emit the `vm_teardown_deferred` event so
+   * the reconciler `vm` resource (issue 52) can converge the now-orphan VM.
+   *
+   * Returns the non-routed action failure reason, or null when the cleanup
+   * succeeded or routed (so the caller can fold it into `decideAttemptOutcome`).
+   */
+  private async tearDownSession(ctx: SessionContext, reason: string): Promise<string | null> {
+    this.detachSession(ctx, reason);
+    await this.awaitExecExit(ctx.execStream);
+    this.deactivateMcpForEntry(ctx.runningEntry);
+    ctx.logger.debug('agent runner cleanup', { reason });
+    const nonRouted = await this.runCleanupActionsOrHook(
+      ctx.issue,
+      resolveCleanupState(ctx.issue, ctx.runningEntry),
+      ctx.runningEntry,
+      ctx.workspacePath,
+      ctx.vmReady,
+      ctx.vmName,
+      ctx.hookCapture,
+      ctx.runLog,
+    );
+    this.logVmTeardownDeferred(ctx, reason);
+    return nonRouted;
+  }
+
+  private detachSession(ctx: SessionContext, reason: string): void {
+    ctx.bridgeReg.cancel(reason);
+    try {
+      if (ctx.acpSocket && !ctx.acpSocket.destroyed) ctx.acpSocket.destroy();
+    } catch { /* ignore */ }
+    try { ctx.execStream.kill(); } catch { /* ignore */ }
+  }
+
+  private async awaitExecExit(execStream: ExecStream): Promise<void> {
+    try { await execStream.exit; } catch { /* ignore */ }
+  }
+
+  private deactivateMcpForEntry(entry: RunningEntry | undefined): void {
+    if (this.mcp && entry) this.mcp.deactivate(entry.identifier);
+  }
+
+  private logVmTeardownDeferred(ctx: SessionContext, reason: string): void {
+    if (ctx.vmReady) ctx.runLog?.system('vm_teardown_deferred', { vm: ctx.vmName, reason });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase pipeline glue: types + helpers used by runAttemptCore + each phase.
+// Kept at module scope (not nested in AgentRunner) so they remain unit-testable
+// and so the class stays focused on orchestration rather than plumbing.
+// ---------------------------------------------------------------------------
+
+type PhaseResult<T> = { ok: true; value: T } | { ok: false; result: RunAttemptResult };
+
+class PhaseFailure extends Error {
+  constructor(public readonly attemptResult: RunAttemptResult) {
+    super(`phase_failure: ${attemptResult.reason}`);
+    this.name = 'PhaseFailure';
+  }
+}
+
+function failPhase(reason: string): { ok: false; result: RunAttemptResult } {
+  return { ok: false, result: { ok: false, reason, threadId: null, turnsCompleted: 0 } };
+}
+
+interface AdapterRuntime {
+  profile: AdapterProfile;
+  adapterBin: string;
+  effectiveAcpCommand: string;
+  effectiveAdapterArgs: string[];
+  runtimeEnv: Record<string, string>;
+}
+
+interface VmStartInputs {
+  mounts: Array<{ host: string; guest: string; readonly: boolean }>;
+  env: Record<string, string>;
+  vmFrom: string | null;
+  vmSmolfile: string | null;
+  vmImage: string | null;
+}
+
+interface VmExecHandle {
+  vmName: string;
+  execStream: ExecStream;
+  bridgeReg: AcpBridgeRegistration;
+}
+
+/**
+ * Mutable context threaded through phases 5–8. `acpSocket` starts null and
+ * is filled in once the bridge handshake completes; `tearDownSession` checks
+ * for null before destroying so the post-bridge-fail path is a no-op for the
+ * socket but still runs the bridge cancel + exec kill + after_run cleanup.
+ */
+interface SessionContext {
+  issue: Issue;
+  runningEntry: RunningEntry | undefined;
+  workspacePath: string;
+  vmName: string;
+  vmReady: boolean;
+  bridgeReg: AcpBridgeRegistration;
+  execStream: ExecStream;
+  acpSocket: Socket | null;
+  hookCapture: (h: string) => HookCapture | undefined;
+  runLog: RunLog | undefined;
+  logger: ReturnType<typeof withIssue>;
+}
+
+interface TurnLoopState {
+  turnsCompleted: number;
+  autonomousTurns: number;
+  lastReason: string;
+  agentFailure: string | null;
+  currentIssue: Issue;
+  pendingSteering: { question: string; context: string | null; reply: string } | null;
+  firstTurn: boolean;
+}
+
+type TurnLoopResult =
+  | { kind: 'done'; lastReason: string; agentFailure: string | null; turnsCompleted: number }
+  | { kind: 'mid_failure'; publicReason: string; cleanupReason: string; turnsCompleted: number };
+
+type IterationResult =
+  | { kind: 'continue' }
+  | { kind: 'break' }
+  | { kind: 'mid_failure'; publicReason: string; cleanupReason: string };
+
+/**
+ * Compose the final RunAttemptResult from the turn-loop outcome + teardown
+ * action ledger. `mid_failure` (prompt render error, tracker refresh error)
+ * gets surfaced verbatim; the happy path delegates to `decideAttemptOutcome`
+ * which encodes the agentFailure > non-routed action failure > success
+ * precedence.
+ */
+function composeAttemptResult(input: {
+  loopRes: TurnLoopResult;
+  sessionId: string;
+  nonRouted: string | null;
+}): RunAttemptResult {
+  if (input.loopRes.kind === 'mid_failure') {
+    return {
+      ok: false,
+      reason: input.loopRes.publicReason,
+      threadId: input.sessionId,
+      turnsCompleted: input.loopRes.turnsCompleted,
+    };
+  }
+  return decideAttemptOutcome({
+    agentFailure: input.loopRes.agentFailure,
+    nonRoutedActionFailureReason: input.nonRouted,
+    lastReason: input.loopRes.lastReason,
+    sessionId: input.sessionId,
+    turnsCompleted: input.loopRes.turnsCompleted,
+  });
 }
