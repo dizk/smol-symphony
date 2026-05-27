@@ -107,52 +107,40 @@ export interface WorkspaceInspection {
   commitsAheadOfBase: number;
 }
 
-/**
- * One entry per workspace dir on disk. Adapter responsibility: filter out
- * non-directories and resolve absolute paths so the resource never has to
- * touch the fs itself.
- */
-export interface WorkspaceListing {
-  /** Sanitized directory name (matches `sanitizeWorkspaceKey(identifier)`). */
-  name: string;
-  /** Absolute path to the workspace dir — fed to the inspector. */
-  path: string;
-}
+/** One entry per workspace dir on disk; the listing adapter filters non-dirs and resolves the absolute path. */
+export type WorkspaceListing = { name: string; path: string };
 
 export interface WorkspaceResourceOptions {
   intended: WorkspaceIntendedProvider;
   /**
-   * Enumerate workspace dirs under the root. Required port; production wires
-   * `defaultListWorkspaceDirs(workspace.root)` from `./workspace-defaults`,
+   * Enumerate workspace dirs under the root. Production wires
+   * `defaultListWorkspaceDirs(workspace.root)` from `./workspace-defaults`;
    * tests pass a stub. Must filter to directories only and translate ENOENT
-   * on the root into an empty list (cold start) — the resource treats any
-   * thrown error as a transient FS hiccup and skips the pass.
+   * on the root into an empty list (cold start).
    */
   listWorkspaces: () => Promise<WorkspaceListing[]>;
-  /**
-   * Filesystem + git inspection. Required port; production wires
-   * `defaultInspectWorkspace` from `./workspace-defaults`, tests pass a stub.
-   * Receives the base branch name (so the inspector can `git rev-parse
-   * <branch>` in the workspace) but does NOT receive the source repo's SHA —
-   * that comparison happens in the resource so we never run a cross-repo git
-   * operation inside the workspace (which only sees objects hardlinked at
-   * clone time).
-   */
-  inspect: (workspacePath: string, baseBranch: string) => Promise<WorkspaceInspection>;
-  /**
-   * Remove a workspace dir. Required port; production binds
-   * `WorkspaceManager.remove` so the configured before_remove hook fires.
-   * Receives the sanitized dir name (which is what
-   * `WorkspaceManager.workspacePathFor` resolves to since sanitization is
-   * idempotent) and the reason.
-   */
-  remove: (identifier: string, reason: RemoveReason) => Promise<void>;
   /**
    * Optional base-branch source. When omitted (or it returns null), the drift
    * detector is skipped for that pass and only stale-workspace removal fires.
    * Production wires the orchestrator as the implementation; tests pass a stub.
    */
   baseRef?: BaseRefProvider;
+  /**
+   * Filesystem + git inspection. Production wires `defaultInspectWorkspace`
+   * from `./workspace-defaults`; tests pass a stub. Receives the base branch
+   * name (so the inspector can `git rev-parse <branch>` in the workspace) but
+   * does NOT receive the source repo's SHA — that comparison happens in the
+   * resource so we never run a cross-repo git operation inside the workspace
+   * (which only sees objects hardlinked at clone time).
+   */
+  inspect: (workspacePath: string, baseBranch: string) => Promise<WorkspaceInspection>;
+  /**
+   * Remove a workspace dir. Receives the sanitized dir name (which is what
+   * `WorkspaceManager.workspacePathFor` resolves to since sanitization is
+   * idempotent) and the reason. Production defers to `WorkspaceManager.remove`
+   * so before_remove fires; tests pass a stub.
+   */
+  remove: (identifier: string, reason: RemoveReason) => Promise<void>;
   /**
    * Override for the create action (tests pass a stub). Receives the raw
    * identifier (not the sanitized dir name — `WorkspaceManager.ensureFor`
@@ -208,27 +196,13 @@ export class WorkspaceResource {
   readonly id = 'workspace';
   readonly dependsOn: string[] = [];
 
-  private readonly listWorkspaces: () => Promise<WorkspaceListing[]>;
-  private readonly inspect: (
-    workspacePath: string,
-    baseBranch: string,
-  ) => Promise<WorkspaceInspection>;
-  private readonly remove: (identifier: string, reason: RemoveReason) => Promise<void>;
-  private readonly create:
-    | ((identifier: string, state: string | null) => Promise<void>)
-    | null;
   private readonly ledger = new ResourceActionLedger(this.id, { maxHistory: MAX_ACTION_HISTORY });
   private lastError: string | null = null;
   private staleCount = 0;
   private stuckCount = 0;
   private createdCount = 0;
 
-  constructor(private readonly opts: WorkspaceResourceOptions) {
-    this.listWorkspaces = opts.listWorkspaces;
-    this.inspect = opts.inspect;
-    this.remove = opts.remove;
-    this.create = opts.create ?? null;
-  }
+  constructor(private readonly opts: WorkspaceResourceOptions) {}
 
   ready(): boolean {
     // Janitorial; doesn't gate dispatch (bake is the only dispatch gate today).
@@ -274,7 +248,7 @@ export class WorkspaceResource {
 
     let entries: WorkspaceListing[];
     try {
-      entries = await this.listWorkspaces();
+      entries = await this.opts.listWorkspaces();
     } catch (err) {
       this.lastError = `workspace_root_read_failed: ${(err as Error).message}`;
       log.warn('workspace reconcile: list failed', { error: (err as Error).message });
@@ -317,7 +291,7 @@ export class WorkspaceResource {
       if (baseRef === null) continue;
       let inspection: WorkspaceInspection;
       try {
-        inspection = await this.inspect(dirPath, baseRef.branch);
+        inspection = await this.opts.inspect(dirPath, baseRef.branch);
       } catch (err) {
         log.debug('workspace reconcile: inspect failed', {
           identifier: name,
@@ -365,7 +339,7 @@ export class WorkspaceResource {
     // can skip it; production wires `WorkspaceManager.ensureFor`, which is
     // idempotent (per-identifier lock + dir-exists check) so a concurrent
     // dispatch call coalesces into the same setup pass.
-    if (this.create !== null) {
+    if (this.opts.create) {
       for (const [key, { identifier, state }] of wanted) {
         if (present.has(key)) continue;
         await this.runCreate(identifier, key, state);
@@ -403,12 +377,12 @@ export class WorkspaceResource {
     sanitizedKey: string,
     state: string | null,
   ): Promise<void> {
-    if (!this.create) return;
+    if (!this.opts.create) return;
     // Action key uses the sanitized identifier (matches what
     // remove_workspace uses) so dashboards can correlate the two
     // operations on the same workspace dir.
     const actionKey = `create_workspace:${sanitizedKey}`;
-    const res = await this.ledger.run(actionKey, () => this.create!(identifier, state));
+    const res = await this.ledger.run(actionKey, () => this.opts.create!(identifier, state));
     if (res.ok) {
       this.createdCount += 1;
       log.info('workspace reconcile: created', { identifier, state });
@@ -420,7 +394,7 @@ export class WorkspaceResource {
 
   private async runRemove(identifier: string, reason: RemoveReason): Promise<void> {
     const actionKey = `remove_workspace:${identifier}`;
-    const res = await this.ledger.run(actionKey, () => this.remove(identifier, reason));
+    const res = await this.ledger.run(actionKey, () => this.opts.remove(identifier, reason));
     if (res.ok) {
       log.info('workspace reconcile: removed', { identifier, reason });
     } else {
