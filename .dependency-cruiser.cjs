@@ -15,7 +15,7 @@ const foundation  = 'src/(types|logging|errors|workspace-types)\.ts$|src/util/[^
 const config      = 'src/workflow\.ts$|src/actions/parsing\.ts$';
 const domain      = 'src/reconciler/(vm|workspace|pr)\.ts$|src/actions/(executor|predicates|templating|index)\.ts$|src/(mcp|issues|prompt)\.ts$';
 const adapters    = 'src/trackers/local\.ts$|src/agent/(smolvm|adapters|acp|tool-call-summary)\.ts$|src/(acp-bridge|runlog|memory|workspace)\.ts$|src/reconciler/bake\.ts$|src/actions/predicate-env\.ts$';
-const application = 'src/orchestrator\\.ts$|src/reconciler/index\\.ts$|src/agent/(runner|integration)\\.ts$';
+const application = 'src/orchestrator\\.ts$|src/reconciler/index\\.ts$|src/agent/runner\\.ts$';
 const entry       = 'src/(http|http-handlers|http-disk)\\.ts$|src/bin/symphony\\.ts$';
 const any = (...xs) => xs.join('|');
 

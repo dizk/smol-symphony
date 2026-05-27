@@ -210,9 +210,7 @@ export interface ActionOutcome {
   reason: string | null;
   /**
    * When non-null, the calling runner should reroute the issue to this state
-   * instead of completing normal cleanup. Mirrors
-   * `routeIntegrationFailureToConflict` semantics but driven by typed action
-   * config rather than the integration block.
+   * instead of completing normal cleanup.
    */
   route_to: string | null;
   /**

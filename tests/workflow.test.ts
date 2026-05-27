@@ -620,111 +620,15 @@ describe('workflow states validation', () => {
 
 });
 
-describe('integration block', () => {
+describe('pr_autopilot block', () => {
   async function withTrackerRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-integration-validate-'));
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-pr-autopilot-validate-'));
     try {
       return await fn(root);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   }
-
-  it('defaults integration off (empty merge_on_states) when block is absent', () => {
-    const cfg = buildServiceConfig(
-      { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(cfg.integration.branch, 'integration');
-    assert.equal(cfg.integration.conflict_state, 'Conflict');
-    assert.deepEqual(cfg.integration.merge_on_states, []);
-  });
-
-  it('parses an explicit integration block with merge_on_states', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: { role: 'terminal' },
-          Cancelled: { role: 'terminal' },
-          Triage: { role: 'holding' },
-          Conflict: { role: 'holding' },
-        },
-        integration: {
-          branch: 'shared-int',
-          conflict_state: 'Conflict',
-          merge_on_states: ['Done'],
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(cfg.integration.branch, 'shared-int');
-    assert.deepEqual(cfg.integration.merge_on_states, ['Done']);
-  });
-
-  it('validation: rejects merge_on_states referencing an undeclared state', async () => {
-    await withTrackerRoot(async (root) => {
-      const cfg = buildServiceConfig(
-        {
-          tracker: { kind: 'local', root },
-          states: {
-            Todo: { role: 'active' },
-            Done: { role: 'terminal' },
-            Triage: { role: 'holding' },
-            Conflict: { role: 'holding' },
-          },
-          integration: { merge_on_states: ['Mystery'] },
-        },
-        '/tmp/WORKFLOW.md',
-      );
-      const err = validateDispatch(cfg);
-      assert.match(err ?? '', /merge_on_states references undeclared state "Mystery"/);
-    });
-  });
-
-  it('validation: rejects merge_on_states referencing a non-terminal state', async () => {
-    await withTrackerRoot(async (root) => {
-      const cfg = buildServiceConfig(
-        {
-          tracker: { kind: 'local', root },
-          states: {
-            Todo: { role: 'active' },
-            Done: { role: 'terminal' },
-            Triage: { role: 'holding' },
-            Conflict: { role: 'holding' },
-          },
-          // Todo is an active state; pointing the merge at it is a config error.
-          integration: { merge_on_states: ['Todo'] },
-        },
-        '/tmp/WORKFLOW.md',
-      );
-      const err = validateDispatch(cfg);
-      assert.match(err ?? '', /must reference a terminal state/);
-    });
-  });
-
-  it('validation: rejects conflict_state that is not a holding state', async () => {
-    await withTrackerRoot(async (root) => {
-      const cfg = buildServiceConfig(
-        {
-          tracker: { kind: 'local', root },
-          states: {
-            Todo: { role: 'active' },
-            Done: { role: 'terminal' },
-            Triage: { role: 'holding' },
-          },
-          // Pointing conflict_state at Done (terminal) is a config error: a
-          // conflict reroute must land in a holding state so the orchestrator
-          // never tries to dispatch it.
-          integration: { conflict_state: 'Done', merge_on_states: ['Done'] },
-        },
-        '/tmp/WORKFLOW.md',
-      );
-      const err = validateDispatch(cfg);
-      assert.match(err ?? '', /must be a holding state/);
-    });
-  });
 
   it('pr_autopilot defaults off when block is absent', () => {
     const cfg = buildServiceConfig(
@@ -879,25 +783,4 @@ describe('integration block', () => {
     });
   });
 
-  it('validation: empty merge_on_states skips the cross-reference check', async () => {
-    // Operators who don't opt into integration shouldn't be gated on having a
-    // Conflict directory declared. validateDispatch only walks the integration
-    // checks when the feature is actually enabled.
-    await withTrackerRoot(async (root) => {
-      const cfg = buildServiceConfig(
-        {
-          tracker: { kind: 'local', root },
-          states: {
-            Todo: { role: 'active' },
-            Done: { role: 'terminal' },
-            Triage: { role: 'holding' },
-          },
-          integration: { conflict_state: 'NonExistent', merge_on_states: [] },
-        },
-        '/tmp/WORKFLOW.md',
-      );
-      const err = validateDispatch(cfg);
-      assert.equal(err, null);
-    });
-  });
 });

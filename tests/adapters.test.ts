@@ -78,7 +78,6 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     },
     server: { port: null, host: '127.0.0.1' },
     mcp: { enabled: true, host: '10.0.2.2', explicit_host_url: null },
-    integration: { branch: 'integration', conflict_state: 'Conflict', merge_on_states: [] },
     states,
   } as ServiceConfig;
 }

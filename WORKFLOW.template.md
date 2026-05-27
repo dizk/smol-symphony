@@ -131,10 +131,8 @@ tracker:
 #             issue to a holding state instead of aborting.
 #
 #             merge's `on_conflict: { route_to: <state> }` is a fast-path
-#             reroute (the action's typed surface for the same shape
-#             `routeIntegrationFailureToConflict` provides for the legacy
-#             integration block). Use `on_conflict: abort` to fail the
-#             action and abort the cleanup pass without a state move.
+#             reroute. Use `on_conflict: abort` to fail the action and abort
+#             the cleanup pass without a state move.
 #
 #             run_in_vm has content-hash caching: identical (workspace tree
 #             ⊕ cmd ⊕ env) tuples skip execution and re-use the prior
@@ -185,49 +183,6 @@ states:
     role: terminal
   Triage:
     role: holding
-  # Optional: a Conflict holding state for the integration-branch flow (see
-  # `integration:` below). Issues land here when the post-Done merge into the
-  # shared `integration` branch fails. Workspace + `agent/<id>` branch are
-  # preserved so an operator (or a future agent) can resolve.
-  Conflict:
-    role: holding
-
-# ─────────────────────────────────────────────────────────────────────────────
-# integration — shared-integration-branch handoff.
-#
-# Optional. When `merge_on_states` is non-empty, the orchestrator host-side
-# merges `agent/<id>` into the named integration branch after the agent
-# transitions an issue into one of those terminal states (typically just Done).
-# Concurrent agents see each other's work via integration without waiting for
-# human PR review against `main`. The merge runs BEFORE the terminal state's
-# `after_run` hook, so a conflict prevents the PR-create hook from firing and
-# routes the issue into the holding `conflict_state` with a diagnostic notes
-# block appended. The workspace and `agent/<id>` branch are preserved on
-# failure so a future resolver can finish the merge by hand.
-#
-# In PR mode (SYMPHONY_REPO set), the merge pushes to `origin` (which the
-# built-in workspace setup, `setupWorkspaceDir` in src/workspace.ts, restored
-# as the GitHub remote — see SPEC §5.3). In local-only mode the orchestrator
-# stages a temp remote pointing at the source repo (SYMPHONY_SOURCE_REPO,
-# default `${PWD}/../../..` of the workspace), pushes integration there, and
-# removes the temp remote — the agent inside the VM never sees this remote.
-#
-# Cancelled is intentionally absent from `merge_on_states`: an abandoned issue
-# does not contribute work to the shared branch.
-# ─────────────────────────────────────────────────────────────────────────────
-integration:
-  # branch (string): name of the shared integration branch. Default: 'integration'.
-  branch: integration
-
-  # conflict_state (string): which holding state to reroute the issue into on
-  # merge conflict or push refusal. Must be a declared `role: holding` state.
-  # Default: 'Conflict'.
-  conflict_state: Conflict
-
-  # merge_on_states (string[]): terminal states whose transitions trigger the
-  # integration merge. Each entry must be a declared `role: terminal` state.
-  # An empty list (default) disables the feature entirely.
-  merge_on_states: [Done]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # pr_autopilot — arm GitHub auto-merge when a terminal-state PR is

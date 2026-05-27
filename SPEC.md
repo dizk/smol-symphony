@@ -400,9 +400,6 @@ Failure handling:
   canonical setup runs only when the directory was created during the
   current ensure call.
 
-Note: a shared integration-branch flow was prototyped but is currently
-disabled; canonical clone is the only supported workspace source.
-
 ### 5.4 Workspace Hooks
 
 Supported hooks: `hooks.after_create`, `hooks.before_run`, `hooks.after_run`,
