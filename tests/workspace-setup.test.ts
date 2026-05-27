@@ -366,6 +366,47 @@ describe('restorePushedBranch', () => {
     }
   });
 
+  it('does not false-match a suffix-colliding remote branch (cuts fresh)', async () => {
+    // origin has refs/heads/archive/agent/88 but NOT agent/88. ls-remote's
+    // suffix matching would exit 0 on a bare `agent/88` pattern; the exact-ref
+    // probe must return false so a genuine first dispatch cuts fresh rather than
+    // trying (and failing) to fetch a nonexistent exact ref and unwinding.
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-collide-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-collide-ws-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-collide-seed-'));
+      try {
+        await git(['init', '-b', 'main'], seed);
+        await git(['config', 'user.name', 'test'], seed);
+        await git(['config', 'user.email', 'test@example.com'], seed);
+        await writeFile(path.join(seed, 'a.txt'), 'base\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'base'], seed);
+        await git(['remote', 'add', 'origin', bareRemote], seed);
+        await git(['push', 'origin', 'main'], seed);
+        await git(['checkout', '-b', 'archive/agent/88'], seed);
+        await writeFile(path.join(seed, 'old.txt'), 'archived\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'archived'], seed);
+        await git(['push', 'origin', 'archive/agent/88'], seed);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+      const wsPath = path.join(wsRoot, '88');
+      await mkdir(wsPath, { recursive: true });
+      await git(['clone', bareRemote, '.'], wsPath);
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'main');
+
+      const restored = await restorePushedBranch(wsPath, 'agent/88');
+      assert.equal(restored, false);
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'main');
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('returns false in local-only mode (no origin remote)', async () => {
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-local-ws-'));
     const wsPath = path.join(wsRoot, '99');

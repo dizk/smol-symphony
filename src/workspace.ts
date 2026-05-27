@@ -298,9 +298,14 @@ export async function restorePushedBranch(
     cwd: workspacePath,
   });
   if (remoteCheck.exit_code !== 0) return false;
+  // Probe the EXACT head ref. `ls-remote … <branch>` does suffix matching, so a
+  // colliding ref like `refs/heads/archive/<branch>` would exit 0 (false positive)
+  // for a `<branch>` that doesn't exist; the exact `fetch` below would then fail
+  // and a first dispatch would unwind forever. `refs/heads/<branch>` matches only
+  // the exact ref.
   const exists = await runProcess(
     'git',
-    ['ls-remote', '--exit-code', '--heads', 'origin', branch],
+    ['ls-remote', '--exit-code', 'origin', `refs/heads/${branch}`],
     noPrompt,
   );
   // exit 2 = reached the remote, no such ref → genuine first dispatch, cut fresh.
