@@ -6,10 +6,10 @@
 // State-of-file shape is the local-tracker contract: see src/trackers/local.ts for the
 // reader side.
 
-import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sanitizeWorkspaceKey } from './util/workspace-key.js';
 import { realClock, isoFromClock } from './util/clock.js';
+import { realIssueFs, type IssueFs } from './util/fs-issues.js';
 import type { StateConfig } from './types.js';
 
 /**
@@ -69,11 +69,14 @@ export function terminalStateNames(states: Record<string, StateConfig>): string[
 // (filename stem) currently present. Used to pick the next free numeric identifier —
 // checking only the target state directory would let a `Done/3.md` silently shadow a
 // freshly created `Todo/3.md` once it moves out of Todo.
-export async function collectExistingIdentifiers(trackerRoot: string): Promise<Set<string>> {
+export async function collectExistingIdentifiers(
+  trackerRoot: string,
+  fs: IssueFs = realIssueFs,
+): Promise<Set<string>> {
   const out = new Set<string>();
   let entries: string[];
   try {
-    entries = await readdir(trackerRoot);
+    entries = await fs.readdir(trackerRoot);
   } catch {
     return out;
   }
@@ -81,14 +84,14 @@ export async function collectExistingIdentifiers(trackerRoot: string): Promise<S
     const dirPath = path.join(trackerRoot, stateDir);
     let st;
     try {
-      st = await stat(dirPath);
+      st = await fs.stat(dirPath);
     } catch {
       continue;
     }
     if (!st.isDirectory()) continue;
     let files: string[];
     try {
-      files = await readdir(dirPath);
+      files = await fs.readdir(dirPath);
     } catch {
       continue;
     }
@@ -123,6 +126,13 @@ export interface WriteIssueFileInput {
    * functional-core lint rule sees no `new Date()` in this file.
    */
   now?: () => number;
+  /**
+   * Injected fs port for mkdir / readdir / stat / writeFile. Defaults to
+   * `realIssueFs` (a `node:fs/promises`-backed adapter) so callers that don't
+   * care about determinism keep working; the seam exists so this module
+   * itself can stay free of a direct `node:fs/promises` import (core-purity).
+   */
+  fs?: IssueFs;
 }
 
 export interface WriteIssueFileResult {
@@ -138,8 +148,9 @@ export interface WriteIssueFileResult {
  * the rest of the orchestrator.
  */
 export async function writeIssueFile(input: WriteIssueFileInput): Promise<WriteIssueFileResult> {
+  const fs = input.fs ?? realIssueFs;
   const stateDir = path.join(input.trackerRoot, input.state);
-  await mkdir(stateDir, { recursive: true });
+  await fs.mkdir(stateDir, { recursive: true });
   let ident: string;
   let filePath: string;
   const explicit = (input.identifier ?? '').trim();
@@ -148,7 +159,7 @@ export async function writeIssueFile(input: WriteIssueFileInput): Promise<WriteI
     if (!ident) throw new Error('identifier must contain at least one allowed character');
     filePath = path.join(stateDir, `${ident}.md`);
     try {
-      await stat(filePath);
+      await fs.stat(filePath);
       throw new Error(`issue ${ident} already exists at ${filePath}`);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
@@ -158,7 +169,7 @@ export async function writeIssueFile(input: WriteIssueFileInput): Promise<WriteI
     // until we find a basename that doesn't already exist in any state directory. Title-slug
     // files from prior cycles are inert here: only numeric basenames consume IDs, so legacy
     // `add-changelog.md` files coexist with the numeric scheme without claiming a slot.
-    const existing = await collectExistingIdentifiers(input.trackerRoot);
+    const existing = await collectExistingIdentifiers(input.trackerRoot, fs);
     let n = 1;
     while (existing.has(String(n))) n += 1;
     ident = String(n);
@@ -194,6 +205,6 @@ export async function writeIssueFile(input: WriteIssueFileInput): Promise<WriteI
   yamlLines.push('---', '');
   const body = (input.description ?? '').trim();
   const content = yamlLines.join('\n') + (body.length > 0 ? body + '\n' : '');
-  await writeFile(filePath, content, 'utf8');
+  await fs.writeFile(filePath, content, 'utf8');
   return { path: filePath, identifier: ident, state: input.state };
 }
