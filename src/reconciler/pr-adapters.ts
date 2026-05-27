@@ -83,27 +83,7 @@ export class GhCliPrApi implements PrApi {
     if (res.exit !== 0) {
       throw new Error(`gh pr view ${prNumber} failed (exit ${res.exit}): ${res.stderr.trim()}`);
     }
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(res.stdout) as Record<string, unknown>;
-    } catch (err) {
-      throw new Error(`gh pr view returned non-JSON: ${(err as Error).message}`);
-    }
-    return {
-      number: typeof parsed.number === 'number' ? parsed.number : prNumber,
-      url: typeof parsed.url === 'string' ? parsed.url : '',
-      state: normalizeState(parsed.state),
-      mergeable: normalizeMergeable(parsed.mergeable),
-      base_ref_name: typeof parsed.baseRefName === 'string' ? parsed.baseRefName : '',
-      base_ref_oid: typeof parsed.baseRefOid === 'string' ? parsed.baseRefOid : null,
-      head_ref_name: typeof parsed.headRefName === 'string' ? parsed.headRefName : '',
-      head_ref_oid: typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '',
-      review_decision: normalizeReviewDecision(parsed.reviewDecision),
-      auto_merge_armed:
-        parsed.autoMergeRequest !== null &&
-        parsed.autoMergeRequest !== undefined &&
-        typeof parsed.autoMergeRequest === 'object',
-    };
+    return parseGhPrView(prNumber, res.stdout);
   }
 
   async armAutoMerge(prNumber: number, strategy: 'squash' | 'merge' | 'rebase'): Promise<void> {
@@ -141,6 +121,30 @@ export class GhCliPrApi implements PrApi {
       throw new Error(`gh api delete branch failed (exit ${res.exit}): ${res.stderr.trim()}`);
     }
   }
+}
+
+function parseGhPrView(prNumber: number, stdout: string): PrView {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(stdout) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`gh pr view returned non-JSON: ${(err as Error).message}`);
+  }
+  return {
+    number: typeof parsed.number === 'number' ? parsed.number : prNumber,
+    url: typeof parsed.url === 'string' ? parsed.url : '',
+    state: normalizeState(parsed.state),
+    mergeable: normalizeMergeable(parsed.mergeable),
+    base_ref_name: typeof parsed.baseRefName === 'string' ? parsed.baseRefName : '',
+    base_ref_oid: typeof parsed.baseRefOid === 'string' ? parsed.baseRefOid : null,
+    head_ref_name: typeof parsed.headRefName === 'string' ? parsed.headRefName : '',
+    head_ref_oid: typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '',
+    review_decision: normalizeReviewDecision(parsed.reviewDecision),
+    auto_merge_armed:
+      parsed.autoMergeRequest !== null &&
+      parsed.autoMergeRequest !== undefined &&
+      typeof parsed.autoMergeRequest === 'object',
+  };
 }
 
 function normalizeState(raw: unknown): PrState {
