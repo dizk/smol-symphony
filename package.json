@@ -50,8 +50,7 @@
     "test": "node --test --import tsx tests/*.test.ts",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "lint": "eslint src --max-warnings 72",
-    "lint:arch": "depcruise src --ts-config tsconfig.json --ignore-known",
-    "check:size": "node scripts/check-diff-size.mjs"
+    "lint:arch": "depcruise src --ts-config tsconfig.json --ignore-known"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.22.1",
