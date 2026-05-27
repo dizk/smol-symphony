@@ -254,60 +254,17 @@ export class AcpBridge {
       if (nl === -1) {
         // Cap the unauthenticated buffer at 1 KiB so a misbehaving client can't grow
         // memory before failing auth.
-        if (buf.length > 1024) {
-          fail('auth header too large');
-        }
+        if (buf.length > 1024) fail('auth header too large');
         return;
       }
       const headerLine = buf.subarray(0, nl).toString('utf8').trim();
       const remainder = buf.subarray(nl + 1);
       clearTimeout(authDeadline);
       socket.removeListener('data', onData);
-      const match = /^Bearer\s+(\S+)$/.exec(headerLine);
-      if (!match) {
-        fail('malformed bearer line');
-        return;
-      }
-      const presented = match[1]!;
-      // Constant-time compare against each pending token. With max_concurrent_agents = 1
-      // there's typically ONE pending entry, but loop anyway for correctness.
-      let matched: Registration | null = null;
-      const presentedBuf = Buffer.from(presented, 'utf8');
-      for (const reg of this.pending.values()) {
-        const expected = Buffer.from(reg.token, 'utf8');
-        if (expected.length !== presentedBuf.length) continue;
-        if (timingSafeEqual(expected, presentedBuf)) {
-          matched = reg;
-          break;
-        }
-      }
-      if (!matched) {
-        fail('invalid token');
-        return;
-      }
+      const matched = this.authenticate(socket, headerLine, fail);
+      if (!matched) return;
       handled = true;
-      log.info('acp bridge accepted', {
-        issue_id: matched.issueId,
-        issue_identifier: matched.identifier,
-        remote: `${socket.remoteAddress}:${socket.remotePort}`,
-      });
-      // CRITICAL: the temporary `data` listener above put the socket in flowing mode.
-      // Removing that listener does NOT auto-pause it — any bytes already buffered in
-      // the kernel or arriving immediately after will be re-emitted in flowing mode and
-      // dropped if no listener is attached yet, which is exactly the window between
-      // `resolve(socket)` and AcpClient's microtask wiring up `ndJsonStream`. Pause
-      // explicitly so the next consumer is responsible for resuming. `unshift` puts the
-      // residual bytes (bearer + ACP-frame in one packet case) back in front of any
-      // subsequent kernel data.
-      socket.pause();
-      if (remainder.length > 0) {
-        socket.unshift(remainder);
-      }
-      // Move from pre-auth tracking into live tracking. Both sets are tied into stop()
-      // for forced teardown on shutdown.
-      this.preAuthSockets.delete(socket);
-      this.liveSockets.add(socket);
-      socket.once('close', () => this.liveSockets.delete(socket));
+      this.promoteToLive(socket, remainder);
       matched.resolve(socket);
     };
     socket.on('data', onData);
@@ -319,5 +276,58 @@ export class AcpBridge {
         fail(`socket error: ${err.message}`);
       }
     });
+  }
+
+  private authenticate(
+    socket: Socket,
+    headerLine: string,
+    fail: (reason: string) => void,
+  ): Registration | null {
+    const match = /^Bearer\s+(\S+)$/.exec(headerLine);
+    if (!match) {
+      fail('malformed bearer line');
+      return null;
+    }
+    const matched = this.findPendingByToken(match[1]!);
+    if (!matched) {
+      fail('invalid token');
+      return null;
+    }
+    log.info('acp bridge accepted', {
+      issue_id: matched.issueId,
+      issue_identifier: matched.identifier,
+      remote: `${socket.remoteAddress}:${socket.remotePort}`,
+    });
+    return matched;
+  }
+
+  // Constant-time compare against each pending token. With max_concurrent_agents = 1
+  // there's typically ONE pending entry, but loop anyway for correctness.
+  private findPendingByToken(presented: string): Registration | null {
+    const presentedBuf = Buffer.from(presented, 'utf8');
+    for (const reg of this.pending.values()) {
+      const expected = Buffer.from(reg.token, 'utf8');
+      if (expected.length !== presentedBuf.length) continue;
+      if (timingSafeEqual(expected, presentedBuf)) return reg;
+    }
+    return null;
+  }
+
+  // CRITICAL: the temporary `data` listener in handleConnection put the socket in flowing
+  // mode. Removing that listener does NOT auto-pause it — any bytes already buffered in
+  // the kernel or arriving immediately after will be re-emitted in flowing mode and
+  // dropped if no listener is attached yet, which is exactly the window between
+  // `resolve(socket)` and AcpClient's microtask wiring up `ndJsonStream`. Pause
+  // explicitly so the next consumer is responsible for resuming. `unshift` puts the
+  // residual bytes (bearer + ACP-frame in one packet case) back in front of any
+  // subsequent kernel data.
+  private promoteToLive(socket: Socket, remainder: Buffer): void {
+    socket.pause();
+    if (remainder.length > 0) socket.unshift(remainder);
+    // Move from pre-auth tracking into live tracking. Both sets are tied into stop()
+    // for forced teardown on shutdown.
+    this.preAuthSockets.delete(socket);
+    this.liveSockets.add(socket);
+    socket.once('close', () => this.liveSockets.delete(socket));
   }
 }
