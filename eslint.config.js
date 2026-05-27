@@ -11,7 +11,7 @@ const shell = [
   // adapters (IO wrappers — should stay thin too)
   'src/trackers/local.ts', 'src/agent/smolvm.ts', 'src/agent/adapters.ts', 'src/agent/acp.ts',
   'src/agent/tool-call-summary.ts', 'src/acp-bridge.ts', 'src/runlog.ts', 'src/memory.ts',
-  'src/reconciler/bake.ts', 'src/workflow-loader.ts', 'src/workspace.ts',
+  'src/reconciler/bake.ts', 'src/reconciler/pr-adapters.ts', 'src/workflow-loader.ts', 'src/workspace.ts',
   // entry
   'src/http.ts', 'src/http-disk.ts', 'src/bin/symphony.ts',
 ];

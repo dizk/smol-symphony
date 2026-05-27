@@ -38,6 +38,7 @@ import {
   type PrTransitionApi,
   type PrWorkspaceEnsureApi,
 } from './pr.js';
+import { GhCliPrApi, GitCliPrGitApi } from './pr-adapters.js';
 import type { ServiceConfig, SmolvmConfig } from '../types.js';
 import type { SmolvmClient } from '../agent/smolvm-port.js';
 import { log } from '../logging.js';
@@ -650,4 +651,5 @@ export type {
   RebaseOutcome,
   PushOutcome,
 } from './pr.js';
-export { GhCliPrApi, GitCliPrGitApi, PrResource } from './pr.js';
+export { PrResource } from './pr.js';
+export { GhCliPrApi, GitCliPrGitApi } from './pr-adapters.js';

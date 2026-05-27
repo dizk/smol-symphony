@@ -26,7 +26,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { closeLogFile, setLogFile } from '../src/logging.js';
 import {
-  GitCliPrGitApi,
   PrResource,
   type EnsureWorkspaceOutcome,
   type PrApi,
@@ -41,6 +40,7 @@ import {
   type PushOutcome,
   type RebaseOutcome,
 } from '../src/reconciler/pr.js';
+import { GitCliPrGitApi } from '../src/reconciler/pr-adapters.js';
 
 // ── shared fixtures ─────────────────────────────────────────────────────────
 
@@ -1079,6 +1079,42 @@ describe('PrResource — cancelled close path', () => {
     await res.reconcile();
     assert.equal(calls.close.length, 0);
     assert.deepEqual(calls.deleteBranch, ['agent/42']);
+  });
+
+  it('does NOT delete the remote branch when gh pr close fails on an open PR', async () => {
+    // Regression: pre-refactor `runClosePr` returned early on close failure,
+    // so the remote branch survived under a still-open PR. The effects-as-data
+    // decide must preserve that ordering — emit `close_pr`, and only emit
+    // `delete_remote_branch` after a successful close outcome.
+    const intent = makeIntent({ kind: 'close', state: 'Cancelled', workspace_path: null });
+    const { api, calls } = makePrApi({
+      view: makeView({ state: 'OPEN' }),
+      closeThrows: new Error('gh pr close 401: bad credentials'),
+    });
+    const { git } = makeGit({});
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const res = new PrResource({
+      intended: intended([intent]),
+      pr: api,
+      git,
+      transition,
+      cleanup,
+      strategy: 'squash',
+      maxRebaseAttempts: 3,
+      conflictRouteTo: 'Todo',
+      conflictHoldingState: 'Conflict',
+      pollIntervalMs: 0,
+    });
+    await res.reconcile();
+    assert.deepEqual(calls.close, [7], 'close was attempted on the open PR');
+    assert.equal(
+      calls.deleteBranch.length,
+      0,
+      'remote branch must NOT be deleted when close failed (PR still open on origin)',
+    );
+    const snap = res.snapshot();
+    assert.match(snap.last_error ?? '', /gh pr close 401/);
   });
 });
 
