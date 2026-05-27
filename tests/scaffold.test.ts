@@ -8,7 +8,7 @@ import {
   ScaffoldError,
   SCAFFOLD_WORKFLOW_TEMPLATE,
 } from '../src/scaffold.js';
-import { loadWorkflow, buildServiceConfig } from '../src/workflow.js';
+import { loadWorkflow } from '../src/workflow-loader.js';
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'symphony-scaffold-'));
@@ -64,11 +64,10 @@ describe('scaffold', () => {
     await withTempDir(async (dir) => {
       const target = path.join(dir, 'WORKFLOW.md');
       await scaffoldWorkflow({ workflowPath: target });
-      const def = await loadWorkflow(target);
       // Should not throw — every required block (states with active/terminal/
       // holding roles, tracker, adapter) must be populated by the scaffold so
       // the operator can iterate on the file without first fixing parse errors.
-      const cfg = buildServiceConfig(def.config, target);
+      const { definition: def, config: cfg } = await loadWorkflow(target);
       assert.equal(cfg.tracker.kind, 'local');
       assert.ok(cfg.states['Todo'], 'scaffold declares a Todo state');
       assert.equal(cfg.states['Todo']!.role, 'active');

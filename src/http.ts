@@ -3,9 +3,8 @@
 // needed.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { parseFrontMatterLenient } from './util/frontmatter.js';
 import type { Orchestrator } from './orchestrator.js';
 import { log } from './logging.js';
 import type { McpRegistry } from './mcp.js';
@@ -26,6 +25,12 @@ import {
   decideCreateIssue,
   decideTriageTransition,
 } from './http-handlers.js';
+import {
+  type DiskIssue,
+  type DiskIssueDetail,
+  listIssuesFromDisk,
+  readIssueFromDisk,
+} from './http-disk.js';
 
 // Re-export so existing imports of StateView (e.g. src/bin/symphony.ts uses the same
 // shape via `getTrackerView`) and any future consumer of the public surface continue
@@ -149,156 +154,6 @@ async function readTextBody(req: IncomingMessage, maxBytes = 1_000_000): Promise
   });
 }
 
-// Browse current issues directly from disk so the UI can show items that are neither
-// currently running nor in the retry queue. Triage entries additionally surface the
-// `proposed_by` / `proposed_at` front-matter so the dashboard can show provenance for
-// agent-authored proposals — fields are optional and null for hand-written issues.
-async function listIssuesFromDisk(trackerRoot: string): Promise<Array<{
-  identifier: string;
-  state: string;
-  title: string;
-  proposed_by: string | null;
-  proposed_at: string | null;
-}>> {
-  const out: Array<{
-    identifier: string;
-    state: string;
-    title: string;
-    proposed_by: string | null;
-    proposed_at: string | null;
-  }> = [];
-  let entries: string[];
-  try {
-    entries = await readdir(trackerRoot);
-  } catch {
-    return out;
-  }
-  for (const stateDir of entries) {
-    const dirPath = path.join(trackerRoot, stateDir);
-    let st;
-    try {
-      st = await stat(dirPath);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    let files: string[];
-    try {
-      files = await readdir(dirPath);
-    } catch {
-      continue;
-    }
-    for (const f of files) {
-      if (!f.endsWith('.md')) continue;
-      const filePath = path.join(dirPath, f);
-      let text: string;
-      try {
-        text = await readFile(filePath, 'utf8');
-      } catch {
-        continue;
-      }
-      const { fields } = parseFrontMatterLenient(text);
-      const title = asString(fields['title']) ?? f.slice(0, -3);
-      const proposed_by = asString(fields['proposed_by']);
-      const proposed_at = asString(fields['proposed_at']);
-      // Prefer the front-matter `identifier:` when set so the dashboard reports the
-      // same identifier the orchestrator dispatches under (LocalMarkdownTracker's
-      // normalize() at src/trackers/local.ts uses `fm.identifier ?? filename`).
-      // Without this, an issue whose front-matter identifier differs from its
-      // filename loses its overlaid running/retrying/awaiting state on the board
-      // and its ticker jump-link points at a missing #row anchor.
-      const fmIdent = asString(fields['identifier']);
-      const identifier = fmIdent && fmIdent.length > 0 ? fmIdent : f.slice(0, -3);
-      out.push({ identifier, state: stateDir, title, proposed_by, proposed_at });
-    }
-  }
-  out.sort((a, b) => a.identifier.localeCompare(b.identifier));
-  return out;
-}
-
-// Read a single issue file by basename identifier. Walks every state directory under the
-// tracker root because the on-disk listing and the dashboard refer to issues by their
-// filename stem; the state is implied by which directory the file is in. Returns null
-// when no .md file matches. Uses the real YAML parser (matches the local tracker) so a
-// detail page sees the same labels / priority / blockers the orchestrator does.
-interface DiskIssueDetail {
-  identifier: string;
-  state: string;
-  filePath: string;
-  frontMatter: Record<string, unknown>;
-  body: string;
-}
-
-async function readIssueFromDisk(
-  trackerRoot: string,
-  identifier: string,
-): Promise<DiskIssueDetail | null> {
-  let entries: string[];
-  try {
-    entries = await readdir(trackerRoot);
-  } catch {
-    return null;
-  }
-  // Fast path: filename stem matches. Common case where the operator never set
-  // a front-matter identifier and the file is just `<identifier>.md`.
-  const target = `${identifier}.md`;
-  for (const stateDir of entries) {
-    const dirPath = path.join(trackerRoot, stateDir);
-    let st;
-    try {
-      st = await stat(dirPath);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    const filePath = path.join(dirPath, target);
-    let text: string;
-    try {
-      text = await readFile(filePath, 'utf8');
-    } catch {
-      continue;
-    }
-    const { fields, body } = parseFrontMatterLenient(text);
-    return { identifier, state: stateDir, filePath, frontMatter: fields, body };
-  }
-  // Fallback: scan every .md file in every state directory and match by the
-  // front-matter `identifier:` field. Handles the case where the orchestrator
-  // dispatches under a front-matter identifier that differs from the filename
-  // stem — same resolution the tracker uses in normalize() (`fm.identifier ??
-  // filename`). Slower (reads every issue file) but only on the not-found path,
-  // and only for trackers that actually exercise the override.
-  for (const stateDir of entries) {
-    const dirPath = path.join(trackerRoot, stateDir);
-    let st;
-    try {
-      st = await stat(dirPath);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    let files: string[];
-    try {
-      files = await readdir(dirPath);
-    } catch {
-      continue;
-    }
-    for (const f of files) {
-      if (!f.endsWith('.md')) continue;
-      const filePath = path.join(dirPath, f);
-      let text: string;
-      try {
-        text = await readFile(filePath, 'utf8');
-      } catch {
-        continue;
-      }
-      const { fields, body } = parseFrontMatterLenient(text);
-      if (asString(fields['identifier']) !== identifier) continue;
-      return { identifier, state: stateDir, filePath, frontMatter: fields, body };
-    }
-  }
-  return null;
-}
-
 async function gatherPartialInputs(
   orch: Orchestrator,
   view: {
@@ -338,13 +193,6 @@ async function gatherPartialInputs(
 type Snapshot = ReturnType<Orchestrator['snapshot']>;
 type RunningRow = Snapshot['running'][number];
 type RetryRow = Snapshot['retrying'][number];
-type DiskIssue = {
-  identifier: string;
-  state: string;
-  title: string;
-  proposed_by: string | null;
-  proposed_at: string | null;
-};
 
 interface PartialInputs {
   workflowName: string;
@@ -600,6 +448,84 @@ function renderColumn(
 </section>`;
 }
 
+interface RowFlags {
+  isAwaiting: boolean;
+  isRunning: boolean;
+  isRetrying: boolean;
+  isHolding: boolean;
+  orphan: boolean;
+}
+
+function rowFlags(state: StateView, running: RunningRow | undefined, retrying: RetryRow | undefined, orphan: boolean): RowFlags {
+  const isAwaiting = !!running?.steering_requested;
+  return {
+    isAwaiting,
+    isRunning: !!running && !isAwaiting,
+    isRetrying: !!retrying,
+    isHolding: !orphan && state.role === 'holding',
+    orphan,
+  };
+}
+
+function rowPillHtml(f: RowFlags): string {
+  if (f.isAwaiting) return '<span class="pill awaiting">awaiting</span>';
+  if (f.isRunning) return '<span class="pill running">running</span>';
+  if (f.isRetrying) return '<span class="pill retrying">retrying</span>';
+  return '';
+}
+
+function rowMetaHtml(running: RunningRow | undefined, retrying: RetryRow | undefined): string {
+  if (running) {
+    const tokens = formatTokens(running.tokens.total_tokens || 0);
+    return `<span class="row-meta">turn ${running.turn_count} · ${escapeHtml(tokens)} tok</span>`;
+  }
+  if (retrying) {
+    const dueAt = formatTimeShort(retrying.due_at) || '—';
+    return `<span class="row-meta">attempt ${retrying.attempt} · due ${escapeHtml(dueAt)}</span>`;
+  }
+  return '';
+}
+
+function rowPeekHtml(running: RunningRow | undefined, isAwaiting: boolean): string {
+  if (!running || isAwaiting) return '';
+  const text = truncate(running.last_message ?? running.last_event ?? '', 110);
+  return text ? `<div class="row-peek dim">${escapeHtml(text)}</div>` : '';
+}
+
+function rowRetryErrHtml(retrying: RetryRow | undefined): string {
+  if (!retrying?.error) return '';
+  return `<div class="row-err">${escapeHtml(truncate(retrying.error, 200))}</div>`;
+}
+
+function rowTriageActionsHtml(ident: string, f: RowFlags): string {
+  if (!(f.isHolding && !f.isRunning && !f.isAwaiting && !f.isRetrying)) return '';
+  const enc = encodeURIComponent(ident);
+  return `<div class="row-actions">
+    <form class="row-action"
+          hx-post="/api/v1/issues/${enc}/approve"
+          hx-target="#board" hx-swap="morph:innerHTML">
+      <button type="submit" class="ghost-sm" title="approve into the first active state">approve</button>
+    </form>
+    <form class="row-action"
+          hx-post="/api/v1/issues/${enc}/discard"
+          hx-target="#board" hx-swap="morph:innerHTML">
+      <button type="submit" class="ghost-sm danger" title="discard the proposal">discard</button>
+    </form>
+  </div>`;
+}
+
+function rowClassList(f: RowFlags, retryHasErr: boolean): string {
+  return [
+    'row',
+    f.isAwaiting ? 'row-await' : '',
+    f.isRunning ? 'row-run' : '',
+    f.isRetrying && retryHasErr ? 'row-retry-stuck' : '',
+    f.orphan ? 'row-orphan' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
 function renderIssueRow(
   i: DiskIssue,
   state: StateView,
@@ -607,81 +533,58 @@ function renderIssueRow(
   retrying: RetryRow | undefined,
   opts?: { orphan?: boolean },
 ): string {
-  const orphan = opts?.orphan === true;
-  const isAwaiting = !!running?.steering_requested;
-  const isRunning = !!running && !isAwaiting;
-  const isRetrying = !!retrying;
-  const isHolding = !orphan && state.role === 'holding';
-  const ident = i.identifier;
-  const escIdent = escapeHtml(ident);
-  const href = `/issues/${encodeURIComponent(ident)}`;
-
-  let pill = '';
-  if (isAwaiting) pill = '<span class="pill awaiting">awaiting</span>';
-  else if (isRunning) pill = '<span class="pill running">running</span>';
-  else if (isRetrying) pill = '<span class="pill retrying">retrying</span>';
-
-  let meta = '';
-  if (running) {
-    const tokens = formatTokens(running.tokens.total_tokens || 0);
-    meta = `<span class="row-meta">turn ${running.turn_count} · ${escapeHtml(tokens)} tok</span>`;
-  } else if (retrying) {
-    const dueAt = formatTimeShort(retrying.due_at) || '—';
-    meta = `<span class="row-meta">attempt ${retrying.attempt} · due ${escapeHtml(dueAt)}</span>`;
-  }
-
-  let peek = '';
-  if (running && !isAwaiting) {
-    const text = truncate(running.last_message ?? running.last_event ?? '', 110);
-    if (text) peek = `<div class="row-peek dim">${escapeHtml(text)}</div>`;
-  }
-
-  let retryErr = '';
-  if (retrying && retrying.error) {
-    retryErr = `<div class="row-err">${escapeHtml(truncate(retrying.error, 200))}</div>`;
-  }
-
-  let triageActions = '';
-  if (isHolding && !isRunning && !isAwaiting && !isRetrying) {
-    triageActions = `<div class="row-actions">
-    <form class="row-action"
-          hx-post="/api/v1/issues/${encodeURIComponent(ident)}/approve"
-          hx-target="#board" hx-swap="morph:innerHTML">
-      <button type="submit" class="ghost-sm" title="approve into the first active state">approve</button>
-    </form>
-    <form class="row-action"
-          hx-post="/api/v1/issues/${encodeURIComponent(ident)}/discard"
-          hx-target="#board" hx-swap="morph:innerHTML">
-      <button type="submit" class="ghost-sm danger" title="discard the proposal">discard</button>
-    </form>
-  </div>`;
-  }
-
-  const steering = isAwaiting ? renderSteeringInline(running!) : '';
-
-  const rowClasses = [
-    'row',
-    isAwaiting ? 'row-await' : '',
-    isRunning ? 'row-run' : '',
-    isRetrying && retrying?.error ? 'row-retry-stuck' : '',
-    orphan ? 'row-orphan' : '',
-  ]
-    .filter(Boolean)
-    .join(' ');
-
-  return `<article class="${rowClasses}" id="row-${escIdent}">
+  const f = rowFlags(state, running, retrying, opts?.orphan === true);
+  const escIdent = escapeHtml(i.identifier);
+  const href = `/issues/${encodeURIComponent(i.identifier)}`;
+  const steering = f.isAwaiting ? renderSteeringInline(running!) : '';
+  const classes = rowClassList(f, !!retrying?.error);
+  return `<article class="${classes}" id="row-${escIdent}">
   <div class="row-head">
     <a class="row-ident" href="${href}" title="open ${escIdent}">${escIdent}</a>
-    ${pill}
+    ${rowPillHtml(f)}
     <span class="grow"></span>
-    ${meta}
+    ${rowMetaHtml(running, retrying)}
   </div>
   <a class="row-title" href="${href}">${escapeHtml(i.title)}</a>
-  ${peek}
-  ${retryErr}
-  ${triageActions}
+  ${rowPeekHtml(running, f.isAwaiting)}
+  ${rowRetryErrHtml(retrying)}
+  ${rowTriageActionsHtml(i.identifier, f)}
   ${steering}
 </article>`;
+}
+
+function steeringSummaryLabel(hasOriginalTask: boolean, hasContext: boolean): string {
+  if (hasOriginalTask && hasContext) return 'original task & agent’s context';
+  if (hasOriginalTask) return 'original task';
+  return 'agent’s context';
+}
+
+function steeringIssueBlock(title: string, body: string): string {
+  if (!title && !body) return '';
+  const titleHtml = title ? `<h3 class="issue-title">${escapeHtml(title)}</h3>` : '';
+  const bodyHtml = body ? `<p class="issue-body">${escapeHtml(body)}</p>` : '';
+  return `<div class="steering-task-label">issue</div>
+      ${titleHtml}
+      ${bodyHtml}`;
+}
+
+function steeringContextBlock(context: string): string {
+  if (!context) return '';
+  return `<div class="steering-task-label">agent’s context</div>
+      <pre class="context">${escapeHtml(context)}</pre>`;
+}
+
+function steeringExtraPanel(title: string, body: string, context: string): string {
+  const hasOriginalTask = title.length > 0 || body.length > 0;
+  if (!hasOriginalTask && !context) return '';
+  const label = steeringSummaryLabel(hasOriginalTask, context.length > 0);
+  return `<details class="steering-task">
+    <summary>${escapeHtml(label)}</summary>
+    <div class="steering-task-body">
+      ${steeringIssueBlock(title, body)}
+      ${steeringContextBlock(context)}
+    </div>
+  </details>`;
 }
 
 function renderSteeringInline(r: RunningRow): string {
@@ -689,29 +592,12 @@ function renderSteeringInline(r: RunningRow): string {
   const context = (r.steering_context ?? '').trim();
   const issueTitle = (r.issue_title ?? '').trim();
   const issueBody = (r.issue_body ?? '').trim();
-  const hasOriginalTask = issueTitle.length > 0 || issueBody.length > 0;
-  const hasAnyExtra = hasOriginalTask || context.length > 0;
   // Stable textarea id + hx-preserve so the every-2s board repoll keeps the
   // operator's draft reply intact across morph swaps.
   const textareaId = `reply-${r.issue_identifier}`;
-  const summaryLabel =
-    hasOriginalTask && context
-      ? 'original task & agent’s context'
-      : hasOriginalTask
-        ? 'original task'
-        : 'agent’s context';
   return `<div class="steering">
   <div class="steering-q">${renderMarkdown(question)}</div>
-  ${hasAnyExtra ? `<details class="steering-task">
-    <summary>${escapeHtml(summaryLabel)}</summary>
-    <div class="steering-task-body">
-      ${hasOriginalTask ? `<div class="steering-task-label">issue</div>
-      ${issueTitle ? `<h3 class="issue-title">${escapeHtml(issueTitle)}</h3>` : ''}
-      ${issueBody ? `<p class="issue-body">${escapeHtml(issueBody)}</p>` : ''}` : ''}
-      ${context ? `<div class="steering-task-label">agent’s context</div>
-      <pre class="context">${escapeHtml(context)}</pre>` : ''}
-    </div>
-  </details>` : ''}
+  ${steeringExtraPanel(issueTitle, issueBody, context)}
   <form class="reply"
         hx-post="/api/v1/issues/${encodeURIComponent(r.issue_identifier)}/steering-reply"
         hx-target="#ticker" hx-swap="morph:innerHTML">
@@ -769,13 +655,10 @@ function renderTotalsPartial(p: PartialInputs): string {
   return `${formatTokens(t.input_tokens)} in · ${formatTokens(t.output_tokens)} out · ${formatTokens(t.total_tokens)} total · ${formatRuntime(t.seconds_running)} runtime`;
 }
 
-function renderDashboardHtml(p: PartialInputs): string {
-  return `<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>symphony · ${escapeHtml(p.workflowName)}</title>
-<style>
+// Dashboard CSS, hoisted to a top-level constant so renderDashboardHtml stays
+// within the imperative-shell max-lines budget. Pure presentation content — no
+// interpolated values — so it lives outside the function.
+const DASHBOARD_CSS = `
 :root {
   color-scheme: dark;
   --inset: #0c0f15; --bench: #0f1115; --raised: #161a22; --chip: #20242c;
@@ -1141,39 +1024,11 @@ footer.totals:empty { display: none; }
 /* htmx ergonomics */
 .htmx-request .refresh { opacity: 0.6; }
 .htmx-settling .row-peek { opacity: 0.85; }
-</style>
-<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
-<script src="https://unpkg.com/idiomorph@0.7.4/dist/idiomorph-ext.min.js"></script>
-</head><body hx-ext="morph">
+`;
 
-<header id="header">
-  <span class="brand">symphony</span>
-  <span class="rule" aria-hidden="true">·</span>
-  <span class="workflow" title="${escapeHtml(p.workflowPath)}">${escapeHtml(p.workflowName)}</span>
-  <span class="tracker-root" title="${escapeHtml(p.trackerRoot)}">${escapeHtml(p.trackerRoot)}</span>
-  <span id="tracker-state"
-        hx-get="/api/v1/partials/header" hx-trigger="every 2s, refreshed from:body"
-        hx-swap="morph:innerHTML">${renderHeaderPartial(p)}</span>
-  <button type="button" class="refresh"
-          hx-post="/api/v1/refresh" hx-swap="none"
-          aria-label="refresh now" title="poll &amp; reconcile">⟳</button>
-</header>
-
-<div id="ticker"
-     hx-get="/api/v1/partials/attention" hx-trigger="every 2s, refreshed from:body"
-     hx-swap="morph:innerHTML">${renderAttentionPartial(p)}</div>
-
-<main id="board"
-      hx-get="/api/v1/partials/board" hx-trigger="every 2s, refreshed from:body"
-      hx-swap="morph:innerHTML">${renderBoardPartial(p)}</main>
-
-${renderNewIssuePanel(p)}
-
-<footer class="totals"
-        hx-get="/api/v1/partials/totals" hx-trigger="every 2s, refreshed from:body"
-        hx-swap="morph:innerHTML">${renderTotalsPartial(p)}</footer>
-
-<script>
+// Dashboard new-issue panel controller. Stored as a top-level constant so the
+// renderDashboardHtml shell stays inside the imperative-shell line budget.
+const DASHBOARD_SCRIPT = `
 (() => {
   const $ = (id) => document.getElementById(id);
   const panel = $('new-panel');
@@ -1255,7 +1110,47 @@ ${renderNewIssuePanel(p)}
     }
   });
 })();
-</script>
+`;
+
+function renderDashboardHtml(p: PartialInputs): string {
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>symphony · ${escapeHtml(p.workflowName)}</title>
+<style>${DASHBOARD_CSS}</style>
+<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+<script src="https://unpkg.com/idiomorph@0.7.4/dist/idiomorph-ext.min.js"></script>
+</head><body hx-ext="morph">
+
+<header id="header">
+  <span class="brand">symphony</span>
+  <span class="rule" aria-hidden="true">·</span>
+  <span class="workflow" title="${escapeHtml(p.workflowPath)}">${escapeHtml(p.workflowName)}</span>
+  <span class="tracker-root" title="${escapeHtml(p.trackerRoot)}">${escapeHtml(p.trackerRoot)}</span>
+  <span id="tracker-state"
+        hx-get="/api/v1/partials/header" hx-trigger="every 2s, refreshed from:body"
+        hx-swap="morph:innerHTML">${renderHeaderPartial(p)}</span>
+  <button type="button" class="refresh"
+          hx-post="/api/v1/refresh" hx-swap="none"
+          aria-label="refresh now" title="poll &amp; reconcile">⟳</button>
+</header>
+
+<div id="ticker"
+     hx-get="/api/v1/partials/attention" hx-trigger="every 2s, refreshed from:body"
+     hx-swap="morph:innerHTML">${renderAttentionPartial(p)}</div>
+
+<main id="board"
+      hx-get="/api/v1/partials/board" hx-trigger="every 2s, refreshed from:body"
+      hx-swap="morph:innerHTML">${renderBoardPartial(p)}</main>
+
+${renderNewIssuePanel(p)}
+
+<footer class="totals"
+        hx-get="/api/v1/partials/totals" hx-trigger="every 2s, refreshed from:body"
+        hx-swap="morph:innerHTML">${renderTotalsPartial(p)}</footer>
+
+<script>${DASHBOARD_SCRIPT}</script>
 
 </body></html>`;
 }
@@ -1271,81 +1166,95 @@ function escapeHtml(s: string): string {
 // bold/italic, and links. Input is treated as untrusted: everything outside the
 // transforms below is HTML-escaped, and link hrefs are restricted to
 // http/https/mailto schemes so a `javascript:` URL can't slip through.
+
+interface BlockMatch { html: string; nextI: number }
+
+const FENCE_OPEN_RE = /^```([\w-]*)\s*$/;
+const FENCE_CLOSE_RE = /^```\s*$/;
+const HEADER_RE = /^(#{1,6})\s+(.+?)\s*#*\s*$/;
+const UL_RE = /^\s*[-*+]\s+/;
+const UL_ITEM_RE = /^\s*[-*+]\s+(.*)$/;
+const OL_RE = /^\s*\d+\.\s+/;
+const OL_ITEM_RE = /^\s*\d+\.\s+(.*)$/;
+const BLOCKQUOTE_RE = /^\s*>\s?/;
+
+function matchFencedCode(lines: string[], i: number): BlockMatch | null {
+  const fence = FENCE_OPEN_RE.exec(lines[i]!);
+  if (!fence) return null;
+  const lang = fence[1] ?? '';
+  const body: string[] = [];
+  let j = i + 1;
+  while (j < lines.length && !FENCE_CLOSE_RE.test(lines[j]!)) {
+    body.push(lines[j]!);
+    j++;
+  }
+  if (j < lines.length) j++; // consume closing fence
+  const langAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+  return { html: `<pre><code${langAttr}>${escapeHtml(body.join('\n'))}</code></pre>`, nextI: j };
+}
+
+function matchHeader(lines: string[], i: number): BlockMatch | null {
+  const m = HEADER_RE.exec(lines[i]!);
+  if (!m) return null;
+  const level = m[1]!.length;
+  return { html: `<h${level}>${renderInlineMarkdown(m[2]!)}</h${level}>`, nextI: i + 1 };
+}
+
+function matchList(lines: string[], i: number, marker: RegExp, item: RegExp, tag: 'ul' | 'ol'): BlockMatch | null {
+  if (!marker.test(lines[i]!)) return null;
+  const items: string[] = [];
+  let j = i;
+  while (j < lines.length && marker.test(lines[j]!)) {
+    items.push(`<li>${renderInlineMarkdown(item.exec(lines[j]!)![1]!)}</li>`);
+    j++;
+  }
+  return { html: `<${tag}>${items.join('')}</${tag}>`, nextI: j };
+}
+
+function matchBlockquote(lines: string[], i: number): BlockMatch | null {
+  if (!BLOCKQUOTE_RE.test(lines[i]!)) return null;
+  const buf: string[] = [];
+  let j = i;
+  while (j < lines.length && BLOCKQUOTE_RE.test(lines[j]!)) {
+    buf.push(lines[j]!.replace(BLOCKQUOTE_RE, ''));
+    j++;
+  }
+  return { html: `<blockquote>${renderMarkdown(buf.join('\n'))}</blockquote>`, nextI: j };
+}
+
+function isBlockBoundary(line: string): boolean {
+  return line.trim() === ''
+    || FENCE_OPEN_RE.test(line)
+    || /^#{1,6}\s+/.test(line)
+    || UL_RE.test(line)
+    || OL_RE.test(line)
+    || BLOCKQUOTE_RE.test(line);
+}
+
+function matchParagraph(lines: string[], i: number): BlockMatch {
+  const para: string[] = [];
+  let j = i;
+  while (j < lines.length && !isBlockBoundary(lines[j]!)) {
+    para.push(lines[j]!);
+    j++;
+  }
+  return { html: `<p>${renderInlineMarkdown(para.join('\n'))}</p>`, nextI: j };
+}
+
 export function renderMarkdown(input: string): string {
-  const text = input.replace(/\r\n?/g, '\n');
-  const lines = text.split('\n');
+  const lines = input.replace(/\r\n?/g, '\n').split('\n');
   const blocks: string[] = [];
   let i = 0;
   while (i < lines.length) {
-    const line = lines[i]!;
-    const fence = /^```([\w-]*)\s*$/.exec(line);
-    if (fence) {
-      const lang = fence[1] ?? '';
-      const body: string[] = [];
-      i++;
-      while (i < lines.length && !/^```\s*$/.test(lines[i]!)) {
-        body.push(lines[i]!);
-        i++;
-      }
-      if (i < lines.length) i++; // consume closing fence
-      const langAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
-      blocks.push(`<pre><code${langAttr}>${escapeHtml(body.join('\n'))}</code></pre>`);
-      continue;
-    }
-    const header = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
-    if (header) {
-      const level = header[1]!.length;
-      blocks.push(`<h${level}>${renderInlineMarkdown(header[2]!)}</h${level}>`);
-      i++;
-      continue;
-    }
-    if (line.trim() === '') {
-      i++;
-      continue;
-    }
-    if (/^\s*[-*+]\s+/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i]!)) {
-        const m = /^\s*[-*+]\s+(.*)$/.exec(lines[i]!)!;
-        items.push(`<li>${renderInlineMarkdown(m[1]!)}</li>`);
-        i++;
-      }
-      blocks.push(`<ul>${items.join('')}</ul>`);
-      continue;
-    }
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i]!)) {
-        const m = /^\s*\d+\.\s+(.*)$/.exec(lines[i]!)!;
-        items.push(`<li>${renderInlineMarkdown(m[1]!)}</li>`);
-        i++;
-      }
-      blocks.push(`<ol>${items.join('')}</ol>`);
-      continue;
-    }
-    if (/^\s*>\s?/.test(line)) {
-      const buf: string[] = [];
-      while (i < lines.length && /^\s*>\s?/.test(lines[i]!)) {
-        buf.push(lines[i]!.replace(/^\s*>\s?/, ''));
-        i++;
-      }
-      blocks.push(`<blockquote>${renderMarkdown(buf.join('\n'))}</blockquote>`);
-      continue;
-    }
-    const para: string[] = [];
-    while (
-      i < lines.length &&
-      lines[i]!.trim() !== '' &&
-      !/^```/.test(lines[i]!) &&
-      !/^#{1,6}\s+/.test(lines[i]!) &&
-      !/^\s*[-*+]\s+/.test(lines[i]!) &&
-      !/^\s*\d+\.\s+/.test(lines[i]!) &&
-      !/^\s*>\s?/.test(lines[i]!)
-    ) {
-      para.push(lines[i]!);
-      i++;
-    }
-    blocks.push(`<p>${renderInlineMarkdown(para.join('\n'))}</p>`);
+    if (lines[i]!.trim() === '') { i++; continue; }
+    const m = matchFencedCode(lines, i)
+      ?? matchHeader(lines, i)
+      ?? matchList(lines, i, UL_RE, UL_ITEM_RE, 'ul')
+      ?? matchList(lines, i, OL_RE, OL_ITEM_RE, 'ol')
+      ?? matchBlockquote(lines, i)
+      ?? matchParagraph(lines, i);
+    blocks.push(m.html);
+    i = m.nextI;
   }
   return blocks.join('\n');
 }
@@ -1401,85 +1310,77 @@ function formatTimestamp(v: unknown): string | null {
   return null;
 }
 
-function renderIssueDetailPage(
-  issue: DiskIssueDetail,
-  view: { workflowPath: string; states: StateView[] },
+function detailRow(label: string, value: string): string {
+  return `<div class="meta-row"><dt>${escapeHtml(label)}</dt><dd>${value}</dd></div>`;
+}
+
+function detailLabelsRow(labels: string[]): string {
+  if (labels.length === 0) return '';
+  const chips = labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join('');
+  return detailRow('labels', `<div class="label-chips">${chips}</div>`);
+}
+
+function detailBlockedByRow(blockedBy: string[]): string {
+  if (blockedBy.length === 0) return '';
+  const items = blockedBy
+    .map((b) => `<a class="blocker-link" href="/issues/${encodeURIComponent(b)}">${escapeHtml(b)}</a>`)
+    .join(', ');
+  return detailRow('blocked by', items);
+}
+
+function detailUrlRow(url: string | null): string {
+  if (!url) return '';
+  const safe = /^https?:/i.test(url) ? url : '';
+  const value = safe
+    ? `<a href="${escapeHtml(safe)}" rel="noopener noreferrer">${escapeHtml(safe)}</a>`
+    : escapeHtml(url);
+  return detailRow('url', value);
+}
+
+function detailProposedByRow(proposedBy: string | null): string {
+  if (!proposedBy) return '';
+  return detailRow(
+    'proposed by',
+    `<a class="blocker-link" href="/issues/${encodeURIComponent(proposedBy)}">${escapeHtml(proposedBy)}</a>`,
+  );
+}
+
+function detailTimestampRow(label: string, ts: string | null): string {
+  if (!ts) return '';
+  return detailRow(label, `<span class="num">${escapeHtml(ts)}</span>`);
+}
+
+// Pill colour follows the declared role: active → running, terminal → done,
+// holding → idle. An undeclared state (stale directory, file dropped by hand
+// into a name not in `states:`) falls back to idle so the detail page still
+// renders legibly.
+function buildDetailMetaRows(
+  fm: Record<string, unknown>,
+  stateClass: string,
+  stateName: string,
 ): string {
-  const fm = issue.frontMatter;
-  const title = asString(fm['title']) ?? issue.identifier;
-  const labels = asStringList(fm['labels']);
-  const blockedBy = asStringList(fm['blocked_by']);
+  const branchName = asString(fm['branch_name']);
   const priority = asNumber(fm['priority']);
   const createdAt = formatTimestamp(fm['created_at']);
   const updatedAt = formatTimestamp(fm['updated_at']);
-  const proposedBy = asString(fm['proposed_by']);
-  const proposedAt = formatTimestamp(fm['proposed_at']);
-  const branchName = asString(fm['branch_name']);
-  const url = asString(fm['url']);
+  const showUpdated = updatedAt && updatedAt !== createdAt ? updatedAt : null;
+  return [
+    detailRow('state', `<span class="pill ${stateClass}">${escapeHtml(stateName)}</span>`),
+    detailLabelsRow(asStringList(fm['labels'])),
+    priority !== null ? detailRow('priority', `<span class="num">${escapeHtml(String(priority))}</span>`) : '',
+    detailBlockedByRow(asStringList(fm['blocked_by'])),
+    branchName ? detailRow('branch', `<code>${escapeHtml(branchName)}</code>`) : '',
+    detailUrlRow(asString(fm['url'])),
+    detailTimestampRow('created', createdAt),
+    detailTimestampRow('updated', showUpdated),
+    detailProposedByRow(asString(fm['proposed_by'])),
+    detailTimestampRow('proposed at', formatTimestamp(fm['proposed_at'])),
+  ].join('');
+}
 
-  // Pill colour follows the declared role: active → running, terminal → done,
-  // holding → idle. An undeclared state (stale directory, file dropped by hand
-  // into a name not in `states:`) falls back to idle so the detail page still
-  // renders legibly.
-  const stateClass = pillClassForState(view.states, issue.state);
-
-  const metaRows: string[] = [];
-  const metaRow = (label: string, value: string): string =>
-    `<div class="meta-row"><dt>${escapeHtml(label)}</dt><dd>${value}</dd></div>`;
-
-  metaRows.push(metaRow('state', `<span class="pill ${stateClass}">${escapeHtml(issue.state)}</span>`));
-  if (labels.length > 0) {
-    const chips = labels
-      .map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`)
-      .join('');
-    metaRows.push(metaRow('labels', `<div class="label-chips">${chips}</div>`));
-  }
-  if (priority !== null) {
-    metaRows.push(metaRow('priority', `<span class="num">${escapeHtml(String(priority))}</span>`));
-  }
-  if (blockedBy.length > 0) {
-    const items = blockedBy
-      .map(
-        (b) =>
-          `<a class="blocker-link" href="/issues/${encodeURIComponent(b)}">${escapeHtml(b)}</a>`,
-      )
-      .join(', ');
-    metaRows.push(metaRow('blocked by', items));
-  }
-  if (branchName) metaRows.push(metaRow('branch', `<code>${escapeHtml(branchName)}</code>`));
-  if (url) {
-    const safe = /^https?:/i.test(url) ? url : '';
-    metaRows.push(
-      metaRow(
-        'url',
-        safe ? `<a href="${escapeHtml(safe)}" rel="noopener noreferrer">${escapeHtml(safe)}</a>` : escapeHtml(url),
-      ),
-    );
-  }
-  if (createdAt) metaRows.push(metaRow('created', `<span class="num">${escapeHtml(createdAt)}</span>`));
-  if (updatedAt && updatedAt !== createdAt)
-    metaRows.push(metaRow('updated', `<span class="num">${escapeHtml(updatedAt)}</span>`));
-  if (proposedBy)
-    metaRows.push(
-      metaRow(
-        'proposed by',
-        `<a class="blocker-link" href="/issues/${encodeURIComponent(proposedBy)}">${escapeHtml(proposedBy)}</a>`,
-      ),
-    );
-  if (proposedAt) metaRows.push(metaRow('proposed at', `<span class="num">${escapeHtml(proposedAt)}</span>`));
-
-  const bodyHtml = issue.body.length > 0
-    ? `<div class="issue-body">${renderMarkdown(issue.body)}</div>`
-    : `<p class="empty dim">no description</p>`;
-
-  const workflowName = path.basename(view.workflowPath || 'workflow.md');
-
-  return `<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(issue.identifier)} · symphony</title>
-<style>
+// Issue-detail CSS, hoisted out of renderIssueDetailPage so the function stays
+// within the imperative-shell line budget. Pure presentation content.
+const DETAIL_PAGE_CSS = `
 :root {
   color-scheme: dark;
   --inset: #0c0f15; --bench: #0f1115; --raised: #161a22; --chip: #20242c;
@@ -1622,7 +1523,26 @@ h2.section-title {
   word-break: break-all;
 }
 .empty { padding: 0.5rem 0; }
-</style>
+`;
+
+function renderIssueDetailPage(
+  issue: DiskIssueDetail,
+  view: { workflowPath: string; states: StateView[] },
+): string {
+  const fm = issue.frontMatter;
+  const title = asString(fm['title']) ?? issue.identifier;
+  const stateClass = pillClassForState(view.states, issue.state);
+  const metaRows = buildDetailMetaRows(fm, stateClass, issue.state);
+  const bodyHtml = issue.body.length > 0
+    ? `<div class="issue-body">${renderMarkdown(issue.body)}</div>`
+    : `<p class="empty dim">no description</p>`;
+  const workflowName = path.basename(view.workflowPath || 'workflow.md');
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(issue.identifier)} · symphony</title>
+<style>${DETAIL_PAGE_CSS}</style>
 </head><body>
 
 <header id="header">
@@ -1641,7 +1561,7 @@ h2.section-title {
     <h1>${escapeHtml(title)}</h1>
   </section>
 
-  <dl class="issue-meta">${metaRows.join('')}</dl>
+  <dl class="issue-meta">${metaRows}</dl>
 
   <h2 class="section-title">description</h2>
   ${bodyHtml}

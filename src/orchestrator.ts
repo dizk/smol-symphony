@@ -19,6 +19,7 @@ import {
   warnOnHooksAndActionsConflict,
   WorkflowError,
 } from './workflow.js';
+import { validateDispatchIo } from './workflow-loader.js';
 import { writeIssueFile, pickHoldingState } from './issues.js';
 import type { ResourceSnapshot } from './reconciler/index.js';
 import type { ProposeFollowupSink } from './actions/index.js';
@@ -232,7 +233,7 @@ export class Orchestrator
   }
 
   async start(): Promise<void> {
-    const validation = validateDispatch(this.cfg);
+    const validation = validateDispatch(this.cfg) ?? validateDispatchIo(this.cfg);
     if (validation) {
       log.error('startup validation failed', { error: validation });
       throw new WorkflowError('workflow_parse_error', validation);
@@ -372,7 +373,7 @@ export class Orchestrator
    * config is invalid (the tick is rescheduled and the caller must return).
    */
   private applyDispatchValidation(): boolean {
-    const validation = validateDispatch(this.cfg);
+    const validation = validateDispatch(this.cfg) ?? validateDispatchIo(this.cfg);
     if (validation) {
       this.lastValidationError = validation;
       log.warn('dispatch validation failed; skipping dispatch', { error: validation });
@@ -1093,6 +1094,7 @@ export class Orchestrator
       description: input.description ?? '',
       priority: input.priority ?? null,
       labels: input.labels ?? [],
+      now: () => Date.now(),
       extra_front_matter: {
         proposed_by: input.parent_identifier,
         proposed_at: new Date().toISOString(),

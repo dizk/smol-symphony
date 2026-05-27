@@ -12,15 +12,16 @@ import {
   runProcess,
   runHookScript as runHookScriptUtil,
   type RunResult,
-  type RunCapture,
 } from './util/process.js';
 import { sanitizeWorkspaceKey } from './util/workspace-key.js';
+import type { HookCapture, HookResult } from './workspace-types.js';
 
-// Re-exported so existing importers (agent/runner.ts, reconciler/workspace.ts, tests)
-// keep their `from '../workspace.js'` import path. The canonical definition lives in
-// the foundation layer so adapters (runlog) and other domain modules (issues) can
-// import it directly without crossing the adapters↛inward boundary.
+// Re-exported so existing shell/entry importers (agent/runner.ts, tests) keep their
+// `from '../workspace.js'` import path. The canonical definitions live in the
+// foundation layer (util/workspace-key, workspace-types) so domain modules can
+// import them directly without crossing the adapters↛inward boundary.
 export { sanitizeWorkspaceKey };
+export type { HookCapture, HookResult };
 
 export class WorkspaceError extends Error {
   constructor(public code: string, message: string) {
@@ -59,18 +60,6 @@ export function assertContained(workspaceRoot: string, candidate: string): void 
     );
   }
 }
-
-// Hook-shaped result. Aliased to the unified RunResult since hook callers and
-// every other shell-out share the same shape; the `ran: false` convention
-// (no hook configured) is encoded by the caller returning `null` rather than
-// by a field on this type.
-export type HookResult = RunResult;
-
-// Optional streaming capture for hook execution. `onChunk` fires for every stdout/stderr
-// burst the hook produces; `onResult` fires once with the final outcome. The orchestrator
-// uses this to mirror hook output into the per-issue JSONL run log in real time. The
-// existing buffered stdout/stderr in HookResult is preserved for callers that don't care.
-export type HookCapture = RunCapture;
 
 // A hook failed when it timed out, exited with a non-zero status, or was terminated by a
 // signal. The signal-termination case is important — otherwise a fatal `before_run` script

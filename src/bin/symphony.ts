@@ -26,7 +26,7 @@ import process from 'node:process';
 import readline from 'node:readline';
 import { existsSync } from 'node:fs';
 import { parseCli } from './cli-args.js';
-import { loadWorkflow, buildServiceConfig, watchWorkflow } from '../workflow.js';
+import { loadWorkflow, watchWorkflow } from '../workflow-loader.js';
 import { scaffoldWorkflow, ScaffoldError } from '../scaffold.js';
 import { invalidateRunInVmByName } from '../actions/index.js';
 import type { RunInVmAction, WorkflowAction } from '../actions/index.js';
@@ -63,18 +63,11 @@ function findRunInVmByName(
 }
 
 async function runRerunCheck(workflowPath: string, name: string): Promise<number> {
-  let def;
-  try {
-    def = await loadWorkflow(workflowPath);
-  } catch (err) {
-    process.stderr.write(`error: failed to load workflow: ${(err as Error).message}\n`);
-    return 1;
-  }
   let cfg;
   try {
-    cfg = buildServiceConfig(def.config, workflowPath);
+    ({ config: cfg } = await loadWorkflow(workflowPath));
   } catch (err) {
-    process.stderr.write(`error: failed to parse workflow: ${(err as Error).message}\n`);
+    process.stderr.write(`error: failed to load workflow: ${(err as Error).message}\n`);
     return 1;
   }
   const match = findRunInVmByName(cfg.states, name);
