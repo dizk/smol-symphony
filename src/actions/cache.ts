@@ -89,29 +89,40 @@ async function workspaceTreeHash(workspacePath: string): Promise<string> {
   const unique = Array.from(new Set(paths)).sort();
   const h = createHash('sha256');
   for (const rel of unique) {
-    const abs = path.join(workspacePath, rel);
-    let buf: Buffer;
-    try {
-      buf = await readFile(abs);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      // ENOENT: tracked file deleted in worktree; record deletion so the
-      // cache key differs from "file still present." EISDIR / other errors:
-      // record as an error marker so we don't silently bucket two
-      // distinguishable states together.
-      h.update(code === 'ENOENT' ? 'D\0' : 'E\0');
-      h.update(rel);
-      h.update('\0');
-      continue;
-    }
-    h.update('F\0');
-    h.update(rel);
-    h.update('\0');
-    h.update(buf.length.toString(10));
-    h.update('\0');
-    h.update(buf);
+    await foldWorkspacePathIntoHash(h, workspacePath, rel);
   }
   return h.digest('hex');
+}
+
+// Read one workspace path and fold it (or its deletion / error marker) into
+// `h`. Extracted from `workspaceTreeHash` to keep that function under the
+// shell-statement budget; the per-path branching is the same as before.
+async function foldWorkspacePathIntoHash(
+  h: ReturnType<typeof createHash>,
+  workspacePath: string,
+  rel: string,
+): Promise<void> {
+  const abs = path.join(workspacePath, rel);
+  let buf: Buffer;
+  try {
+    buf = await readFile(abs);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // ENOENT: tracked file deleted in worktree; record deletion so the
+    // cache key differs from "file still present." EISDIR / other errors:
+    // record as an error marker so we don't silently bucket two
+    // distinguishable states together.
+    h.update(code === 'ENOENT' ? 'D\0' : 'E\0');
+    h.update(rel);
+    h.update('\0');
+    return;
+  }
+  h.update('F\0');
+  h.update(rel);
+  h.update('\0');
+  h.update(buf.length.toString(10));
+  h.update('\0');
+  h.update(buf);
 }
 
 // Thin shape adapter: workspace-tree hashing wants `stdout | null` (null on
