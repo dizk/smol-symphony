@@ -299,6 +299,54 @@ describe('action: push_branch happy path', () => {
     }
   });
 
+  it('retries with --force-with-lease when the plain push is rejected "(fetch first)" (divergent remote)', async () => {
+    // The fresh-cut re-dispatch case: the workspace cut agent/<id> from base
+    // without restoring the remote branch, so local has NO knowledge of the
+    // already-pushed remote tip. git rejects with "(fetch first)" / "remote
+    // contains work that you do not have locally" rather than
+    // "(non-fast-forward)". The fallback must still recognize it and
+    // force-with-lease onto the freshly-fetched remote tip — otherwise the
+    // push fails, the issue reroutes, and it loops forever.
+    const source = await makeSourceRepo();
+    const bare = await makeBareRepo();
+    const { wsParent, ws } = await makeWorkspace(source, '42', { remote: { name: 'origin', url: bare } });
+    const sibling = await mkdtemp(path.join(os.tmpdir(), 'symphony-fetchfirst-sibling-'));
+    try {
+      // A separate clone pushes agent/42 = commit X to the remote. The ws never
+      // fetches it, so it has no remote-tracking ref for the advanced tip.
+      await git(['clone', bare, '.'], sibling);
+      await git(['config', 'user.name', 'peer'], sibling);
+      await git(['config', 'user.email', 'peer@example.com'], sibling);
+      await git(['checkout', '-b', 'agent/42'], sibling);
+      await writeFile(path.join(sibling, 'x.txt'), 'X\n', 'utf8');
+      await git(['add', '.'], sibling);
+      await git(['commit', '-m', 'X'], sibling);
+      await git(['push', '-u', 'origin', 'agent/42'], sibling);
+
+      // ws's local agent/42 was cut from base with no knowledge of X; commit Y.
+      await writeFile(path.join(ws, 'y.txt'), 'Y\n', 'utf8');
+      await git(['add', '.'], ws);
+      await git(['commit', '-m', 'Y'], ws);
+      const shaY = await git(['rev-parse', 'HEAD'], ws);
+
+      const ctx = baseContext(ws, '42');
+      const result = await runActions(
+        [{ kind: 'push_branch', remote: 'origin', ref: '$branch' }],
+        { workspacePath: ws, ctx, snapshotId: 'actions:Done' },
+      );
+      assert.equal(result.ok, true);
+      assert.equal(result.actions[0]!.state, 'done');
+      // Remote now points at the force-pushed local SHA.
+      const remoteSha = await git(['rev-parse', 'agent/42'], bare);
+      assert.equal(remoteSha, shaY);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(bare, { recursive: true, force: true });
+      await rm(wsParent, { recursive: true, force: true });
+      await rm(sibling, { recursive: true, force: true });
+    }
+  });
+
   it('does not retry with force when the push fails for an unrelated reason', async () => {
     // Auth / network / missing-remote failures must not be papered over with
     // force-with-lease — only non-fast-forward rejections trigger the retry.

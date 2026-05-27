@@ -119,6 +119,10 @@ export interface SetupWorkspaceDirOptions {
   // GitHub `owner/repo` when the operator wants the after_run hook to push
   // back. `null` leaves the workspace network-isolated (no origin remote).
   originRepo: string | null;
+  // Explicit origin URL override. Defaults to the canonical
+  // `https://github.com/<originRepo>.git`. Exists so tests (and non-github
+  // remotes) can point origin at a reachable URL; production leaves it unset.
+  originUrl?: string;
   // Pinned identity for commits the agent makes in the workspace.
   gitIdentity: { name: string; email: string };
 }
@@ -181,7 +185,7 @@ async function runGitExpect(args: string[], cwd: string): Promise<RunResult> {
  * and for unwinding the directory on failure.
  */
 export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise<void> {
-  const { workspacePath, sourceRepo, baseBranch, branch, originRepo, gitIdentity } = opts;
+  const { workspacePath, sourceRepo, baseBranch, branch, originRepo, originUrl, gitIdentity } = opts;
   // 1. Source repo must look like a git repo. Same check the shell ran, lifted
   //    into TypeScript so the error surfaces as a typed WorkspaceError rather
   //    than a shell exit code the runner has to decode.
@@ -228,7 +232,7 @@ export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise
   //    why; the source repo's local `<base>` is the canonical base ref.
   if (originRepo && originRepo.length > 0) {
     await runGitExpect(
-      ['remote', 'add', 'origin', `https://github.com/${originRepo}.git`],
+      ['remote', 'add', 'origin', originUrl ?? `https://github.com/${originRepo}.git`],
       workspacePath,
     );
     // `gh auth setup-git` is best-effort: a host without gh installed should
@@ -275,9 +279,15 @@ export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise
  * advanced past the first push, so the PR stayed CONFLICTING and the autopilot
  * re-routed it forever — a non-converging Done→conflict→reroute→redo loop.
  *
- * Network git calls run with `GIT_TERMINAL_PROMPT=0` so an unreachable or
- * unauthenticated origin fails fast (and the caller falls back to a fresh branch)
- * instead of blocking on a credential prompt.
+ * Fails closed on a transport/auth error rather than cutting fresh: only an
+ * `ls-remote --exit-code` "no matching refs" (exit 2) means the branch truly
+ * doesn't exist yet. An unreachable/unauthenticated origin (exit 128, …) is
+ * indistinguishable from "branch present but unobservable", so falling back to a
+ * fresh cut there would risk the next push force-with-lease'ing over already-
+ * pushed work once the origin recovers (`runCanonicalSetup` won't re-run on the
+ * existing dir). Throwing makes `runCanonicalSetup` unwind the dir so a later
+ * tick retries the restore. Network calls run with `GIT_TERMINAL_PROMPT=0` so
+ * they fail fast instead of blocking on a credential prompt.
  */
 export async function restorePushedBranch(
   workspacePath: string,
@@ -288,14 +298,35 @@ export async function restorePushedBranch(
     cwd: workspacePath,
   });
   if (remoteCheck.exit_code !== 0) return false;
+  // Probe the EXACT head ref. `ls-remote … <branch>` does suffix matching, so a
+  // colliding ref like `refs/heads/archive/<branch>` would exit 0 (false positive)
+  // for a `<branch>` that doesn't exist; the exact `fetch` below would then fail
+  // and a first dispatch would unwind forever. `refs/heads/<branch>` matches only
+  // the exact ref.
   const exists = await runProcess(
     'git',
-    ['ls-remote', '--exit-code', '--heads', 'origin', branch],
+    ['ls-remote', '--exit-code', 'origin', `refs/heads/${branch}`],
     noPrompt,
   );
-  if (exists.exit_code !== 0) return false;
-  const fetched = await runProcess('git', ['fetch', '--no-tags', 'origin', branch], noPrompt);
-  if (fetched.exit_code !== 0) return false;
+  // exit 2 = reached the remote, no such ref → genuine first dispatch, cut fresh.
+  if (exists.exit_code === 2) return false;
+  // Any other non-zero (128, …) is a transport/auth failure — fail closed.
+  if (exists.exit_code !== 0) {
+    throw new WorkspaceError(
+      'workspace_setup_origin_unreachable',
+      `git ls-remote origin ${branch} failed (exit ${exists.exit_code}): ${(exists.stderr || exists.stdout).trim()}`,
+    );
+  }
+  // Fetch the exact head ref (matching the probe): an unqualified `<branch>`
+  // refspec would resolve a same-named tag (refs/tags/<branch>) into FETCH_HEAD
+  // even with --no-tags, and checkout would then restore the tag's commit.
+  const fetched = await runProcess('git', ['fetch', '--no-tags', 'origin', `refs/heads/${branch}`], noPrompt);
+  if (fetched.exit_code !== 0) {
+    throw new WorkspaceError(
+      'workspace_setup_branch_fetch_failed',
+      `git fetch origin ${branch} failed (exit ${fetched.exit_code}): ${(fetched.stderr || fetched.stdout).trim()}`,
+    );
+  }
   await runGitExpect(['checkout', '-b', branch, 'FETCH_HEAD'], workspacePath);
   return true;
 }

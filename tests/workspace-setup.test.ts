@@ -106,31 +106,35 @@ describe('setupWorkspaceDir', () => {
     }
   });
 
-  it('restores an origin pointing at the canonical HTTPS URL when SYMPHONY_REPO is set', async () => {
-    // PR mode: origin must be present and target the canonical HTTPS URL for
-    // the configured GitHub repo. `gh auth setup-git` and the
-    // `origin/<base>` fetch are best-effort (network/auth dependent) and
-    // happen to be no-ops in this test env; the key invariant is that
-    // origin is restored to a usable URL after the clone-time strip.
+  it('restores origin and cuts a fresh per-issue branch on first dispatch (reachable origin, no pushed branch)', async () => {
+    // PR mode against a reachable origin with no pushed agent/<id> yet: origin
+    // is restored and HEAD lands on a freshly-cut agent/7. origin points at a
+    // local bare remote (originUrl) so the restore probe is hermetic and
+    // ls-remote returns a clean "no such ref" (exit 2); production derives
+    // https://github.com/<originRepo>.git.
     const source = await makeSourceRepo();
+    const bare = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-setup-pr-remote-'));
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-setup-pr-'));
     const wsPath = path.join(wsRoot, '7');
     await mkdir(wsPath, { recursive: true });
     try {
+      await git(['init', '--bare', '-b', 'main'], bare);
       await setupWorkspaceDir({
         workspacePath: wsPath,
         sourceRepo: source,
         baseBranch: 'main',
         branch: 'agent/7',
         originRepo: 'octo/example',
+        originUrl: bare,
         gitIdentity: { name: 'symphony-agent', email: 'agent@symphony.local' },
       });
       const headRef = await git(['symbolic-ref', '--short', 'HEAD'], wsPath);
-      assert.equal(headRef, 'agent/7', 'agent branch checked out');
+      assert.equal(headRef, 'agent/7', 'fresh agent branch checked out');
       const originUrl = await git(['remote', 'get-url', 'origin'], wsPath);
-      assert.equal(originUrl, 'https://github.com/octo/example.git');
+      assert.equal(originUrl, bare, 'origin restored to the configured URL');
     } finally {
       await rm(source, { recursive: true, force: true });
+      await rm(bare, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });
     }
   });
@@ -362,6 +366,100 @@ describe('restorePushedBranch', () => {
     }
   });
 
+  it('does not false-match a suffix-colliding remote branch (cuts fresh)', async () => {
+    // origin has refs/heads/archive/agent/88 but NOT agent/88. ls-remote's
+    // suffix matching would exit 0 on a bare `agent/88` pattern; the exact-ref
+    // probe must return false so a genuine first dispatch cuts fresh rather than
+    // trying (and failing) to fetch a nonexistent exact ref and unwinding.
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-collide-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-collide-ws-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-collide-seed-'));
+      try {
+        await git(['init', '-b', 'main'], seed);
+        await git(['config', 'user.name', 'test'], seed);
+        await git(['config', 'user.email', 'test@example.com'], seed);
+        await writeFile(path.join(seed, 'a.txt'), 'base\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'base'], seed);
+        await git(['remote', 'add', 'origin', bareRemote], seed);
+        await git(['push', 'origin', 'main'], seed);
+        await git(['checkout', '-b', 'archive/agent/88'], seed);
+        await writeFile(path.join(seed, 'old.txt'), 'archived\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'archived'], seed);
+        await git(['push', 'origin', 'archive/agent/88'], seed);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+      const wsPath = path.join(wsRoot, '88');
+      await mkdir(wsPath, { recursive: true });
+      await git(['clone', bareRemote, '.'], wsPath);
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'main');
+
+      const restored = await restorePushedBranch(wsPath, 'agent/88');
+      assert.equal(restored, false);
+      assert.equal(await git(['symbolic-ref', '--short', 'HEAD'], wsPath), 'main');
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fetches the exact branch ref, not a same-named tag', async () => {
+    // A tag sharing the branch name (refs/tags/<branch>) pointing elsewhere must
+    // not be checked out in place of the branch. Fetching refs/heads/<branch>
+    // (matching the probe) restores the branch commit, not the tag's.
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-tag-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-tag-ws-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      let branchSha = '';
+      let baseSha = '';
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-tag-seed-'));
+      try {
+        await git(['init', '-b', 'main'], seed);
+        await git(['config', 'user.name', 'test'], seed);
+        await git(['config', 'user.email', 'test@example.com'], seed);
+        await writeFile(path.join(seed, 'a.txt'), 'base\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'base'], seed);
+        await git(['remote', 'add', 'origin', bareRemote], seed);
+        await git(['push', 'origin', 'main'], seed);
+        baseSha = await git(['rev-parse', 'HEAD'], seed);
+        await git(['checkout', '-b', 'agent/tagcollide'], seed);
+        await writeFile(path.join(seed, 'work.txt'), 'branch work\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'branch work'], seed);
+        branchSha = await git(['rev-parse', 'HEAD'], seed);
+        // Tag of the same name pointing at base (a different commit than the branch).
+        await git(['tag', 'agent/tagcollide', 'main'], seed);
+        await git(
+          ['push', 'origin', 'refs/heads/agent/tagcollide:refs/heads/agent/tagcollide', 'refs/tags/agent/tagcollide:refs/tags/agent/tagcollide'],
+          seed,
+        );
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+      assert.notEqual(branchSha, baseSha);
+      const wsPath = path.join(wsRoot, 'tc');
+      await mkdir(wsPath, { recursive: true });
+      await git(['clone', bareRemote, '.'], wsPath);
+
+      const restored = await restorePushedBranch(wsPath, 'agent/tagcollide');
+      assert.equal(restored, true);
+      assert.equal(
+        await git(['rev-parse', 'HEAD'], wsPath),
+        branchSha,
+        'restored the branch commit, not the same-named tag',
+      );
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('returns false in local-only mode (no origin remote)', async () => {
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-local-ws-'));
     const wsPath = path.join(wsRoot, '99');
@@ -375,6 +473,30 @@ describe('restorePushedBranch', () => {
       await git(['commit', '-m', 'base'], wsPath);
       const restored = await restorePushedBranch(wsPath, 'agent/99');
       assert.equal(restored, false);
+    } finally {
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed (throws) when the origin is unreachable, so setup unwinds and a later tick can retry', async () => {
+    // Transport/auth failure must NOT be treated as "no branch" and cut fresh:
+    // that would risk a later force-with-lease over already-pushed work once the
+    // origin recovers. An unreachable origin makes ls-remote exit 128 → throw.
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-unreachable-ws-'));
+    const wsPath = path.join(wsRoot, '55');
+    try {
+      await mkdir(wsPath, { recursive: true });
+      await git(['init', '-b', 'main'], wsPath);
+      await git(['config', 'user.name', 'test'], wsPath);
+      await git(['config', 'user.email', 'test@example.com'], wsPath);
+      await writeFile(path.join(wsPath, 'a.txt'), 'base\n');
+      await git(['add', '.'], wsPath);
+      await git(['commit', '-m', 'base'], wsPath);
+      await git(['remote', 'add', 'origin', '/nonexistent/symphony-restore-unreachable-remote'], wsPath);
+      await assert.rejects(
+        restorePushedBranch(wsPath, 'agent/55'),
+        /ls-remote origin agent\/55 failed/,
+      );
     } finally {
       await rm(wsRoot, { recursive: true, force: true });
     }
