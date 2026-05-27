@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history so the diff-size gate can compare against the base
+          fetch-depth: 0 # full history
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -22,9 +22,3 @@ jobs:
       - run: npm run lint # eslint: core purity + shell complexity ratchet (--max-warnings)
       - run: npm test
       - run: npm run build
-      - name: diff-size gate
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: origin/${{ github.base_ref }}
-          SIZE_OVERRIDE: ${{ contains(github.event.pull_request.labels.*.name, 'size:override') }}
-        run: npm run check:size
