@@ -571,6 +571,162 @@ export class AgentRunner {
     entry.issue.state = targetState;
   }
 
+  /**
+   * Cleanup phase 1: shared-integration-branch handoff. When the agent has
+   * just transitioned into a terminal state listed in
+   * `integration.merge_on_states`, attempt a host-side merge of
+   * `agent/<identifier>` into the shared integration branch BEFORE the
+   * terminal state's after_run/actions runs. On success the caller proceeds
+   * into the same cleanup tail; on conflict / push-refusal the runner reroutes
+   * the issue to the configured holding state (Conflict), preserves the
+   * workspace + agent branch, and returns `integrationFailed: true` so the
+   * caller skips the after_run path (no orphan PR opens).
+   *
+   * The returned `cleanupState` reflects the post-reroute state when the merge
+   * failed, and the unchanged input state otherwise.
+   */
+  private async runIntegrationMergeAndReroute(
+    issue: Issue,
+    runningEntry: RunningEntry | undefined,
+    workspacePath: string,
+    hookCapture: (hook: string) => HookCapture | undefined,
+    runLog: RunLog | undefined,
+  ): Promise<{ cleanupState: string; integrationFailed: boolean }> {
+    const cleanupState = runningEntry?.issue.state ?? issue.state;
+    if (runningEntry === undefined) {
+      return { cleanupState, integrationFailed: false };
+    }
+    const integrationCfg = this.cfg.integration;
+    const gated = shouldRunIntegrationMerge({
+      transitioned: runningEntry.transitioned,
+      cleanupState,
+      mergeOnStates: integrationCfg.merge_on_states,
+    });
+    if (!gated) {
+      return { cleanupState, integrationFailed: false };
+    }
+    const remote = resolveIntegrationRemote(workspacePath);
+    runLog?.system('integration_merge_started', {
+      identifier: runningEntry.identifier,
+      integration_branch: integrationCfg.branch,
+      terminal_state: cleanupState,
+      remote: remote.kind,
+    });
+    const result = await performIntegrationMerge({
+      workspacePath,
+      identifier: runningEntry.identifier,
+      integrationBranch: integrationCfg.branch,
+      baseBranch: process.env.SYMPHONY_BASE_BRANCH || 'main',
+      remote,
+      timeoutMs: this.cfg.hooks.timeout_ms,
+      capture: hookCapture('integration_merge'),
+    });
+    if (result.ok) {
+      runLog?.system('integration_merge_succeeded', {
+        integration_branch: result.integrationBranch,
+        remote: result.remote,
+        merged_at: result.merged_at,
+      });
+      return { cleanupState, integrationFailed: false };
+    }
+    runLog?.system('integration_merge_failed', {
+      reason: result.reason,
+      integration_branch: result.integrationBranch,
+      remote: result.remote,
+      diagnostic: result.diagnostic.slice(0, 2000),
+    });
+    await routeIntegrationFailureToConflict(
+      this.tracker,
+      runningEntry,
+      integrationCfg.conflict_state,
+      result,
+    );
+    // The reroute mutates runningEntry.issue.state to the conflict state; the
+    // returned cleanupState picks up the conflict state's hooks (typically
+    // none) for the after_run resolution below.
+    return { cleanupState: runningEntry.issue.state, integrationFailed: true };
+  }
+
+  /**
+   * Cleanup phase 2: dispatch the per-state `actions:` block or the legacy
+   * `hooks.after_run` shell, gated on `decideCleanupExecution`. Stages the
+   * SYMPHONY_* env vars + temp body file once for whichever branch runs and
+   * tears them down via the `finally`. Returns the non-routed action failure
+   * reason (or null when the cleanup succeeded / routed-failed / was skipped)
+   * so the caller can fold it into the attempt outcome.
+   */
+  private async runCleanupActionsOrHook(
+    issue: Issue,
+    cleanupState: string,
+    runningEntry: RunningEntry | undefined,
+    workspacePath: string,
+    vmReady: boolean,
+    vmName: string,
+    integrationFailed: boolean,
+    hookCapture: (hook: string) => HookCapture | undefined,
+    runLog: RunLog | undefined,
+  ): Promise<string | null> {
+    const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
+    const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
+    const cleanupActions = resolveActionsForState(this.cfg, cleanupState);
+    const decisionInput = {
+      integrationFailed,
+      hasRunningEntry: runningEntry !== undefined,
+      actionsLength: cleanupActions?.length ?? 0,
+      hasAfterRunHook: Boolean(cleanupHooks.after_run),
+    };
+    const cleanupExec = decideCleanupExecution(decisionInput);
+    let extraEnv: Record<string, string> | undefined,
+      extraEnvCleanup: (() => Promise<void>) | null = null;
+    if (shouldStageAfterRunEnv(decisionInput)) {
+      try {
+        ({ env: extraEnv, cleanup: extraEnvCleanup } = await buildAfterRunHookEnv(
+          runningEntry!,
+        ));
+      } catch (err) {
+        logger.warn('after_run env staging failed; running hook without SYMPHONY_PR_* vars', {
+          error: (err as Error).message,
+        });
+      }
+    }
+    let nonRoutedActionFailureReason: string | null = null;
+    try {
+      // Per-state `actions:` block wins over `hooks.after_run` (issue 36
+      // AC2). decideCleanupExecution guarantees runningEntry + non-empty
+      // cleanupActions when it returns 'actions', so the `!`s are sound.
+      if (cleanupExec === 'actions') {
+        // run_in_vm goes through the per-issue VM's exec channel. The VM is
+        // still alive here — destroy is deferred to the reconciler after
+        // runAttempt returns. The `vmReady` guard mirrors the bring-up gate.
+        const runInVm: RunInVmExecutor | undefined = vmReady
+          ? this.buildVmRunInVm(vmName, runLog)
+          : undefined;
+        const actionResult = await this.runStateActions(
+          cleanupState,
+          cleanupActions!,
+          runningEntry!,
+          workspacePath,
+          extraEnv,
+          hookCapture('actions'),
+          runInVm,
+        );
+        if (!actionResult.ok && !actionResult.route_to) {
+          nonRoutedActionFailureReason = actionResult.reason ?? 'unknown';
+        }
+      } else if (cleanupExec === 'hook') {
+        await this.workspaces.runAfterRunBestEffort(
+          workspacePath,
+          cleanupHooks,
+          hookCapture('after_run'),
+          extraEnv,
+        );
+      }
+    } finally {
+      if (extraEnvCleanup) await extraEnvCleanup();
+    }
+    return nonRoutedActionFailureReason;
+  }
+
   async runAttempt(
     issue: Issue,
     attempt: number | null,
@@ -914,146 +1070,31 @@ export class AgentRunner {
         this.mcp.deactivate(runningEntry.identifier);
       }
       logger.debug('agent runner cleanup', { reason });
-      // Resolve after_run against the issue's CURRENT state. If the agent called
-      // symphony.transition during the attempt, the MCP handler updated
-      // runningEntry.issue.state to the new state, so terminal-state hooks (e.g. Done's
-      // PR-create hook) fire instead of the initial state's. Falls back to the initial
-      // state when no entry is wired or the transition never happened.
-      let cleanupState = runningEntry?.issue.state ?? issue.state;
-      // Shared-integration-branch handoff (issue 19). When the agent has just
-      // transitioned into a terminal state that the operator opted in to
-      // `integration.merge_on_states`, attempt a host-side merge of
-      // `agent/<identifier>` into the shared integration branch BEFORE the
-      // terminal state's after_run hook fires. The merge owns the state-machine
-      // call: on success we proceed into the same after_run path the Done hook
-      // expects (push + gh pr create); on conflict / push-refusal we reroute the
-      // issue to the configured holding state (Conflict), append a diagnostic
-      // notes block, preserve the workspace and `agent/<id>` branch, and skip
-      // after_run so no orphan PR opens. The post-reroute cleanupState picks up
-      // the holding state's hooks (typically none), so the after_run path below
-      // becomes a no-op in that branch.
-      let integrationFailed = false;
-      const integrationCfg = this.cfg.integration;
-      const integrationGated =
-        runningEntry !== undefined &&
-        shouldRunIntegrationMerge({
-          transitioned: runningEntry.transitioned,
-          cleanupState,
-          mergeOnStates: integrationCfg.merge_on_states,
-        });
-      if (integrationGated && runningEntry) {
-        const remote = resolveIntegrationRemote(workspace.path);
-        runLog?.system('integration_merge_started', {
-          identifier: runningEntry.identifier,
-          integration_branch: integrationCfg.branch,
-          terminal_state: cleanupState,
-          remote: remote.kind,
-        });
-        const result = await performIntegrationMerge({
-          workspacePath: workspace.path,
-          identifier: runningEntry.identifier,
-          integrationBranch: integrationCfg.branch,
-          baseBranch: process.env.SYMPHONY_BASE_BRANCH || 'main',
-          remote,
-          timeoutMs: this.cfg.hooks.timeout_ms,
-          capture: hookCapture('integration_merge'),
-        });
-        if (result.ok) {
-          runLog?.system('integration_merge_succeeded', {
-            integration_branch: result.integrationBranch,
-            remote: result.remote,
-            merged_at: result.merged_at,
-          });
-        } else {
-          runLog?.system('integration_merge_failed', {
-            reason: result.reason,
-            integration_branch: result.integrationBranch,
-            remote: result.remote,
-            diagnostic: result.diagnostic.slice(0, 2000),
-          });
-          await routeIntegrationFailureToConflict(
-            this.tracker,
-            runningEntry,
-            integrationCfg.conflict_state,
-            result,
-          );
-          integrationFailed = true;
-          // The reroute mutates runningEntry.issue.state to the conflict state.
-          // Refresh the local copy so after_run resolution below picks up the
-          // conflict state's hooks (typically none) and so vm_teardown_deferred
-          // logging shows the post-reroute state.
-          cleanupState = runningEntry.issue.state;
-        }
-      }
-      const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
-      const cleanupActions = resolveActionsForState(this.cfg, cleanupState);
-      const cleanupExec = decideCleanupExecution({
-        integrationFailed,
-        hasRunningEntry: runningEntry !== undefined,
-        actionsLength: cleanupActions?.length ?? 0,
-        hasAfterRunHook: Boolean(cleanupHooks.after_run),
-      });
-      // Stage SYMPHONY_* env vars + a temp body file once. Both the legacy
-      // after_run shell and the typed-action executor consume the same values
-      // (the action templating context derives from this map); building it
-      // once avoids two redundant tracker reads on the Done state's transition.
-      let extraEnv: Record<string, string> | undefined;
-      let extraEnvCleanup: (() => Promise<void>) | null = null;
-      if (
-        shouldStageAfterRunEnv({
-          integrationFailed,
-          hasRunningEntry: runningEntry !== undefined,
-          actionsLength: cleanupActions?.length ?? 0,
-          hasAfterRunHook: Boolean(cleanupHooks.after_run),
-        })
-      ) {
-        try {
-          const staged = await buildAfterRunHookEnv(runningEntry!);
-          extraEnv = staged.env;
-          extraEnvCleanup = staged.cleanup;
-        } catch (err) {
-          logger.warn('after_run env staging failed; running hook without SYMPHONY_PR_* vars', {
-            error: (err as Error).message,
-          });
-        }
-      }
-      try {
-        // Per-state `actions:` block wins over `hooks.after_run` (issue 36
-        // AC2; deprecation warning fires once at orchestrator startup).
-        // `cleanupExec` collapses the integration/actions/hook branching into
-        // a single decision the shell switches on.
-        if (cleanupExec === 'actions' && runningEntry && cleanupActions) {
-          // run_in_vm goes through the per-issue VM's exec channel (same
-          // sandbox the agent ran in). Ordering inside cleanup() guarantees
-          // the VM is still alive at this point — VM destroy is the very
-          // last step below. We only wire the closure when bring-up
-          // succeeded; the `if (vmReady)` guard mirrors the destroy guard.
-          const runInVm: RunInVmExecutor | undefined = vmReady
-            ? this.buildVmRunInVm(vmName, runLog)
-            : undefined;
-          const actionResult = await this.runStateActions(
-            cleanupState,
-            cleanupActions,
-            runningEntry,
-            workspace.path,
-            extraEnv,
-            hookCapture('actions'),
-            runInVm,
-          );
-          if (!actionResult.ok && !actionResult.route_to) {
-            nonRoutedActionFailureReason = actionResult.reason ?? 'unknown';
-          }
-        } else if (cleanupExec === 'hook') {
-          await this.workspaces.runAfterRunBestEffort(
-            workspace.path,
-            cleanupHooks,
-            hookCapture('after_run'),
-            extraEnv,
-          );
-        }
-      } finally {
-        if (extraEnvCleanup) await extraEnvCleanup();
-      }
+      // Phase 1: shared-integration-branch handoff (issue 19). Returns the
+      // cleanupState reflecting any conflict-state reroute and a flag the
+      // next phase uses to skip after_run when the merge failed.
+      const integrationResult = await this.runIntegrationMergeAndReroute(
+        issue,
+        runningEntry,
+        workspace.path,
+        hookCapture,
+        runLog,
+      );
+      // Phase 2: per-state `actions:` block or legacy `hooks.after_run`,
+      // gated on `decideCleanupExecution`. Captures any non-routed action
+      // failure so the orchestrator surfaces it instead of marking the
+      // attempt successful while the push/PR-create never landed.
+      nonRoutedActionFailureReason = await this.runCleanupActionsOrHook(
+        issue,
+        integrationResult.cleanupState,
+        runningEntry,
+        workspace.path,
+        vmReady,
+        vmName,
+        integrationResult.integrationFailed,
+        hookCapture,
+        runLog,
+      );
       // Per the agreed lifecycle, every attempt gets a fresh VM. Teardown is the
       // reconciler `vm` resource's job (issue 52): the runner only mutates desired
       // state. By the time this `cleanup()` returns, `runAttempt` returns to the
