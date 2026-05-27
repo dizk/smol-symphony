@@ -429,7 +429,18 @@ async function applyPushBranch(
 }
 
 function isNonFastForward(res: { stdout: string; stderr: string }): boolean {
-  return /non-fast-forward/i.test(`${res.stdout}\n${res.stderr}`);
+  // git phrases a rejected push two ways, both safely resolvable by re-fetching
+  // the remote ref and force-with-lease'ing onto its just-observed tip:
+  //   • "(non-fast-forward)" — the remote-tracking ref is current but the push
+  //     rewrites history (the rebase-in-place case).
+  //   • "(fetch first)" / "remote contains work that you do not have locally" —
+  //     the remote ref advanced beyond, or was never fetched into, the local
+  //     clone. This is the re-dispatch case where the workspace cut the branch
+  //     fresh from base without restoring the pushed `agent/<id>` tip; matching
+  //     only "non-fast-forward" skipped the fallback and surfaced a hard failure.
+  return /non-fast-forward|fetch first|remote contains work that you do not have/i.test(
+    `${res.stdout}\n${res.stderr}`,
+  );
 }
 
 async function applyCreatePrIfMissing(
