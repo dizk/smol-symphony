@@ -657,6 +657,7 @@ export class McpRegistry {
         description,
         priority,
         labels,
+        now: realClock,
         extra_front_matter: {
           proposed_by: active.identifier,
           proposed_at: isoFromClock(this.now),

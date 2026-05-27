@@ -19,19 +19,29 @@
 //   `boot-config.json` fallback remains for robustness across smolvm versions
 //   and for the narrow window before the daemon removes it. We only kill
 //   workers whose resolved name starts with `symphony-`; anything else (an
-//   operator's personal VM, a sibling tool's workers) is left alone.
+//   operator's personal VM, a sibling tool's workers) is left alone. The IO
+//   side of this mapping lives in `./index.ts`; this module stays pure.
 //
-// Defense in depth: a worker whose name can't be resolved from either source
-// drops out of the reapable set. The reaper would rather leak than blindly
-// kill a process whose VM name we can't confirm.
+// Effects-as-data (issue 69): the decision of WHAT to do is a pure function
+// (`decideVm`) of the observed state; HOW it's done (smolvm CLI, /proc reads,
+// process.kill, sleep) is the shell's job. This module is import-pure:
+// no `node:fs`, no timers, no adapter imports.
 
-import { readFile, readdir } from 'node:fs/promises';
-import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
-import { SYMPHONY_VM_PREFIX, type SmolvmClient } from '../agent/smolvm-port.js';
 import { log } from '../logging.js';
 import { ResourceActionLedger } from './ledger.js';
-import type { ResourceSnapshot } from './types.js';
+import type {
+  DestroyMachineAction,
+  KillBootWorkerAction,
+  ResourceSnapshot,
+} from './types.js';
+
+// Domain constant. Every VM the orchestrator creates is named with this
+// prefix; the reaper only acts on names that match. The smolvm-port adapter
+// mirrors the same value where it mints VM names — keep them in sync.
+export const SYMPHONY_VM_PREFIX = 'symphony-';
+
+const DEFAULT_KILL_GRACE_MS = 3_000;
+const MAX_ACTION_HISTORY = 32;
 
 /**
  * Source of the orchestrator's currently-intended VM set. Returned each
@@ -49,22 +59,31 @@ export interface BootWorker {
   vmName: string;
 }
 
+/**
+ * Minimal smolvm surface the reaper consumes. Subset of the `SmolvmClient`
+ * port; declared locally so vm.ts stays adapter-import-free.
+ */
+export interface VmRegistryPort {
+  list(): Promise<string[]>;
+  destroy(name: string): Promise<void>;
+}
+
 export interface VmResourceOptions {
-  smolvm: SmolvmClient;
+  smolvm: VmRegistryPort;
   intended: IntendedVmProvider;
   /**
-   * Process enumerator (overridable for tests). Returns workers whose VM name
-   * could be resolved from the persistent `<vmdir>/name` file (with a
-   * `boot-config.json` fallback). Workers with no resolvable name are dropped
-   * at the source.
+   * Process enumerator. Production wiring (defaultListBootWorkers in
+   * `./index.ts`) returns workers whose VM name could be resolved from the
+   * persistent `<vmdir>/name` file (with a `boot-config.json` fallback).
+   * Workers with no resolvable name are dropped at the source.
    */
-  listBootWorkers?: () => Promise<BootWorker[]>;
+  listBootWorkers: () => Promise<BootWorker[]>;
   /**
-   * Send a signal to a host PID (overridable for tests). Defaults to
-   * `process.kill`. Receivers throw nothing on success and ESRCH/EPERM via
+   * Send a signal to a host PID. Production wiring delegates to `process.kill`
+   * in `./index.ts`. Receivers throw nothing on success and ESRCH/EPERM via
    * a thrown Error on failure.
    */
-  killProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
   /**
    * SIGTERM-to-SIGKILL grace period (ms). A boot worker that ignores SIGTERM
    * is SIGKILL'd after this delay. Default 3s; tests pass a small value so
@@ -73,108 +92,61 @@ export interface VmResourceOptions {
   killGraceMs?: number;
 }
 
-const DEFAULT_KILL_GRACE_MS = 3_000;
-const MAX_ACTION_HISTORY = 32;
-
 /**
- * Resolve a `_boot-vm` worker's VM name from its on-disk identity.
- *
- * The argv-referenced `boot-config.json` lives under
- * `~/.cache/smolvm/vms/<hash>/boot-config.json`, but smolvm consumes and
- * deletes that file shortly after the VM boots — so for a running VM it isn't
- * present on disk. The persistent sibling file `<dir>/name` holds the
- * daemon-registered VM name as plain text and survives the VM's lifetime.
- *
- * Prefer `<dir>/name`. Fall back to parsing `boot-config.json` for robustness
- * across smolvm versions and for the narrow pre-consume window. Returns null
- * if neither yields a non-empty string — the reaper only acts on
- * confidently-identified strays.
+ * Snapshot of every input `decideVm` needs. Populated by the shell's
+ * observation pass — `decideVm` is a pure function of this record.
  */
-export async function resolveBootWorkerVmName(configPath: string): Promise<string | null> {
-  const dir = path.dirname(configPath);
-  try {
-    const raw = await readFile(path.join(dir, 'name'), 'utf8');
-    const name = raw.trim();
-    if (name.length > 0) return name;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // ENOENT is the expected case across smolvm versions that don't write a
-    // sibling name file; anything else is worth a debug breadcrumb.
-    if (code !== 'ENOENT') {
-      log.debug('vm reaper: name file read failed', { dir, error: (err as Error).message });
-    }
-  }
-  let body: string;
-  try {
-    body = await readFile(configPath, 'utf8');
-  } catch {
-    log.debug('vm reaper: boot-config read failed', { configPath });
-    return null;
-  }
-  let parsed: { name?: unknown };
-  try {
-    parsed = JSON.parse(body) as { name?: unknown };
-  } catch {
-    log.debug('vm reaper: boot-config malformed', { configPath });
-    return null;
-  }
-  const name = parsed.name;
-  if (typeof name !== 'string' || name.length === 0) return null;
-  return name;
+export interface VmObservedState {
+  /** Names the orchestrator wants to keep alive (current dispatch set). */
+  intended: ReadonlySet<string>;
+  /** Names known to the smolvm daemon (`smolvm machine ls`). */
+  registry: readonly string[];
+  /** Host `_boot-vm` workers whose VM name resolved from disk. */
+  workers: readonly BootWorker[];
 }
 
 /**
- * Enumerate every `_boot-vm` host worker and map it to its symphony VM name
- * via the persistent `<vmdir>/name` file (with a `boot-config.json` fallback).
- * Linux-only (reads /proc).
- *
- * Workers whose argv has no boot-config path, or whose VM name can't be
- * resolved from either source, are dropped silently — the reaper only acts on
- * confidently-identified strays.
+ * Reaper effect, applied by the shell. Reuses the typed action records from
+ * `./types.ts` so the dashboard's existing `ReconcilerAction` taxonomy doubles
+ * as the effect language.
  */
-export async function defaultListBootWorkers(): Promise<BootWorker[]> {
-  const procDir = '/proc';
-  let entries: string[];
-  try {
-    entries = await readdir(procDir);
-  } catch {
-    return [];
-  }
-  const out: BootWorker[] = [];
-  for (const ent of entries) {
-    const pid = Number(ent);
-    if (!Number.isInteger(pid) || pid <= 0) continue;
-    let raw: string;
-    try {
-      raw = await readFile(path.join(procDir, ent, 'cmdline'), 'utf8');
-    } catch {
-      continue;
+export type VmEffect = DestroyMachineAction | KillBootWorkerAction;
+
+/**
+ * Pure decision: given the observed VM/worker state, return the effects the
+ * shell should apply. No IO, no clock reads, no logging.
+ *
+ * Effect rules:
+ *   • Registry entry starts with SYMPHONY_VM_PREFIX and isn't intended
+ *     → `destroy_machine`.
+ *   • Worker's vmName starts with SYMPHONY_VM_PREFIX and isn't intended
+ *     → `kill_boot_worker`.
+ *
+ * Anything outside the symphony-prefixed namespace is left untouched
+ * (operator VMs, sibling tools' workers).
+ */
+export function decideVm(state: VmObservedState): VmEffect[] {
+  const out: VmEffect[] = [];
+  for (const name of state.registry) {
+    if (name.startsWith(SYMPHONY_VM_PREFIX) && !state.intended.has(name)) {
+      out.push({ kind: 'destroy_machine', vm_name: name });
     }
-    const argv = raw.split('\0').filter((s) => s.length > 0);
-    if (argv.length === 0) continue;
-    if (!argv.some((a) => path.basename(a) === '_boot-vm')) continue;
-    const configPath = argv.find((a) => a.endsWith('boot-config.json'));
-    if (!configPath) continue;
-    const vmName = await resolveBootWorkerVmName(configPath);
-    if (vmName === null) continue;
-    out.push({ pid, vmName });
+  }
+  for (const w of state.workers) {
+    if (!w.vmName.startsWith(SYMPHONY_VM_PREFIX)) continue;
+    if (state.intended.has(w.vmName)) continue;
+    out.push({ kind: 'kill_boot_worker', pid: w.pid, vm_name: w.vmName });
   }
   return out;
-}
-
-function defaultKillProcess(pid: number, signal: NodeJS.Signals | 0): void {
-  process.kill(pid, signal);
 }
 
 /**
  * VM resource. Desired = orchestrator's intended VM set. Actual = union of
  * `smolvm machine ls` (filtered by `symphony-` prefix) and `_boot-vm` workers
- * mapped through boot-config.json (also `symphony-` filtered).
- *
- * Diff → two action shapes:
- *   • destroy_machine — registry-tracked symphony VM not in intended.
- *   • kill_boot_worker — host PID running a symphony VM, not in intended;
- *                        SIGTERM → grace → SIGKILL if still alive.
+ * (also `symphony-` filtered). `reconcile()` is the thin shell loop:
+ * observe → `decideVm` → apply. The two-phase shape (destroy machines, then
+ * re-observe and kill survivors) reuses `decideVm` on the survivor set so the
+ * pure decision keeps owning what counts as a stray.
  *
  * Independent of bake (`dependsOn: []`). Doesn't gate dispatch.
  */
@@ -190,8 +162,8 @@ export class VmResource {
   private lastError: string | null = null;
 
   constructor(private readonly opts: VmResourceOptions) {
-    this.listBootWorkers = opts.listBootWorkers ?? defaultListBootWorkers;
-    this.killProcess = opts.killProcess ?? defaultKillProcess;
+    this.listBootWorkers = opts.listBootWorkers;
+    this.killProcess = opts.killProcess;
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   }
 
@@ -209,23 +181,17 @@ export class VmResource {
     // Treat that as an empty actual set on this axis — the process axis still
     // catches surviving workers.
     const registry = await this.opts.smolvm.list();
-    let workers: BootWorker[];
-    try {
-      workers = await this.listBootWorkers();
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.lastError = `boot worker enumeration failed: ${msg}`;
-      log.warn('vm reaper: boot worker enumeration failed', { error: msg });
-      workers = [];
-    }
+    const workers = await this.observeWorkers();
 
-    const strayMachines = registry
-      .filter((n) => n.startsWith(SYMPHONY_VM_PREFIX) && !desired.has(n));
-    const strayWorkers = workers
-      .filter((w) => w.vmName.startsWith(SYMPHONY_VM_PREFIX) && !desired.has(w.vmName));
+    const initial = decideVm({ intended: desired, registry, workers });
+    if (initial.length === 0) return;
 
-    if (strayMachines.length === 0 && strayWorkers.length === 0) return;
-
+    const strayMachines = initial.filter(
+      (e): e is DestroyMachineAction => e.kind === 'destroy_machine',
+    );
+    const strayWorkers = initial.filter(
+      (e): e is KillBootWorkerAction => e.kind === 'kill_boot_worker',
+    );
     log.info('vm reaper: destroying strays', {
       stray_machines: strayMachines.length,
       stray_workers: strayWorkers.length,
@@ -235,22 +201,17 @@ export class VmResource {
     // upstream smolvm releases the registry slot and (in the bug-free path)
     // also takes the `_boot-vm` worker down. Parallel: smolvm.destroy already
     // bounds each call with its own timeout.
-    await Promise.all(strayMachines.map((n) => this.destroyMachine(n)));
+    await Promise.all(strayMachines.map((e) => this.destroyMachine(e.vm_name)));
 
     // Re-enumerate workers so the SIGTERM step skips PIDs the daemon destroy
-    // already brought down. Without this we'd needlessly SIGTERM dead PIDs and
-    // log noise; with the upstream bug present, the survivors are the ones we
-    // actually need to kill.
-    let survivors: BootWorker[];
-    try {
-      survivors = await this.listBootWorkers();
-    } catch {
-      survivors = workers;
-    }
-    const stillStray = survivors.filter(
-      (w) => w.vmName.startsWith(SYMPHONY_VM_PREFIX) && !desired.has(w.vmName),
+    // already brought down. `decideVm` runs again over the survivors so the
+    // pure function still owns what counts as a stray.
+    const survivors = await this.observeWorkers();
+    const followup = decideVm({ intended: desired, registry: [], workers: survivors });
+    const stillStray = followup.filter(
+      (e): e is KillBootWorkerAction => e.kind === 'kill_boot_worker',
     );
-    await Promise.all(stillStray.map((w) => this.killWorker(w)));
+    await Promise.all(stillStray.map((e) => this.killWorker({ pid: e.pid, vmName: e.vm_name })));
   }
 
   snapshot(): ResourceSnapshot {
@@ -261,6 +222,17 @@ export class VmResource {
       last_error: this.lastError,
       actions: this.ledger.snapshot(),
     };
+  }
+
+  private async observeWorkers(): Promise<BootWorker[]> {
+    try {
+      return await this.listBootWorkers();
+    } catch (err) {
+      const msg = (err as Error).message;
+      this.lastError = `boot worker enumeration failed: ${msg}`;
+      log.warn('vm reaper: boot worker enumeration failed', { error: msg });
+      return [];
+    }
   }
 
   private async destroyMachine(name: string): Promise<void> {
@@ -290,7 +262,9 @@ export class VmResource {
       log.warn('vm reaper: SIGTERM failed', { pid: w.pid, vm: w.vmName, error: msg });
       return;
     }
-    await delay(this.killGraceMs);
+    // Inline timer (rather than `node:timers/promises`) keeps the file
+    // adapter-import-free for the functional-core lint.
+    await new Promise<void>((resolve) => { setTimeout(resolve, this.killGraceMs); });
     // Probe with signal 0 — throws ESRCH if the process has exited. If it's
     // still alive, escalate to SIGKILL.
     let alive = false;

@@ -12,6 +12,7 @@ import {
   stageRuntimeFile,
 } from '../src/agent/adapters.js';
 import { validateDispatch } from '../src/workflow.js';
+import { validateDispatchIo } from '../src/workflow-loader.js';
 import type { ServiceConfig } from '../src/types.js';
 
 function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
@@ -288,6 +289,45 @@ describe('stageCredential', () => {
         () => access(path.join(ws, '.git', 'info', 'exclude'), fsConstants.F_OK),
         /ENOENT/,
       );
+    } finally {
+      (os as { homedir: () => string }).homedir = origHome;
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('strips the OAuth refreshToken from the claude credential before staging (issue 77)', async () => {
+    // The host token rotates on use; if a VM kept the refreshToken it could refresh
+    // (and thus rotate) the shared token, invalidating the host's copy and forcing a
+    // host /login. Stage access-token-only; the access token is re-staged each attempt.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-'));
+    const fakeHome = path.join(tmp, 'home');
+    const ws = path.join(tmp, 'ws');
+    await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+    await mkdir(path.join(ws, '.git'), { recursive: true });
+    await writeFile(
+      path.join(fakeHome, '.claude', '.credentials.json'),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'sk-ant-oat01-keep',
+          refreshToken: 'sk-ant-ort01-secret',
+          expiresAt: 123,
+          scopes: ['x'],
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    const origHome = os.homedir;
+    (os as { homedir: () => string }).homedir = () => fakeHome;
+    try {
+      const staged = await stageCredential(ws, ADAPTERS.claude);
+      const text = await readFile(staged.absPath, 'utf8');
+      assert.ok(!text.includes('ort01'), 'no refresh-token material may reach the staged file');
+      const body = JSON.parse(text);
+      assert.equal(body.claudeAiOauth.refreshToken, undefined, 'refreshToken stripped');
+      assert.equal(body.claudeAiOauth.accessToken, 'sk-ant-oat01-keep', 'accessToken preserved');
+      assert.equal(body.claudeAiOauth.expiresAt, 123, 'expiresAt preserved');
+      assert.deepEqual(body.claudeAiOauth.scopes, ['x'], 'unrelated fields preserved');
     } finally {
       (os as { homedir: () => string }).homedir = origHome;
       await rm(tmp, { recursive: true, force: true });
@@ -628,12 +668,16 @@ describe('validateDispatch', () => {
   });
 
   it('rejects smolvm.smolfile pointing at a missing file', async () => {
+    // smolfile existence is an fs probe; structural validateDispatch returns
+    // null and the loader-side validateDispatchIo surfaces the missing-file
+    // error.
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
       const cfg = bareCfg({ adapter: 'claude' });
       cfg.tracker.root = root;
       cfg.smolvm.smolfile = path.join(root, 'no-such-Smolfile');
-      const err = validateDispatch(cfg);
+      assert.equal(validateDispatch(cfg), null);
+      const err = validateDispatchIo(cfg);
       assert.ok(err, 'expected validation error');
       assert.match(err!, /smolvm\.smolfile not found/);
     } finally {
@@ -650,6 +694,7 @@ describe('validateDispatch', () => {
       await writeFile(smolfilePath, 'image = "node:24-bookworm-slim"\n');
       cfg.smolvm.smolfile = smolfilePath;
       assert.equal(validateDispatch(cfg), null);
+      assert.equal(validateDispatchIo(cfg), null);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

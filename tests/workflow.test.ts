@@ -7,9 +7,11 @@ import {
   splitFrontMatter,
   buildServiceConfig,
   expandVar,
+  parseWorkflow,
   resolveHooksForState,
   validateDispatch,
 } from '../src/workflow.js';
+import { validateDispatchIo } from '../src/workflow-loader.js';
 import { activeStateNames, terminalStateNames } from '../src/issues.js';
 
 // Reused across the tests that don't care about the states block itself; covers
@@ -41,7 +43,6 @@ describe('workflow', () => {
   });
 
   it('rejects unset $VAR for tracker.root', () => {
-    delete process.env.SYM_DOES_NOT_EXIST;
     assert.throws(() =>
       buildServiceConfig(
         {
@@ -49,14 +50,53 @@ describe('workflow', () => {
           states: minimalStates,
         },
         '/tmp/WORKFLOW.md',
+        {},
       ),
     );
   });
 
   it('expands env vars only on $VAR pattern', () => {
-    process.env.SYM_FOO = '/some/abs';
-    assert.equal(expandVar('$SYM_FOO'), '/some/abs');
-    assert.equal(expandVar('https://api.example/path'), 'https://api.example/path');
+    assert.equal(expandVar('$SYM_FOO', { SYM_FOO: '/some/abs' }), '/some/abs');
+    assert.equal(expandVar('https://api.example/path', {}), 'https://api.example/path');
+  });
+
+  it('parseWorkflow returns both definition and config from a string', () => {
+    const text = [
+      '---',
+      'tracker:',
+      '  kind: local',
+      '  root: /tmp/issues',
+      'states:',
+      '  Todo: { role: active }',
+      '  Done: { role: terminal }',
+      '  Triage: { role: holding }',
+      '---',
+      'prompt body {{ issue.identifier }}',
+    ].join('\n');
+    const { definition, config } = parseWorkflow(text, '/tmp/WORKFLOW.md');
+    assert.equal(config.tracker.kind, 'local');
+    assert.equal(config.tracker.root, '/tmp/issues');
+    assert.equal(definition.prompt_template, 'prompt body {{ issue.identifier }}');
+    assert.deepEqual(Object.keys(config.states), ['Todo', 'Done', 'Triage']);
+  });
+
+  it('parseWorkflow threads env into $VAR expansion', () => {
+    const text = [
+      '---',
+      'tracker:',
+      '  kind: local',
+      '  root: $SYM_TRACKER_ROOT',
+      'states:',
+      '  Todo: { role: active }',
+      '  Done: { role: terminal }',
+      '  Triage: { role: holding }',
+      '---',
+      'body',
+    ].join('\n');
+    const { config } = parseWorkflow(text, '/tmp/WORKFLOW.md', {
+      SYM_TRACKER_ROOT: '/var/lib/symphony',
+    });
+    assert.equal(config.tracker.root, '/var/lib/symphony');
   });
 
   it('builds defaults', () => {
@@ -517,8 +557,10 @@ describe('workflow states validation', () => {
 
   it('rejects per-state adapter whose host credential is missing', async () => {
     // Point HOME at an empty tmp dir so the cred file the validator probes for
-    // does not exist. assertHostCredentialReadable uses os.homedir() which reads
-    // $HOME at call time.
+    // does not exist. validateDispatchIo uses hostCredentialAbsPathForId, which
+    // calls os.homedir() (reads $HOME) at call time. The fs probe lives in the
+    // shell loader; the pure structural validateDispatch no longer touches the
+    // disk.
     await withTrackerRoot(async (root) => {
       const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-'));
       const prevHome = process.env.HOME;
@@ -535,7 +577,8 @@ describe('workflow states validation', () => {
           },
           '/tmp/WORKFLOW.md',
         );
-        const err = validateDispatch(cfg);
+        assert.equal(validateDispatch(cfg), null);
+        const err = validateDispatchIo(cfg);
         assert.match(err ?? '', /requires a host credential at/);
       } finally {
         if (prevHome === undefined) delete process.env.HOME;
@@ -547,8 +590,8 @@ describe('workflow states validation', () => {
 
   it('accepts a workflow with no per-state adapter overrides even when host cred is missing', async () => {
     // The acp-level adapter check still runs (via the existing orchestrator
-    // startup probe), but validateStates only walks per-state adapters; a state
-    // without `adapter` must not trigger a credential check.
+    // startup probe), but validateDispatchIo only walks per-state adapters; a
+    // state without `adapter` must not trigger a credential check.
     await withTrackerRoot(async (root) => {
       const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-'));
       const prevHome = process.env.HOME;
@@ -565,8 +608,8 @@ describe('workflow states validation', () => {
           },
           '/tmp/WORKFLOW.md',
         );
-        const err = validateDispatch(cfg);
-        assert.equal(err, null);
+        assert.equal(validateDispatch(cfg), null);
+        assert.equal(validateDispatchIo(cfg), null);
       } finally {
         if (prevHome === undefined) delete process.env.HOME;
         else process.env.HOME = prevHome;

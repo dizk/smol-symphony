@@ -16,6 +16,7 @@ export {
   type ProposeFollowupSink,
   type RunInVmExecutor,
 } from './executor.js';
+export { planActions, type Effect } from './effects.js';
 export { renderTemplate, renderTree, TemplateError } from './templating.js';
 export { evaluatePredicate } from './predicates.js';
 export {
