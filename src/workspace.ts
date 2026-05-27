@@ -253,6 +253,45 @@ export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise
 }
 
 /**
+ * Per-dispatch fetch of the workspace's base ref. Runs `git fetch --no-tags
+ * origin <base>` so `origin/<base>` is current in the workspace before the
+ * dispatched agent runs `git rebase origin/<base>` as the first step of its
+ * Todo flow (issue 101). The host runs this because the in-VM agent has no
+ * network credentials; `gh auth setup-git` on the host makes the fetch work
+ * with the canonical HTTPS `origin` symphony configures in PR mode.
+ *
+ * No-op (returns `ok: true, skipped: true`) when the workspace has no
+ * `origin` remote — that's the local-only mode where there is no network
+ * source for the base ref, and the source repo's local `<base>` is the
+ * only truth. Fetch failures don't throw: the agent's `git rebase
+ * origin/<base>` will surface the missing ref itself.
+ */
+export async function fetchBaseInWorkspace(
+  workspacePath: string,
+  baseBranch: string,
+): Promise<{ ok: boolean; skipped: boolean; diagnostic: string | null }> {
+  const remoteCheck = await runProcess('git', ['remote', 'get-url', 'origin'], {
+    cwd: workspacePath,
+  });
+  if (remoteCheck.exit_code !== 0) {
+    return { ok: true, skipped: true, diagnostic: null };
+  }
+  const fetch = await runProcess(
+    'git',
+    ['fetch', '--no-tags', 'origin', baseBranch],
+    { cwd: workspacePath },
+  );
+  if (fetch.exit_code !== 0) {
+    return {
+      ok: false,
+      skipped: false,
+      diagnostic: (fetch.stderr || fetch.stdout).trim(),
+    };
+  }
+  return { ok: true, skipped: false, diagnostic: null };
+}
+
+/**
  * Inputs the WorkspaceManager passes to its `createWorkspace` action so the
  * canonical setup can run before the optional repo-local `after_create` shell.
  * Falls back to env-derived defaults (SYMPHONY_*) when fields are omitted.

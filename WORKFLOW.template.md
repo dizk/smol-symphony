@@ -230,31 +230,24 @@ integration:
   merge_on_states: [Done]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# pr_autopilot — keep terminal-state PRs rebased on origin/<base> and let
-# GitHub auto-merge them when checks pass.
+# pr_autopilot — arm GitHub auto-merge when a terminal-state PR is
+# mergeable; route non-mergeable PRs back to the implementing state.
 #
 # Optional. When `enabled: true` the reconciler grows a `pr` resource that, on
 # every tick, looks up each issue in `merge_state` (default `Done`) via
 # `gh pr list --head agent/<id>`, fetches its detail with `gh pr view`, and:
 #
-#   • Force-with-lease rebases `agent/<id>` onto `origin/<base>` when the PR
-#     is behind the base branch. The lease binds the head SHA the autopilot
-#     last observed, so a concurrent push (operator or sibling tool) is
-#     detected rather than clobbered.
-#   • Arms GitHub's auto-merge once the PR is mergeable
+#   • Arms GitHub's auto-merge when the PR is `mergeable: MERGEABLE`
 #     (`gh pr merge --auto --<strategy> --delete-branch`). GitHub merges as
 #     soon as required checks pass and review requirements are satisfied.
-#   • On rebase conflict — or when `gh pr view` reports
-#     `mergeable: CONFLICTING` — appends a structured notes block to the
-#     issue file (conflicted file list + diagnostic) and routes the issue
-#     from `merge_state` back to `conflict_route_to` (default: the first
-#     declared `role: active` state). The workspace + `agent/<id>` branch
-#     are preserved across the round trip; the dispatch loop picks up the
-#     issue again with the conflict markers in place.
-#   • After `max_rebase_attempts` consecutive failures, routes the issue
-#     into `conflict_holding_state` (default: a `role: holding` state
-#     literally named `Conflict`, else the first declared holding state)
-#     and stops attempting until the operator intervenes.
+#   • When the PR is `mergeable: CONFLICTING`, appends a structured notes
+#     block to the issue file and routes the issue from `merge_state` back
+#     to `conflict_route_to` (default: the first declared `role: active`
+#     state). The workspace + `agent/<id>` branch are preserved. Before the
+#     next dispatch symphony runs `git fetch origin <base>` so
+#     `origin/<base>` is current in the workspace, and the Todo prompt's
+#     first step is `git rebase origin/<base>` — so resolving the conflict
+#     is the agent's normal flow, not an out-of-band autopilot operation.
 #   • For issues in `close_state` (default `Cancelled`) with an open PR,
 #     closes the PR without merge and best-effort-deletes the remote branch.
 #
@@ -287,21 +280,10 @@ pr_autopilot:
   # omit by setting an empty string) to disable the close path.
   close_state: Cancelled
 
-  # conflict_route_to (string, optional): active state to route an issue
-  # back to on rebase conflict. Defaults to the first declared `role: active`
+  # conflict_route_to (string, optional): active state to route a non-
+  # mergeable issue back into. Defaults to the first declared `role: active`
   # state — for symphony's two-stage Todo/Review workflow that's Todo.
   conflict_route_to: Todo
-
-  # conflict_holding_state (string, optional): holding state for the circuit
-  # breaker. After max_rebase_attempts consecutive failures the issue lands
-  # here. Defaults to a declared `role: holding` state literally named
-  # `Conflict` (case-insensitive); falls back to the first declared holding
-  # state if there's no Conflict.
-  conflict_holding_state: Conflict
-
-  # max_rebase_attempts (int): how many consecutive rebase conflicts to
-  # tolerate before tripping the circuit breaker. Default 3.
-  max_rebase_attempts: 3
 
   # auto_merge_strategy (enum: squash|merge|rebase): forwarded to
   # `gh pr merge --auto --<strategy>`. Default 'squash'.

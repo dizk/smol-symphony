@@ -38,12 +38,10 @@ import {
   PrResource,
   type PrApi,
   type PrCleanupApi,
-  type PrGitApi,
   type PrIntendedProvider,
   type PrTransitionApi,
-  type PrWorkspaceEnsureApi,
 } from './pr.js';
-import { GhCliPrApi, GitCliPrGitApi } from './pr-adapters.js';
+import { GhCliPrApi } from './pr-adapters.js';
 import type { ServiceConfig, SmolvmConfig } from '../types.js';
 import type { SmolvmClient } from '../agent/smolvm-port.js';
 import { log } from '../logging.js';
@@ -81,10 +79,8 @@ export interface ReconcilerOptions {
   // implements every callback) can be built after the Reconciler.
   prIntendedProvider?: PrIntendedProvider;
   prApi?: PrApi;
-  prGit?: PrGitApi;
   prTransition?: PrTransitionApi;
   prCleanup?: PrCleanupApi;
-  prWorkspaceEnsure?: PrWorkspaceEnsureApi;
 }
 
 export class Reconciler {
@@ -115,10 +111,8 @@ export class Reconciler {
   private pr: PrResource | null = null;
   private prIntended: PrIntendedProvider | null = null;
   private prApi: PrApi | null = null;
-  private prGit: PrGitApi | null = null;
   private prTransition: PrTransitionApi | null = null;
   private prCleanup: PrCleanupApi | null = null;
-  private prWorkspaceEnsure: PrWorkspaceEnsureApi | null = null;
   private backstopTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   // Single-flight: collapse concurrent reconcile() calls into one ongoing pass so
@@ -172,10 +166,8 @@ export class Reconciler {
   private initPrProviders(opts: ReconcilerOptions): void {
     if (opts.prIntendedProvider) this.prIntended = opts.prIntendedProvider;
     if (opts.prApi) this.prApi = opts.prApi;
-    if (opts.prGit) this.prGit = opts.prGit;
     if (opts.prTransition) this.prTransition = opts.prTransition;
     if (opts.prCleanup) this.prCleanup = opts.prCleanup;
-    if (opts.prWorkspaceEnsure) this.prWorkspaceEnsure = opts.prWorkspaceEnsure;
   }
 
   /**
@@ -187,13 +179,7 @@ export class Reconciler {
    */
   private buildPrResource(): PrResource | null {
     if (!this.cfg.pr_autopilot.enabled) return null;
-    if (
-      !this.prIntended ||
-      !this.prApi ||
-      !this.prGit ||
-      !this.prTransition ||
-      !this.prCleanup
-    ) {
+    if (!this.prIntended || !this.prApi || !this.prTransition || !this.prCleanup) {
       return null;
     }
     const conflictRouteTo =
@@ -201,15 +187,10 @@ export class Reconciler {
     return new PrResource({
       intended: this.prIntended,
       pr: this.prApi,
-      git: this.prGit,
       transition: this.prTransition,
       cleanup: this.prCleanup,
-      workspaceEnsure: this.prWorkspaceEnsure ?? undefined,
       strategy: this.cfg.pr_autopilot.auto_merge_strategy,
-      maxRebaseAttempts: this.cfg.pr_autopilot.max_rebase_attempts,
       conflictRouteTo,
-      conflictHoldingState:
-        this.cfg.pr_autopilot.conflict_holding_state ?? defaultConflictHolding(this.cfg),
       pollIntervalMs: this.cfg.pr_autopilot.poll_interval_ms,
       actor: 'pr-autopilot',
     });
@@ -262,17 +243,13 @@ export class Reconciler {
   setPrAutopilotProviders(opts: {
     intended: PrIntendedProvider;
     pr: PrApi;
-    git: PrGitApi;
     transition: PrTransitionApi;
     cleanup: PrCleanupApi;
-    workspaceEnsure?: PrWorkspaceEnsureApi;
   }): void {
     this.prIntended = opts.intended;
     this.prApi = opts.pr;
-    this.prGit = opts.git;
     this.prTransition = opts.transition;
     this.prCleanup = opts.cleanup;
-    if (opts.workspaceEnsure !== undefined) this.prWorkspaceEnsure = opts.workspaceEnsure;
     this.pr = this.buildPrResource();
   }
 
@@ -364,9 +341,9 @@ export class Reconciler {
     if (this.workspace) {
       this.workspace = this.buildWorkspaceResource();
     }
-    // PR autopilot reads strategy / max_rebase_attempts / route-state fields
-    // from cfg at construction. Rebuild so a reload that flips `enabled` or
-    // changes any field takes effect on the next pass.
+    // PR autopilot reads strategy / route-state fields from cfg at
+    // construction. Rebuild so a reload that flips `enabled` or changes any
+    // field takes effect on the next pass.
     this.pr = this.buildPrResource();
     void this.reconcile().catch((err) =>
       log.warn('reconcile after config reload failed', { error: (err as Error).message }),
@@ -528,22 +505,6 @@ function defaultConflictRouteTo(cfg: ServiceConfig): string {
 }
 
 /**
- * Default holding state for circuit-broken issues. Prefers a declared state
- * literally named `Conflict` (case-insensitive); otherwise falls back to the
- * first declared holding state. Returns null when no holding state exists,
- * which only happens on a workflow that bypassed validation.
- */
-function defaultConflictHolding(cfg: ServiceConfig): string | null {
-  let firstHolding: string | null = null;
-  for (const [name, sc] of Object.entries(cfg.states)) {
-    if (sc.role !== 'holding') continue;
-    if (firstHolding === null) firstHolding = name;
-    if (name.toLowerCase() === 'conflict') return name;
-  }
-  return firstHolding;
-}
-
-/**
  * Resolve a `_boot-vm` worker's VM name from its on-disk identity. The
  * argv-referenced `boot-config.json` lives under
  * `~/.cache/smolvm/vms/<hash>/boot-config.json`, but smolvm consumes and
@@ -649,13 +610,8 @@ export type {
   PrState,
   PrMergeable,
   PrApi,
-  PrGitApi,
   PrTransitionApi,
   PrCleanupApi,
-  PrWorkspaceEnsureApi,
-  EnsureWorkspaceOutcome,
-  RebaseOutcome,
-  PushOutcome,
 } from './pr.js';
 export { PrResource } from './pr.js';
-export { GhCliPrApi, GitCliPrGitApi } from './pr-adapters.js';
+export { GhCliPrApi } from './pr-adapters.js';

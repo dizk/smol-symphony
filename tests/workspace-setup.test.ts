@@ -19,7 +19,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { setupWorkspaceDir, resolveSetupOptions } from '../src/workspace.js';
+import { fetchBaseInWorkspace, setupWorkspaceDir, resolveSetupOptions } from '../src/workspace.js';
 
 interface GitResult {
   exit: number;
@@ -151,6 +151,118 @@ describe('setupWorkspaceDir', () => {
       );
     } finally {
       await rm(source, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('fetchBaseInWorkspace (issue 101)', () => {
+  it('runs `git fetch --no-tags origin <base>` and updates the remote-tracking ref', async () => {
+    // Bare remote → workspace clones from it on `main`; an advancing commit on
+    // the bare remote (via a sibling clone) is picked up by the pre-dispatch
+    // fetch. The post-fetch `origin/main` SHA must match the new tip.
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-ws-'));
+    const pusher = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-pusher-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      // Seed the remote with one commit on main.
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-seed-'));
+      try {
+        await git(['init', '-b', 'main'], seed);
+        await git(['config', 'user.name', 'test'], seed);
+        await git(['config', 'user.email', 'test@example.com'], seed);
+        await writeFile(path.join(seed, 'a.txt'), 'one\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'seed'], seed);
+        await git(['remote', 'add', 'origin', bareRemote], seed);
+        await git(['push', 'origin', 'main'], seed);
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+
+      // Clone the workspace.
+      const wsPath = path.join(wsRoot, '42');
+      await mkdir(wsPath, { recursive: true });
+      await git(['clone', bareRemote, '.'], wsPath);
+      await git(['config', 'user.name', 'symphony-agent'], wsPath);
+      await git(['config', 'user.email', 'agent@symphony.local'], wsPath);
+      await git(['checkout', '-b', 'agent/42'], wsPath);
+      const oldOriginMain = await git(['rev-parse', 'origin/main'], wsPath);
+
+      // Advance main on the remote from a sibling clone — mirrors a peer PR
+      // landing while this workspace was paused between dispatches.
+      await git(['clone', bareRemote, '.'], pusher);
+      await git(['config', 'user.name', 'peer'], pusher);
+      await git(['config', 'user.email', 'peer@example.com'], pusher);
+      await writeFile(path.join(pusher, 'b.txt'), 'two\n');
+      await git(['add', '.'], pusher);
+      await git(['commit', '-m', 'advance'], pusher);
+      await git(['push', 'origin', 'main'], pusher);
+      const advancedSha = await git(['rev-parse', 'HEAD'], pusher);
+
+      const result = await fetchBaseInWorkspace(wsPath, 'main');
+      assert.deepEqual(result, { ok: true, skipped: false, diagnostic: null });
+
+      const newOriginMain = await git(['rev-parse', 'origin/main'], wsPath);
+      assert.equal(newOriginMain, advancedSha, 'origin/main now points at the advanced tip');
+      assert.notEqual(newOriginMain, oldOriginMain, 'fetch actually moved the ref forward');
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+      await rm(pusher, { recursive: true, force: true });
+    }
+  });
+
+  it('returns skipped:true when no origin remote is configured (local-only mode)', async () => {
+    // Workspaces created by `setupWorkspaceDir` in local mode have all
+    // remotes stripped. The pre-dispatch fetch must no-op cleanly so an
+    // operator who doesn't use PR mode isn't broken by the new behavior.
+    const source = await makeSourceRepo();
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-local-ws-'));
+    const wsPath = path.join(wsRoot, '42');
+    await mkdir(wsPath, { recursive: true });
+    try {
+      await setupWorkspaceDir({
+        workspacePath: wsPath,
+        sourceRepo: source,
+        baseBranch: 'main',
+        branch: 'agent/42',
+        originRepo: null,
+        gitIdentity: { name: 'symphony-agent', email: 'agent@symphony.local' },
+      });
+      // Sanity: no remote.
+      const remotes = await git(['remote'], wsPath);
+      assert.equal(remotes, '');
+
+      const result = await fetchBaseInWorkspace(wsPath, 'main');
+      assert.deepEqual(result, { ok: true, skipped: true, diagnostic: null });
+    } finally {
+      await rm(source, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('returns ok:false with a diagnostic when the fetch fails (e.g. base ref missing on remote)', async () => {
+    // origin points at a bare remote that does NOT have the requested base
+    // branch. `git fetch` will exit non-zero; the helper surfaces a typed
+    // failure rather than throwing, so the dispatch path can log + continue.
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-fail-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-fail-ws-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      // No commits on main — fetching a nonexistent branch fails.
+      const wsPath = path.join(wsRoot, '42');
+      await mkdir(wsPath, { recursive: true });
+      await git(['init', '-b', 'main'], wsPath);
+      await git(['remote', 'add', 'origin', bareRemote], wsPath);
+
+      const result = await fetchBaseInWorkspace(wsPath, 'nonexistent-branch');
+      assert.equal(result.ok, false);
+      assert.equal(result.skipped, false);
+      assert.match(result.diagnostic ?? '', /couldn't find remote ref|fatal/i);
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });
     }
   });

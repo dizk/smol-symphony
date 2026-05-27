@@ -734,7 +734,6 @@ describe('integration block', () => {
     assert.equal(cfg.pr_autopilot.enabled, false);
     assert.equal(cfg.pr_autopilot.merge_state, 'Done');
     assert.equal(cfg.pr_autopilot.close_state, 'Cancelled');
-    assert.equal(cfg.pr_autopilot.max_rebase_attempts, 3);
     assert.equal(cfg.pr_autopilot.auto_merge_strategy, 'squash');
   });
 
@@ -748,8 +747,6 @@ describe('integration block', () => {
           merge_state: 'Done',
           close_state: 'Cancelled',
           conflict_route_to: 'Todo',
-          conflict_holding_state: 'Conflict',
-          max_rebase_attempts: 5,
           auto_merge_strategy: 'rebase',
           poll_interval_ms: 15000,
         },
@@ -758,8 +755,6 @@ describe('integration block', () => {
     );
     assert.equal(cfg.pr_autopilot.enabled, true);
     assert.equal(cfg.pr_autopilot.conflict_route_to, 'Todo');
-    assert.equal(cfg.pr_autopilot.conflict_holding_state, 'Conflict');
-    assert.equal(cfg.pr_autopilot.max_rebase_attempts, 5);
     assert.equal(cfg.pr_autopilot.auto_merge_strategy, 'rebase');
     assert.equal(cfg.pr_autopilot.poll_interval_ms, 15000);
   });
@@ -811,13 +806,13 @@ describe('integration block', () => {
     assert.equal(explicitBlank.pr_autopilot.close_state, null);
   });
 
-  it('pr_autopilot rejects max_rebase_attempts <= 0 at parse time', () => {
+  it('pr_autopilot rejects poll_interval_ms < 0 at parse time', () => {
     assert.throws(() =>
       buildServiceConfig(
         {
           tracker: { kind: 'local', root: '/tmp/issues' },
           states: minimalStates,
-          pr_autopilot: { enabled: true, max_rebase_attempts: 0 },
+          pr_autopilot: { enabled: true, poll_interval_ms: -1 },
         },
         '/tmp/WORKFLOW.md',
       ),
