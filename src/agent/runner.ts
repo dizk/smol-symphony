@@ -472,10 +472,9 @@ export class AgentRunner {
 
   /**
    * Drive the typed action executor for a state's `actions:` block. Reroutes
-   * the issue when an action returns `route_to` (today: `merge` on conflict).
-   * Mirrors the integration-merge reroute machinery so the failure path keeps
-   * the workspace + agent branch available for the operator who picks up the
-   * issue in the conflict state.
+   * the issue when an action returns `route_to` (today: `merge` on conflict);
+   * the workspace and `agent/<id>` branch are preserved so the operator who
+   * picks up the issue in the routed state can resolve it.
    *
    * Returns the underlying `ActionExecResult` so the caller can distinguish
    * "rerouted (treat as success — the agent's work is done; the issue lives
