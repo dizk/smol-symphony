@@ -213,7 +213,12 @@ acp:
   # model-gated by claude-agent-acp's `supportedEffortLevels`.
   effort: xhigh
   shell: bash
-  prompt_timeout_ms: 1800000
+  # Hard cap on a single session/prompt regardless of activity. Raised from 30min to
+  # 60min (the code default) because a heavy refactor turn at effort=xhigh can run a
+  # single uninterrupted turn past 30min — issue 103's healthy attempt was killed
+  # mid-edit at the old 1800000 cap with turns_completed:0. Distinct from
+  # stall_timeout_ms below (which only trips on NO activity).
+  prompt_timeout_ms: 3600000
   read_timeout_ms: 30000
   # ACP TCP bridge. Symphony binds a listener on `bridge.bind_host:bind_port`; the in-VM
   # proxy (`/opt/symphony/vm-agent.mjs`) dials `bridge.reach_host:bind_port` on startup
