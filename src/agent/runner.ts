@@ -1090,7 +1090,7 @@ export class AgentRunner {
       args.logger,
     );
     if (!startRes.ok) return startRes;
-    const regRes = this.registerBridgeOrFail(
+    const regRes = await this.registerBridgeOrFail(
       args.issue,
       args.workspacePath,
       args.initialHooks,
@@ -1200,22 +1200,23 @@ export class AgentRunner {
     }
   }
 
-  private registerBridgeOrFail(
+  private async registerBridgeOrFail(
     issue: Issue,
     workspacePath: string,
     initialHooks: ReturnType<typeof resolveHooksForState>,
     hookCapture: (h: string) => HookCapture | undefined,
     logger: ReturnType<typeof withIssue>,
-  ): PhaseResult<{ bridgeReg: AcpBridgeRegistration }> {
+  ): Promise<PhaseResult<{ bridgeReg: AcpBridgeRegistration }>> {
     try {
       const bridgeReg = this.acpBridge!.register(issue.id, issue.identifier);
       return { ok: true, value: { bridgeReg } };
     } catch (err) {
       logger.error('acp bridge register failed', { error: (err as Error).message });
       // VM is live but the bridge is gone; teardown is the reconciler `vm`
-      // resource's job. After_run runs best-effort here; the reaper kicks on
-      // worker exit. Best-effort so a flaky hook doesn't mask the real cause.
-      void this.workspaces.runAfterRunBestEffort(
+      // resource's job. Await after_run so the failure path preserves the
+      // pre-refactor ordering — the attempt does not return (and the worker
+      // lifecycle does not advance) until cleanup hooks have run.
+      await this.workspaces.runAfterRunBestEffort(
         workspacePath,
         initialHooks,
         hookCapture('after_run'),
