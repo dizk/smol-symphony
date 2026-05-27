@@ -246,7 +246,9 @@ describe('fetchBaseInWorkspace (issue 101)', () => {
   it('returns ok:false with a diagnostic when the fetch fails (e.g. base ref missing on remote)', async () => {
     // origin points at a bare remote that does NOT have the requested base
     // branch. `git fetch` will exit non-zero; the helper surfaces a typed
-    // failure rather than throwing, so the dispatch path can log + continue.
+    // failure rather than throwing so the dispatch path can abort the
+    // attempt without launching the agent against a stale base ref (issue
+    // 101 invariant: fresh `origin/<base>` is a dispatch precondition).
     const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-fail-remote-'));
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-base-fetch-fail-ws-'));
     try {

@@ -260,11 +260,16 @@ export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise
  * network credentials; `gh auth setup-git` on the host makes the fetch work
  * with the canonical HTTPS `origin` symphony configures in PR mode.
  *
+ * A fresh `origin/<base>` is a dispatch precondition: when an `origin` is
+ * configured and the fetch fails (auth, network, missing ref), this returns
+ * `ok: false` with a diagnostic and the caller must abort the attempt — not
+ * launch the agent against a stale ref, which would reproduce the stale-base
+ * behavior issue 101 eliminates.
+ *
  * No-op (returns `ok: true, skipped: true`) when the workspace has no
  * `origin` remote — that's the local-only mode where there is no network
  * source for the base ref, and the source repo's local `<base>` is the
- * only truth. Fetch failures don't throw: the agent's `git rebase
- * origin/<base>` will surface the missing ref itself.
+ * only truth.
  */
 export async function fetchBaseInWorkspace(
   workspacePath: string,
