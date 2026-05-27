@@ -209,6 +209,46 @@ describe('LocalMarkdownTracker.moveIssueToState', () => {
 });
 
 describe('McpRegistry JSON-RPC', () => {
+  it('routes token issuance + comparison through the injected CryptoEnv', async () => {
+    // Issue 96: tests can pin a deterministic CryptoEnv so token shape and
+    // wrong-token rejection don't depend on randomBytes / timingSafeEqual
+    // ambient state. The registry must use the env for both `activate` (mint)
+    // and `isActive` (compare), and a constant-time-equal stub returning false
+    // must reject even a literally-matching token.
+    const { root, cleanup } = await setupTree();
+    try {
+      const t = makeTracker(root);
+      const calls: Array<'newToken' | 'constantTimeEqual'> = [];
+      let nextToken = 'deterministic-token-A';
+      const reg = new McpRegistry(t, {
+        crypto: {
+          newToken: () => {
+            calls.push('newToken');
+            return nextToken;
+          },
+          constantTimeEqual: (a, b) => {
+            calls.push('constantTimeEqual');
+            return a === b;
+          },
+        },
+      });
+      const entry = makeEntry('ABC-1', 'In Progress');
+      const token = reg.activate(entry);
+      assert.equal(token, 'deterministic-token-A');
+      assert.deepEqual(calls, ['newToken']);
+      assert.equal(reg.isActive('ABC-1', 'deterministic-token-A'), true);
+      assert.equal(reg.isActive('ABC-1', 'deterministic-token-B'), false);
+      // Mint a second token on a second activation; verify it doesn't reuse the first.
+      nextToken = 'deterministic-token-B';
+      const entry2 = makeEntry('ABC-2', 'In Progress');
+      const token2 = reg.activate(entry2);
+      assert.equal(token2, 'deterministic-token-B');
+      assert.notEqual(token2, token);
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('lists the three tools', async () => {
     const { root, cleanup } = await setupTree();
     try {
