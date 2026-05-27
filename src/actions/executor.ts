@@ -31,6 +31,7 @@ import type {
   EnsureBranchAction,
   CheckoutAction,
   MergeAction,
+  PredicateEnv,
   ProposeFollowupAction,
   PushBranchAction,
   RunInVmAction,
@@ -50,6 +51,23 @@ import { log } from '../logging.js';
 import { realClock, isoFromClock, type ClockNow } from '../util/clock.js';
 
 const MAX_ACTION_HISTORY = 16;
+
+/**
+ * Fallback `PredicateEnv` used when none is wired into the executor.
+ * String-truthy predicates never touch the env, so an unwired executor still
+ * evaluates `if: $var`. But a `branch_exists` / `file_present` call NEEDS IO
+ * — throwing here surfaces the missing wiring on the action ledger instead
+ * of silently returning false (which would let the action run unconditionally
+ * after a workspace template error and mask the real bug).
+ */
+const UNWIRED_PREDICATE_ENV: PredicateEnv = {
+  async branchExists() {
+    throw new Error('branch_exists predicate cannot evaluate: no predicateEnv wired into executor');
+  },
+  async pathExists() {
+    throw new Error('file_present predicate cannot evaluate: no predicateEnv wired into executor');
+  },
+};
 
 export interface ProposeFollowupSink {
   /**
@@ -117,6 +135,15 @@ export interface ActionExecutorOptions {
    * back to host spawn, which would defeat the sandbox boundary).
    */
   runInVm?: RunInVmExecutor;
+  /**
+   * IO seam for `if:` predicates. Production wires `defaultPredicateEnv`
+   * (fs.stat + `git rev-parse` via runProcess); tests can pin deterministic
+   * outcomes. When absent, string-truthy predicates still evaluate (they
+   * never touch the env), but a `branch_exists`/`file_present` call throws
+   * with a clear diagnostic so the missing wiring surfaces on the action
+   * ledger rather than silently returning false.
+   */
+  predicateEnv?: PredicateEnv;
   /** Logical scope id (e.g. `actions:Done`) for snapshot keying. */
   snapshotId: string;
   /**
@@ -220,7 +247,12 @@ async function runOneEffect(
   const { rendered, predicate, policy } = effect;
   let shouldRun: boolean;
   try {
-    shouldRun = await evaluatePredicate(predicate, opts.ctx, opts.workspacePath);
+    shouldRun = await evaluatePredicate(
+      predicate,
+      opts.ctx,
+      opts.workspacePath,
+      opts.predicateEnv ?? UNWIRED_PREDICATE_ENV,
+    );
   } catch (err) {
     const msg = (err as Error).message;
     upd(actionKey, { state: 'error', finished_at: iso(), error: msg });

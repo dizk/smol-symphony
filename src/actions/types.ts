@@ -28,6 +28,21 @@ export type ActionPredicate =
   | null;
 
 /**
+ * Port the pure predicate evaluator reaches IO through. `branchExists` is
+ * backed by `git rev-parse --verify --quiet` in production; `pathExists` is
+ * backed by `fs.stat`. The default implementation lives in
+ * `src/actions/predicate-env.ts` so the evaluator core stays free of
+ * `node:fs/promises` and `runProcess` imports.
+ *
+ * `pathExists` receives an absolute path — the evaluator resolves relative
+ * file_present strings against the workspace before calling.
+ */
+export interface PredicateEnv {
+  branchExists(ref: string, workspacePath: string): Promise<boolean>;
+  pathExists(absPath: string): Promise<boolean>;
+}
+
+/**
  * Per-action error policy. Defaults: retry 3 times with exponential backoff
  * starting at 1s, then abort the run. `then: "route_to"` reroutes the issue
  * into a declared state (used by `merge`'s on_conflict).
