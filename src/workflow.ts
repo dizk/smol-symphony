@@ -407,7 +407,6 @@ export function buildServiceConfig(
       : null
     : 'Cancelled';
   const conflictRouteToRaw = asString(prAutopilotRaw['conflict_route_to']);
-  const conflictHoldingRaw = asString(prAutopilotRaw['conflict_holding_state']);
   const strategyRaw = asString(prAutopilotRaw['auto_merge_strategy']) ?? 'squash';
   const autoMergeStrategy: 'squash' | 'merge' | 'rebase' =
     strategyRaw === 'merge' || strategyRaw === 'rebase' ? strategyRaw : 'squash';
@@ -419,20 +418,9 @@ export function buildServiceConfig(
       conflictRouteToRaw && conflictRouteToRaw.trim().length > 0
         ? conflictRouteToRaw.trim()
         : null,
-    conflict_holding_state:
-      conflictHoldingRaw && conflictHoldingRaw.trim().length > 0
-        ? conflictHoldingRaw.trim()
-        : null,
-    max_rebase_attempts: asInt(prAutopilotRaw['max_rebase_attempts'], 3),
     auto_merge_strategy: autoMergeStrategy,
     poll_interval_ms: asInt(prAutopilotRaw['poll_interval_ms'], 30_000),
   };
-  if (prAutopilot.max_rebase_attempts <= 0) {
-    throw new WorkflowError(
-      'workflow_parse_error',
-      'pr_autopilot.max_rebase_attempts must be a positive integer',
-    );
-  }
   if (prAutopilot.poll_interval_ms < 0) {
     throw new WorkflowError(
       'workflow_parse_error',
@@ -796,16 +784,6 @@ function validatePrAutopilot(
     }
     if (states[routeCanonical]!.role !== 'active') {
       return `pr_autopilot.conflict_route_to "${cfg.conflict_route_to}" must be an active state (got role: ${states[routeCanonical]!.role})`;
-    }
-  }
-
-  if (cfg.conflict_holding_state !== null) {
-    const holdingCanonical = byLower.get(cfg.conflict_holding_state.toLowerCase());
-    if (!holdingCanonical) {
-      return `pr_autopilot.conflict_holding_state references undeclared state "${cfg.conflict_holding_state}"`;
-    }
-    if (states[holdingCanonical]!.role !== 'holding') {
-      return `pr_autopilot.conflict_holding_state "${cfg.conflict_holding_state}" must be a holding state (got role: ${states[holdingCanonical]!.role})`;
     }
   }
 

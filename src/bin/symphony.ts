@@ -38,7 +38,7 @@ import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
-import { GhCliPrApi, GitCliPrGitApi, Reconciler } from '../reconciler/index.js';
+import { GhCliPrApi, Reconciler } from '../reconciler/index.js';
 import { closeLogFile, log, setLogFile } from '../logging.js';
 import type { ServiceConfig, WorkflowDefinition } from '../types.js';
 import type { WorkflowSource } from '../workflow.js';
@@ -417,14 +417,12 @@ function wirePostConstructionProviders(opts: {
   reconciler.setPrAutopilotProviders({
     intended: orch,
     pr: new GhCliPrApi({ timeoutMs: 30_000 }),
-    git: new GitCliPrGitApi({ timeoutMs: 60_000 }),
-    transition: { routeIssue: (input) => orch.routeIssueForAutopilot(input) },
-    cleanup: { removeWorkspace: (identifier) => orch.removeWorkspace(identifier) },
-    // Issue 53: re-materialize a missing workspace before the autopilot's
-    // rebase step so a Done-state PR whose workspace was reaped (e.g.
-    // pr_autopilot was enabled after the dir was cleaned by the pre-autopilot
-    // terminal rule) gets recovered instead of stalling silently.
-    workspaceEnsure: { ensureWorkspace: (args) => orch.ensureWorkspaceForAutopilot(args) },
+    transition: {
+      routeIssue: (input) => orch.routeIssueForAutopilot(input),
+    },
+    cleanup: {
+      removeWorkspace: (identifier) => orch.removeWorkspace(identifier),
+    },
   });
 }
 

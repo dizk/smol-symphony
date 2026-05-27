@@ -1,12 +1,18 @@
 // PR autopilot resource (issue 38 / reconciler stage 4). Owns the lifecycle of
-// each terminal-state issue's GitHub PR: keeps it rebased on origin/<base>, arms
-// `gh pr merge --auto`, and routes rebase conflicts back to the implementing
-// state with the conflict context attached. Sits behind `pr_autopilot.enabled`
-// so a workflow that hasn't opted in observes no behavior change at runtime.
+// each terminal-state issue's GitHub PR: arms `gh pr merge --auto` when the
+// PR is mergeable, routes non-mergeable PRs back to the implementing state
+// (where the agent rebases onto a freshly-fetched base as part of its normal
+// flow), and reaps workspace + remote branch once GitHub merges or closes
+// the PR. Sits behind `pr_autopilot.enabled` so a workflow that hasn't opted
+// in observes no behavior change at runtime.
 //
 // Desired state per issue:
-//   - identifier in `merge_state` (e.g. Done) with an open PR:
-//       PR is rebased on origin/<base> and `gh pr merge --auto --<strategy>` is armed.
+//   - identifier in `merge_state` (e.g. Done) with a MERGEABLE open PR:
+//       `gh pr merge --auto --<strategy>` is armed.
+//   - identifier in `merge_state` with a CONFLICTING (or otherwise non-
+//       mergeable) open PR: issue is routed back to `conflict_route_to`
+//       (default: the first declared active state) with notes; the dispatched
+//       agent owns the rebase.
 //   - identifier in `merge_state` whose PR has merged or closed:
 //       local + (best-effort) remote branch deleted; workspace removed.
 //   - identifier in `close_state` (e.g. Cancelled) with an open PR:
@@ -17,51 +23,38 @@
 //     Cached for `poll_interval_ms` per PR so a fast reconcile cadence does not
 //     storm the GH API.
 //
-// Conflict handling: rebase conflict ≠ operator's problem. The resource:
-//   1. Counts the attempt (per-identifier).
-//   2. Appends a structured notes block to the issue file via the tracker's
-//      moveIssueToState — same code path the MCP transition tool uses, so
-//      file locking and atomic-write rules are unchanged.
-//   3. Routes the issue from merge_state back to `conflict_route_to` (default:
-//      first declared active state). The workspace + agent/<id> branch survive
-//      across the active-state transition naturally (per the orchestrator's
-//      role-driven cleanup rule), and the dispatch loop picks up the issue
-//      again with the conflict markers in place.
-//   4. After `max_rebase_attempts` consecutive failures, routes to the
-//      configured holding state (default: a `Conflict` state if declared) so
-//      the operator can intervene.
+// Conflict handling: the autopilot does not rebase. A non-mergeable PR is
+// reported (notes block + state transition) and the dispatched agent does
+// the work. This matches the workspace clone model: the host runs
+// `git fetch origin <base>` before each dispatch so `origin/<base>` is
+// current in the workspace, and the Todo prompt instructs the agent to
+// `git rebase origin/<base>` as the first step.
 //
-// All git + GH I/O is behind injectable callbacks. Production wires real
-// shell-outs (see `./pr-adapters.ts` — the shell module that implements PrApi
-// + PrGitApi against `gh` / `git` on the host); tests pass synchronous stubs.
+// All GH I/O is behind injectable callbacks. Production wires real shell-outs
+// (see `./pr-adapters.ts` — the shell module that implements PrApi against
+// `gh` on the host); tests pass synchronous stubs.
 
 import { log } from '../logging.js';
 import { realClock, type ClockNow } from '../util/clock.js';
 import { ResourceActionLedger } from './ledger.js';
 import {
   decidePr,
-  type EnsureWorkspaceOutcome,
   type PrCacheView,
   type PrEffect,
   type PrIntent,
   type PrObservation,
   type PrSummary,
   type PrView,
-  type PushOutcome,
-  type RebaseOutcome,
 } from './pr-decide.js';
 import type { ResourceSnapshot } from './types.js';
 
 export type {
-  EnsureWorkspaceOutcome,
   PrIntent,
   PrIntentKind,
   PrMergeable,
   PrState,
   PrSummary,
   PrView,
-  PushOutcome,
-  RebaseOutcome,
 } from './pr-decide.js';
 
 export interface PrIntendedProvider {
@@ -96,33 +89,6 @@ export interface PrApi {
 }
 
 /**
- * Git-facing operations executed inside the per-issue workspace. The rebase
- * step also captures the conflicted file list so the conflict notes that get
- * appended to the tracker file are concrete (file paths + counts) rather than
- * a generic "merge failed" line.
- */
-export interface PrGitApi {
-  /**
-   * Rebase `branch` onto `origin/<baseBranch>` inside `workspacePath`. The
-   * `expectedHeadSha` is the SHA the reconciler last saw on the PR; mismatches
-   * surface as `kind: 'concurrent_push'` (someone else pushed in the meantime)
-   * so the reconciler defers rather than clobbering.
-   */
-  rebaseOnto(args: {
-    workspacePath: string;
-    branch: string;
-    baseBranch: string;
-    expectedHeadSha: string;
-  }): Promise<RebaseOutcome>;
-  /** Force-with-lease push the rebased branch back to origin. */
-  pushForceWithLease(args: {
-    workspacePath: string;
-    branch: string;
-    expectedHeadSha: string;
-  }): Promise<PushOutcome>;
-}
-
-/**
  * Append a notes block + move the tracker file from `fromState` to `toState`.
  * Same shape as the MCP transition tool's tracker call so existing locking /
  * atomic-write guarantees apply.
@@ -147,48 +113,11 @@ export interface PrCleanupApi {
   removeWorkspace(identifier: string): Promise<void>;
 }
 
-/**
- * Idempotent materializer for the autopilot's per-issue workspace. Production
- * wires this to a closure that re-clones the source repo, fetches the remote
- * `agent/<id>` branch, and positions the local branch at the remote tip so
- * the standard rebase flow can run.
- *
- * Why this exists: an operator who flips `pr_autopilot.enabled` true after an
- * issue has already reached Done (and its workspace has been reaped by the
- * pre-autopilot terminal cleanup) leaves the autopilot with a non-null
- * `workspace_path` pointing at a missing directory. Without this seam the
- * rebase step would throw silently in git (the directory doesn't exist) and
- * the PR would stay BEHIND forever.
- *
- * The callback MUST be idempotent: the resource calls it on every rebase
- * pass, and production typically short-circuits when the directory already
- * exists.
- */
-export interface PrWorkspaceEnsureApi {
-  ensureWorkspace(args: {
-    identifier: string;
-    workspacePath: string;
-    branch: string;
-    baseBranch: string;
-    expectedHeadSha: string;
-  }): Promise<EnsureWorkspaceOutcome>;
-}
-
 export interface PrResourceOptions {
   intended: PrIntendedProvider;
   pr: PrApi;
-  git: PrGitApi;
   transition: PrTransitionApi;
   cleanup: PrCleanupApi;
-  /**
-   * Optional workspace materializer. When wired (production), the resource
-   * calls it before every rebase so a missing workspace (autopilot enabled
-   * after the dir was reaped, see issue 53) is re-cloned + repositioned on
-   * the remote branch tip rather than silently failing in `git rebaseOnto`.
-   * Tests that stub `git.rebaseOnto` may omit this; the resource skips the
-   * pre-rebase ensure when it's absent.
-   */
-  workspaceEnsure?: PrWorkspaceEnsureApi;
   /**
    * GitHub auto-merge strategy. Mirrors the workflow's
    * `pr_autopilot.auto_merge_strategy`; the resource doesn't hardcode 'squash'
@@ -196,20 +125,12 @@ export interface PrResourceOptions {
    * 'rebase' (linear history).
    */
   strategy: 'squash' | 'merge' | 'rebase';
-  /** Maximum consecutive rebase attempts before circuit-breaking. */
-  maxRebaseAttempts: number;
   /**
-   * State the resource routes a conflict-rebasing issue back into. v1
-   * defaults to the first declared active state; the orchestrator resolves
-   * this from the workflow before constructing the resource.
+   * State the resource routes a non-mergeable issue back into. v1 defaults
+   * to the first declared active state; the orchestrator resolves this from
+   * the workflow before constructing the resource.
    */
   conflictRouteTo: string;
-  /**
-   * Holding state the resource routes into after `maxRebaseAttempts`
-   * consecutive failures. When null the circuit-broken issue stays in the
-   * merge state and a `last_error` annotation surfaces on the dashboard.
-   */
-  conflictHoldingState: string | null;
   /**
    * Per-PR cache TTL. `gh pr view` and `gh pr list` results within the
    * window are reused. 0 disables caching (used by tests that want every
@@ -242,20 +163,13 @@ interface PerIssueState {
   lastLookupAt: number;
   prView: PrView | null;
   lastViewAt: number;
-  // Rebase attempt counter. Persisted across Done → conflict_route_to →
-  // ... → Done cycles so the circuit breaker accumulates consecutive
-  // failures (see issue 38 acceptance criteria). Reset only on a
-  // successful rebase, terminal cleanup (merge/close), or a circuit-broken
-  // route to the holding state — NOT when the identifier leaves the
-  // intended set or when we route back to the implementing state.
-  rebaseAttempts: number;
   lastObservedHeadSha: string | null;
   // True once we've called armAutoMerge for this PR; idempotency lives in
   // the action (gh accepts re-arming), but tracking this lets the snapshot
   // surface "armed" without re-querying.
   armed: boolean;
   // Cleanup latch. Once a merged/closed PR's workspace + remote branch
-  // have been reaped we don't want to re-arm or rebase on subsequent ticks.
+  // have been reaped we don't want to re-arm on subsequent ticks.
   completed: boolean;
 }
 
@@ -303,24 +217,12 @@ export class PrResource {
       return;
     }
 
-    // For identifiers no longer in the intended set, clear the transient
-    // fields (cached PR view, head SHA, armed flag, completed latch) so
-    // when they return we re-resolve everything from gh — but KEEP the
-    // rebaseAttempts counter so the circuit breaker accumulates across
-    // Done → conflict_route_to → ... → Done cycles. Without this, the
-    // counter would reset every time we route a conflict, and the
-    // max_rebase_attempts breaker would be unreachable in practice.
+    // For identifiers no longer in the intended set, drop the per-issue
+    // state entirely — there is no counter to preserve anymore; the next
+    // return to the merge state re-resolves everything from gh.
     const wanted = new Set(intents.map((i) => i.identifier));
     for (const id of [...this.state.keys()]) {
-      if (!wanted.has(id)) {
-        const st = this.state.get(id)!;
-        if (st.rebaseAttempts === 0) {
-          // Nothing to remember — drop the whole entry to bound the map.
-          this.state.delete(id);
-        } else {
-          this.resetTransient(st);
-        }
-      }
+      if (!wanted.has(id)) this.state.delete(id);
     }
 
     // Reset per-pass error so a transient failure that has resolved doesn't
@@ -352,11 +254,6 @@ export class PrResource {
     };
   }
 
-  /** Test helper: read the rebase attempt count for an identifier. */
-  rebaseAttemptsFor(identifier: string): number {
-    return this.state.get(identifier)?.rebaseAttempts ?? 0;
-  }
-
   /** Test helper: read the cached PR view (post-pass). */
   viewFor(identifier: string): PrView | null {
     return this.state.get(identifier)?.prView ?? null;
@@ -370,7 +267,6 @@ export class PrResource {
         lastLookupAt: 0,
         prView: null,
         lastViewAt: 0,
-        rebaseAttempts: 0,
         lastObservedHeadSha: null,
         armed: false,
         completed: false,
@@ -381,10 +277,9 @@ export class PrResource {
   }
 
   /**
-   * Wipe everything except `rebaseAttempts`. Used when an identifier leaves
-   * the intended set (typically because we routed it back to the implementing
-   * state for an agent to resolve) so the next return to the merge state
-   * starts with a fresh PR view but keeps the consecutive-conflict counter.
+   * Wipe everything except `completed`. Used when we route the issue back
+   * to the implementing state so the next return to the merge state starts
+   * with a fresh PR view.
    */
   private resetTransient(st: PerIssueState): void {
     st.prSummary = undefined;
@@ -398,12 +293,11 @@ export class PrResource {
 
   /**
    * Drive one intent through the decide → apply loop. Observation is rebuilt
-   * incrementally as each effect runs: `observe_summary` / `observe_view` /
-   * `rebase_and_push` populate fields the next `decidePr` call consults; pure
-   * cache mutations fold straight into the next iteration's `cache` snapshot.
-   * The cap is a defensive guard — decide reduces work on every iteration
-   * (a `_resolved` flag flips, or an outcome lands) so it terminates well
-   * inside the bound.
+   * incrementally as each effect runs: `observe_summary` / `observe_view`
+   * populate fields the next `decidePr` call consults; pure cache mutations
+   * fold straight into the next iteration's `cache` snapshot. The cap is a
+   * defensive guard — decide reduces work on every iteration (a `_resolved`
+   * flag flips, or an outcome lands) so it terminates well inside the bound.
    */
   private async processIntent(intent: PrIntent): Promise<void> {
     let obs = this.buildObservation(intent);
@@ -428,16 +322,12 @@ export class PrResource {
       summary: null,
       viewResolved: false,
       view: null,
-      rebaseAttempted: false,
-      rebaseOutcome: null,
       closeAttempted: false,
       closeOutcome: null,
       halt: false,
       config: {
         strategy: this.opts.strategy,
-        maxRebaseAttempts: this.opts.maxRebaseAttempts,
         conflictRouteTo: this.opts.conflictRouteTo,
-        conflictHoldingState: this.opts.conflictHoldingState,
       },
     };
   }
@@ -447,7 +337,6 @@ export class PrResource {
       completed: st.completed,
       armed: st.armed,
       lastObservedHeadSha: st.lastObservedHeadSha,
-      rebaseAttempts: st.rebaseAttempts,
     };
   }
 
@@ -455,7 +344,6 @@ export class PrResource {
     completed: false,
     armed: false,
     lastObservedHeadSha: null,
-    rebaseAttempts: 0,
   };
 
   /**
@@ -475,16 +363,6 @@ export class PrResource {
         const st = this.getOrInit(eff.identifier);
         const view = await this.fetchPrView(eff.identifier, eff.prNumber, st);
         return { ...obs, viewResolved: true, view, cache: this.cacheView(st) };
-      }
-      case 'rebase_and_push': {
-        const st = this.getOrInit(eff.identifier);
-        const outcome = await this.runRebase(obs.intent, obs.view!, st);
-        return {
-          ...obs,
-          rebaseAttempted: true,
-          rebaseOutcome: outcome,
-          cache: this.cacheView(st),
-        };
       }
       case 'arm_auto_merge': {
         await this.runArmAutoMerge(eff.identifier, eff.prNumber, eff.strategy);
@@ -508,68 +386,25 @@ export class PrResource {
         await this.runConflictTransition(eff);
         return { ...obs, halt: true };
       }
-      case 'log_concurrent_push': {
-        log.info('pr reconcile: deferring, head SHA changed since last observation', {
-          identifier: eff.identifier,
-          observed: eff.observed,
-          now: eff.now,
-        });
-        return obs;
-      }
       case 'update_observed_head': {
         const st = this.getOrInit(eff.identifier);
         st.lastObservedHeadSha = eff.sha;
-        // Emitted only in defer paths (concurrent-push detection + rebase
-        // outcome=concurrent_push). Treat as terminal for this pass.
-        return { ...obs, cache: this.cacheView(st), halt: true };
+        return { ...obs, cache: this.cacheView(st) };
       }
       case 'mark_completed': {
         const st = this.getOrInit(eff.identifier);
         st.completed = true;
         return { ...obs, cache: this.cacheView(st) };
       }
-      case 'reset_attempts': {
-        const st = this.getOrInit(eff.identifier);
-        st.rebaseAttempts = 0;
-        return { ...obs, cache: this.cacheView(st) };
-      }
-      case 'increment_attempts': {
-        const st = this.getOrInit(eff.identifier);
-        st.rebaseAttempts = eff.attempt;
-        log.info('pr reconcile: conflict attempt', {
-          identifier: eff.identifier,
-          attempt: eff.attempt,
-          max: eff.max,
-        });
-        return { ...obs, cache: this.cacheView(st) };
-      }
       case 'reset_transient': {
         const st = this.state.get(eff.identifier);
         if (st) this.resetTransient(st);
-        // Always paired with route_conflict (route_to_implementing branch);
-        // terminal for this pass.
+        // Always paired with route_conflict; terminal for this pass.
         return {
           ...obs,
           cache: st ? this.cacheView(st) : PrResource.EMPTY_CACHE,
           halt: true,
         };
-      }
-      case 'forget_identifier': {
-        this.state.delete(eff.identifier);
-        // Paired with route_conflict in the circuit-broken branch.
-        return { ...obs, cache: PrResource.EMPTY_CACHE, halt: true };
-      }
-      case 'clamp_attempts': {
-        const st = this.getOrInit(eff.identifier);
-        st.rebaseAttempts = eff.value;
-        // Only emitted in the breaker no-holding-state branch; terminal.
-        return { ...obs, cache: this.cacheView(st), halt: true };
-      }
-      case 'set_last_error': {
-        this.lastError = eff.message;
-        // Emitted only after rebase outcome=error or breaker no-holding;
-        // both are terminal for the pass.
-        return { ...obs, halt: true };
       }
     }
   }
@@ -625,11 +460,7 @@ export class PrResource {
       const view = await this.opts.pr.view(prNumber);
       st.prView = view;
       st.lastViewAt = now;
-      // Pin the observed head SHA on the first successful view so the
-      // concurrent-push guard has a reference even before the first rebase.
-      if (st.lastObservedHeadSha === null) {
-        st.lastObservedHeadSha = view.head_ref_oid;
-      }
+      st.lastObservedHeadSha = view.head_ref_oid;
       st.armed = view.auto_merge_armed;
       this.ledger.done(actionKey);
       return view;
@@ -644,141 +475,6 @@ export class PrResource {
       });
       return null;
     }
-  }
-
-  private async runRebase(
-    intent: PrIntent,
-    view: PrView,
-    st: PerIssueState,
-  ): Promise<RebaseOutcome> {
-    const actionKey = `rebase_and_force_push:${intent.identifier}`;
-    this.ledger.start(actionKey);
-    if (intent.workspace_path === null) {
-      // Defensive: callers should not invoke runRebase without a workspace.
-      const msg = 'rebase requested without workspace path';
-      this.ledger.error(actionKey, msg);
-      log.warn('pr reconcile: rebase failed', {
-        identifier: intent.identifier,
-        stage: 'precondition',
-        error: msg,
-      });
-      return { kind: 'error', diagnostic: msg };
-    }
-    // Issue 53: re-materialize a missing workspace on demand. The autopilot
-    // owns the workspace once an issue enters merge_state; if it's been
-    // reaped (e.g. operator flipped pr_autopilot enabled after the dir was
-    // cleaned up by the pre-autopilot terminal rule), this restores it so
-    // the rebase doesn't throw silently in git.
-    if (this.opts.workspaceEnsure) {
-      const ensure = await this.opts.workspaceEnsure.ensureWorkspace({
-        identifier: intent.identifier,
-        workspacePath: intent.workspace_path,
-        branch: intent.branch,
-        baseBranch: intent.base_branch,
-        expectedHeadSha: view.head_ref_oid,
-      });
-      if (ensure.kind === 'error') {
-        this.ledger.error(actionKey, ensure.diagnostic);
-        log.warn('pr reconcile: rebase failed', {
-          identifier: intent.identifier,
-          stage: 'ensure_workspace',
-          error: ensure.diagnostic,
-        });
-        return { kind: 'error', diagnostic: ensure.diagnostic };
-      }
-    }
-    let rebase: RebaseOutcome;
-    try {
-      rebase = await this.opts.git.rebaseOnto({
-        workspacePath: intent.workspace_path,
-        branch: intent.branch,
-        baseBranch: intent.base_branch,
-        expectedHeadSha: view.head_ref_oid,
-      });
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.ledger.error(actionKey, msg);
-      log.warn('pr reconcile: rebase failed', {
-        identifier: intent.identifier,
-        stage: 'rebase_threw',
-        error: msg,
-      });
-      return { kind: 'error', diagnostic: msg };
-    }
-
-    if (rebase.kind === 'ok') {
-      // Force-with-lease push. The git side has already verified the
-      // workspace's local HEAD matches the SHA we observed; the lease binds
-      // the SHA we expect on the remote so a concurrent push between this
-      // step and the previous one is detected (rather than silently
-      // overwritten).
-      let push: PushOutcome;
-      try {
-        push = await this.opts.git.pushForceWithLease({
-          workspacePath: intent.workspace_path,
-          branch: intent.branch,
-          expectedHeadSha: view.head_ref_oid,
-        });
-      } catch (err) {
-        const msg = (err as Error).message;
-        this.ledger.error(actionKey, msg);
-        log.warn('pr reconcile: rebase failed', {
-          identifier: intent.identifier,
-          stage: 'push_threw',
-          error: msg,
-        });
-        return { kind: 'error', diagnostic: msg };
-      }
-      if (push.kind === 'concurrent_push') {
-        this.ledger.error(actionKey, push.diagnostic);
-        log.warn('pr reconcile: rebase failed', {
-          identifier: intent.identifier,
-          stage: 'push_concurrent',
-          error: push.diagnostic,
-        });
-        return { kind: 'concurrent_push', observed_head_sha: view.head_ref_oid };
-      }
-      if (push.kind === 'error') {
-        this.ledger.error(actionKey, push.diagnostic);
-        log.warn('pr reconcile: rebase failed', {
-          identifier: intent.identifier,
-          stage: 'push_error',
-          error: push.diagnostic,
-        });
-        return { kind: 'error', diagnostic: push.diagnostic };
-      }
-      this.ledger.done(actionKey);
-      log.info('pr reconcile: rebase+push ok', {
-        identifier: intent.identifier,
-        new_head_sha: rebase.new_head_sha,
-      });
-      // After a successful push the PR's head SHA on GitHub will change to
-      // the new SHA. Pin it locally so the next pass's view-vs-state diff
-      // is correct.
-      st.lastObservedHeadSha = rebase.new_head_sha;
-      // Invalidate the view cache so the next pass sees fresh mergeable
-      // state (the rebase may have changed it from CONFLICTING to
-      // MERGEABLE or UNKNOWN).
-      st.prView = null;
-      st.lastViewAt = 0;
-      return rebase;
-    }
-    const finalDiagnostic =
-      rebase.kind === 'conflict'
-        ? 'rebase conflict'
-        : rebase.kind === 'concurrent_push'
-        ? 'concurrent push'
-        : rebase.kind === 'error'
-        ? rebase.diagnostic
-        : 'unknown';
-    this.ledger.error(actionKey, finalDiagnostic);
-    log.warn('pr reconcile: rebase failed', {
-      identifier: intent.identifier,
-      stage: 'rebase_outcome',
-      outcome: rebase.kind,
-      error: finalDiagnostic,
-    });
-    return rebase;
   }
 
   private async runArmAutoMerge(
@@ -838,9 +534,9 @@ export class PrResource {
 
   /**
    * Apply the `route_conflict` effect: same tracker.routeIssue call shape and
-   * action-ledger key as before. Counter increment + state cleanup
-   * (`reset_transient` / `forget_identifier`) ride as separate effects
-   * emitted by `decidePr` so the breaker logic is testable as pure data.
+   * action-ledger key as before. State cleanup (`reset_transient`) rides as
+   * a separate effect emitted by `decidePr` so the routing logic is testable
+   * as pure data.
    */
   private async runConflictTransition(
     eff: Extract<PrEffect, { kind: 'route_conflict' }>,
@@ -856,7 +552,7 @@ export class PrResource {
       }),
     );
     if (res.ok) {
-      log.info('pr reconcile: routed to conflict-handling state', {
+      log.info('pr reconcile: routed to implementing state', {
         identifier: eff.identifier,
         from_state: eff.fromState,
         to_state: eff.toState,
@@ -871,4 +567,3 @@ export class PrResource {
     }
   }
 }
-

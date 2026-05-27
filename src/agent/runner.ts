@@ -15,7 +15,7 @@ import type {
   WorkflowDefinition,
 } from '../types.js';
 import type { IssueTracker } from '../trackers/types.js';
-import { WorkspaceManager, sanitizeWorkspaceKey } from '../workspace.js';
+import { WorkspaceManager, fetchBaseInWorkspace, sanitizeWorkspaceKey } from '../workspace.js';
 import { renderPrompt } from '../prompt.js';
 import { SmolvmClient, SYMPHONY_VM_PREFIX } from './smolvm.js';
 import { AcpClient } from './acp.js';
@@ -796,6 +796,41 @@ export class AgentRunner {
     } catch (err) {
       logger.error('workspace error', { error: (err as Error).message });
       return { ok: false, reason: 'workspace error', threadId: null, turnsCompleted: 0 };
+    }
+
+    // Issue 101: a fresh `origin/<base>` is a dispatch precondition. The
+    // host fetches it before every dispatch (fresh OR re-dispatch) so the
+    // agent's first step (per the Todo prompt) — `git rebase origin/<base>`
+    // — runs against a current ref. The in-VM agent has no network
+    // credentials, so the host owns this. If the fetch fails when an
+    // `origin` is configured (auth, network, missing ref) we abort the
+    // attempt rather than launching the agent against a stale base; doing
+    // otherwise reproduces exactly the stale-base behavior this refactor
+    // eliminates. Skipped cleanly in local-only mode (no `origin`
+    // configured) — the source repo's local `<base>` is the only truth.
+    const baseBranch =
+      process.env.SYMPHONY_BASE_BRANCH && process.env.SYMPHONY_BASE_BRANCH.length > 0
+        ? process.env.SYMPHONY_BASE_BRANCH
+        : 'main';
+    const fetchResult = await fetchBaseInWorkspace(workspace.path, baseBranch);
+    if (!fetchResult.ok) {
+      logger.error('pre-dispatch base fetch failed; aborting attempt', {
+        base_branch: baseBranch,
+        error: fetchResult.diagnostic,
+      });
+      runLog?.system('pre_dispatch_base_fetch_failed', {
+        base_branch: baseBranch,
+        error: fetchResult.diagnostic,
+      });
+      return {
+        ok: false,
+        reason: 'pre-dispatch base fetch failed',
+        threadId: null,
+        turnsCompleted: 0,
+      };
+    }
+    if (!fetchResult.skipped) {
+      runLog?.system('pre_dispatch_base_fetch_ok', { base_branch: baseBranch });
     }
 
     try {

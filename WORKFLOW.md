@@ -82,16 +82,7 @@ states:
     # cleaned up after the run unwinds and the commits are discarded with it.
   Triage:
     # Landing directory for `symphony.propose_issue`. Never dispatched; the
-    # operator approves or discards from the dashboard. Must precede `Conflict`
-    # below so propose_issue (which lands in the first holding state) still
-    # targets Triage rather than the integration-conflict bucket.
-    role: holding
-  Conflict:
-    # Holding state for issues whose post-terminal merge fails. Currently inert
-    # because the `integration:` block is not declared (shared-integration flow
-    # is disabled); nothing routes here. Kept as a no-op declaration so
-    # re-enabling integration later is a one-block addition rather than also
-    # needing to re-declare the holding state.
+    # operator approves or discards from the dashboard.
     role: holding
 
 tracker:
@@ -121,12 +112,15 @@ tracker:
 # rewrite: canonical workspace setup is now TypeScript-owned and runs before
 # any optional `after_create` hook (see SPEC §5.3 and WORKFLOW.template.md).
 
-# PR autopilot (issue 38). Enabled 2026-05-25 so Done-state PRs are kept rebased
-# on origin/main and GitHub auto-merge is armed once checks pass; rebase
-# conflicts route the issue back to Todo with conflict markers, and after 3
-# consecutive failures it parks in the Conflict holding state. Strategy `squash`
-# matches the repo's `NN: title (#PR)` history. Defaults below mirror symphony's
-# state names (merge=Done, close=Cancelled, conflict→Todo, holding=Conflict).
+# PR autopilot (issue 38, simplified by issue 101). Enabled 2026-05-25 so
+# Done-state PRs that are MERGEABLE have GitHub auto-merge armed; PRs reported
+# as CONFLICTING are routed back to Todo for the dispatched agent to rebase
+# (the host runs `git fetch origin <base>` before each dispatch so
+# `origin/<base>` is current in the workspace, and the Todo prompt's first
+# step is `git rebase origin/<base>`). There is no autopilot-side rebase
+# machinery and no consecutive-failure circuit breaker — the same route +
+# redispatch path handles a stale-base branch and a genuinely-conflicting
+# one. Strategy `squash` matches the repo's `NN: title (#PR)` history.
 #
 # PREREQUISITE: `gh pr merge --auto` requires at least one branch-protection
 # rule on `main`, or arming auto-merge errors. Ensure one exists in the repo's
@@ -140,8 +134,6 @@ pr_autopilot:
   merge_state: Done
   close_state: Cancelled
   conflict_route_to: Todo
-  conflict_holding_state: Conflict
-  max_rebase_attempts: 3
   auto_merge_strategy: squash
   poll_interval_ms: 30000
 
@@ -199,8 +191,8 @@ agent:
   # SERIALIZED to 1 (2026-05-27) to stop the FC/IS burn-down conflict storm:
   # every burn-down PR edits the same policy files (package.json --max-warnings
   # ratchet, .dependency-cruiser.cjs, eslint.config.js), so any two in flight
-  # conflict by construction and loop Done->Conflict. Serial dispatch makes each
-  # PR rebase on the prior merge. Revert to 2 once the arch-burndown queue drains.
+  # conflict by construction. Serial dispatch makes each PR rebase on the prior
+  # merge. Revert to 2 once the arch-burndown queue drains.
   max_concurrent_agents: 1
   max_turns: 6
   max_retry_backoff_ms: 120000
@@ -311,21 +303,38 @@ Orientation:
 You are the **implementer**. Your job: turn the issue into a working change on
 the per-issue branch, then hand off to the reviewer.
 
-1. Read enough of the codebase to understand the change you need to make.
-2. Decide where the change belongs before writing it. The orchestrator
+1. **Rebase onto a fresh base first.** Symphony has just fetched
+   `origin/main` into your workspace (or whatever base branch
+   `SYMPHONY_BASE_BRANCH` names — `main` is the default and matches this
+   project). The very first thing to do is rebase your branch onto it:
+
+   ```
+   git rebase origin/main
+   ```
+
+   - On a fresh issue this is a no-op (you're already on top of base).
+   - On a re-dispatch where base has advanced this picks up the new commits.
+   - If `git rebase` reports conflicts, **resolve them in-tree as part of
+     this turn** (reconcile your change with what landed on base), `git add`
+     the resolved files, and `git rebase --continue` (repeat per replayed
+     commit). Then proceed to step 2. There is no separate conflict state
+     to route to — handling the conflict is part of normal implementation
+     work, just like any other rebase you'd do on your own machine.
+2. Read enough of the codebase to understand the change you need to make.
+3. Decide where the change belongs before writing it. The orchestrator
    (`src/agent/runner.ts`, `src/mcp.ts`, `src/orchestrator.ts`) owns the
    state machine and the tracker. Hooks in `WORKFLOW.md` are for repo-local
    glue: cloning the workspace, `git push`, `gh pr create`, rescuing
-   artifacts. State-machine behavior (new transitions, conflict routing,
-   anything that mutates tracker files or runtime entry state) belongs in
-   the orchestrator with typed APIs and tests — not in a shell hook. If you
+   artifacts. State-machine behavior (new transitions, anything that
+   mutates tracker files or runtime entry state) belongs in the
+   orchestrator with typed APIs and tests — not in a shell hook. If you
    find yourself adding a `SYMPHONY_*` env var so a hook can reach into
    orchestrator state, or writing a hook that the runner then has to
    re-detect via a post-hook scan, that is the signal you are on the wrong
    side of the seam: stop and put the logic in the runner/MCP layer
    instead. The issue body may sketch a shell-shaped solution; treat that
    as one option, not a directive.
-3. Make the smallest correct change for the issue's stated scope, and keep it
+4. Make the smallest correct change for the issue's stated scope, and keep it
    focused. If you notice work beyond what the issue states, call
    `symphony.propose_issue` for it rather than expanding this change to swallow
    follow-up work. Add or update tests where the change is testable. Before
@@ -336,8 +345,8 @@ the per-issue branch, then hand off to the reviewer.
    only needs to keep `npm run lint` green at the *current* ratchet (it will, as long
    as you reduce or hold the warning count). Lowering it yourself just collides with
    every other in-flight issue's `package.json` and forces manual conflict resolution.
-4. Commit your work to the per-issue branch with a short message.
-5. Hand off to the reviewer by calling:
+5. Commit your work to the per-issue branch with a short message.
+6. Hand off to the reviewer by calling:
 
    ```
    symphony.transition({
