@@ -57,6 +57,24 @@ function asTimestamp(v: unknown): string | null {
   return null;
 }
 
+// Compose the appended-notes body. Pure: extracted so `appendNotesBlock` stays small
+// enough for the imperative-shell complexity budget. Guarantees a blank line between the
+// prior body and the new header; the block itself ends with a newline so subsequent
+// appends stay readable.
+function buildNotesAppendedBody(
+  original: string,
+  fromState: string,
+  toState: string,
+  notes: string,
+  actor: string | undefined,
+): string {
+  const who = actor && actor.length > 0 ? actor : 'unknown';
+  const ts = new Date().toISOString();
+  const header = `## ${who} — ${ts} — ${fromState} → ${toState}`;
+  const sep = original.endsWith('\n\n') ? '' : original.endsWith('\n') ? '\n' : '\n\n';
+  return `${original}${sep}${header}\n\n${notes}\n`;
+}
+
 // Thin wrapper over the shared parser. Translates FrontMatterError → TrackerError
 // so the scanner's existing skip-and-log catch picks them up under the same code.
 function splitFrontMatter(text: string): { config: Record<string, unknown>; body: string } {
@@ -169,129 +187,26 @@ export class LocalMarkdownTracker implements IssueTracker {
     // When the caller pins a root (snapshot from dispatch time), scan there.
     // Otherwise use whatever the live config says. This protects in-flight
     // transition calls from a WORKFLOW.md reload that mutates tracker.root.
-    const root = opts?.fromRoot ?? this.root;
+    const { fromRoot, fromState, notes: rawNotes, actor } = opts ?? {};
+    const root = fromRoot ?? this.root;
+    const notes = typeof rawNotes === 'string' ? rawNotes : '';
     const all = await this.scanAllAt(root);
     const candidates = all.filter((raw) => this.idOf(raw) === issueId);
     if (candidates.length === 0) {
       throw new TrackerError('local_issue_not_found', `no issue file matches id ${issueId}`);
     }
-    // Multiple files can share the same id when a stale terminal copy (e.g. an old
-    // Done/ABC-1.md from a prior cycle) survives alongside a live In Progress/ABC-1.md.
-    // `readdir` ordering is filesystem-dependent, so a blind `.find(...)` can pick the
-    // stale copy and — if its state already equals `toState` — silently no-op via the
-    // identity short-circuit below, leaving the active file stranded. Prefer the copy
-    // whose state matches the caller-supplied `fromState`; if that still doesn't
-    // resolve to a single file, refuse to guess.
-    let match: RawIssueFile;
-    if (candidates.length === 1) {
-      match = candidates[0]!;
-    } else {
-      const fromState = opts?.fromState;
-      const preferred = fromState
-        ? candidates.filter((raw) => raw.state.toLowerCase() === fromState.toLowerCase())
-        : [];
-      if (preferred.length === 1) {
-        match = preferred[0]!;
-      } else {
-        const states = candidates.map((raw) => raw.state).join(', ');
-        throw new TrackerError(
-          'local_issue_ambiguous',
-          `multiple issue files match id ${issueId} across states [${states}]; pass fromState to disambiguate`,
-        );
-      }
-    }
+    const match = this.resolveMatch(candidates, issueId, fromState);
     if (match.state.toLowerCase() === toState.toLowerCase()) {
       return { fromState: match.state, toState: match.state, newPath: match.filePath };
     }
-    // Notes append. We re-read the file (the scan parsed front-matter + body but discarded
-    // the verbatim text) so the rewrite preserves operator-visible whitespace, comments,
-    // and any trailing newlines exactly. The append block format is fixed across the
-    // tracker so the dashboard / downstream tooling can recognise it.
-    const notes = typeof opts?.notes === 'string' ? opts.notes : '';
     if (notes.length > 0) {
-      let original: string;
-      try {
-        original = await readFile(match.filePath, 'utf8');
-      } catch (err) {
-        throw new TrackerError(
-          'local_issue_notes_read_error',
-          `failed to read ${match.filePath} for notes append: ${(err as Error).message}`,
-        );
-      }
-      const actor = opts?.actor && opts.actor.length > 0 ? opts.actor : 'unknown';
-      const ts = new Date().toISOString();
-      const header = `## ${actor} — ${ts} — ${match.state} → ${toState}`;
-      // Guarantee a blank line between the prior body and the new header. The block
-      // itself ends with a newline so subsequent appends stay readable.
-      const sep = original.endsWith('\n\n') ? '' : original.endsWith('\n') ? '\n' : '\n\n';
-      const appended = `${original}${sep}${header}\n\n${notes}\n`;
-      // Write to <id>.md.tmp in the SAME source state directory, fsync the file
-      // descriptor for durability, then atomic-rename onto <id>.md. Same-directory rename
-      // is atomic on POSIX filesystems; both files live under the source state directory
-      // so the cross-directory move below operates on a single up-to-date file.
-      const tmpPath = match.filePath + '.tmp';
-      let fh;
-      try {
-        fh = await open(tmpPath, 'w', 0o644);
-        await fh.writeFile(appended, 'utf8');
-        await fh.sync();
-      } catch (err) {
-        try {
-          if (fh) await fh.close();
-        } catch {
-          // best-effort close — surfacing the original error is more useful.
-        }
-        throw new TrackerError(
-          'local_issue_notes_write_error',
-          `failed to write notes tmp file ${tmpPath}: ${(err as Error).message}`,
-        );
-      }
-      try {
-        await fh.close();
-      } catch {
-        // The file is on disk and fsync'd; close failures are not load-bearing.
-      }
-      try {
-        await rename(tmpPath, match.filePath);
-      } catch (err) {
-        throw new TrackerError(
-          'local_issue_notes_rename_error',
-          `failed to atomic-rename ${tmpPath} -> ${match.filePath}: ${(err as Error).message}`,
-        );
-      }
+      await this.appendNotesBlock(match, toState, notes, actor);
     }
     const targetDir = path.join(root, toState);
     await mkdir(targetDir, { recursive: true });
-    const basename = path.basename(match.filePath);
-    const newPath = path.join(targetDir, basename);
-    // POSIX `rename` overwrites the destination silently. Refuse to clobber a stale
-    // terminal file with the same basename (e.g. an old Done/ABC-1.md left from a prior
-    // run before this issue was recreated in In Progress). A small TOCTOU race remains
-    // — another writer can create the target between this check and rename — but the
-    // realistic failure mode is operator-leftover files, not concurrent writes.
-    try {
-      await stat(newPath);
-      throw new TrackerError(
-        'local_issue_target_exists',
-        `refusing to overwrite existing file at ${newPath}`,
-      );
-    } catch (err) {
-      if (err instanceof TrackerError) throw err;
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw new TrackerError(
-          'local_issue_move_error',
-          `failed to stat target ${newPath}: ${(err as Error).message}`,
-        );
-      }
-    }
-    try {
-      await rename(match.filePath, newPath);
-    } catch (err) {
-      throw new TrackerError(
-        'local_issue_move_error',
-        `failed to move ${match.filePath} -> ${newPath}: ${(err as Error).message}`,
-      );
-    }
+    const newPath = path.join(targetDir, path.basename(match.filePath));
+    await this.assertTargetFree(newPath);
+    await this.crossDirRename(match.filePath, newPath);
     log.info('issue transitioned', {
       issue_id: issueId,
       from_state: match.state,
@@ -299,6 +214,129 @@ export class LocalMarkdownTracker implements IssueTracker {
       path: newPath,
     });
     return { fromState: match.state, toState, newPath };
+  }
+
+  private async crossDirRename(srcPath: string, dstPath: string): Promise<void> {
+    try {
+      await rename(srcPath, dstPath);
+    } catch (err) {
+      throw new TrackerError(
+        'local_issue_move_error',
+        `failed to move ${srcPath} -> ${dstPath}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // Multiple files can share the same id when a stale terminal copy (e.g. an old
+  // Done/ABC-1.md from a prior cycle) survives alongside a live In Progress/ABC-1.md.
+  // `readdir` ordering is filesystem-dependent, so a blind `.find(...)` can pick the
+  // stale copy and — if its state already equals `toState` — silently no-op via the
+  // identity short-circuit in the caller, leaving the active file stranded. Prefer the
+  // copy whose state matches the caller-supplied `fromState`; if that still doesn't
+  // resolve to a single file, refuse to guess.
+  private resolveMatch(
+    candidates: RawIssueFile[],
+    issueId: string,
+    fromState: string | undefined,
+  ): RawIssueFile {
+    if (candidates.length === 1) return candidates[0]!;
+    const preferred = fromState
+      ? candidates.filter((raw) => raw.state.toLowerCase() === fromState.toLowerCase())
+      : [];
+    if (preferred.length === 1) return preferred[0]!;
+    const states = candidates.map((raw) => raw.state).join(', ');
+    throw new TrackerError(
+      'local_issue_ambiguous',
+      `multiple issue files match id ${issueId} across states [${states}]; pass fromState to disambiguate`,
+    );
+  }
+
+  // We re-read the file (the scan parsed front-matter + body but discarded the verbatim
+  // text) so the rewrite preserves operator-visible whitespace, comments, and any
+  // trailing newlines exactly. The append block format is fixed across the tracker so the
+  // dashboard / downstream tooling can recognise it.
+  private async appendNotesBlock(
+    match: RawIssueFile,
+    toState: string,
+    notes: string,
+    actor: string | undefined,
+  ): Promise<void> {
+    const original = await this.readForNotesAppend(match.filePath);
+    const appended = buildNotesAppendedBody(original, match.state, toState, notes, actor);
+    await this.durablyReplaceInPlace(match.filePath, appended);
+  }
+
+  private async readForNotesAppend(filePath: string): Promise<string> {
+    try {
+      return await readFile(filePath, 'utf8');
+    } catch (err) {
+      throw new TrackerError(
+        'local_issue_notes_read_error',
+        `failed to read ${filePath} for notes append: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // Write to <targetPath>.tmp in the SAME directory, fsync the file descriptor for
+  // durability, then atomic-rename onto targetPath. Same-directory rename is atomic on
+  // POSIX filesystems, so any subsequent cross-directory move operates on a single
+  // up-to-date file.
+  private async durablyReplaceInPlace(targetPath: string, contents: string): Promise<void> {
+    const tmpPath = targetPath + '.tmp';
+    await this.writeAndFsync(tmpPath, contents);
+    try {
+      await rename(tmpPath, targetPath);
+    } catch (err) {
+      throw new TrackerError(
+        'local_issue_notes_rename_error',
+        `failed to atomic-rename ${tmpPath} -> ${targetPath}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  private async writeAndFsync(tmpPath: string, contents: string): Promise<void> {
+    let fh;
+    try {
+      fh = await open(tmpPath, 'w', 0o644);
+      await fh.writeFile(contents, 'utf8');
+      await fh.sync();
+    } catch (err) {
+      try {
+        if (fh) await fh.close();
+      } catch {
+        // best-effort close — surfacing the original error is more useful.
+      }
+      throw new TrackerError(
+        'local_issue_notes_write_error',
+        `failed to write notes tmp file ${tmpPath}: ${(err as Error).message}`,
+      );
+    }
+    try {
+      await fh.close();
+    } catch {
+      // The file is on disk and fsync'd; close failures are not load-bearing.
+    }
+  }
+
+  // POSIX `rename` overwrites the destination silently. Refuse to clobber a stale
+  // terminal file with the same basename (e.g. an old Done/ABC-1.md left from a prior
+  // run before this issue was recreated in In Progress). A small TOCTOU race remains
+  // — another writer can create the target between this check and the subsequent rename
+  // — but the realistic failure mode is operator-leftover files, not concurrent writes.
+  private async assertTargetFree(newPath: string): Promise<void> {
+    try {
+      await stat(newPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw new TrackerError(
+        'local_issue_move_error',
+        `failed to stat target ${newPath}: ${(err as Error).message}`,
+      );
+    }
+    throw new TrackerError(
+      'local_issue_target_exists',
+      `refusing to overwrite existing file at ${newPath}`,
+    );
   }
 
   private idOf(raw: RawIssueFile): string {
@@ -344,47 +382,64 @@ export class LocalMarkdownTracker implements IssueTracker {
         log.warn('skipping undeclared state directory', { dir: dirPath });
         continue;
       }
-      const state = dirEntry;
-      let files: string[];
-      try {
-        files = await readdir(dirPath);
-      } catch {
-        continue;
-      }
-      for (const fileName of files) {
-        if (!fileName.endsWith('.md')) continue;
-        const filePath = path.join(dirPath, fileName);
-        let st;
-        try {
-          st = await stat(filePath);
-        } catch {
-          continue;
-        }
-        if (!st.isFile()) continue;
-        let text: string;
-        try {
-          text = await readFile(filePath, 'utf8');
-        } catch (err) {
-          log.warn('skipping unreadable issue file', { file: filePath, error: (err as Error).message });
-          continue;
-        }
-        let parsed: { config: Record<string, unknown>; body: string };
-        try {
-          parsed = splitFrontMatter(text);
-        } catch (err) {
-          log.warn('skipping malformed issue file', { file: filePath, error: (err as Error).message });
-          continue;
-        }
-        out.push({
-          filePath,
-          identifier: fileName.slice(0, -3),
-          state,
-          frontMatter: parsed.config,
-          description: parsed.body,
-        });
-      }
+      out.push(...(await this.scanStateDir(dirPath, dirEntry)));
     }
     return out;
+  }
+
+  // Read every .md file in a single state directory. Per-file failures (unreadable,
+  // malformed front matter) are skipped with a warning so one bad file doesn't poison
+  // the whole scan; a readdir failure on the directory itself silently yields nothing
+  // for the same reason.
+  private async scanStateDir(dirPath: string, state: string): Promise<RawIssueFile[]> {
+    let files: string[];
+    try {
+      files = await readdir(dirPath);
+    } catch {
+      return [];
+    }
+    const out: RawIssueFile[] = [];
+    for (const fileName of files) {
+      if (!fileName.endsWith('.md')) continue;
+      const raw = await this.readIssueFile(path.join(dirPath, fileName), fileName, state);
+      if (raw) out.push(raw);
+    }
+    return out;
+  }
+
+  private async readIssueFile(
+    filePath: string,
+    fileName: string,
+    state: string,
+  ): Promise<RawIssueFile | null> {
+    let st;
+    try {
+      st = await stat(filePath);
+    } catch {
+      return null;
+    }
+    if (!st.isFile()) return null;
+    let text: string;
+    try {
+      text = await readFile(filePath, 'utf8');
+    } catch (err) {
+      log.warn('skipping unreadable issue file', { file: filePath, error: (err as Error).message });
+      return null;
+    }
+    let parsed: { config: Record<string, unknown>; body: string };
+    try {
+      parsed = splitFrontMatter(text);
+    } catch (err) {
+      log.warn('skipping malformed issue file', { file: filePath, error: (err as Error).message });
+      return null;
+    }
+    return {
+      filePath,
+      identifier: fileName.slice(0, -3),
+      state,
+      frontMatter: parsed.config,
+      description: parsed.body,
+    };
   }
 
   // Build normalized Issue objects. `all` is used to resolve blocker states.
