@@ -43,6 +43,7 @@ import {
   type RunInVmExecutor,
   type WorkflowAction,
 } from '../actions/index.js';
+import { defaultPredicateEnv } from '../actions/predicate-env.js';
 import type { ResourceSnapshot } from '../reconciler/index.js';
 import {
   performIntegrationMerge,
@@ -504,6 +505,7 @@ export class AgentRunner {
       capture: capture ?? undefined,
       followupSink: this.followupSink ?? undefined,
       runInVm: runInVm ?? undefined,
+      predicateEnv: defaultPredicateEnv,
       snapshotId,
       now: () => Date.now(),
     });

@@ -341,6 +341,86 @@ export function resolveSetupOptions(args: ResolveSetupOptionsArgs): SetupWorkspa
   };
 }
 
+// Resolve the workspace dir, creating it if missing. Returns true when this call
+// performed the mkdir (so the caller can gate one-time setup like the canonical
+// clone and `after_create` on first-mkdir). Rejects symlinks (containment risk)
+// and non-directory entries.
+async function ensureWorkspaceDirExists(wsPath: string): Promise<boolean> {
+  try {
+    // lstat (not stat) so a symlink at the workspace path is rejected: a symlink
+    // could redirect hook execution and the returned cwd outside the workspace
+    // root, which violates the §5.5 containment invariant.
+    const st = await lstat(wsPath);
+    if (st.isSymbolicLink()) {
+      throw new WorkspaceError(
+        'workspace_path_is_symlink',
+        `workspace path ${wsPath} is a symlink; refusing to use`,
+      );
+    }
+    if (!st.isDirectory()) {
+      throw new WorkspaceError(
+        'workspace_path_not_directory',
+        `expected directory at ${wsPath}, found a non-directory`,
+      );
+    }
+    return false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      await mkdir(wsPath, { recursive: true });
+      return true;
+    }
+    throw err;
+  }
+}
+
+// Best-effort removal of a partially prepared workspace dir so the next dispatch
+// tick can retry cleanly. Errors are swallowed (cleanup is non-fatal).
+async function unwindWorkspaceDir(wsPath: string): Promise<void> {
+  try {
+    await rm(wsPath, { recursive: true, force: true });
+  } catch {
+    // Best-effort cleanup.
+  }
+}
+
+// Run the canonical TypeScript clone+branch+remote setup on a freshly created
+// workspace dir. On failure, unwinds the dir before rethrowing.
+async function runCanonicalSetup(
+  identifier: string,
+  wsPath: string,
+  workflowDir: string,
+): Promise<void> {
+  try {
+    await setupWorkspaceDir(
+      resolveSetupOptions({
+        identifier,
+        workspacePath: wsPath,
+        workflowDir,
+      }),
+    );
+  } catch (err) {
+    await unwindWorkspaceDir(wsPath);
+    throw err;
+  }
+}
+
+// Run the optional repo-local `after_create` hook on a freshly created workspace.
+// §5.4: failure is fatal — unwind the partially prepared dir before rethrowing.
+async function runAfterCreateHook(
+  wsPath: string,
+  hooks: HooksConfig,
+  capture: HookCapture | undefined,
+): Promise<void> {
+  if (!hooks.after_create) return;
+  const res = await runHookScript(hooks.after_create, wsPath, hooks.timeout_ms, capture);
+  if (!hookFailed(res)) return;
+  await unwindWorkspaceDir(wsPath);
+  throw new WorkspaceError(
+    'after_create_failed',
+    `after_create hook ${hookFailureReason(res)}`,
+  );
+}
+
 export class WorkspaceManager {
   // Per-identifier in-flight promise map. Coalesces concurrent ensureFor
   // calls for the same identifier into a single setup pass so the dispatch
@@ -410,76 +490,11 @@ export class WorkspaceManager {
     await mkdir(workspaceRoot, { recursive: true });
     const wsPath = this.workspacePathFor(identifier);
     assertContained(workspaceRoot, wsPath);
-
-    let createdNow = false;
-    try {
-      // Use lstat so symlinks at the workspace path are rejected: a symlink could redirect
-      // hook execution and the returned cwd outside the workspace root, which violates the
-      // §5.5 containment invariant.
-      const st = await lstat(wsPath);
-      if (st.isSymbolicLink()) {
-        throw new WorkspaceError(
-          'workspace_path_is_symlink',
-          `workspace path ${wsPath} is a symlink; refusing to use`,
-        );
-      }
-      if (!st.isDirectory()) {
-        throw new WorkspaceError(
-          'workspace_path_not_directory',
-          `expected directory at ${wsPath}, found a non-directory`,
-        );
-      }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        await mkdir(wsPath, { recursive: true });
-        createdNow = true;
-      } else {
-        throw err;
-      }
-    }
-
+    const createdNow = await ensureWorkspaceDirExists(wsPath);
     if (createdNow) {
-      // Canonical clone+branch+remote setup. Fatal failure unwinds the dir
-      // so the next dispatch tick can retry cleanly.
-      try {
-        await setupWorkspaceDir(
-          resolveSetupOptions({
-            identifier,
-            workspacePath: wsPath,
-            workflowDir: this.cfg.workflow_dir,
-          }),
-        );
-      } catch (err) {
-        try {
-          await rm(wsPath, { recursive: true, force: true });
-        } catch {
-          // Best-effort cleanup.
-        }
-        throw err;
-      }
+      await runCanonicalSetup(identifier, wsPath, this.cfg.workflow_dir);
+      await runAfterCreateHook(wsPath, hooks, captureAfterCreate);
     }
-
-    if (createdNow && hooks.after_create) {
-      const res = await runHookScript(
-        hooks.after_create,
-        wsPath,
-        hooks.timeout_ms,
-        captureAfterCreate,
-      );
-      if (hookFailed(res)) {
-        // §5.4: after_create failure is fatal — also unwind the partially prepared directory.
-        try {
-          await rm(wsPath, { recursive: true, force: true });
-        } catch {
-          // Best-effort cleanup.
-        }
-        throw new WorkspaceError(
-          'after_create_failed',
-          `after_create hook ${hookFailureReason(res)}`,
-        );
-      }
-    }
-
     return {
       path: wsPath,
       workspace_key: sanitizeWorkspaceKey(identifier),

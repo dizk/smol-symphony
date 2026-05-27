@@ -522,16 +522,26 @@ function defaultConflictRouteTo(cfg: ServiceConfig): string {
  */
 export async function resolveBootWorkerVmName(configPath: string): Promise<string | null> {
   const dir = path.dirname(configPath);
+  const fromName = await readNameFile(dir);
+  if (fromName !== null) return fromName;
+  return readBootConfigName(configPath);
+}
+
+async function readNameFile(dir: string): Promise<string | null> {
   try {
     const raw = await readFile(path.join(dir, 'name'), 'utf8');
     const name = raw.trim();
-    if (name.length > 0) return name;
+    return name.length > 0 ? name : null;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
       log.debug('vm reaper: name file read failed', { dir, error: (err as Error).message });
     }
+    return null;
   }
+}
+
+async function readBootConfigName(configPath: string): Promise<string | null> {
   let body: string;
   try {
     body = await readFile(configPath, 'utf8');
@@ -567,24 +577,29 @@ export async function defaultListBootWorkers(): Promise<BootWorker[]> {
   }
   const out: BootWorker[] = [];
   for (const ent of entries) {
-    const pid = Number(ent);
-    if (!Number.isInteger(pid) || pid <= 0) continue;
-    let raw: string;
-    try {
-      raw = await readFile(path.join(procDir, ent, 'cmdline'), 'utf8');
-    } catch {
-      continue;
-    }
-    const argv = raw.split('\0').filter((s) => s.length > 0);
-    if (argv.length === 0) continue;
-    if (!argv.some((a) => path.basename(a) === '_boot-vm')) continue;
-    const configPath = argv.find((a) => a.endsWith('boot-config.json'));
-    if (!configPath) continue;
-    const vmName = await resolveBootWorkerVmName(configPath);
-    if (vmName === null) continue;
-    out.push({ pid, vmName });
+    const worker = await inspectProcEntry(procDir, ent);
+    if (worker !== null) out.push(worker);
   }
   return out;
+}
+
+async function inspectProcEntry(procDir: string, ent: string): Promise<BootWorker | null> {
+  const pid = Number(ent);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  let raw: string;
+  try {
+    raw = await readFile(path.join(procDir, ent, 'cmdline'), 'utf8');
+  } catch {
+    return null;
+  }
+  const argv = raw.split('\0').filter((s) => s.length > 0);
+  if (argv.length === 0) return null;
+  if (!argv.some((a) => path.basename(a) === '_boot-vm')) return null;
+  const configPath = argv.find((a) => a.endsWith('boot-config.json'));
+  if (!configPath) return null;
+  const vmName = await resolveBootWorkerVmName(configPath);
+  if (vmName === null) return null;
+  return { pid, vmName };
 }
 
 function defaultKillProcess(pid: number, signal: NodeJS.Signals | 0): void {

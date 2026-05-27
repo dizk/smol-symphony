@@ -5,11 +5,9 @@
 // today's WORKFLOW.md; the issue body explicitly caps the predicate set
 // there: "If users want more, they've outgrown declarative."
 
-import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { ActionContext, ActionPredicate } from './types.js';
+import type { ActionContext, ActionPredicate, PredicateEnv } from './types.js';
 import { renderTemplate } from './templating.js';
-import { runProcess } from '../util/process.js';
 
 /**
  * Evaluate a predicate against the context. `null`/undefined → always true
@@ -19,11 +17,16 @@ import { runProcess } from '../util/process.js';
  * — `if: $repo` matches the issue body's example exactly. A bare literal
  * (`if: yes`) is treated as truthy; the literal-false case `if: ""` /
  * `if: null` falls through to "always".
+ *
+ * IO is routed through the injected `PredicateEnv` so the evaluator core
+ * stays pure (no `node:fs` / `runProcess` imports). String-truthy predicates
+ * never touch the env.
  */
 export async function evaluatePredicate(
   predicate: ActionPredicate | undefined,
   ctx: ActionContext,
   workspacePath: string,
+  env: PredicateEnv,
 ): Promise<boolean> {
   if (predicate === null || predicate === undefined) return true;
   if (typeof predicate === 'string') {
@@ -38,26 +41,13 @@ export async function evaluatePredicate(
   if ('branch_exists' in predicate) {
     const ref = renderTemplate(predicate.branch_exists, ctx).trim();
     if (ref.length === 0) return false;
-    return runGitSilent(['rev-parse', '--verify', '--quiet', `refs/heads/${ref}`], workspacePath);
+    return env.branchExists(ref, workspacePath);
   }
   if ('file_present' in predicate) {
     const file = renderTemplate(predicate.file_present, ctx).trim();
     if (file.length === 0) return false;
     const abs = path.isAbsolute(file) ? file : path.join(workspacePath, file);
-    try {
-      const st = await stat(abs);
-      return st.isFile() || st.isDirectory();
-    } catch {
-      return false;
-    }
+    return env.pathExists(abs);
   }
   return false;
-}
-
-// Thin shape adapter over runProcess: predicates only care about exit==0.
-// The underlying invocation already uses `--verify --quiet` so neither stream
-// should produce meaningful output; the tiny default clamp is plenty.
-async function runGitSilent(args: string[], cwd: string): Promise<boolean> {
-  const r = await runProcess('git', args, { cwd, appendErrorToStderr: false });
-  return r.exit_code === 0;
 }

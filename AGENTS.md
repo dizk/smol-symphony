@@ -17,7 +17,8 @@ OpenCode, etc.) working on this repo. Keep it short.
 - `Smolfile` — declarative per-issue VM (image, resources, apt/npm install,
   scripts/ → /opt/symphony bind mount). Referenced by `WORKFLOW.md`'s
   `smolvm.smolfile`. Alternative starters live under `templates/`
-  (e.g. `templates/Smolfile.rust` for Rust projects).
+  (e.g. `templates/Smolfile.rust` for Rust projects,
+  `templates/Smolfile.kotlin` for Kotlin / Gradle projects).
 - `src/http.ts` — HTTP dashboard + MCP endpoint listener.
 - `WORKFLOW.md` — canonical workflow this repo dispatches against itself.
 - `WORKFLOW.template.md` — annotated reference for workflow file syntax.
