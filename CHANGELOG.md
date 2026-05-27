@@ -27,6 +27,15 @@ hand work off between them via a single MCP call.
   same ACP adapter set the root Smolfile does. Point `smolvm.smolfile` in
   WORKFLOW.md at it, or copy it to the project root as `Smolfile` and adjust
   the `volumes` path noted in the file header.
+- `templates/Smolfile.kotlin`. A starter Smolfile for Kotlin / Gradle (or
+  any JVM-on-Gradle) projects: bases on `eclipse-temurin:21-jdk-noble` so
+  `java` and `JAVA_HOME` are wired up for a project-checked-in `gradlew`
+  wrapper, layers NodeSource so the in-VM proxy still has a Node runtime,
+  installs a recent stable Gradle on `$PATH` for wrapper-less projects, and
+  warms the Gradle / JVM caches via `gradle --version` so the bake step
+  amortises that cost. The file header documents the optional
+  `~/.gradle:/root/.gradle` host volume for persisting dependency jars
+  across per-issue VMs.
 - `pr_autopilot` workflow block (default off). When `enabled: true` the
   reconciler grows a `pr` resource that, on every tick, keeps each
   terminal-state issue's GitHub PR rebased on `origin/<base>`, arms
