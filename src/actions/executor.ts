@@ -13,9 +13,9 @@
 //
 // The executor never mutates the issue's tracker state directly; reroute
 // requests are returned as `route_to` on the result and the runner (which
-// holds the McpRegistry / tracker) performs the move. Same separation as
-// `routeIntegrationFailureToConflict`: keep the git/gh/exec side
-// pure-functional, the orchestrator-state side next to the runner.
+// holds the McpRegistry / tracker) performs the move. The git/gh/exec side
+// stays pure-functional; the orchestrator-state side lives next to the
+// runner.
 
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';

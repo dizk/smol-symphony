@@ -3,51 +3,13 @@ import assert from 'node:assert/strict';
 import {
   decideAttemptOutcome,
   decideCleanupExecution,
-  shouldRunIntegrationMerge,
   shouldStageAfterRunEnv,
 } from '../src/agent/runner-decisions.js';
 
-describe('shouldRunIntegrationMerge', () => {
-  it('is false unless the agent transitioned and the state is opted in', () => {
-    const opts = { mergeOnStates: ['Done'] };
-    assert.equal(
-      shouldRunIntegrationMerge({ transitioned: false, cleanupState: 'Done', ...opts }),
-      false,
-    );
-    assert.equal(
-      shouldRunIntegrationMerge({ transitioned: true, cleanupState: 'Review', ...opts }),
-      false,
-    );
-    assert.equal(
-      shouldRunIntegrationMerge({ transitioned: true, cleanupState: 'done', ...opts }),
-      true,
-      'matches case-insensitively against merge_on_states',
-    );
-  });
-
-  it('is false when merge_on_states is empty (feature off)', () => {
-    assert.equal(
-      shouldRunIntegrationMerge({ transitioned: true, cleanupState: 'Done', mergeOnStates: [] }),
-      false,
-    );
-  });
-});
-
 describe('decideCleanupExecution', () => {
-  it('skips, prefers actions over hook, falls back, and needs runningEntry for actions', () => {
+  it('prefers actions over hook, falls back, and needs runningEntry for actions', () => {
     assert.equal(
       decideCleanupExecution({
-        integrationFailed: true,
-        hasRunningEntry: true,
-        actionsLength: 3,
-        hasAfterRunHook: true,
-      }),
-      'skip',
-      'integration reroute => no post-cleanup work',
-    );
-    assert.equal(
-      decideCleanupExecution({
-        integrationFailed: false,
         hasRunningEntry: true,
         actionsLength: 2,
         hasAfterRunHook: true,
@@ -57,7 +19,6 @@ describe('decideCleanupExecution', () => {
     );
     assert.equal(
       decideCleanupExecution({
-        integrationFailed: false,
         hasRunningEntry: true,
         actionsLength: 0,
         hasAfterRunHook: true,
@@ -66,7 +27,6 @@ describe('decideCleanupExecution', () => {
     );
     assert.equal(
       decideCleanupExecution({
-        integrationFailed: false,
         hasRunningEntry: false,
         actionsLength: 3,
         hasAfterRunHook: false,
@@ -76,7 +36,6 @@ describe('decideCleanupExecution', () => {
     );
     assert.equal(
       decideCleanupExecution({
-        integrationFailed: false,
         hasRunningEntry: true,
         actionsLength: 0,
         hasAfterRunHook: false,
@@ -90,7 +49,6 @@ describe('shouldStageAfterRunEnv', () => {
   it('stages only when a consumer (actions or hook) will run with a runningEntry', () => {
     assert.equal(
       shouldStageAfterRunEnv({
-        integrationFailed: false,
         hasRunningEntry: true,
         actionsLength: 1,
         hasAfterRunHook: false,
@@ -99,7 +57,6 @@ describe('shouldStageAfterRunEnv', () => {
     );
     assert.equal(
       shouldStageAfterRunEnv({
-        integrationFailed: false,
         hasRunningEntry: true,
         actionsLength: 0,
         hasAfterRunHook: true,
@@ -108,17 +65,6 @@ describe('shouldStageAfterRunEnv', () => {
     );
     assert.equal(
       shouldStageAfterRunEnv({
-        integrationFailed: true,
-        hasRunningEntry: true,
-        actionsLength: 1,
-        hasAfterRunHook: true,
-      }),
-      false,
-      'integration reroute skips staging',
-    );
-    assert.equal(
-      shouldStageAfterRunEnv({
-        integrationFailed: false,
         hasRunningEntry: false,
         actionsLength: 1,
         hasAfterRunHook: true,

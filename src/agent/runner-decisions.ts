@@ -5,8 +5,6 @@
 // up a VM or a workspace. Everything in this module is deterministic and
 // side-effect free.
 
-import { shouldMergeForState } from './integration.js';
-
 export interface AttemptOutcome {
   ok: boolean;
   reason: string;
@@ -14,31 +12,16 @@ export interface AttemptOutcome {
   turnsCompleted: number;
 }
 
-export interface IntegrationMergeGate {
-  transitioned: boolean;
-  cleanupState: string;
-  mergeOnStates: readonly string[];
-}
-
-/** Integration merge gate: requires a transition AND opt-in via merge_on_states. */
-export function shouldRunIntegrationMerge(gate: IntegrationMergeGate): boolean {
-  if (!gate.transitioned) return false;
-  if (gate.mergeOnStates.length === 0) return false;
-  return shouldMergeForState(gate.cleanupState, gate.mergeOnStates as string[]);
-}
-
 export type CleanupExecution = 'actions' | 'hook' | 'skip';
 
 export interface CleanupExecutionInput {
-  integrationFailed: boolean;
   hasRunningEntry: boolean;
   actionsLength: number;
   hasAfterRunHook: boolean;
 }
 
-/** Cleanup branches: actions wins over hook (issue 36 AC2); integration failure skips. */
+/** Cleanup branches: actions wins over hook (issue 36 AC2). */
 export function decideCleanupExecution(input: CleanupExecutionInput): CleanupExecution {
-  if (input.integrationFailed) return 'skip';
   if (input.actionsLength > 0 && input.hasRunningEntry) return 'actions';
   if (input.hasAfterRunHook) return 'hook';
   return 'skip';
@@ -46,7 +29,6 @@ export function decideCleanupExecution(input: CleanupExecutionInput): CleanupExe
 
 /** SYMPHONY_* env staging is only worth doing when the cleanup tail will read it. */
 export function shouldStageAfterRunEnv(input: CleanupExecutionInput): boolean {
-  if (input.integrationFailed) return false;
   if (!input.hasRunningEntry) return false;
   return input.actionsLength > 0 || input.hasAfterRunHook;
 }

@@ -187,10 +187,7 @@ const MAX_ACTION_HISTORY = 32;
  *                        before any rebuild attempt.
  *
  * `dependsOn: ['base_ref']` is informational. v1 doesn't ship a base_ref
- * resource; the BaseRefProvider is a direct dependency call. The metadata is
- * carried forward for the stage-4 `integration_branch` resource that
- * [[issue-31]] sketched (now slated for [[issue-36]] follow-up if shared-
- * integration is ever re-enabled).
+ * resource; the BaseRefProvider is a direct dependency call.
  */
 export class WorkspaceResource {
   readonly id = 'workspace';

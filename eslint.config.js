@@ -6,7 +6,7 @@ import tsParser from '@typescript-eslint/parser';
 
 const shell = [
   // application / wiring (the imperative shell proper)
-  'src/orchestrator.ts', 'src/agent/runner.ts', 'src/reconciler/index.ts', 'src/agent/integration.ts',
+  'src/orchestrator.ts', 'src/agent/runner.ts', 'src/reconciler/index.ts',
   'src/actions/executor.ts', // run-side of planActions/runEffects split (issue 68)
   // adapters (IO wrappers — should stay thin too)
   'src/trackers/local.ts', 'src/agent/smolvm.ts', 'src/agent/adapters.ts', 'src/agent/acp.ts',

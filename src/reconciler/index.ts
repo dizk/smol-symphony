@@ -3,8 +3,8 @@
 //
 // Stage 1 ships exactly one resource: the Smolfile-driven bake. The DAG walker,
 // per-action ledger, and dispatch-gating predicate are written generically so
-// later stages (VM lifecycle, workspace lifecycle, integration branch management
-// — issues 33–36) can plug in by registering additional resources.
+// later stages (VM lifecycle, workspace lifecycle — issues 33–36) can plug in
+// by registering additional resources.
 //
 // Triggers (per issue 31 sketch):
 //   • startup            — orchestrator calls reconcile() before the first dispatch.

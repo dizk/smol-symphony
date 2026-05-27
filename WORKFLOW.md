@@ -92,26 +92,6 @@ tracker:
   # auto-mkdirs every declared state directory under this root on startup.
   root: ~/.symphony/trackers/smol-symphony
 
-# Shared-integration-branch flow is currently DISABLED. Per-issue workspaces
-# clone directly from the base branch; terminal-state merges land via the
-# standard PR flow against `main` rather than a shared `integration` ref.
-#
-# To re-enable (e.g. when concurrent dispatches become common), restore an
-# `integration:` block here:
-#
-#   integration:
-#     branch: integration
-#     conflict_state: Conflict
-#     merge_on_states: [Done]
-#
-# and teach the orchestrator's built-in workspace setup (`setupWorkspaceDir`
-# in src/workspace.ts) to clone from the integration ref instead of the base
-# branch (seeded from base on first run). The orchestrator path that performs
-# the host-side merge keys on a non-empty `merge_on_states` list — leaving the
-# block absent fully skips the feature. There is no `hooks.after_create` to
-# rewrite: canonical workspace setup is now TypeScript-owned and runs before
-# any optional `after_create` hook (see SPEC §5.3 and WORKFLOW.template.md).
-
 # PR autopilot (issue 38, simplified by issue 101). Enabled 2026-05-25 so
 # Done-state PRs that are MERGEABLE have GitHub auto-merge armed; PRs reported
 # as CONFLICTING are routed back to Todo for the dispatched agent to rebase
