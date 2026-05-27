@@ -22,12 +22,17 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import {
-  defaultInspectWorkspace,
   WorkspaceResource,
   type BaseRefProvider,
   type WorkspaceInspection,
   type WorkspaceIntendedProvider,
+  type WorkspaceResourceOptions,
 } from '../src/reconciler/workspace.js';
+import {
+  defaultInspectWorkspace,
+  defaultListWorkspaceDirs,
+  defaultRemoveWorkspace,
+} from '../src/reconciler/workspace-defaults.js';
 import { setupWorkspaceDir } from '../src/workspace.js';
 
 // --- shared fixtures ---------------------------------------------------------
@@ -74,6 +79,22 @@ async function dirExists(p: string): Promise<boolean> {
   }
 }
 
+// Production wiring lives in reconciler/index.ts; tests reach for the same
+// adapter defaults so they don't have to re-implement the readdir+stat or git
+// listing. Required ports get sensible defaults; callers override `inspect` /
+// `remove` / `create` / `baseRef` / `listWorkspaces` as needed.
+function makeResource(
+  root: string,
+  overrides: Partial<WorkspaceResourceOptions> & Pick<WorkspaceResourceOptions, 'intended'>,
+): WorkspaceResource {
+  return new WorkspaceResource({
+    listWorkspaces: () => defaultListWorkspaceDirs(root),
+    inspect: defaultInspectWorkspace,
+    remove: (id) => defaultRemoveWorkspace(root, id),
+    ...overrides,
+  });
+}
+
 // --- tests -------------------------------------------------------------------
 
 describe('WorkspaceResource — stale removal', () => {
@@ -83,8 +104,7 @@ describe('WorkspaceResource — stale removal', () => {
     const root = await makeWorkspaceRoot('42', '7');
     try {
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['7']),
         remove: async (id) => {
           removed.push(id);
@@ -111,8 +131,7 @@ describe('WorkspaceResource — stale removal', () => {
     // entirely (deleted by an operator), and the AC enumerates it explicitly.
     const root = await makeWorkspaceRoot('ghost');
     try {
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended([]),
         remove: async (id) => rm(path.join(root, id), { recursive: true, force: true }),
       });
@@ -128,8 +147,7 @@ describe('WorkspaceResource — stale removal', () => {
     // returns null. The active dir must survive regardless.
     const root = await makeWorkspaceRoot('alive');
     try {
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['alive']),
         // No baseRef, no inspect.
       });
@@ -148,8 +166,7 @@ describe('WorkspaceResource — stale removal', () => {
     const root = await makeWorkspaceRoot('99');
     try {
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended([], ['99']),
         remove: async (id) => {
           removed.push(id);
@@ -183,8 +200,7 @@ describe('WorkspaceResource — drift detection (non-destructive)', () => {
         commitsAheadOfBase: 0,
       });
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['up-to-date']),
         baseRef: fakeBase('deadbeef'),
         inspect,
@@ -211,8 +227,7 @@ describe('WorkspaceResource — drift detection (non-destructive)', () => {
     const root = await makeWorkspaceRoot('drifted');
     try {
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['drifted']),
         baseRef: fakeBase('newer-base-sha'),
         inspect: async () => ({
@@ -247,8 +262,7 @@ describe('WorkspaceResource — drift detection (non-destructive)', () => {
     const root = await makeWorkspaceRoot('dirty');
     try {
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['dirty']),
         baseRef: fakeBase('newer-base-sha'),
         inspect: async () => ({
@@ -280,8 +294,7 @@ describe('WorkspaceResource — drift detection (non-destructive)', () => {
     const root = await makeWorkspaceRoot('ahead');
     try {
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['ahead']),
         baseRef: fakeBase('newer-base-sha'),
         inspect: async () => ({
@@ -311,8 +324,7 @@ describe('WorkspaceResource — drift detection (non-destructive)', () => {
     const root = await makeWorkspaceRoot('no-base');
     try {
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['no-base']),
         baseRef: fakeBase('newer-base-sha'),
         inspect: async () => ({
@@ -345,8 +357,7 @@ describe('WorkspaceResource — create_workspace', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-'));
     try {
       const created: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['new-issue']),
         create: async (id) => {
           created.push(id);
@@ -372,8 +383,7 @@ describe('WorkspaceResource — create_workspace', () => {
     const root = await makeWorkspaceRoot('existing');
     try {
       const created: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['existing']),
         create: async (id) => {
           created.push(id);
@@ -396,8 +406,7 @@ describe('WorkspaceResource — create_workspace', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-sanitize-'));
     try {
       const created: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['foo/bar']),
         create: async (id) => {
           created.push(id);
@@ -422,8 +431,7 @@ describe('WorkspaceResource — create_workspace', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-inflight-'));
     try {
       const created: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended([], ['claimed']),
         create: async (id) => {
           created.push(id);
@@ -442,8 +450,7 @@ describe('WorkspaceResource — create_workspace', () => {
     // identifiers in the same pass should still get processed.
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-create-err-'));
     try {
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['boom']),
         create: async () => {
           throw new Error('synthetic create failure');
@@ -467,8 +474,7 @@ describe('WorkspaceResource — create_workspace', () => {
     // the diff. Belt-and-suspenders on the resource's optionality.
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-no-create-'));
     try {
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['missing']),
         // no create callback
       });
@@ -489,8 +495,7 @@ describe('WorkspaceResource — create_workspace', () => {
     const root = path.join(os.tmpdir(), `symphony-ws-cold-${Date.now()}`);
     try {
       const created: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended(['fresh']),
         create: async (id) => {
           created.push(id);
@@ -514,8 +519,7 @@ describe('WorkspaceResource — create_workspace', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-state-'));
     try {
       const received: Array<{ identifier: string; state: string | null }> = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intendedWithStates(
           new Map([
             ['active-issue', 'Review'],
@@ -560,8 +564,7 @@ describe('WorkspaceResource — fail-closed on tracker error', () => {
         },
         inFlightIdentifiers: () => new Map(),
       };
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: provider,
         remove: async (id) => {
           removed.push(id);
@@ -583,8 +586,7 @@ describe('WorkspaceResource — snapshot shape', () => {
   it('reports id, ready, and a per-action ledger', async () => {
     const root = await makeWorkspaceRoot('stale1', 'stale2');
     try {
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended([]),
         remove: async (id) => rm(path.join(root, id), { recursive: true, force: true }),
       });
@@ -604,8 +606,7 @@ describe('WorkspaceResource — snapshot shape', () => {
   it('records errors when removal fails', async () => {
     const root = await makeWorkspaceRoot('boom');
     try {
-      const res = new WorkspaceResource({
-        workspaceRoot: root,
+      const res = makeResource(root, {
         intended: intended([]),
         remove: async () => {
           throw new Error('synthetic remove failure');
@@ -627,8 +628,7 @@ describe('WorkspaceResource — snapshot shape', () => {
     // First-run scenario: the workspaces dir hasn't been created yet. Don't
     // log a spurious error or surface ENOENT as a failure.
     const root = path.join(os.tmpdir(), `symphony-ws-missing-${Date.now()}`);
-    const res = new WorkspaceResource({
-      workspaceRoot: root,
+    const res = makeResource(root, {
       intended: intended([]),
     });
     await res.reconcile();
@@ -721,8 +721,7 @@ describe('WorkspaceResource — real git drift detection', () => {
         currentBaseRef: async () => ({ branch: 'main', sha: srcBaseAfter }),
       };
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: wsRoot,
+      const res = makeResource(wsRoot, {
         intended: intended(['42']),
         baseRef,
         // NO inspect override — exercises defaultInspectWorkspace.
@@ -767,8 +766,7 @@ describe('WorkspaceResource — real git drift detection', () => {
       const baseRef: BaseRefProvider = {
         currentBaseRef: async () => ({ branch: 'main', sha: srcBase }),
       };
-      const res = new WorkspaceResource({
-        workspaceRoot: wsRoot,
+      const res = makeResource(wsRoot, {
         intended: intended(['7']),
         baseRef,
       });
@@ -816,8 +814,7 @@ describe('WorkspaceResource — real git drift detection', () => {
         currentBaseRef: async () => ({ branch: 'main', sha: srcBaseAfter }),
       };
       const removed: string[] = [];
-      const res = new WorkspaceResource({
-        workspaceRoot: wsRoot,
+      const res = makeResource(wsRoot, {
         intended: intended(['9']),
         baseRef,
         remove: async (id) => {
@@ -848,8 +845,7 @@ describe('WorkspaceResource — real git drift detection', () => {
     const source = await makeRealSourceRepo();
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-create-e2e-'));
     try {
-      const res = new WorkspaceResource({
-        workspaceRoot: wsRoot,
+      const res = makeResource(wsRoot, {
         intended: intended(['new-issue']),
         baseRef: {
           currentBaseRef: async () => ({
