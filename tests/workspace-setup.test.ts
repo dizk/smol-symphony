@@ -407,6 +407,59 @@ describe('restorePushedBranch', () => {
     }
   });
 
+  it('fetches the exact branch ref, not a same-named tag', async () => {
+    // A tag sharing the branch name (refs/tags/<branch>) pointing elsewhere must
+    // not be checked out in place of the branch. Fetching refs/heads/<branch>
+    // (matching the probe) restores the branch commit, not the tag's.
+    const bareRemote = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-tag-remote-'));
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-tag-ws-'));
+    try {
+      await git(['init', '--bare', '-b', 'main'], bareRemote);
+      let branchSha = '';
+      let baseSha = '';
+      const seed = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-tag-seed-'));
+      try {
+        await git(['init', '-b', 'main'], seed);
+        await git(['config', 'user.name', 'test'], seed);
+        await git(['config', 'user.email', 'test@example.com'], seed);
+        await writeFile(path.join(seed, 'a.txt'), 'base\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'base'], seed);
+        await git(['remote', 'add', 'origin', bareRemote], seed);
+        await git(['push', 'origin', 'main'], seed);
+        baseSha = await git(['rev-parse', 'HEAD'], seed);
+        await git(['checkout', '-b', 'agent/tagcollide'], seed);
+        await writeFile(path.join(seed, 'work.txt'), 'branch work\n');
+        await git(['add', '.'], seed);
+        await git(['commit', '-m', 'branch work'], seed);
+        branchSha = await git(['rev-parse', 'HEAD'], seed);
+        // Tag of the same name pointing at base (a different commit than the branch).
+        await git(['tag', 'agent/tagcollide', 'main'], seed);
+        await git(
+          ['push', 'origin', 'refs/heads/agent/tagcollide:refs/heads/agent/tagcollide', 'refs/tags/agent/tagcollide:refs/tags/agent/tagcollide'],
+          seed,
+        );
+      } finally {
+        await rm(seed, { recursive: true, force: true });
+      }
+      assert.notEqual(branchSha, baseSha);
+      const wsPath = path.join(wsRoot, 'tc');
+      await mkdir(wsPath, { recursive: true });
+      await git(['clone', bareRemote, '.'], wsPath);
+
+      const restored = await restorePushedBranch(wsPath, 'agent/tagcollide');
+      assert.equal(restored, true);
+      assert.equal(
+        await git(['rev-parse', 'HEAD'], wsPath),
+        branchSha,
+        'restored the branch commit, not the same-named tag',
+      );
+    } finally {
+      await rm(bareRemote, { recursive: true, force: true });
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('returns false in local-only mode (no origin remote)', async () => {
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-local-ws-'));
     const wsPath = path.join(wsRoot, '99');

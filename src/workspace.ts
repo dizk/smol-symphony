@@ -317,7 +317,10 @@ export async function restorePushedBranch(
       `git ls-remote origin ${branch} failed (exit ${exists.exit_code}): ${(exists.stderr || exists.stdout).trim()}`,
     );
   }
-  const fetched = await runProcess('git', ['fetch', '--no-tags', 'origin', branch], noPrompt);
+  // Fetch the exact head ref (matching the probe): an unqualified `<branch>`
+  // refspec would resolve a same-named tag (refs/tags/<branch>) into FETCH_HEAD
+  // even with --no-tags, and checkout would then restore the tag's commit.
+  const fetched = await runProcess('git', ['fetch', '--no-tags', 'origin', `refs/heads/${branch}`], noPrompt);
   if (fetched.exit_code !== 0) {
     throw new WorkspaceError(
       'workspace_setup_branch_fetch_failed',
