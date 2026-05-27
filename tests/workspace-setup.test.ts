@@ -106,31 +106,35 @@ describe('setupWorkspaceDir', () => {
     }
   });
 
-  it('restores an origin pointing at the canonical HTTPS URL when SYMPHONY_REPO is set', async () => {
-    // PR mode: origin must be present and target the canonical HTTPS URL for
-    // the configured GitHub repo. `gh auth setup-git` and the
-    // `origin/<base>` fetch are best-effort (network/auth dependent) and
-    // happen to be no-ops in this test env; the key invariant is that
-    // origin is restored to a usable URL after the clone-time strip.
+  it('restores origin and cuts a fresh per-issue branch on first dispatch (reachable origin, no pushed branch)', async () => {
+    // PR mode against a reachable origin with no pushed agent/<id> yet: origin
+    // is restored and HEAD lands on a freshly-cut agent/7. origin points at a
+    // local bare remote (originUrl) so the restore probe is hermetic and
+    // ls-remote returns a clean "no such ref" (exit 2); production derives
+    // https://github.com/<originRepo>.git.
     const source = await makeSourceRepo();
+    const bare = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-setup-pr-remote-'));
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-setup-pr-'));
     const wsPath = path.join(wsRoot, '7');
     await mkdir(wsPath, { recursive: true });
     try {
+      await git(['init', '--bare', '-b', 'main'], bare);
       await setupWorkspaceDir({
         workspacePath: wsPath,
         sourceRepo: source,
         baseBranch: 'main',
         branch: 'agent/7',
         originRepo: 'octo/example',
+        originUrl: bare,
         gitIdentity: { name: 'symphony-agent', email: 'agent@symphony.local' },
       });
       const headRef = await git(['symbolic-ref', '--short', 'HEAD'], wsPath);
-      assert.equal(headRef, 'agent/7', 'agent branch checked out');
+      assert.equal(headRef, 'agent/7', 'fresh agent branch checked out');
       const originUrl = await git(['remote', 'get-url', 'origin'], wsPath);
-      assert.equal(originUrl, 'https://github.com/octo/example.git');
+      assert.equal(originUrl, bare, 'origin restored to the configured URL');
     } finally {
       await rm(source, { recursive: true, force: true });
+      await rm(bare, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });
     }
   });
@@ -375,6 +379,30 @@ describe('restorePushedBranch', () => {
       await git(['commit', '-m', 'base'], wsPath);
       const restored = await restorePushedBranch(wsPath, 'agent/99');
       assert.equal(restored, false);
+    } finally {
+      await rm(wsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed (throws) when the origin is unreachable, so setup unwinds and a later tick can retry', async () => {
+    // Transport/auth failure must NOT be treated as "no branch" and cut fresh:
+    // that would risk a later force-with-lease over already-pushed work once the
+    // origin recovers. An unreachable origin makes ls-remote exit 128 → throw.
+    const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-restore-unreachable-ws-'));
+    const wsPath = path.join(wsRoot, '55');
+    try {
+      await mkdir(wsPath, { recursive: true });
+      await git(['init', '-b', 'main'], wsPath);
+      await git(['config', 'user.name', 'test'], wsPath);
+      await git(['config', 'user.email', 'test@example.com'], wsPath);
+      await writeFile(path.join(wsPath, 'a.txt'), 'base\n');
+      await git(['add', '.'], wsPath);
+      await git(['commit', '-m', 'base'], wsPath);
+      await git(['remote', 'add', 'origin', '/nonexistent/symphony-restore-unreachable-remote'], wsPath);
+      await assert.rejects(
+        restorePushedBranch(wsPath, 'agent/55'),
+        /ls-remote origin agent\/55 failed/,
+      );
     } finally {
       await rm(wsRoot, { recursive: true, force: true });
     }
