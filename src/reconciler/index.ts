@@ -30,6 +30,11 @@ import {
   type WorkspaceResourceOptions,
 } from './workspace.js';
 import {
+  defaultInspectWorkspace,
+  defaultListWorkspaceDirs,
+  defaultRemoveWorkspace,
+} from './workspace-defaults.js';
+import {
   PrResource,
   type PrApi,
   type PrCleanupApi,
@@ -212,12 +217,13 @@ export class Reconciler {
 
   private buildWorkspaceResource(): WorkspaceResource | null {
     if (!this.workspaceIntended) return null;
+    const root = this.cfg.workspace.root;
     return new WorkspaceResource({
-      workspaceRoot: this.cfg.workspace.root,
       intended: this.workspaceIntended,
       baseRef: this.workspaceBaseRef,
-      inspect: this.workspaceInspect,
-      remove: this.workspaceRemove,
+      listWorkspaces: () => defaultListWorkspaceDirs(root),
+      inspect: this.workspaceInspect ?? defaultInspectWorkspace,
+      remove: this.workspaceRemove ?? ((identifier) => defaultRemoveWorkspace(root, identifier)),
       create: this.workspaceCreate,
     });
   }

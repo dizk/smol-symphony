@@ -29,10 +29,7 @@
 // it, a brand-new issue's workspace could be reaped seconds after creation
 // because the reconciler raced ahead of the tracker read.
 
-import { readdir, stat } from 'node:fs/promises';
-import path from 'node:path';
 import { sanitizeWorkspaceKey } from '../util/workspace-key.js';
-import { runProcess } from '../util/process.js';
 import { log } from '../logging.js';
 import { ResourceActionLedger } from './ledger.js';
 import type { ResourceSnapshot } from './types.js';
@@ -110,30 +107,52 @@ export interface WorkspaceInspection {
   commitsAheadOfBase: number;
 }
 
+/**
+ * One entry per workspace dir on disk. Adapter responsibility: filter out
+ * non-directories and resolve absolute paths so the resource never has to
+ * touch the fs itself.
+ */
+export interface WorkspaceListing {
+  /** Sanitized directory name (matches `sanitizeWorkspaceKey(identifier)`). */
+  name: string;
+  /** Absolute path to the workspace dir — fed to the inspector. */
+  path: string;
+}
+
 export interface WorkspaceResourceOptions {
-  workspaceRoot: string;
   intended: WorkspaceIntendedProvider;
+  /**
+   * Enumerate workspace dirs under the root. Required port; production wires
+   * `defaultListWorkspaceDirs(workspace.root)` from `./workspace-defaults`,
+   * tests pass a stub. Must filter to directories only and translate ENOENT
+   * on the root into an empty list (cold start) — the resource treats any
+   * thrown error as a transient FS hiccup and skips the pass.
+   */
+  listWorkspaces: () => Promise<WorkspaceListing[]>;
+  /**
+   * Filesystem + git inspection. Required port; production wires
+   * `defaultInspectWorkspace` from `./workspace-defaults`, tests pass a stub.
+   * Receives the base branch name (so the inspector can `git rev-parse
+   * <branch>` in the workspace) but does NOT receive the source repo's SHA —
+   * that comparison happens in the resource so we never run a cross-repo git
+   * operation inside the workspace (which only sees objects hardlinked at
+   * clone time).
+   */
+  inspect: (workspacePath: string, baseBranch: string) => Promise<WorkspaceInspection>;
+  /**
+   * Remove a workspace dir. Required port; production binds
+   * `WorkspaceManager.remove` so the configured before_remove hook fires.
+   * Receives the sanitized dir name (which is what
+   * `WorkspaceManager.workspacePathFor` resolves to since sanitization is
+   * idempotent) and the reason.
+   */
+  remove: (identifier: string, reason: RemoveReason) => Promise<void>;
   /**
    * Optional base-branch source. When omitted (or it returns null), the drift
    * detector is skipped for that pass and only stale-workspace removal fires.
    * Production wires the orchestrator as the implementation; tests pass a stub.
    */
   baseRef?: BaseRefProvider;
-  /**
-   * Override for filesystem + git inspection (tests pass a stub). Receives the
-   * base branch name (so the inspector can `git rev-parse <branch>` in the
-   * workspace) but does NOT receive the source repo's SHA — that comparison
-   * happens in the resource so we never run a cross-repo git operation inside
-   * the workspace (which only sees objects hardlinked at clone time).
-   */
-  inspect?: (workspacePath: string, baseBranch: string) => Promise<WorkspaceInspection>;
-  /**
-   * Override for the remove action (tests pass a stub). Receives the
-   * sanitized dir name (which is what `WorkspaceManager.workspacePathFor`
-   * resolves to since sanitization is idempotent) and the reason. Production
-   * defers to `WorkspaceManager.remove` so before_remove fires.
-   */
-  remove?: (identifier: string, reason: RemoveReason) => Promise<void>;
   /**
    * Override for the create action (tests pass a stub). Receives the raw
    * identifier (not the sanitized dir name — `WorkspaceManager.ensureFor`
@@ -159,78 +178,6 @@ export interface WorkspaceResourceOptions {
 export type RemoveReason = 'stale_issue';
 
 const MAX_ACTION_HISTORY = 32;
-
-/**
- * Stat-based default inspector. All git invocations are workspace-local: we
- * never reach across to the source repo's object store, which is why drift
- * detection lives in the resource (comparing this inspector's
- * `workspaceBaseSha` to `BaseRefProvider.currentBaseRef().sha`) rather than
- * here. Returns `head: null` for anything that doesn't look like a git repo —
- * the caller treats that as "can't reason about this dir, don't touch it."
- */
-export async function defaultInspectWorkspace(
-  workspacePath: string,
-  baseBranch: string,
-): Promise<WorkspaceInspection> {
-  const head = await runGitCapture(workspacePath, ['rev-parse', 'HEAD']);
-  if (head.exit !== 0 || head.stdout.trim().length === 0) {
-    return {
-      head: null,
-      workspaceBaseSha: null,
-      hasUncommitted: false,
-      commitsAheadOfBase: 0,
-    };
-  }
-  const headSha = head.stdout.trim();
-  const status = await runGitCapture(workspacePath, ['status', '--porcelain']);
-  const hasUncommitted = status.exit === 0 && status.stdout.length > 0;
-  // Workspace's frozen view of the base branch — the SHA that was current in
-  // the source repo at clone time. The setup pipeline cuts the agent branch
-  // from this ref, so it's always present unless an operator manually deleted
-  // it.
-  const wsBase = await runGitCapture(workspacePath, ['rev-parse', baseBranch]);
-  const workspaceBaseSha =
-    wsBase.exit === 0 && wsBase.stdout.trim().length > 0 ? wsBase.stdout.trim() : null;
-  let aheadCount = 0;
-  if (workspaceBaseSha !== null) {
-    // `<base>..HEAD` walks only objects the workspace itself owns — no
-    // cross-repo reachability needed. Exits non-zero only for malformed refs;
-    // treat that as 0 commits ahead rather than poisoning the snapshot.
-    const ahead = await runGitCapture(workspacePath, [
-      'rev-list',
-      '--count',
-      `${workspaceBaseSha}..${headSha}`,
-    ]);
-    aheadCount = ahead.exit === 0 ? Number(ahead.stdout.trim()) || 0 : 0;
-  }
-  return { head: headSha, workspaceBaseSha, hasUncommitted, commitsAheadOfBase: aheadCount };
-}
-
-interface GitCaptureResult {
-  exit: number;
-  stdout: string;
-  stderr: string;
-}
-
-// Thin shape adapter over runProcess. Stays as a named local because the
-// inspector's call sites read `result.exit` rather than `exit_code`, and
-// historical clamp is 16 KiB (smaller than the unified default — the
-// inspector only ever reads a SHA or a single porcelain status line).
-async function runGitCapture(cwd: string, args: string[]): Promise<GitCaptureResult> {
-  const r = await runProcess('git', args, { cwd, maxBytes: 16_384, appendErrorToStderr: false });
-  return { exit: r.exit_code ?? -1, stdout: r.stdout, stderr: r.stderr };
-}
-
-/**
- * Default removal: just `rm -rf` the directory. Production wiring overrides
- * this with `WorkspaceManager.remove` so the configured before_remove hook
- * fires. The two-callback design lets tests skip the hook plumbing entirely.
- */
-async function defaultRemoveWorkspace(workspaceRoot: string, identifier: string): Promise<void> {
-  const { rm } = await import('node:fs/promises');
-  const dir = path.join(workspaceRoot, identifier);
-  await rm(dir, { recursive: true, force: true });
-}
 
 /**
  * Workspace resource. Desired = active issue workspaces (set of sanitized
@@ -261,6 +208,7 @@ export class WorkspaceResource {
   readonly id = 'workspace';
   readonly dependsOn: string[] = [];
 
+  private readonly listWorkspaces: () => Promise<WorkspaceListing[]>;
   private readonly inspect: (
     workspacePath: string,
     baseBranch: string,
@@ -276,10 +224,9 @@ export class WorkspaceResource {
   private createdCount = 0;
 
   constructor(private readonly opts: WorkspaceResourceOptions) {
-    this.inspect = opts.inspect ?? defaultInspectWorkspace;
-    this.remove =
-      opts.remove ??
-      ((identifier) => defaultRemoveWorkspace(this.opts.workspaceRoot, identifier));
+    this.listWorkspaces = opts.listWorkspaces;
+    this.inspect = opts.inspect;
+    this.remove = opts.remove;
     this.create = opts.create ?? null;
   }
 
@@ -289,10 +236,10 @@ export class WorkspaceResource {
   }
 
   async reconcile(): Promise<void> {
-    // Read the desired set up front. Even if `readdir` returns ENOENT
-    // (workspace.root not yet created), we still want to create dirs for
-    // every active identifier — the create path will mkdir the root via
-    // `ensureFor`. Pulling this before the readdir collapses the two
+    // Read the desired set up front. Even if `listWorkspaces` returns the
+    // empty set (workspace.root not yet created), we still want to create
+    // dirs for every active identifier — the create path will mkdir the root
+    // via `ensureFor`. Pulling this before the listing collapses the two
     // branches into one flow.
     //
     // Fail closed when the tracker read throws: we must NOT treat the empty
@@ -325,21 +272,13 @@ export class WorkspaceResource {
       wanted.set(sanitizeWorkspaceKey(id), { identifier: id, state });
     }
 
-    let entries: string[];
+    let entries: WorkspaceListing[];
     try {
-      entries = await readdir(this.opts.workspaceRoot);
+      entries = await this.listWorkspaces();
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') {
-        entries = [];
-      } else {
-        this.lastError = `workspace_root_read_failed: ${(err as Error).message}`;
-        log.warn('workspace reconcile: readdir failed', {
-          workspace_root: this.opts.workspaceRoot,
-          error: (err as Error).message,
-        });
-        return;
-      }
+      this.lastError = `workspace_root_read_failed: ${(err as Error).message}`;
+      log.warn('workspace reconcile: list failed', { error: (err as Error).message });
+      return;
     }
 
     let baseRef: { branch: string; sha: string } | null = null;
@@ -366,21 +305,12 @@ export class WorkspaceResource {
     // create-loop below only fires for the missing ones.
     const present = new Set<string>();
 
-    for (const entry of entries) {
-      const dirPath = path.join(this.opts.workspaceRoot, entry);
-      let st;
-      try {
-        st = await stat(dirPath);
-      } catch {
+    for (const { name, path: dirPath } of entries) {
+      if (!wanted.has(name)) {
+        await this.runRemove(name, 'stale_issue');
         continue;
       }
-      if (!st.isDirectory()) continue;
-
-      if (!wanted.has(entry)) {
-        await this.runRemove(entry, 'stale_issue');
-        continue;
-      }
-      present.add(entry);
+      present.add(name);
 
       // In the desired set. Check for drift (non-destructive). No baseRef
       // means we can't compare; just skip and treat the workspace as ok.
@@ -390,7 +320,7 @@ export class WorkspaceResource {
         inspection = await this.inspect(dirPath, baseRef.branch);
       } catch (err) {
         log.debug('workspace reconcile: inspect failed', {
-          identifier: entry,
+          identifier: name,
           error: (err as Error).message,
         });
         continue;
@@ -411,21 +341,21 @@ export class WorkspaceResource {
         const reason = inspection.hasUncommitted
           ? 'uncommitted changes present'
           : `${inspection.commitsAheadOfBase} commit(s) ahead of base`;
-        const msg = `workspace ${entry} stuck: base advanced and ${reason}`;
+        const msg = `workspace ${name} stuck: base advanced and ${reason}`;
         this.lastError = msg;
-        this.recordMark(entry, 'stuck', reason);
+        this.recordMark(name, 'stuck', reason);
         log.warn('workspace reconcile: stuck (drift, agent work present)', {
-          identifier: entry,
+          identifier: name,
           reason,
         });
         continue;
       }
       this.staleCount += 1;
       const staleReason = 'base advanced past workspace HEAD; re-clone is opt-in';
-      this.lastError = `workspace ${entry} stale: ${staleReason}`;
-      this.recordMark(entry, 'stale', staleReason);
+      this.lastError = `workspace ${name} stale: ${staleReason}`;
+      this.recordMark(name, 'stale', staleReason);
       log.info('workspace reconcile: stale (drift, no agent work to lose)', {
-        identifier: entry,
+        identifier: name,
         reason: staleReason,
       });
     }
