@@ -17,6 +17,8 @@
 // `reconcile --force` (CLI flag) propagates `{ force: true }` through to each
 // resource so the bake can drop its cached artifact and rebuild.
 
+import { readFile, readdir } from 'node:fs/promises';
+import path from 'node:path';
 import { BakeResource, SmolvmBakeExecutor, type BakeExecutor } from './bake.js';
 import { defaultCacheRoot } from './cache.js';
 import type { ReconcilerSnapshot } from './types.js';
@@ -143,8 +145,8 @@ export class Reconciler {
       this.vm = new VmResource({
         smolvm: this.smolvm,
         intended: opts.vmIntendedProvider,
-        listBootWorkers: this.vmListBootWorkers,
-        killProcess: this.vmKillProcess,
+        listBootWorkers: this.vmListBootWorkers ?? defaultListBootWorkers,
+        killProcess: this.vmKillProcess ?? defaultKillProcess,
         killGraceMs: this.vmKillGraceMs,
       });
     }
@@ -235,8 +237,8 @@ export class Reconciler {
     this.vm = new VmResource({
       smolvm: this.smolvm,
       intended: provider,
-      listBootWorkers: this.vmListBootWorkers,
-      killProcess: this.vmKillProcess,
+      listBootWorkers: this.vmListBootWorkers ?? defaultListBootWorkers,
+      killProcess: this.vmKillProcess ?? defaultKillProcess,
       killGraceMs: this.vmKillGraceMs,
     });
   }
@@ -534,9 +536,97 @@ function defaultConflictHolding(cfg: ServiceConfig): string | null {
   return firstHolding;
 }
 
+/**
+ * Resolve a `_boot-vm` worker's VM name from its on-disk identity. The
+ * argv-referenced `boot-config.json` lives under
+ * `~/.cache/smolvm/vms/<hash>/boot-config.json`, but smolvm consumes and
+ * deletes that file shortly after the VM boots — so for a running VM it isn't
+ * present on disk. The persistent sibling file `<dir>/name` holds the
+ * daemon-registered VM name as plain text and survives the VM's lifetime.
+ *
+ * Prefer `<dir>/name`. Fall back to parsing `boot-config.json` for robustness
+ * across smolvm versions and for the narrow pre-consume window. Returns null
+ * if neither yields a non-empty string — the reaper only acts on
+ * confidently-identified strays.
+ *
+ * Lives here (shell) rather than vm.ts (core) so the fs imports don't violate
+ * the functional-core purity rule.
+ */
+export async function resolveBootWorkerVmName(configPath: string): Promise<string | null> {
+  const dir = path.dirname(configPath);
+  try {
+    const raw = await readFile(path.join(dir, 'name'), 'utf8');
+    const name = raw.trim();
+    if (name.length > 0) return name;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      log.debug('vm reaper: name file read failed', { dir, error: (err as Error).message });
+    }
+  }
+  let body: string;
+  try {
+    body = await readFile(configPath, 'utf8');
+  } catch {
+    log.debug('vm reaper: boot-config read failed', { configPath });
+    return null;
+  }
+  let parsed: { name?: unknown };
+  try {
+    parsed = JSON.parse(body) as { name?: unknown };
+  } catch {
+    log.debug('vm reaper: boot-config malformed', { configPath });
+    return null;
+  }
+  const name = parsed.name;
+  if (typeof name !== 'string' || name.length === 0) return null;
+  return name;
+}
+
+/**
+ * Enumerate every `_boot-vm` host worker and map it to its symphony VM name
+ * via the persistent `<vmdir>/name` file (with a `boot-config.json` fallback).
+ * Linux-only (reads /proc). Workers whose name can't be resolved are dropped
+ * silently — the reaper only acts on confidently-identified strays.
+ */
+export async function defaultListBootWorkers(): Promise<BootWorker[]> {
+  const procDir = '/proc';
+  let entries: string[];
+  try {
+    entries = await readdir(procDir);
+  } catch {
+    return [];
+  }
+  const out: BootWorker[] = [];
+  for (const ent of entries) {
+    const pid = Number(ent);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    let raw: string;
+    try {
+      raw = await readFile(path.join(procDir, ent, 'cmdline'), 'utf8');
+    } catch {
+      continue;
+    }
+    const argv = raw.split('\0').filter((s) => s.length > 0);
+    if (argv.length === 0) continue;
+    if (!argv.some((a) => path.basename(a) === '_boot-vm')) continue;
+    const configPath = argv.find((a) => a.endsWith('boot-config.json'));
+    if (!configPath) continue;
+    const vmName = await resolveBootWorkerVmName(configPath);
+    if (vmName === null) continue;
+    out.push({ pid, vmName });
+  }
+  return out;
+}
+
+function defaultKillProcess(pid: number, signal: NodeJS.Signals | 0): void {
+  process.kill(pid, signal);
+}
+
 export type { BakeExecutor } from './bake.js';
 export type { ReconcilerSnapshot, ResourceSnapshot, ActionStatus } from './types.js';
-export type { IntendedVmProvider, BootWorker } from './vm.js';
+export type { IntendedVmProvider, BootWorker, VmEffect, VmObservedState } from './vm.js';
+export { decideVm } from './vm.js';
 export type {
   WorkspaceIntendedProvider,
   BaseRefProvider,

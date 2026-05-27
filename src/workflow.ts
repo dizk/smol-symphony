@@ -1,10 +1,8 @@
-// WORKFLOW.md loader, watcher, and typed config view (SPEC §4).
+// WORKFLOW.md parser and typed config view (SPEC §4). Pure: no fs, no process.
+// The on-disk read and watcher live in `./workflow-loader.ts` (shell).
 
-import { readFile } from 'node:fs/promises';
-import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import chokidar from 'chokidar';
 import { parseFrontMatter, FrontMatterError } from './util/frontmatter.js';
 import type {
   ServiceConfig,
@@ -25,17 +23,16 @@ import type {
   PrAutopilotConfig,
 } from './types.js';
 import { log } from './logging.js';
-import {
-  isKnownAdapter,
-  hostCredentialAbsPathForId,
-  type AcpAdapterId,
-} from './agent/adapter-names.js';
-import { accessSync, constants as fsConstants } from 'node:fs';
+import { isKnownAdapter } from './agent/adapter-names.js';
 import { parseActionsBlock } from './actions/parsing.js';
 import type { WorkflowAction } from './actions/types.js';
 import { WorkflowError } from './errors.js';
 
 export { WorkflowError };
+
+// Env map threaded through the pure parser. The shell loader passes
+// `process.env`; tests pass an explicit map (or omit to get an empty one).
+export type WorkflowEnv = Record<string, string | undefined>;
 
 // §4.2: split YAML front matter from prompt body. Thin wrapper over the shared
 // parser that translates FrontMatterError → WorkflowError so callers keep
@@ -54,19 +51,26 @@ export function splitFrontMatter(text: string): { config: Record<string, unknown
   return { config: fm.fields, body: fm.body };
 }
 
-export async function loadWorkflow(workflowPath: string): Promise<WorkflowDefinition> {
-  let text: string;
-  try {
-    text = await readFile(workflowPath, 'utf8');
-  } catch (err) {
-    throw new WorkflowError('missing_workflow_file', `cannot read ${workflowPath}: ${(err as Error).message}`);
-  }
-  const { config, body } = splitFrontMatter(text);
-  return { config, prompt_template: body };
+/**
+ * Pure entry point: split front matter, build the typed view, and return both
+ * shapes. The shell loader reads the file from disk and the operator's env,
+ * then calls this. `env` defaults to an empty map so tests that do not exercise
+ * `$VAR` expansion need not thread it through.
+ */
+export function parseWorkflow(
+  text: string,
+  workflowPath: string,
+  env: WorkflowEnv = {},
+): { definition: WorkflowDefinition; config: ServiceConfig } {
+  const { config: raw, body } = splitFrontMatter(text);
+  const definition: WorkflowDefinition = { config: raw, prompt_template: body };
+  const config = buildServiceConfig(raw, workflowPath, env);
+  return { definition, config };
 }
 
-// $VAR / ~ expansion for path/command fields.
-export function expandVar(value: string): string {
+// $VAR / ~ expansion for path/command fields. `env` carries the variable map
+// (the shell loader passes process.env; tests pass an explicit shape).
+export function expandVar(value: string, env: WorkflowEnv = {}): string {
   if (typeof value !== 'string') return value;
   let s = value;
   if (s.startsWith('~/') || s === '~') {
@@ -74,7 +78,7 @@ export function expandVar(value: string): string {
   }
   const m = s.match(/^\$([A-Z_][A-Z0-9_]*)$/);
   if (m) {
-    const envVal = process.env[m[1]!];
+    const envVal = env[m[1]!];
     return envVal ?? '';
   }
   return s;
@@ -113,10 +117,14 @@ function getObject(parent: Record<string, unknown>, key: string): Record<string,
   return {};
 }
 
-// Build a fully typed ServiceConfig from a parsed front matter map.
+// Build a fully typed ServiceConfig from a parsed front matter map. `env`
+// supplies the variable map for `$VAR` expansion (and `XDG_RUNTIME_DIR` for
+// the smolvm endpoint default); defaults to {} so pure callers don't need to
+// thread one in.
 export function buildServiceConfig(
   raw: Record<string, unknown>,
   workflowPath: string,
+  env: WorkflowEnv = {},
 ): ServiceConfig {
   const workflowAbs = path.resolve(workflowPath);
   const workflowDir = path.dirname(workflowAbs);
@@ -128,7 +136,7 @@ export function buildServiceConfig(
   const trackerRootRaw = asString(trackerRaw['root']);
   let trackerRoot: string | null = null;
   if (trackerRootRaw) {
-    const expanded = expandVar(trackerRootRaw);
+    const expanded = expandVar(trackerRootRaw, env);
     if (expanded === '') {
       throw new WorkflowError(
         'workflow_parse_error',
@@ -158,7 +166,7 @@ export function buildServiceConfig(
   const wsRootInput = asString(workspaceRaw['root']);
   let workspaceRoot: string;
   if (wsRootInput) {
-    const expanded = expandVar(wsRootInput);
+    const expanded = expandVar(wsRootInput, env);
     if (expanded === '') {
       throw new WorkflowError(
         'workflow_parse_error',
@@ -178,7 +186,7 @@ export function buildServiceConfig(
   const logsRootInput = asString(logsRaw['root']);
   let logsRoot: string;
   if (logsRootInput) {
-    const expanded = expandVar(logsRootInput);
+    const expanded = expandVar(logsRootInput, env);
     if (expanded === '') {
       throw new WorkflowError(
         'workflow_parse_error',
@@ -270,7 +278,7 @@ export function buildServiceConfig(
   const fromRaw = asString(smolvmRaw['from']);
   let from: string | null = null;
   if (fromRaw) {
-    const expanded = expandVar(fromRaw);
+    const expanded = expandVar(fromRaw, env);
     if (expanded === '') {
       throw new WorkflowError(
         'workflow_parse_error',
@@ -282,7 +290,7 @@ export function buildServiceConfig(
   const smolfileRaw = asString(smolvmRaw['smolfile']);
   let smolfile: string | null = null;
   if (smolfileRaw) {
-    const expanded = expandVar(smolfileRaw);
+    const expanded = expandVar(smolfileRaw, env);
     if (expanded === '') {
       throw new WorkflowError(
         'workflow_parse_error',
@@ -299,7 +307,7 @@ export function buildServiceConfig(
         const hostRaw = asString(m['host']);
         const guest = asString(m['guest']);
         if (!hostRaw || !guest) return [];
-        const expandedHost = expandVar(hostRaw);
+        const expandedHost = expandVar(hostRaw, env);
         if (expandedHost === '') return [];
         const host = path.isAbsolute(expandedHost)
           ? expandedHost
@@ -325,7 +333,7 @@ export function buildServiceConfig(
     ]),
     endpoint:
       asString(smolvmRaw['endpoint']) ??
-      `unix://${process.env.XDG_RUNTIME_DIR ?? '/run/user/1000'}/smolvm.sock`,
+      `unix://${env['XDG_RUNTIME_DIR'] ?? '/run/user/1000'}/smolvm.sock`,
   };
 
   // server extension (§9.5)
@@ -699,15 +707,17 @@ export function warnOnHooksAndActionsConflict(cfg: ServiceConfig): void {
   }
 }
 
-// Dispatch preflight validation.
+// Dispatch preflight validation (structural, pure). The fs-touching probes —
+// `tracker.root` existence, `smolvm.smolfile` existence, per-state adapter
+// credential readability — live in the shell loader's `validateDispatchIo`,
+// which the orchestrator calls alongside this function. Keeping the structural
+// half pure means tests and the reload tick can re-run it cheaply on every
+// reconcile without re-hitting the disk.
 export function validateDispatch(cfg: ServiceConfig): string | null {
   if (cfg.tracker.kind !== 'local') {
     return `unsupported_tracker_kind: ${cfg.tracker.kind || '<missing>'}`;
   }
   if (!cfg.tracker.root) return 'tracker.root must be set for local tracker';
-  if (!existsSync(cfg.tracker.root) || !statSync(cfg.tracker.root).isDirectory()) {
-    return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
-  }
   // `cfg.states` is always populated by buildServiceConfig — the parser refuses
   // workflows without a `states:` block — so callers never need a fallback here.
   const statesError = validateStates(cfg.states);
@@ -723,11 +733,6 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   );
   if (sources.length > 1) {
     return 'smolvm: set at most one of image / from / smolfile (mutually exclusive)';
-  }
-  // smolfile is the path the runner hands smolvm via `--smolfile`. Verify it exists at
-  // parse time so a typo / wrong cwd fails fast rather than at the first dispatch.
-  if (cfg.smolvm.smolfile && !existsSync(cfg.smolvm.smolfile)) {
-    return `smolvm.smolfile not found: ${cfg.smolvm.smolfile}`;
   }
   // The bridge transport requires the VM to dial the host. Without networking the proxy
   // can never reach `SYMPHONY_ACP_URL`, every attempt fails after connect_timeout_ms,
@@ -877,21 +882,16 @@ function validateStates(states: Record<string, StateConfig>): string | null {
         }
       }
     }
-    if (cfg.adapter !== undefined) {
-      if (!isKnownAdapter(cfg.adapter)) {
-        return `state "${name}": adapter "${cfg.adapter}" is not a known profile; use one of: claude, codex`;
-      }
-      const credPath = hostCredentialAbsPathForId(cfg.adapter as AcpAdapterId);
-      try {
-        accessSync(credPath, fsConstants.R_OK);
-      } catch (err) {
-        return `state "${name}": adapter "${cfg.adapter}" requires a host credential at ${credPath}, but it is missing or unreadable: ${(err as Error).message}`;
-      }
+    if (cfg.adapter !== undefined && !isKnownAdapter(cfg.adapter)) {
+      return `state "${name}": adapter "${cfg.adapter}" is not a known profile; use one of: claude, codex`;
     }
   }
   return null;
 }
 
+// Port type for the watcher implemented by the shell loader. Defined here so
+// core consumers (orchestrator, tests) depend on the shape without reaching
+// into the loader module directly.
 export type WorkflowChangeCallback = (
   next: { definition: WorkflowDefinition; config: ServiceConfig } | { error: WorkflowError },
 ) => void;
@@ -900,58 +900,4 @@ export interface WorkflowSource {
   current(): { definition: WorkflowDefinition; config: ServiceConfig };
   onChange(cb: WorkflowChangeCallback): () => void;
   stop(): Promise<void>;
-}
-
-// Build + watch a workflow source. Throws on initial load failure.
-export async function watchWorkflow(workflowPath: string): Promise<WorkflowSource> {
-  const workflowAbs = path.resolve(workflowPath);
-  const initialDef = await loadWorkflow(workflowAbs);
-  const initialCfg = buildServiceConfig(initialDef.config, workflowAbs);
-  let current = { definition: initialDef, config: initialCfg };
-  const listeners = new Set<WorkflowChangeCallback>();
-
-  const watcher = chokidar.watch(workflowAbs, {
-    ignoreInitial: true,
-    persistent: true,
-  });
-
-  let reloadInFlight: Promise<void> | null = null;
-
-  const reload = async () => {
-    if (reloadInFlight) return reloadInFlight;
-    reloadInFlight = (async () => {
-      try {
-        const def = await loadWorkflow(workflowAbs);
-        const cfg = buildServiceConfig(def.config, workflowAbs);
-        current = { definition: def, config: cfg };
-        log.info('workflow reloaded', { path: workflowAbs });
-        for (const cb of listeners) cb({ definition: def, config: cfg });
-      } catch (err) {
-        const e =
-          err instanceof WorkflowError
-            ? err
-            : new WorkflowError('workflow_parse_error', (err as Error).message);
-        log.warn('workflow reload failed; keeping last good config', { error: e.message, code: e.code });
-        for (const cb of listeners) cb({ error: e });
-      } finally {
-        reloadInFlight = null;
-      }
-    })();
-    return reloadInFlight;
-  };
-
-  watcher.on('change', () => void reload());
-  watcher.on('add', () => void reload());
-  // §4.5: workflow read errors must block dispatch. If the file is deleted or temporarily
-  // renamed, surface a missing_workflow_file error so the orchestrator knows.
-  watcher.on('unlink', () => void reload());
-
-  return {
-    current: () => current,
-    onChange: (cb) => {
-      listeners.add(cb);
-      return () => listeners.delete(cb);
-    },
-    stop: () => watcher.close(),
-  };
 }
