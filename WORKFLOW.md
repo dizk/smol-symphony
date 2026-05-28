@@ -185,6 +185,12 @@ acp:
   # under the TCP bridge transport — the launch shape is fixed; fork
   # scripts/vm-agent.mjs if you need to customize what the proxy spawns.
   adapter: claude
+  # Credentials are staged into the workspace as a sanitized copy of
+  # ~/.claude/.credentials.json (refreshToken stripped). Issue 113 ships the
+  # alternative `proxy` mode behind this knob — set credentials_mode: proxy
+  # to route through the host credential proxy instead. The default stays
+  # `file` until the proxy path is fully validated end-to-end.
+  # credentials_mode: file
   # Reasoning effort forwarded to claude-agent-acp via a staged settings.json
   # (`{"effortLevel": "xhigh"}`) copied into /root/.claude/settings.json before the
   # adapter starts. xhigh is the second-highest tier under Opus 4.7 (max is the top

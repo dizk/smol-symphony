@@ -426,6 +426,30 @@ acp:
   #   codex    — codex-acp;        stages ~/.codex/auth.json
   adapter: claude
 
+  # credentials_mode (enum: file|proxy): how the host hands credentials to the
+  # in-VM adapter (issue 113). Default: 'file'.
+  #
+  #   file   — historical path. The entire host credential file is read,
+  #            sensitive fields stripped (claude: refreshToken), and written
+  #            into the workspace runtime dir; deriveAcpCommand copies it
+  #            into the adapter's expected guest path before exec. The VM
+  #            sees the short-lived accessToken on its filesystem.
+  #   proxy  — symphony binds a host credential proxy on `credentials.proxy_*`
+  #            (defaults: 127.0.0.1 with an ephemeral port). On each dispatch
+  #            the proxy mints a per-VM sentinel; the VM is launched with
+  #            ANTHROPIC_BASE_URL pointed at the proxy and
+  #            ANTHROPIC_AUTH_TOKEN=<sentinel>. The proxy validates each
+  #            inbound sentinel, swaps in the live access token read from
+  #            ~/.claude/.credentials.json (refreshing host-side via
+  #            `claude -p "ok"` under flock when the cache is stale), and
+  #            forwards to api.anthropic.com. The VM gets a minimal
+  #            ~/.claude.json staged for identity only — NO refreshToken, NO
+  #            accessToken on the VM filesystem.
+  #
+  # `proxy` mode is the long-term direction; `file` stays the default during
+  # the transition window so workflows that haven't migrated still work.
+  # credentials_mode: file
+
   # model (string | null): optional model selector forwarded to the chosen adapter.
   # Each adapter profile knows how to surface it natively:
   #   claude  — exported as ANTHROPIC_MODEL on the adapter process. Accepts anything
@@ -500,6 +524,35 @@ acp:
     # connect_timeout_ms (int): how long to wait for the in-VM proxy to connect after
     # the sandbox is launched, before failing the attempt. Default: 30000
     connect_timeout_ms: 30000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# credentials — host credential lifecycle (issue 113). Only consulted when
+# `acp.credentials_mode === 'proxy'`. The proxy listens on host loopback and
+# substitutes the real OAuth access token for a per-VM sentinel on every
+# request. The ticker keeps the host's cached access token warm by
+# periodically running `claude -p "ok"` — Claude Code's own OAuth path
+# detects the stale token, refreshes against Anthropic, and atomically writes
+# the rotated tuple back to `~/.claude/.credentials.json`. Symphony never
+# implements OAuth; Anthropic's own client does.
+# ─────────────────────────────────────────────────────────────────────────────
+credentials:
+  # proxy_bind_host (string): host the credential proxy binds on. Defaults to
+  # loopback so the proxy is unreachable from outside the host. The smolvm
+  # guest-loopback shim rewrites the in-VM 127.0.0.1 to the host's 127.0.0.1
+  # transparently, same as the ACP bridge case. Default: 127.0.0.1
+  proxy_bind_host: 127.0.0.1
+
+  # proxy_bind_port (int): port the credential proxy binds on. 0 picks an
+  # ephemeral port at startup. Default: 0
+  proxy_bind_port: 0
+
+  # ticker_interval_ms (int): how often the host ticker spawns `claude -p "ok"`
+  # to refresh the OAuth cache. The proxy also refreshes on demand when a VM
+  # request lands with an expired cached token, so the ticker is belt-to-the-
+  # braces for idle periods. Set to 0 to disable the in-symphony ticker
+  # entirely (operator runs their own systemd timer instead). Default: 21600000
+  # (6 hours).
+  ticker_interval_ms: 21600000
 
 # ─────────────────────────────────────────────────────────────────────────────
 # smolvm — microVM execution environment.

@@ -10,7 +10,9 @@ const shell = [
   'src/actions/executor.ts', // run-side of planActions/runEffects split (issue 68)
   // adapters (IO wrappers — should stay thin too)
   'src/trackers/local.ts', 'src/agent/smolvm.ts', 'src/agent/adapters.ts', 'src/agent/acp.ts',
-  'src/agent/tool-call-summary.ts', 'src/acp-bridge.ts', 'src/runlog.ts', 'src/memory.ts',
+  'src/agent/tool-call-summary.ts', 'src/agent/credential-proxy.ts',
+  'src/agent/credential-ticker.ts',
+  'src/acp-bridge.ts', 'src/runlog.ts', 'src/memory.ts',
   'src/reconciler/bake.ts', 'src/reconciler/cache.ts', 'src/reconciler/pr-adapters.ts',
   'src/actions/cache.ts', 'src/workflow-loader.ts', 'src/workspace.ts',
   // entry

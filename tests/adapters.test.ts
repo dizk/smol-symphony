@@ -48,6 +48,7 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     },
     acp: {
       adapter: 'claude',
+      credentials_mode: 'file',
       model: null,
       effort: null,
       shell: 'bash',
@@ -192,6 +193,28 @@ describe('adapters registry', () => {
     const cpIdx = cmd.indexOf('settings.json');
     const execIdx = cmd.indexOf('exec node');
     assert.ok(cpIdx > 0 && cpIdx < execIdx, 'extra cp must precede exec');
+  });
+
+  it('deriveAcpCommand under proxy mode (stagedRelPath=null) omits credential cp but still wipes guestDir', () => {
+    // Issue 113: when credentials_mode=proxy the in-VM client gets its bearer
+    // from ANTHROPIC_AUTH_TOKEN/ANTHROPIC_BASE_URL via env, not from a staged
+    // credential file. The bash prelude still wipes /root/.claude/ (defense in
+    // depth) and copies the minimal identity file via extraFiles.
+    const cmd = deriveAcpCommand(ADAPTERS.claude, null, [
+      {
+        stagedRelPath: '.git/symphony-runtime/identity/claude.json',
+        guestPath: '/root/.claude.json',
+      },
+    ]);
+    assert.match(cmd, /^rm -rf \/root\/\.claude && mkdir -p \/root\/\.claude/);
+    // No credential cp line should appear.
+    assert.doesNotMatch(cmd, /\.credentials\.json/);
+    // The identity file lands at /root/.claude.json (NOT /root/.claude/.credentials.json).
+    assert.match(
+      cmd,
+      /cp \.git\/symphony-runtime\/identity\/claude\.json \/root\/\.claude\.json/,
+    );
+    assert.match(cmd, /exec node \/opt\/symphony\/vm-agent\.mjs$/);
   });
 
   it('deriveAcpCommand emits an extra mkdir when an extra file targets a different guestDir', () => {

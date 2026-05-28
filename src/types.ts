@@ -160,6 +160,29 @@ export interface AgentConfig {
 export interface AcpConfig {
   adapter: string;
   /**
+   * How the host hands credentials to the in-VM adapter (issue 113).
+   *
+   *   • `file`  — the historical path: the entire host credential file is
+   *     read, sensitive fields stripped (claude: `refreshToken`), and
+   *     written into the workspace runtime dir. The bash prelude in
+   *     `deriveAcpCommand` copies it into the adapter's expected guest path.
+   *   • `proxy` — symphony binds a host credential proxy on loopback. Each
+   *     dispatch is registered with a per-VM sentinel; the proxy validates
+   *     inbound sentinels, substitutes the real upstream access token, and
+   *     forwards to api.anthropic.com. The VM gets `ANTHROPIC_BASE_URL`
+   *     pointing at the proxy plus `ANTHROPIC_AUTH_TOKEN=<sentinel>` and a
+   *     minimal `~/.claude.json` identity file (oauthAccount UUIDs only).
+   *     Refresh stays host-side: the host's own `claude -p` ticker rotates
+   *     `~/.claude/.credentials.json`; the proxy reads the current token on
+   *     every request. VMs hold no `refreshToken` or `accessToken` on
+   *     filesystem, so they cannot rotate-poison the operator's interactive
+   *     `claude` session.
+   *
+   * Defaults to `file` during the transition window; flip to `proxy` once
+   * the proxy lands. Per-workflow knob so operators opt in.
+   */
+  credentials_mode: 'file' | 'proxy';
+  /**
    * Optional model selector forwarded to the adapter. Each adapter profile decides how
    * to surface it (env var for claude-agent-acp's ANTHROPIC_MODEL; `-c model="..."` argv
    * for codex-acp). Null means "use the adapter's own default".
@@ -299,6 +322,26 @@ export interface PrAutopilotConfig {
   poll_interval_ms: number;
 }
 
+/**
+ * Host-side credential lifecycle (issue 113). Only consulted when
+ * `acp.credentials_mode === 'proxy'`. The bind host/port for the credential
+ * proxy plus the ticker interval that proactively spawns `claude -p "ok"` to
+ * keep the host's cached access token warm during idle periods.
+ */
+export interface CredentialsConfig {
+  /** Host the credential proxy binds on. Default: 127.0.0.1 (host-only). */
+  proxy_bind_host: string;
+  /** Port the credential proxy binds on. 0 picks an ephemeral port. */
+  proxy_bind_port: number;
+  /**
+   * How often the host ticker spawns `claude -p "ok"` to keep the OAuth
+   * cache warm. Belt-and-braces to the proxy's on-demand fallback. Default:
+   * 6h. Set to 0 to disable the ticker entirely (operator runs their own
+   * systemd timer instead, or simply leans on the proxy's on-demand path).
+   */
+  ticker_interval_ms: number;
+}
+
 export interface ServiceConfig {
   workflow_path: string;
   workflow_dir: string;
@@ -313,6 +356,7 @@ export interface ServiceConfig {
   server: ServerConfig;
   mcp: McpConfig;
   pr_autopilot: PrAutopilotConfig;
+  credentials: CredentialsConfig;
   // Canonical per-state configuration map. The same map is mirrored onto
   // `tracker.states` so the tracker (which only sees its slice of config)
   // keeps the state set without reaching back into the full ServiceConfig.

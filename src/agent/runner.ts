@@ -23,12 +23,14 @@ import {
   ADAPTERS,
   deriveAcpCommand,
   isKnownAdapter,
+  stageClaudeIdentity,
   stageCredential,
   stageRuntimeFile,
   type AcpAdapterId,
   type ExtraGuestFile,
   type ModelInjection,
 } from './adapters.js';
+import type { CredentialProxy } from './credential-proxy.js';
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
@@ -332,10 +334,22 @@ export class AgentRunner {
      * undefined.
      */
     private actionSnapshotSink: ActionSnapshotSink | null = null,
+    /**
+     * Host credential proxy (issue 113). Only required when
+     * `cfg.acp.credentials_mode === 'proxy'`; in `file` mode the runner stages
+     * the full credential file as before and never touches the proxy. The
+     * proxy mints per-dispatch sentinels that the in-VM client uses as its
+     * upstream Bearer; symphony deregisters on teardown.
+     */
+    private credentialProxy: CredentialProxy | null = null,
   ) {}
 
   setAcpBridge(bridge: AcpBridge | null): void {
     this.acpBridge = bridge;
+  }
+
+  setCredentialProxy(proxy: CredentialProxy | null): void {
+    this.credentialProxy = proxy;
   }
 
   setBakedArtifactProvider(provider: BakedArtifactProvider | null): void {
@@ -700,6 +714,7 @@ export class AgentRunner {
       hookCapture,
       runLog,
       logger,
+      credentialSentinel: vm.credentialSentinel,
     };
     const session = this.unwrap(
       await this.connectBridgeAndInitSession({
@@ -861,11 +876,17 @@ export class AgentRunner {
   // -------------------------------------------------------------------------
 
   /**
-   * Stage the credential, apply model/effort runtime injections, and derive
-   * the final ACP launch command. Pre-handshake failures unwind through the
-   * normal phase pipeline — there is no shell `after_run` cleanup to fire any
-   * more (the Done-state push/PR work runs as typed `actions:` on a successful
-   * cleanup pass, not on early dispatch error).
+   * Stage credentials (file or proxy mode), apply model/effort runtime
+   * injections, and derive the final ACP launch command. Pre-handshake
+   * failures unwind through the normal phase pipeline.
+   *
+   * Mode dispatch (issue 113):
+   *   • `file`  — historical path: stage the host credential file (with
+   *     `refreshToken` stripped for claude) and `cp` it into the adapter's
+   *     guest path before exec.
+   *   • `proxy` — stage only the minimal identity file `~/.claude.json` and
+   *     wire ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN to the host
+   *     credential proxy's per-VM sentinel. The VM holds no token bytes.
    */
   private async prepareAdapterRuntime(
     workspacePath: string,
@@ -873,39 +894,120 @@ export class AgentRunner {
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<AdapterRuntime>> {
     const profile = ADAPTERS[resolved.adapter];
+    if (this.cfg.acp.credentials_mode === 'proxy') {
+      return this.prepareProxyAdapterRuntime(workspacePath, profile, resolved, logger);
+    }
+    return this.prepareFileAdapterRuntime(workspacePath, profile, resolved, logger);
+  }
+
+  private async prepareFileAdapterRuntime(
+    workspacePath: string,
+    profile: AdapterProfile,
+    resolved: ResolvedDispatchConfig,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<AdapterRuntime>> {
     let staged: Awaited<ReturnType<typeof stageCredential>>;
     try {
       staged = await stageCredential(workspacePath, profile);
     } catch (err) {
-      logger.error('credential staging failed', {
-        adapter: profile.id,
-        error: (err as Error).message,
-      });
+      logger.error('credential staging failed', { adapter: profile.id, error: (err as Error).message });
       return failPhase('credential staging error');
     }
-    let injected: { runtimeEnv: Record<string, string>; runtimeArgs: string[]; runtimeExtraFiles: ExtraGuestFile[] };
-    try {
-      injected = await this.applyRuntimeInjections(workspacePath, profile, resolved);
-    } catch (err) {
-      logger.error('runtime injection staging failed', {
-        adapter: profile.id,
-        error: (err as Error).message,
-      });
-      return failPhase('runtime injection staging error');
-    }
+    const injectedRes = await this.applyRuntimeInjectionsOrFail(workspacePath, profile, resolved, logger);
+    if (!injectedRes.ok) return injectedRes;
+    const injected = injectedRes.value;
     const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, injected.runtimeExtraFiles);
-    const adapterBin = profile.binary[0]!;
-    const adapterArgs = profile.binary.slice(1);
     return {
       ok: true,
       value: {
         profile,
-        adapterBin,
+        adapterBin: profile.binary[0]!,
         effectiveAcpCommand,
-        effectiveAdapterArgs: [...adapterArgs, ...injected.runtimeArgs],
+        effectiveAdapterArgs: [...profile.binary.slice(1), ...injected.runtimeArgs],
         runtimeEnv: injected.runtimeEnv,
+        credentialSentinel: null,
+        needsCredentialProxy: false,
       },
     };
+  }
+
+  private async prepareProxyAdapterRuntime(
+    workspacePath: string,
+    profile: AdapterProfile,
+    resolved: ResolvedDispatchConfig,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<AdapterRuntime>> {
+    if (profile.id !== 'claude') {
+      logger.error('credentials_mode=proxy supports only the claude adapter today', {
+        adapter: profile.id,
+      });
+      return failPhase('credentials_mode proxy requires claude adapter');
+    }
+    if (!this.credentialProxy) {
+      logger.error('credentials_mode=proxy but no credential proxy is wired', {});
+      return failPhase('credential proxy unavailable');
+    }
+    const injectedRes = await this.applyRuntimeInjectionsOrFail(workspacePath, profile, resolved, logger);
+    if (!injectedRes.ok) return injectedRes;
+    const extraFiles = await this.stageProxyExtras(workspacePath, injectedRes.value, logger);
+    if (!extraFiles.ok) return extraFiles;
+    // Sentinel registration is deferred to `bringUpVmAndExec` — we don't want
+    // a sentinel sitting in the registry if VM start fails. The runtime env
+    // and command are sealed at exec time.
+    const effectiveAcpCommand = deriveAcpCommand(profile, null, extraFiles.value);
+    return {
+      ok: true,
+      value: {
+        profile,
+        adapterBin: profile.binary[0]!,
+        effectiveAcpCommand,
+        effectiveAdapterArgs: [...profile.binary.slice(1), ...injectedRes.value.runtimeArgs],
+        runtimeEnv: injectedRes.value.runtimeEnv,
+        credentialSentinel: null,
+        needsCredentialProxy: true,
+      },
+    };
+  }
+
+  /**
+   * Stage the minimal `~/.claude.json` identity (oauthAccount UUIDs only) and
+   * append it to the extra guest files list so the bash prelude copies it to
+   * `/root/.claude.json` before exec. Identity staging is best-effort: a
+   * missing host `~/.claude.json` is logged and the dispatch proceeds.
+   */
+  private async stageProxyExtras(
+    workspacePath: string,
+    injected: { runtimeExtraFiles: ExtraGuestFile[] },
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<ExtraGuestFile[]>> {
+    const out: ExtraGuestFile[] = [...injected.runtimeExtraFiles];
+    try {
+      const identity = await stageClaudeIdentity(workspacePath);
+      if (identity) {
+        out.push({ stagedRelPath: identity.relPath, guestPath: '/root/.claude.json' });
+      } else {
+        logger.warn('credentials_mode=proxy: ~/.claude.json identity missing or malformed', {});
+      }
+    } catch (err) {
+      logger.error('identity staging failed', { error: (err as Error).message });
+      return failPhase('identity staging error');
+    }
+    return { ok: true, value: out };
+  }
+
+  private async applyRuntimeInjectionsOrFail(
+    workspacePath: string,
+    profile: AdapterProfile,
+    resolved: ResolvedDispatchConfig,
+    logger: ReturnType<typeof withIssue>,
+  ): Promise<PhaseResult<{ runtimeEnv: Record<string, string>; runtimeArgs: string[]; runtimeExtraFiles: ExtraGuestFile[] }>> {
+    try {
+      const injected = await this.applyRuntimeInjections(workspacePath, profile, resolved);
+      return { ok: true, value: injected };
+    } catch (err) {
+      logger.error('runtime injection staging failed', { adapter: profile.id, error: (err as Error).message });
+      return failPhase('runtime injection staging error');
+    }
   }
 
   /**
@@ -1004,15 +1106,56 @@ export class AgentRunner {
     if (!startRes.ok) return startRes;
     const regRes = await this.registerBridgeOrFail(args.issue, args.logger);
     if (!regRes.ok) return regRes;
+    const credentialReg = this.registerCredentialSentinel(args.issue, args.adapter);
+    const execAdapter = this.applyCredentialEnv(args.adapter, credentialReg);
     const execStream = this.launchExecStream(
       vmName,
       args.workspacePath,
       regRes.value.bridgeReg,
       args.acpReachUrl,
-      args.adapter,
+      execAdapter,
     );
     this.attachStderrTap(execStream, args.issue, args.runLog, args.logger);
-    return { ok: true, value: { vmName, execStream, bridgeReg: regRes.value.bridgeReg } };
+    return {
+      ok: true,
+      value: {
+        vmName,
+        execStream,
+        bridgeReg: regRes.value.bridgeReg,
+        credentialSentinel: credentialReg?.sentinel ?? null,
+      },
+    };
+  }
+
+  /**
+   * Mint a credential-proxy sentinel for this dispatch when adapter prep
+   * flagged proxy mode. Sentinel registration happens AFTER VM start +
+   * bridge register so an early failure doesn't leak a registry entry — the
+   * proxy's registry is in-process, but a leaked entry would still be a
+   * loose end across the dispatch lifecycle.
+   */
+  private registerCredentialSentinel(
+    issue: Issue,
+    adapter: AdapterRuntime,
+  ): { sentinel: string; baseUrl: string } | null {
+    if (!adapter.needsCredentialProxy || !this.credentialProxy) return null;
+    return this.credentialProxy.register({ issueId: issue.id, identifier: issue.identifier });
+  }
+
+  /** Fold the credential-proxy env vars onto the adapter runtime env. */
+  private applyCredentialEnv(
+    adapter: AdapterRuntime,
+    reg: { sentinel: string; baseUrl: string } | null,
+  ): AdapterRuntime {
+    if (!reg) return adapter;
+    return {
+      ...adapter,
+      runtimeEnv: {
+        ...adapter.runtimeEnv,
+        ANTHROPIC_BASE_URL: reg.baseUrl,
+        ANTHROPIC_AUTH_TOKEN: reg.sentinel,
+      },
+    };
   }
 
   /**
@@ -1624,6 +1767,7 @@ export class AgentRunner {
     this.detachSession(ctx, reason);
     await this.awaitExecExit(ctx.execStream);
     this.deactivateMcpForEntry(ctx.runningEntry);
+    this.deregisterCredentialSentinel(ctx);
     ctx.logger.debug('agent runner cleanup', { reason });
     const nonRouted = await this.runCleanupActions(
       ctx.issue,
@@ -1653,6 +1797,12 @@ export class AgentRunner {
 
   private deactivateMcpForEntry(entry: RunningEntry | undefined): void {
     if (this.mcp && entry) this.mcp.deactivate(entry.identifier);
+  }
+
+  private deregisterCredentialSentinel(ctx: SessionContext): void {
+    if (this.credentialProxy && ctx.credentialSentinel) {
+      this.credentialProxy.deregister(ctx.credentialSentinel);
+    }
   }
 
   private logVmTeardownDeferred(ctx: SessionContext, reason: string): void {
@@ -1685,6 +1835,19 @@ interface AdapterRuntime {
   effectiveAcpCommand: string;
   effectiveAdapterArgs: string[];
   runtimeEnv: Record<string, string>;
+  /**
+   * Credential-proxy sentinel minted at adapter prep when
+   * `acp.credentials_mode === 'proxy'`. Null in file mode. Stashed on the
+   * SessionContext so tearDownSession can deregister it.
+   */
+  credentialSentinel: string | null;
+  /**
+   * True when the runner should register a sentinel with the credential
+   * proxy at VM exec time (proxy mode). Sentinel registration is deferred
+   * until VM start succeeds so an early dispatch failure can't leak a
+   * registry entry.
+   */
+  needsCredentialProxy: boolean;
 }
 
 interface VmStartInputs {
@@ -1699,6 +1862,12 @@ interface VmExecHandle {
   vmName: string;
   execStream: ExecStream;
   bridgeReg: AcpBridgeRegistration;
+  /**
+   * Credential-proxy sentinel registered for this dispatch (proxy mode); null
+   * in file mode. Threaded onto the SessionContext so tearDownSession can
+   * deregister it.
+   */
+  credentialSentinel: string | null;
 }
 
 /**
@@ -1719,6 +1888,12 @@ interface SessionContext {
   hookCapture: (h: string) => HookCapture | undefined;
   runLog: RunLog | undefined;
   logger: ReturnType<typeof withIssue>;
+  /**
+   * Credential-proxy sentinel for this dispatch (proxy mode only). Captured
+   * at session construction so `tearDownSession` can deregister it without
+   * reaching back into the AdapterRuntime.
+   */
+  credentialSentinel: string | null;
 }
 
 interface TurnLoopState {
