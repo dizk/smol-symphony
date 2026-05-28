@@ -19,11 +19,7 @@ import {
   type WorkflowSource,
 } from './workflow.js';
 import type { ServiceConfig, WorkflowDefinition } from './types.js';
-import {
-  hostCredentialAbsPathForId,
-  isKnownAdapter,
-  type AcpAdapterId,
-} from './agent/adapter-names.js';
+import { hostClaudeCredentialPath, isKnownAdapter } from './agent/adapter-names.js';
 import { log } from './logging.js';
 
 export type { WorkflowChangeCallback, WorkflowSource };
@@ -75,12 +71,17 @@ export function validateDispatchIo(cfg: ServiceConfig): string | null {
 
 function probeStateCredential(stateName: string, adapter: string | undefined): string | null {
   if (adapter === undefined || !isKnownAdapter(adapter)) return null;
-  const credPath = hostCredentialAbsPathForId(adapter as AcpAdapterId);
+  // Only the claude adapter has a host-file dependency: the credential proxy
+  // reads `~/.claude/.credentials.json` on every upstream request to swap
+  // the live access token in for a per-VM sentinel. The codex adapter relies
+  // on `OPENAI_API_KEY` forwarded via `smolvm.forward_env` — no file probe.
+  if (adapter !== 'claude') return null;
+  const credPath = hostClaudeCredentialPath();
   try {
     accessSync(credPath, fsConstants.R_OK);
     return null;
   } catch (err) {
-    return `state "${stateName}": adapter "${adapter}" requires a host credential at ${credPath}, but it is missing or unreadable: ${(err as Error).message}`;
+    return `state "${stateName}": adapter "claude" requires a host credential at ${credPath}, but it is missing or unreadable: ${(err as Error).message}`;
   }
 }
 

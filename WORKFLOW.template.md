@@ -420,35 +420,27 @@ agent:
 # acp — Agent Client Protocol adapter selection.
 # ─────────────────────────────────────────────────────────────────────────────
 acp:
-  # adapter (string): one of symphony's known profiles. The profile encodes the
-  # binary to launch and the host credential file to stage. Default: 'claude'.
-  #   claude   — claude-agent-acp; stages ~/.claude/.credentials.json
-  #   codex    — codex-acp;        stages ~/.codex/auth.json
+  # adapter (string): one of symphony's known profiles. Default: 'claude'.
+  #   claude   — claude-agent-acp. Routes through the host credential proxy;
+  #              no credential file enters the VM.
+  #   codex    — codex-acp. Reads `OPENAI_API_KEY` from `smolvm.forward_env`;
+  #              no credential file enters the VM.
   adapter: claude
 
-  # credentials_mode (enum: file|proxy): how the host hands credentials to the
-  # in-VM adapter (issue 113). Default: 'file'.
+  # Credentials never enter the VM (issue 113). For claude, symphony binds a
+  # host credential proxy on `credentials.proxy_*` (defaults: 127.0.0.1 with
+  # an ephemeral port). On each dispatch the proxy mints a per-VM sentinel;
+  # the VM is launched with ANTHROPIC_BASE_URL pointed at the proxy and
+  # ANTHROPIC_AUTH_TOKEN=<sentinel>. The proxy validates each inbound
+  # sentinel, swaps in the live access token read from
+  # ~/.claude/.credentials.json (refreshing host-side via `claude -p "ok"`
+  # under flock when the cache is stale), and forwards to api.anthropic.com.
+  # The VM gets a minimal ~/.claude.json staged for identity only — NO
+  # refreshToken, NO accessToken on the VM filesystem.
   #
-  #   file   — historical path. The entire host credential file is read,
-  #            sensitive fields stripped (claude: refreshToken), and written
-  #            into the workspace runtime dir; deriveAcpCommand copies it
-  #            into the adapter's expected guest path before exec. The VM
-  #            sees the short-lived accessToken on its filesystem.
-  #   proxy  — symphony binds a host credential proxy on `credentials.proxy_*`
-  #            (defaults: 127.0.0.1 with an ephemeral port). On each dispatch
-  #            the proxy mints a per-VM sentinel; the VM is launched with
-  #            ANTHROPIC_BASE_URL pointed at the proxy and
-  #            ANTHROPIC_AUTH_TOKEN=<sentinel>. The proxy validates each
-  #            inbound sentinel, swaps in the live access token read from
-  #            ~/.claude/.credentials.json (refreshing host-side via
-  #            `claude -p "ok"` under flock when the cache is stale), and
-  #            forwards to api.anthropic.com. The VM gets a minimal
-  #            ~/.claude.json staged for identity only — NO refreshToken, NO
-  #            accessToken on the VM filesystem.
-  #
-  # `proxy` mode is the long-term direction; `file` stays the default during
-  # the transition window so workflows that haven't migrated still work.
-  # credentials_mode: file
+  # For codex, no host-file dependency exists under the proxy architecture;
+  # codex-acp picks up `OPENAI_API_KEY` from the env forwarded via
+  # `smolvm.forward_env`.
 
   # model (string | null): optional model selector forwarded to the chosen adapter.
   # Each adapter profile knows how to surface it natively:
@@ -526,14 +518,13 @@ acp:
     connect_timeout_ms: 30000
 
 # ─────────────────────────────────────────────────────────────────────────────
-# credentials — host credential lifecycle (issue 113). Only consulted when
-# `acp.credentials_mode === 'proxy'`. The proxy listens on host loopback and
-# substitutes the real OAuth access token for a per-VM sentinel on every
-# request. The ticker keeps the host's cached access token warm by
-# periodically running `claude -p "ok"` — Claude Code's own OAuth path
-# detects the stale token, refreshes against Anthropic, and atomically writes
-# the rotated tuple back to `~/.claude/.credentials.json`. Symphony never
-# implements OAuth; Anthropic's own client does.
+# credentials — host credential lifecycle (issue 113). The proxy listens on
+# host loopback and substitutes the real OAuth access token for a per-VM
+# sentinel on every request. The ticker keeps the host's cached access token
+# warm by periodically running `claude -p "ok"` — Claude Code's own OAuth
+# path detects the stale token, refreshes against Anthropic, and atomically
+# writes the rotated tuple back to `~/.claude/.credentials.json`. Symphony
+# never implements OAuth; Anthropic's own client does.
 # ─────────────────────────────────────────────────────────────────────────────
 credentials:
   # proxy_bind_host (string): host the credential proxy binds on. Defaults to

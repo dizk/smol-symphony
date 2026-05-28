@@ -250,18 +250,14 @@ async function loadAndValidateConfig(workflowPath: string): Promise<LoadedConfig
 }
 
 /**
- * Build the host credential proxy + ticker (issue 113), gated on
- * `acp.credentials_mode: proxy`. In file mode (the default) both are null;
- * the runner stages the credential file as before and never touches the
- * proxy.
+ * Build the host credential proxy + ticker (issue 113). The proxy is the
+ * only path the in-VM claude-agent-acp uses to reach Anthropic — every
+ * dispatch goes through it.
  */
 function buildCredentialPipeline(config: ServiceConfig): {
-  credentialProxy: CredentialProxy | null;
-  credentialTicker: CredentialTicker | null;
+  credentialProxy: CredentialProxy;
+  credentialTicker: CredentialTicker;
 } {
-  if (config.acp.credentials_mode !== 'proxy') {
-    return { credentialProxy: null, credentialTicker: null };
-  }
   const credentialProxy = new CredentialProxy();
   const credentialTicker = new CredentialTicker({
     intervalMs: config.credentials.ticker_interval_ms,
@@ -276,8 +272,8 @@ interface OrchestratorGraph {
   smolvm: SmolvmClient;
   mcp: McpRegistry;
   acpBridge: AcpBridge;
-  credentialProxy: CredentialProxy | null;
-  credentialTicker: CredentialTicker | null;
+  credentialProxy: CredentialProxy;
+  credentialTicker: CredentialTicker;
   reconciler: Reconciler;
   runner: AgentRunner;
   orch: Orchestrator;
@@ -525,17 +521,15 @@ async function startTransports(opts: {
 }
 
 /**
- * Bind the host credential proxy (issue 113) when proxy mode is on, then
- * start the host ticker. Both no-op when `acp.credentials_mode === 'file'`.
- * A bind failure here is fatal for proxy mode — without the proxy, in-VM
- * dispatches would fail closed at first upstream request.
+ * Bind the host credential proxy (issue 113) and start the host ticker.
+ * A bind failure here is fatal — without the proxy, in-VM dispatches
+ * would fail closed at first upstream request.
  */
 async function startCredentialProxyOrFail(
   config: ServiceConfig,
   graph: OrchestratorGraph,
   src: WorkflowSource,
 ): Promise<void> {
-  if (!graph.credentialProxy) return;
   try {
     await graph.credentialProxy.start(
       config.credentials.proxy_bind_host,
@@ -547,7 +541,7 @@ async function startCredentialProxyOrFail(
       { src },
     );
   }
-  graph.credentialTicker?.start();
+  graph.credentialTicker.start();
 }
 
 /**
@@ -684,8 +678,8 @@ async function main() {
     log.info('shutdown requested', { signal });
     await graph.orch.stop();
     await graph.acpBridge.stop().catch(() => undefined);
-    graph.credentialTicker?.stop();
-    if (graph.credentialProxy) await graph.credentialProxy.stop().catch(() => undefined);
+    graph.credentialTicker.stop();
+    await graph.credentialProxy.stop().catch(() => undefined);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
     await closeLogFile().catch(() => undefined);

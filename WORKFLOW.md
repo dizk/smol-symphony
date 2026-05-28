@@ -178,19 +178,17 @@ agent:
   max_retry_backoff_ms: 120000
 
 acp:
-  # Selecting "claude" is enough: symphony reads ~/.claude/.credentials.json on
-  # the host, stages a copy into the workspace's runtime dir, and auto-generates
-  # a launch command that places the file at the adapter's expected path inside
-  # the VM before exec'ing the in-VM proxy. There is no `command` escape hatch
-  # under the TCP bridge transport — the launch shape is fixed; fork
-  # scripts/vm-agent.mjs if you need to customize what the proxy spawns.
+  # Selecting "claude" is enough: symphony probes ~/.claude/.credentials.json
+  # on the host at startup (the credential proxy reads it on every upstream
+  # request to substitute the live access token for a per-VM sentinel) and
+  # auto-generates a launch command for the in-VM proxy. There is no `command`
+  # escape hatch under the TCP bridge transport — the launch shape is fixed;
+  # fork scripts/vm-agent.mjs if you need to customize what the proxy spawns.
   adapter: claude
-  # Credentials are staged into the workspace as a sanitized copy of
-  # ~/.claude/.credentials.json (refreshToken stripped). Issue 113 ships the
-  # alternative `proxy` mode behind this knob — set credentials_mode: proxy
-  # to route through the host credential proxy instead. The default stays
-  # `file` until the proxy path is fully validated end-to-end.
-  # credentials_mode: file
+  # Credentials never enter the VM (issue 113). The host credential proxy
+  # substitutes a per-VM sentinel for the real Anthropic OAuth access token on
+  # every upstream request; codex-acp reads `OPENAI_API_KEY` out of
+  # `smolvm.forward_env`.
   # Reasoning effort forwarded to claude-agent-acp via a staged settings.json
   # (`{"effortLevel": "xhigh"}`) copied into /root/.claude/settings.json before the
   # adapter starts. xhigh is the second-highest tier under Opus 4.7 (max is the top
