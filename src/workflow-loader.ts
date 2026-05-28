@@ -10,7 +10,7 @@
 import path from 'node:path';
 import process from 'node:process';
 import { readFile } from 'node:fs/promises';
-import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, readFileSync, statSync } from 'node:fs';
 import chokidar from 'chokidar';
 import {
   parseWorkflow,
@@ -19,7 +19,13 @@ import {
   type WorkflowSource,
 } from './workflow.js';
 import type { ServiceConfig, WorkflowDefinition } from './types.js';
-import { hostClaudeCredentialPath, isKnownAdapter } from './agent/adapter-names.js';
+import {
+  codexCredentialAvailable,
+  codexMissingCredentialMessage,
+  hostClaudeCredentialPath,
+  hostCodexCredentialPath,
+  isKnownAdapter,
+} from './agent/adapter-names.js';
 import { log } from './logging.js';
 
 export type { WorkflowChangeCallback, WorkflowSource };
@@ -69,15 +75,20 @@ export function validateDispatchIo(cfg: ServiceConfig): string | null {
   return null;
 }
 
+// Both proxy-backed adapters have a host credential we can probe at load time.
+// claude: the proxy reads `~/.claude/.credentials.json` on every upstream
+// request to swap the live access token in for a per-VM sentinel. codex: the
+// proxy reads either a `~/.codex/auth.json` token or an `OPENAI_API_KEY` env
+// var. A missing credential fails here at load time instead of as an opaque
+// per-request proxy error mid-dispatch.
 function probeStateCredential(stateName: string, adapter: string | undefined): string | null {
   if (adapter === undefined || !isKnownAdapter(adapter)) return null;
-  // Only the claude adapter has a single host-file dependency we can probe at
-  // load time: the credential proxy reads `~/.claude/.credentials.json` on every
-  // upstream request to swap the live access token in for a per-VM sentinel.
-  // codex routes through the same proxy but has two valid credential sources
-  // (a `~/.codex/auth.json` token or an `OPENAI_API_KEY` env var), so the proxy
-  // validates it lazily at request time rather than via a startup file probe.
-  if (adapter !== 'claude') return null;
+  if (adapter === 'claude') return probeClaudeStateCredential(stateName);
+  if (adapter === 'codex') return probeCodexStateCredential(stateName);
+  return null;
+}
+
+function probeClaudeStateCredential(stateName: string): string | null {
   const credPath = hostClaudeCredentialPath();
   try {
     accessSync(credPath, fsConstants.R_OK);
@@ -85,6 +96,17 @@ function probeStateCredential(stateName: string, adapter: string | undefined): s
   } catch (err) {
     return `state "${stateName}": adapter "claude" requires a host credential at ${credPath}, but it is missing or unreadable: ${(err as Error).message}`;
   }
+}
+
+function probeCodexStateCredential(stateName: string): string | null {
+  let authText: string | null = null;
+  try {
+    authText = readFileSync(hostCodexCredentialPath(), 'utf8');
+  } catch {
+    authText = null;
+  }
+  if (codexCredentialAvailable(authText, process.env)) return null;
+  return `state "${stateName}": ${codexMissingCredentialMessage()}`;
 }
 
 /**

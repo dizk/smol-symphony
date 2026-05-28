@@ -14,13 +14,12 @@ import type { AgentRunner } from '../src/agent/runner.js';
 import type { SmolvmClient } from '../src/agent/smolvm.js';
 import { Reconciler } from '../src/reconciler/index.js';
 
-// Startup credential contract under the credential-proxy architecture (#114/#116):
-// the only adapter whose host credential is probed at startup is `claude` — it has
-// a single required file (`~/.claude/.credentials.json`). The probe walks the union
-// of workflow-level and per-state adapters, but short-circuits unless `claude` is
-// referenced anywhere. codex also routes through the proxy, but has two valid
-// sources (`~/.codex/auth.json` or `OPENAI_API_KEY`), so the proxy validates it
-// lazily on first request rather than via a startup file probe.
+// Startup credential contract under the credential-proxy architecture
+// (#114/#116/#120): every proxy-backed adapter in the union of workflow-level
+// and per-state adapters is probed at startup. claude needs a readable
+// `~/.claude/.credentials.json`; codex needs either a `~/.codex/auth.json` token
+// or an `OPENAI_API_KEY` env var. A missing credential fails fast here rather
+// than surfacing as an opaque per-request proxy failure mid-dispatch.
 
 function makeTracker(): IssueTracker {
   return {
@@ -97,14 +96,20 @@ async function buildCfgAndDef(
 
 describe('Orchestrator startup credential check', () => {
   it('fails startup when the claude credential is missing for a workflow that references claude', async () => {
-    // Empty fake $HOME — `~/.claude/.credentials.json` is absent. A workflow
-    // that pins claude on any state must surface the missing-host-credential
-    // as a startup error rather than letting the proxy fail mid-dispatch.
+    // `~/.claude/.credentials.json` is absent (codex is satisfied so the probe
+    // gets past it to the claude state). A workflow that pins claude on any
+    // state — even just a per-state override — must surface the missing
+    // host-credential at startup rather than letting the proxy fail mid-dispatch.
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-'));
     const prevHome = process.env.HOME;
     process.env.HOME = fakeHome;
     try {
+      await mkdir(path.join(fakeHome, '.codex'), { recursive: true });
+      await writeFile(
+        path.join(fakeHome, '.codex', 'auth.json'),
+        JSON.stringify({ tokens: { access_token: 'codex-oauth-token' } }),
+      );
       const { cfg, def } = await buildCfgAndDef(
         {
           acp: { adapter: 'codex' },
@@ -134,17 +139,69 @@ describe('Orchestrator startup credential check', () => {
     }
   });
 
-  it('starts cleanly when the claude credential is present (codex needs no host file)', async () => {
-    // Both adapters referenced; only the claude credential is startup-probed.
-    // codex routes through the proxy with two valid sources validated lazily on
-    // first request, so the startup probe ignores it.
+  it('fails startup when the codex credential is missing for a workflow that references codex', async () => {
+    // Empty fake $HOME (no `~/.codex/auth.json`) AND no OPENAI_API_KEY env: a
+    // workflow that pins codex anywhere must surface the missing credential at
+    // startup, mirroring the claude probe.
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-codex-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-codex-tracker-'));
+    const prevHome = process.env.HOME;
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.HOME = fakeHome;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      // claude credential present so the probe gets past claude to codex.
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          states: {
+            Todo: { role: 'active', adapter: 'codex' },
+            Review: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      const { workflowSrc, tracker, workspaces, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, workspaces, runner);
+      await assert.rejects(
+        () => orch.start(),
+        (err: unknown) =>
+          err instanceof Error &&
+          /codex/.test(err.message) &&
+          /credential/.test(err.message),
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('starts cleanly when both adapter credentials are present (codex via auth.json)', async () => {
+    // Both adapters referenced; both credentials present. codex is satisfied by
+    // a `~/.codex/auth.json` token (no OPENAI_API_KEY env needed).
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-ok-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-ok-'));
     const prevHome = process.env.HOME;
+    const prevKey = process.env.OPENAI_API_KEY;
     process.env.HOME = fakeHome;
+    delete process.env.OPENAI_API_KEY;
     try {
       await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
       await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+      await mkdir(path.join(fakeHome, '.codex'), { recursive: true });
+      await writeFile(
+        path.join(fakeHome, '.codex', 'auth.json'),
+        JSON.stringify({ tokens: { access_token: 'codex-oauth-token' } }),
+      );
 
       const { cfg, def } = await buildCfgAndDef(
         {
@@ -165,6 +222,47 @@ describe('Orchestrator startup credential check', () => {
     } finally {
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('starts cleanly when codex is satisfied by OPENAI_API_KEY alone (no auth.json)', async () => {
+    // No `~/.codex/auth.json` on disk, but OPENAI_API_KEY is exported — the
+    // proxy's env fallback covers it, so the startup probe must accept it.
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-envkey-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-envkey-'));
+    const prevHome = process.env.HOME;
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.HOME = fakeHome;
+    process.env.OPENAI_API_KEY = 'sk-env-codex';
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          states: {
+            Todo: { role: 'active', adapter: 'codex' },
+            Review: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      const { workflowSrc, tracker, workspaces, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, workspaces, runner);
+      await orch.start();
+      await orch.stop();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
       await rm(fakeHome, { recursive: true, force: true });
       await rm(trackerRoot, { recursive: true, force: true });
     }

@@ -24,8 +24,14 @@ import { writeIssueFile, pickHoldingState } from './issues.js';
 import type { ResourceSnapshot } from './reconciler/index.js';
 import type { ProposeFollowupSink } from './actions/index.js';
 import type { AgentRunner } from './agent/runner.js';
-import { hostClaudeCredentialPath, isKnownAdapter } from './agent/adapter-names.js';
-import { accessSync, constants as fsConstants } from 'node:fs';
+import {
+  codexCredentialAvailable,
+  codexMissingCredentialMessage,
+  hostClaudeCredentialPath,
+  hostCodexCredentialPath,
+  isKnownAdapter,
+} from './agent/adapter-names.js';
+import { accessSync, constants as fsConstants, readFileSync } from 'node:fs';
 import { activeStateNames, terminalStateNames } from './issues.js';
 import {
   buildIssueDetailDto,
@@ -247,17 +253,21 @@ export class Orchestrator
   }
 
   /**
-   * Fail fast when symphony will dispatch to claude but the host's
-   * `~/.claude/.credentials.json` (consumed by the credential proxy) is
-   * missing. Per-state overrides can change the adapter, so the set is the
-   * union of `cfg.acp.adapter` and every distinct `states.<name>.adapter`.
-   * codex is not probed here: its credential has two valid sources (a
-   * `~/.codex/auth.json` token or an `OPENAI_API_KEY` env var), so the proxy
-   * validates it lazily on the first request rather than at startup.
+   * Fail fast when symphony will dispatch to an adapter whose host credential
+   * (consumed by the credential proxy) is missing. Per-state overrides can
+   * change the adapter, so the set is the union of `cfg.acp.adapter` and every
+   * distinct `states.<name>.adapter`. claude needs `~/.claude/.credentials.json`;
+   * codex needs either a `~/.codex/auth.json` token or an `OPENAI_API_KEY` env
+   * var. A missing credential surfaces here as a clear startup error rather than
+   * an opaque per-request proxy failure mid-dispatch.
    */
   private async assertAdapterCredentials(): Promise<void> {
     const ids = requiredAdapterIds(this.cfg, isKnownAdapter);
-    if (!ids.has('claude')) return;
+    if (ids.has('claude')) this.assertClaudeCredential();
+    if (ids.has('codex')) this.assertCodexCredential();
+  }
+
+  private assertClaudeCredential(): void {
     const credPath = hostClaudeCredentialPath();
     try {
       accessSync(credPath, fsConstants.R_OK);
@@ -266,6 +276,19 @@ export class Orchestrator
       log.error('startup credential check failed', { adapter: 'claude', error: msg });
       throw new WorkflowError('missing_host_credential', msg);
     }
+  }
+
+  private assertCodexCredential(): void {
+    let authText: string | null = null;
+    try {
+      authText = readFileSync(hostCodexCredentialPath(), 'utf8');
+    } catch {
+      authText = null;
+    }
+    if (codexCredentialAvailable(authText, process.env)) return;
+    const msg = codexMissingCredentialMessage();
+    log.error('startup credential check failed', { adapter: 'codex', error: msg });
+    throw new WorkflowError('missing_host_credential', msg);
   }
 
   /**
