@@ -23,9 +23,9 @@ export function isKnownAdapter(id: string): id is AcpAdapterId {
  * credential proxy reads this on every upstream request to substitute the
  * live access token for a per-VM sentinel; the workflow loader probes its
  * existence at startup so a missing file fails fast with a clear message
- * instead of opaque per-request errors. The codex adapter has no host file
- * dependency under the proxy architecture — it relies on `OPENAI_API_KEY`
- * forwarded via `smolvm.forward_env`.
+ * instead of opaque per-request errors. codex routes through the same proxy but
+ * reads its credential from `~/.codex/auth.json` (a ChatGPT-OAuth access token
+ * or `OPENAI_API_KEY`) or an `OPENAI_API_KEY` env var, so it is not probed here.
  */
 export function hostClaudeCredentialPath(): string {
   return path.join(os.homedir(), '.claude', '.credentials.json');

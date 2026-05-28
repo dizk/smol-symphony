@@ -20,6 +20,7 @@ import {
 import { stageClaudeIdentity } from '../src/agent/adapters.js';
 
 interface RecordedRequest {
+  host: string;
   method: string;
   pathname: string;
   headers: Record<string, string>;
@@ -41,6 +42,7 @@ function makeFakeUpstream(): FakeUpstream {
     },
     async send(input) {
       calls.push({
+        host: input.host,
         method: input.method,
         pathname: input.pathname,
         headers: input.headers,
@@ -610,6 +612,167 @@ describe('CredentialProxy: ratelimit + org headers forwarded to in-VM client', (
     assert.equal(res.headers.get('anthropic-ratelimit-unified-5h-status'), 'allowed');
     assert.equal(res.headers.get('anthropic-ratelimit-unified-5h-utilization'), '0.42');
     assert.equal(res.headers.get('anthropic-ratelimit-unified-7d-utilization'), '0.08');
+  });
+});
+
+describe('CredentialProxy: adapter-keyed upstream profiles (codex)', () => {
+  let tmp = '';
+  let proxy: CredentialProxy | null = null;
+  let upstream: FakeUpstream;
+  let base = '';
+  let prevOpenAiKey: string | undefined;
+
+  afterEach(async () => {
+    if (proxy) {
+      await proxy.stop();
+      proxy = null;
+    }
+    if (tmp) {
+      await rm(tmp, { recursive: true, force: true });
+      tmp = '';
+    }
+    if (prevOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = prevOpenAiKey;
+  });
+
+  async function boot(opts: {
+    claude?: object;
+    codexAuth?: object;
+    codexEnvKey?: string;
+  }): Promise<void> {
+    tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-multi-'));
+    const claudePath = path.join(tmp, 'claude-credentials.json');
+    const codexPath = path.join(tmp, 'codex-auth.json');
+    if (opts.claude) await writeFile(claudePath, JSON.stringify(opts.claude), 'utf8');
+    if (opts.codexAuth) await writeFile(codexPath, JSON.stringify(opts.codexAuth), 'utf8');
+    prevOpenAiKey = process.env.OPENAI_API_KEY;
+    if (opts.codexEnvKey !== undefined) process.env.OPENAI_API_KEY = opts.codexEnvKey;
+    else delete process.env.OPENAI_API_KEY;
+    upstream = makeFakeUpstream();
+    proxy = new CredentialProxy({
+      upstream,
+      lockPath: path.join(tmp, 'refresh.lock'),
+      credentialsPath: claudePath, // claude shorthand
+      profileOverrides: { codex: { credentialsPath: codexPath } },
+    });
+    await proxy.start('127.0.0.1', 0);
+    base = `http://127.0.0.1:${proxy.port()}`;
+  }
+
+  it('routes a codex registration to api.openai.com with the ChatGPT-OAuth access token', async () => {
+    await boot({
+      codexAuth: {
+        OPENAI_API_KEY: null,
+        tokens: { access_token: 'cx-access-token', refresh_token: 'cx-REFRESH-token', account_id: 'acc-1' },
+        last_refresh: '2026-05-20T00:00:00Z',
+      },
+    });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'codex' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{"ok":true}') });
+    const res = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}`, 'content-type': 'application/json' },
+      body: '{"model":"gpt-5.5"}',
+    });
+    assert.equal(res.status, 200);
+    const call = upstream.calls[0]!;
+    assert.equal(call.host, 'api.openai.com');
+    assert.equal(call.headers['authorization'], 'Bearer cx-access-token');
+    // The refresh token must NEVER reach upstream — it stays host-side.
+    assert.equal(JSON.stringify(call).includes('cx-REFRESH-token'), false);
+  });
+
+  it('falls back to the auth.json OPENAI_API_KEY when there is no OAuth token bundle', async () => {
+    await boot({ codexAuth: { OPENAI_API_KEY: 'sk-codex-file-key' } });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'codex' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '',
+    });
+    assert.equal(upstream.calls[0]!.headers['authorization'], 'Bearer sk-codex-file-key');
+  });
+
+  it('falls back to the OPENAI_API_KEY env var when auth.json is absent', async () => {
+    await boot({ codexEnvKey: 'sk-codex-env-key' }); // no codexAuth file written
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'codex' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '',
+    });
+    assert.equal(upstream.calls[0]!.headers['authorization'], 'Bearer sk-codex-env-key');
+  });
+
+  it('503s a codex dispatch when neither auth.json nor OPENAI_API_KEY yields a token', async () => {
+    await boot({}); // no codex file, no env key
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'codex' });
+    const res = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '',
+    });
+    assert.equal(res.status, 503);
+    assert.equal(upstream.calls.length, 0);
+  });
+
+  it('forwards the OpenAI x-ratelimit-* billing-tell headers back to the in-VM client', async () => {
+    await boot({ codexAuth: { tokens: { access_token: 'cx-access' } } });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'codex' });
+    upstream.nextResponse({
+      statusCode: 200,
+      headers: {
+        'content-type': 'application/json',
+        'x-ratelimit-limit-requests': '500',
+        'x-ratelimit-remaining-requests': '499',
+        'x-ratelimit-remaining-tokens': '29000',
+      },
+      body: jsonBody('{}'),
+    });
+    const res = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-ratelimit-limit-requests'), '500');
+    assert.equal(res.headers.get('x-ratelimit-remaining-requests'), '499');
+    assert.equal(res.headers.get('x-ratelimit-remaining-tokens'), '29000');
+  });
+
+  it('keys upstream + credential per registration: claude and codex on one proxy', async () => {
+    await boot({
+      claude: { claudeAiOauth: { accessToken: 'an-access', expiresAt: Date.now() + 3_600_000 } },
+      codexAuth: { tokens: { access_token: 'oa-access' } },
+    });
+    const claudeReg = proxy!.register({ issueId: 'ic', identifier: 'C', adapterId: 'claude' });
+    const codexReg = proxy!.register({ issueId: 'ix', identifier: 'X', adapterId: 'codex' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claudeReg.sentinel}` },
+      body: '',
+    });
+    await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${codexReg.sentinel}` },
+      body: '',
+    });
+    assert.equal(upstream.calls[0]!.host, 'api.anthropic.com');
+    assert.equal(upstream.calls[0]!.headers['authorization'], 'Bearer an-access');
+    assert.equal(upstream.calls[1]!.host, 'api.openai.com');
+    assert.equal(upstream.calls[1]!.headers['authorization'], 'Bearer oa-access');
+  });
+
+  it('register() rejects an unknown adapter id', async () => {
+    await boot({ codexAuth: { tokens: { access_token: 'x' } } });
+    assert.throws(
+      () => proxy!.register({ issueId: 'i', identifier: '1', adapterId: 'opencode' as never }),
+      /no upstream profile for adapter/,
+    );
   });
 });
 

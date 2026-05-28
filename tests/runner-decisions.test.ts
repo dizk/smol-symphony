@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import type { Issue } from '../src/types.js';
 import {
   classifyTurnOutcome,
+  computeForwardedEnv,
   decideAttemptOutcome,
   decideTurnContinuation,
   deriveActionContext,
+  proxyCredentialEnv,
   selectPromptKind,
 } from '../src/agent/runner-decisions.js';
+import { ADAPTERS } from '../src/agent/adapters.js';
 
 function makeIssue(state: string): Issue {
   return {
@@ -212,5 +215,50 @@ describe('deriveActionContext', () => {
     });
     assert.equal(ctx.pr_title, 'iss-9', 'no title → just the id');
     assert.equal(ctx.repo, null);
+  });
+});
+
+describe('proxyCredentialEnv', () => {
+  const reg = { sentinel: 'sk-symphony-xyz', baseUrl: 'http://127.0.0.1:5000' };
+
+  it('stages the sentinel + base URL under the claude env var names', () => {
+    assert.deepEqual(proxyCredentialEnv(ADAPTERS.claude.proxyEnv, 'claude', reg), {
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:5000',
+      ANTHROPIC_AUTH_TOKEN: 'sk-symphony-xyz',
+    });
+  });
+
+  it('stages the sentinel + base URL under the codex env var names', () => {
+    assert.deepEqual(proxyCredentialEnv(ADAPTERS.codex.proxyEnv, 'codex', reg), {
+      OPENAI_BASE_URL: 'http://127.0.0.1:5000',
+      OPENAI_API_KEY: 'sk-symphony-xyz',
+    });
+  });
+
+  it('throws when a proxy adapter declares no proxyEnv (profile bug)', () => {
+    assert.throws(() => proxyCredentialEnv(undefined, 'opencode', reg), /declares no proxyEnv/);
+  });
+});
+
+describe('computeForwardedEnv', () => {
+  const readEnv = (k: string): string | undefined =>
+    ({ OPENAI_API_KEY: 'sk-real-openai', ANTHROPIC_API_KEY: 'sk-real-anthropic', EMPTY: '' })[k];
+
+  it('forwards present, non-empty vars and skips unset/empty ones', () => {
+    assert.deepEqual(computeForwardedEnv(['OPENAI_API_KEY', 'EMPTY', 'MISSING'], undefined, readEnv), {
+      OPENAI_API_KEY: 'sk-real-openai',
+    });
+  });
+
+  it('omits the proxy credential var so the real key never reaches the VM boot env', () => {
+    // The whole point of proxy mode: with OPENAI_API_KEY omitted, the real key
+    // is absent from the forwarded env even though it is in the forward_env list.
+    const env = computeForwardedEnv(
+      ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY'],
+      'OPENAI_API_KEY',
+      readEnv,
+    );
+    assert.equal(env.OPENAI_API_KEY, undefined);
+    assert.equal(env.ANTHROPIC_API_KEY, 'sk-real-anthropic');
   });
 });

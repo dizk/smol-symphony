@@ -7,17 +7,29 @@ and how — to extend the host credential proxy to the codex adapter.
 
 **Important provenance caveat.** The Anthropic matrix (#112) was measured
 *live* against `https://api.anthropic.com/v1/messages` from a host holding an
-active Claude Max credential. **This doc could NOT be measured live**: the
-implementing environment has no OpenAI API key, no ChatGPT-subscription
-`~/.codex/auth.json`, and no outbound network credentials. Every row below is
-therefore **doc-derived** — synthesised from OpenAI / codex documentation, the
-`codex-rs` source behaviour described in those docs, well-established OpenAI API
-conventions, and the 2026-05-28 web research pass recorded in the issue body.
-Rows that would require a live token to confirm are marked
-**`DOC-DERIVED (needs live confirm)`**. The recommendation (§6) is written to be
-safe under that uncertainty: it does **not** flip codex onto an unverified path.
+active Claude Max credential. **This doc could NOT be measured live by the
+implementer**: the implementing environment has no OpenAI API key, no
+ChatGPT-subscription `~/.codex/auth.json`, and no outbound credential. Every row
+below is therefore **doc-derived** — synthesised from OpenAI / codex
+documentation, the `codex-rs` source behaviour described in those docs,
+well-established OpenAI API conventions, and the 2026-05-28 web research pass
+recorded in the issue body. Rows that would require a live token to confirm are
+marked **`DOC-DERIVED (needs live confirm)`**.
 
-Captured: 2026-05-28.
+**Implementation status (issue #116).** The generalization (§6 follow-up steps
+2–4) has landed and `codex.credentialStrategy` is flipped to `'proxy'`. The
+load-bearing Q2 risk (codex-acp honoring the base URL for the *OAuth handshake*)
+is **sidestepped by design**: the VM only ever receives
+`OPENAI_API_KEY=<sentinel>` + `OPENAI_BASE_URL=<proxy>`, so codex-acp runs in the
+SDK's high-confidence API-key code path (§5 / Q4) and never performs the OAuth
+handshake itself — that, and refresh, stay host-side. The live confirm is now
+performed by the **Review dispatch itself**: the reviewer is codex, so a
+successful Review run *is* the smoke test that codex-acp honors `OPENAI_BASE_URL`
+for inference through the proxy. The remaining rows below should be updated from
+`DOC-DERIVED` to measured once the reviewer observes the real billing-tell
+header in the proxy's `credential proxy: upstream ratelimit` log line.
+
+Captured: 2026-05-28. Implemented: issue #116.
 
 ---
 
@@ -87,9 +99,25 @@ is carried as a gap into the implementation slice.
 
 ## 3. Research Q2 — does codex-acp honor `OPENAI_BASE_URL`? (THE GATING UNKNOWN)
 
-**Answer: unresolved, and unresolvable in this environment.** This is the
-load-bearing question for whether the proxy can interpose at all, and it could
-**not** be settled without a live codex-acp + ChatGPT-OAuth environment.
+**Resolution (issue #116): sidestepped, not answered.** The original framing
+asked whether codex-acp honors the base URL *for the ChatGPT-OAuth handshake*.
+The #116 implementation removes that dependency: the VM is presented as
+**API-key mode** (`OPENAI_API_KEY=<sentinel>` + `OPENAI_BASE_URL=<proxy>`), so
+the in-VM codex-acp never runs the OAuth handshake — it attaches the sentinel as
+a bearer to inference calls aimed at the base URL, and the host proxy swaps in
+the real credential (an API key, or a ChatGPT-OAuth `access_token` read from
+`~/.codex/auth.json`). The only thing that must hold for the VM side is that
+codex-acp honors `OPENAI_BASE_URL` for *inference*, which is the §5 / Q4
+high-confidence path (the OpenAI SDK honors `base_url` for normal API calls).
+The OAuth refresh stays entirely host-side (§4 option c). The Review dispatch
+(codex, live) confirms inference-through-proxy works end to end.
+
+The original analysis is retained below for context.
+
+**Answer (as originally researched): unresolved, and unresolvable in the
+implementer's environment.** This was the load-bearing question for whether the
+proxy can interpose *on the OAuth path*, and it could **not** be settled without
+a live codex-acp + ChatGPT-OAuth environment.
 
 What the docs say (cuts both ways):
 
@@ -186,7 +214,23 @@ slice of a future codex-proxy implementation.
 
 ---
 
-## 6. Decision (resolves issue #115 acceptance bullet 2)
+## 6. Decision (resolves issue #115 acceptance bullet 2; implemented in #116)
+
+> **Update (issue #116).** The deferral described below is now resolved. The
+> `CredentialProxy` has been generalized to an adapter-keyed `UpstreamProfile`
+> (upstream host, credential reader, env fallback, refresher, billing-tell
+> header set per adapter), a codex profile was added (api.openai.com,
+> `~/.codex/auth.json` `tokens.access_token` / `OPENAI_API_KEY` reader — never
+> the refresh token — with an `OPENAI_API_KEY` env fallback, long-TTL no-op
+> refresher per §4 option c), the per-dispatch env now picks
+> `OPENAI_BASE_URL`/`OPENAI_API_KEY` from the adapter's `proxyEnv`, the real
+> credential var is stripped from the VM boot env, and
+> `codex.credentialStrategy` is flipped to `'proxy'`. The live confirm (Q2
+> inference-through-proxy + the Q4 billing-tell header) is performed by the
+> Review dispatch, since the reviewer is codex. The original deferral rationale
+> is preserved below for the record.
+
+
 
 Issue #115 offers two implementation branches: **(a)** generalize the proxy to
 support codex end-to-end, or **(b)** a documented decision that codex stays
