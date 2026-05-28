@@ -47,11 +47,12 @@ tracker:
 #                and the landing directory for `symphony.propose_issue`.
 #   adapter   (string, optional): override the workflow-level `acp.adapter` for
 #             agents dispatched in this state. Must be a known profile (claude,
-#             codex). claude has a single host credential file
-#             (~/.claude/.credentials.json) that is probed for readability at
-#             startup; codex has two valid sources (~/.codex/auth.json or
-#             OPENAI_API_KEY) and is validated lazily by the proxy on first
-#             request, so it is not startup-probed.
+#             codex). Both route through the host credential proxy and are
+#             startup-probed so a missing credential fails fast. claude has a
+#             single host credential file (~/.claude/.credentials.json) that is
+#             probed for readability; codex passes when either ~/.codex/auth.json
+#             holds a token (ChatGPT-OAuth tokens.access_token or a top-level
+#             OPENAI_API_KEY) or the host OPENAI_API_KEY env var is set.
 #   model     (string, optional): override `acp.model` for this state.
 #             Blank or whitespace-only values normalize to "use the adapter
 #             default" (same as the workflow-level acp.model semantics).

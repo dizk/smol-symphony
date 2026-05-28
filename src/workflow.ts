@@ -714,14 +714,15 @@ export function warnOnHooksAndActionsConflict(cfg: ServiceConfig): void {
 }
 
 // Dispatch preflight validation (structural, pure). The fs-touching probes —
-// `tracker.root` existence, `smolvm.smolfile` existence, and the claude host
-// credential file — live in the shell loader's `validateDispatchIo`, which the
-// orchestrator calls alongside this function. Only claude is startup-probed: it
-// has a single required host file (`~/.claude/.credentials.json`). codex routes
-// through the same proxy but has two valid sources (`~/.codex/auth.json` or
-// `OPENAI_API_KEY`), so the proxy validates it lazily on first request rather
-// than at load time. Keeping the structural half pure means tests and the reload
-// tick can re-run it cheaply on every reconcile without re-hitting the disk.
+// `tracker.root` existence, `smolvm.smolfile` existence, and the proxy-backed
+// adapter credentials — live in the shell loader's `validateDispatchIo`, which
+// the orchestrator calls alongside this function. Both proxy adapters are
+// startup-probed: claude requires a single readable host file
+// (`~/.claude/.credentials.json`); codex passes when either `~/.codex/auth.json`
+// holds a token (ChatGPT-OAuth `tokens.access_token` or a top-level
+// `OPENAI_API_KEY`) or the host `OPENAI_API_KEY` env var is set. Keeping this
+// structural half pure means tests and the reload tick can re-run it cheaply on
+// every reconcile without re-hitting the disk.
 export function validateDispatch(cfg: ServiceConfig): string | null {
   if (cfg.tracker.kind !== 'local') {
     return `unsupported_tracker_kind: ${cfg.tracker.kind || '<missing>'}`;
