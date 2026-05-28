@@ -35,7 +35,7 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest, type RequestOptions as HttpsRequestOptions } from 'node:https';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFile, mkdir, open as fsOpen, type FileHandle } from 'node:fs/promises';
+import { readFile, mkdir, open as fsOpen, stat as fsStat, unlink as fsUnlink } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -95,7 +95,7 @@ export interface UpstreamResponse {
 export interface CredentialProxyOptions {
   /** Path to host claude credentials JSON. Default: ~/.claude/.credentials.json. */
   credentialsPath?: string;
-  /** Path to the flock target used to serialize host-side refreshes. */
+  /** Path to the cross-process lock file serializing host-side refreshes. */
   lockPath?: string;
   /** Refresh when (expiresAt - now) is below this many ms. Default 60_000. */
   refreshMarginMs?: number;
@@ -107,6 +107,20 @@ export interface CredentialProxyOptions {
   override?: HeaderOverride;
   /** Clock; tests inject a deterministic one. */
   now?: () => number;
+  /** Polling interval (ms) while waiting on the cross-process lock. Default 25. */
+  lockPollMs?: number;
+  /**
+   * Lock files older than this (ms) are treated as abandoned by a crashed
+   * holder and force-cleared. Must comfortably exceed the worst-case refresher
+   * runtime (a `claude -p ok` round-trip). Default 180_000 (3 minutes).
+   */
+  lockStaleMs?: number;
+  /**
+   * Hard cap on time spent waiting for the cross-process lock. Default 90_000
+   * (90 seconds). Bounded so a pathological peer can't hang a VM request
+   * indefinitely; on timeout, the caller falls back to the stale cached token.
+   */
+  lockAcquireTimeoutMs?: number;
 }
 
 interface Registration {
@@ -183,6 +197,9 @@ export class CredentialProxy {
   private readonly upstream: UpstreamRequestor;
   private readonly refresher: () => Promise<void>;
   private readonly now: () => number;
+  private readonly lockPollMs: number;
+  private readonly lockStaleMs: number;
+  private readonly lockAcquireTimeoutMs: number;
   private override: HeaderOverride;
   private stopped = false;
   // In-process single-flight: when a refresh is in flight, every other caller
@@ -190,13 +207,18 @@ export class CredentialProxy {
   private refreshInFlight: Promise<void> | null = null;
 
   constructor(opts: CredentialProxyOptions = {}) {
-    this.credentialsPath = opts.credentialsPath ?? path.join(os.homedir(), '.claude', '.credentials.json');
-    this.lockPath = opts.lockPath ?? path.join(os.homedir(), '.symphony', 'oauth', 'refresh.lock');
-    this.refreshMarginMs = opts.refreshMarginMs ?? 60_000;
-    this.upstream = opts.upstream ?? defaultUpstream();
-    this.refresher = opts.refresher ?? defaultRefresher();
-    this.override = opts.override ?? NOOP_OVERRIDE;
-    this.now = opts.now ?? (() => Date.now());
+    const wiring = resolveCredentialProxyWiring(opts);
+    const tuning = resolveCredentialProxyTuning(opts);
+    this.credentialsPath = wiring.credentialsPath;
+    this.lockPath = wiring.lockPath;
+    this.upstream = wiring.upstream;
+    this.refresher = wiring.refresher;
+    this.override = wiring.override;
+    this.now = wiring.now;
+    this.refreshMarginMs = tuning.refreshMarginMs;
+    this.lockPollMs = tuning.lockPollMs;
+    this.lockStaleMs = tuning.lockStaleMs;
+    this.lockAcquireTimeoutMs = tuning.lockAcquireTimeoutMs;
   }
 
   /**
@@ -289,9 +311,9 @@ export class CredentialProxy {
 
   /**
    * Spawn `claude -p "ok"` (or the injected refresher) under a host-side
-   * flock so concurrent symphony processes — and concurrent in-process
-   * callers — collapse into one refresh. Anthropic's own client owns OAuth:
-   * we just trigger it and re-read the rotated credential.
+   * cross-process lock so concurrent symphony processes — and concurrent
+   * in-process callers — collapse into one refresh. Anthropic's own client
+   * owns OAuth: we just trigger it and re-read the rotated credential.
    */
   async refreshNow(): Promise<void> {
     if (this.refreshInFlight) return this.refreshInFlight;
@@ -304,17 +326,85 @@ export class CredentialProxy {
 
   private async runRefreshUnderLock(): Promise<void> {
     await mkdir(path.dirname(this.lockPath), { recursive: true });
-    let handle: FileHandle | null = null;
+    const acquired = await this.acquireFileLock();
+    if (!acquired) {
+      // Could not acquire within timeout — proceed without the lock rather
+      // than failing the request. The caller will return whatever token is
+      // in the cache; in the worst case the upstream rejects with 401 and
+      // the in-VM runner surfaces that as a normal auth error.
+      log.warn('credential proxy: lock acquire timed out; refreshing without serialization', {
+        path: this.lockPath,
+      });
+      try {
+        await this.refresher();
+      } catch (err) {
+        log.warn('credential proxy: unserialized refresh failed', { error: (err as Error).message });
+        throw err;
+      }
+      return;
+    }
     try {
-      handle = await fsOpen(this.lockPath, 'w');
-      // Best-effort POSIX advisory lock — Node exposes `flock` only via
-      // `node:fs/promises` on recent versions. We serialize in-process via
-      // `refreshInFlight` already; the file just exists so cross-process
-      // serialization works under `flock(1)` from the operator's shell.
       await this.refresher();
     } finally {
-      if (handle) await handle.close().catch(() => undefined);
+      await this.releaseFileLock();
     }
+  }
+
+  /**
+   * Cross-process advisory lock built on `O_CREAT | O_EXCL`. Each holder
+   * writes its PID into the lockfile so a second process can detect a
+   * crashed predecessor; mtime-based staleness is the backstop when PID
+   * inspection fails (different host, PID reuse, etc.).
+   *
+   * Returns true on acquire, false on timeout.
+   */
+  private async acquireFileLock(): Promise<boolean> {
+    const start = this.now();
+    let firstAttempt = true;
+    while (true) {
+      try {
+        // O_CREAT | O_EXCL via the 'wx' open flag: filesystem-atomic create.
+        // If two processes race here, exactly one succeeds and the other
+        // gets EEXIST; we then poll until the holder releases or the file
+        // is detected stale.
+        const handle = await fsOpen(this.lockPath, 'wx', 0o600);
+        try {
+          await handle.writeFile(`${process.pid}\n`, 'utf8');
+        } finally {
+          await handle.close().catch(() => undefined);
+        }
+        return true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST') throw err;
+        if (await this.lockHolderIsStale()) {
+          await fsUnlink(this.lockPath).catch(() => undefined);
+          continue;
+        }
+        if (firstAttempt) {
+          log.debug('credential proxy: refresh lock held; waiting', { path: this.lockPath });
+          firstAttempt = false;
+        }
+        if (this.now() - start >= this.lockAcquireTimeoutMs) return false;
+        await sleep(this.lockPollMs);
+      }
+    }
+  }
+
+  private async releaseFileLock(): Promise<void> {
+    await fsUnlink(this.lockPath).catch(() => undefined);
+  }
+
+  private async lockHolderIsStale(): Promise<boolean> {
+    let mtimeMs: number;
+    try {
+      const st = await fsStat(this.lockPath);
+      mtimeMs = st.mtimeMs;
+    } catch {
+      // Vanished between the EEXIST and our stat — treat as released.
+      return true;
+    }
+    return this.now() - mtimeMs > this.lockStaleMs;
   }
 
   /**
@@ -428,6 +518,45 @@ export class CredentialProxy {
     }
     return null;
   }
+}
+
+// The constructor's nullish-coalescing chain would otherwise blow the FC/IS
+// complexity budget, so defaults are applied in two thematic groups.
+
+function resolveCredentialProxyWiring(opts: CredentialProxyOptions): {
+  credentialsPath: string;
+  lockPath: string;
+  upstream: UpstreamRequestor;
+  refresher: () => Promise<void>;
+  override: HeaderOverride;
+  now: () => number;
+} {
+  return {
+    credentialsPath: opts.credentialsPath ?? path.join(os.homedir(), '.claude', '.credentials.json'),
+    lockPath: opts.lockPath ?? path.join(os.homedir(), '.symphony', 'oauth', 'refresh.lock'),
+    upstream: opts.upstream ?? defaultUpstream(),
+    refresher: opts.refresher ?? defaultRefresher(),
+    override: opts.override ?? NOOP_OVERRIDE,
+    now: opts.now ?? (() => Date.now()),
+  };
+}
+
+function resolveCredentialProxyTuning(opts: CredentialProxyOptions): {
+  refreshMarginMs: number;
+  lockPollMs: number;
+  lockStaleMs: number;
+  lockAcquireTimeoutMs: number;
+} {
+  return {
+    refreshMarginMs: opts.refreshMarginMs ?? 60_000,
+    lockPollMs: opts.lockPollMs ?? 25,
+    lockStaleMs: opts.lockStaleMs ?? 180_000,
+    lockAcquireTimeoutMs: opts.lockAcquireTimeoutMs ?? 90_000,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 function writeProxyError(res: ServerResponse, status: number, message: string): void {

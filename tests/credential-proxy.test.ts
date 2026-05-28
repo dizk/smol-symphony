@@ -295,6 +295,109 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
     assert.equal(resB.status, 200);
     assert.equal(booted.refresherCalls, 1, 'expected single-flight collapse to 1 spawn');
   });
+
+  it('serializes refresh across two proxy instances sharing one lock file', async () => {
+    // Two CredentialProxy instances simulate two symphony processes: each has
+    // its own `refreshInFlight` (in-process single-flight) but they share the
+    // on-disk lockPath. With a real cross-process lock the second instance's
+    // refresher must wait for the first to finish; without one they'd race.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-multilock-'));
+    const credentialsPath = path.join(tmp, '.credentials.json');
+    const lockPath = path.join(tmp, 'refresh.lock');
+    await writeFile(
+      credentialsPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: 'init', expiresAt: Date.now() + 3_600_000 } }),
+      'utf8',
+    );
+    // Span tracking: each refresher records [start, end] timestamps. Two real
+    // serialized spans must not overlap; concurrent (broken-lock) spans will.
+    type Span = { start: number; end: number };
+    const spansA: Span[] = [];
+    const spansB: Span[] = [];
+    let releaseA: (() => void) | null = null;
+    const holdA = new Promise<void>((resolve) => { releaseA = resolve; });
+    const makeProxy = (label: 'A' | 'B', spans: Span[], hold?: Promise<void>): CredentialProxy =>
+      new CredentialProxy({
+        credentialsPath,
+        lockPath,
+        upstream: makeFakeUpstream(),
+        refresher: async () => {
+          const start = Date.now();
+          if (hold) await hold;
+          // Even without a hold, give the scheduler a chance to interleave.
+          await new Promise((r) => setTimeout(r, 25));
+          const end = Date.now();
+          spans.push({ start, end });
+          void label;
+        },
+        // Tight polling so the test completes quickly.
+        lockPollMs: 5,
+        lockStaleMs: 60_000,
+        lockAcquireTimeoutMs: 10_000,
+      });
+    const proxyA = makeProxy('A', spansA, holdA);
+    const proxyB = makeProxy('B', spansB);
+    try {
+      // Start A; A's refresher blocks on holdA. B must queue on the file lock.
+      const refreshA = proxyA.refreshNow();
+      // Let A acquire the lock and enter its refresher.
+      await new Promise((r) => setTimeout(r, 30));
+      const refreshB = proxyB.refreshNow();
+      // Now release A; A finishes, releases the lock, B acquires and runs.
+      await new Promise((r) => setTimeout(r, 30));
+      releaseA!();
+      await Promise.all([refreshA, refreshB]);
+      assert.equal(spansA.length, 1, 'A refresher ran once');
+      assert.equal(spansB.length, 1, 'B refresher ran once');
+      const [a] = spansA;
+      const [b] = spansB;
+      // The cross-process lock guarantee: spans are disjoint, with B's start
+      // at or after A's end. Allow a small clock-resolution slack.
+      assert.ok(
+        b!.start + 5 >= a!.end,
+        `expected B (start=${b!.start}) to start after A ended (end=${a!.end}); ` +
+          'cross-process file lock is not serializing',
+      );
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('breaks through a stale lockfile abandoned by a crashed holder', async () => {
+    // If a previous holder crashed before unlinking the lockfile, the next
+    // acquire must detect the stale lock (mtime older than lockStaleMs) and
+    // force-clear it rather than blocking forever.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-stalelock-'));
+    const credentialsPath = path.join(tmp, '.credentials.json');
+    const lockPath = path.join(tmp, 'refresh.lock');
+    await writeFile(
+      credentialsPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: 'init', expiresAt: Date.now() + 3_600_000 } }),
+      'utf8',
+    );
+    // Pre-create the lockfile and backdate its mtime to look abandoned.
+    await writeFile(lockPath, '999999\n', 'utf8');
+    const { utimes } = await import('node:fs/promises');
+    const ancient = new Date(Date.now() - 5 * 60_000); // 5 min old
+    await utimes(lockPath, ancient, ancient);
+
+    let ran = 0;
+    const proxy = new CredentialProxy({
+      credentialsPath,
+      lockPath,
+      upstream: makeFakeUpstream(),
+      refresher: async () => { ran += 1; },
+      lockPollMs: 5,
+      lockStaleMs: 30_000, // 30s threshold; the lockfile is 5 min old
+      lockAcquireTimeoutMs: 5_000,
+    });
+    try {
+      await proxy.refreshNow();
+      assert.equal(ran, 1, 'refresher should run after breaking the stale lock');
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('CredentialProxy: header-override seam', () => {
