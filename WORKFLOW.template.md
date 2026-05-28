@@ -282,13 +282,20 @@ workspace:
 #                        attempt_ended, reconciliation_terminating, etc.).
 #
 # Orchestrator-side: a single `<root>/symphony.log` (created on demand) gets
-# every structured log line that symphony writes to stderr — workflow loads,
-# dispatch decisions, hook results, reconciler ticks, shutdown — in the same
-# `key=value` text format. Lets an agent reviewing a finished run (typically
-# with `.symphony/logs/` mounted into a VM) replay orchestrator-side events
+# every structured log line symphony emits — workflow loads, dispatch
+# decisions, hook results, reconciler ticks, shutdown — in `key=value` text
+# format. Lets an agent reviewing a finished run (typically with
+# `.symphony/logs/` mounted into a VM) replay orchestrator-side events
 # alongside the per-issue JSONL traces in the same directory. Set the
 # `SYMPHONY_LOG_FILE` env var to override the path; set it to the empty
 # string to disable the file sink entirely (stderr remains).
+#
+# Console routing: while the file sink is active (the default), the structured
+# stream goes to the file ONLY — the console shows just the startup banner
+# (workflow, tracker root, dashboard URL, log-file path). `tail -f` the log
+# file to follow the detail. Pass `--verbose` (alias `--foreground`) to mirror
+# the structured stream back onto the console for interactive debugging. With
+# no file sink configured, the structured stream stays on stderr.
 #
 # Intended for later evaluation — typically by another agent running inside a VM
 # — so the schema is verbose on purpose. Writes are best-effort: a failure to

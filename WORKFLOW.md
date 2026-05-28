@@ -127,10 +127,12 @@ workspace:
 # One JSONL file per issue, appended across attempts and process restarts;
 # captures every ACP JSON-RPC frame to/from the VM, raw adapter stderr,
 # host-side hook output, and orchestrator lifecycle events — intended for
-# later evaluation by another agent. The sibling `symphony.log` mirrors the
-# orchestrator's stderr structured log (dispatch, hooks, reconciler, shutdown)
-# in the same `key=value` format so a post-hoc review has both surfaces in
-# one directory. See WORKFLOW.template.md for the full schema.
+# later evaluation by another agent. The sibling `symphony.log` captures the
+# orchestrator's structured log (dispatch, hooks, reconciler, shutdown) in the
+# same `key=value` format so a post-hoc review has both surfaces in one
+# directory. While the file sink is active the console shows only the startup
+# banner; `tail -f symphony.log` follows the detail, and `--verbose` mirrors it
+# back to the console. See WORKFLOW.template.md for the full schema.
 logs:
   root: ./.symphony/logs
 
