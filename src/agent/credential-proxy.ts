@@ -21,10 +21,19 @@
 // The "only the host refreshes" invariant is structural: VMs have no
 // `refreshToken` on their filesystem under proxy mode. When the cached access
 // token is past its `expiresAt` (or within a small margin) the proxy spawns
-// `claude -p "ok"` on the host under an flock so concurrent stale-cache
-// callers collapse into a single refresh. The host's own ticker (running on
+// `claude -p "ok"` on the host under a kernel-managed `flock(2)` advisory lock
+// (via `flock(1)`) so concurrent stale-cache callers — across processes —
+// collapse into a single refresh. The host's own ticker (running on
 // `cfg.credentials.ticker_interval_ms`) keeps the cache warm during idle
 // periods so the first VM request after expiry doesn't pay the spawn latency.
+//
+// Why `flock(1)` and not a homegrown lockfile protocol: the kernel owns the
+// lock state. Two contenders cannot both believe they hold the lock; the lock
+// is released automatically when the holder process dies (no stale-lock
+// problem, no PID-liveness heuristics); and a peer cannot delete another
+// peer's live lock (an `O_CREAT|O_EXCL` lockfile + `unlink` scheme always
+// races on break/release ownership, see the codex review thread on this issue
+// for the concrete sequence).
 //
 // A typed header-override seam runs immediately before each upstream forward.
 // Its default is no-op (the in-VM client emits its own well-formed identity
@@ -35,8 +44,8 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest, type RequestOptions as HttpsRequestOptions } from 'node:https';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFile, mkdir, open as fsOpen, unlink as fsUnlink } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { readFile, mkdir } from 'node:fs/promises';
+import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import type { AddressInfo } from 'node:net';
@@ -107,22 +116,36 @@ export interface CredentialProxyOptions {
   override?: HeaderOverride;
   /** Clock; tests inject a deterministic one. */
   now?: () => number;
-  /** Polling interval (ms) while waiting on the cross-process lock. Default 25. */
-  lockPollMs?: number;
   /**
-   * Hard cap on time spent waiting for the cross-process lock. Default 90_000
-   * (90 seconds). Bounded so a pathological peer can't hang a VM request
-   * indefinitely; on timeout, refreshNow fails closed (no refresher spawn).
+   * Hard cap on time spent waiting to acquire the cross-process refresh lock.
+   * Default 90_000 (90 seconds). Bounded so a pathological peer can't hang a
+   * VM request indefinitely; on timeout, refreshNow fails closed (no refresher
+   * spawn) and ensureFreshToken re-reads the cache to pick up whatever the
+   * peer rotated to (or returns the stale token to let upstream surface 401).
    */
   lockAcquireTimeoutMs?: number;
   /**
-   * Liveness check used to detect a dead lock holder. Default: `process.kill(pid, 0)`
-   * — the kernel reports ESRCH iff the holder process is gone, which is the only
-   * acceptable "proof the holder is gone" signal (mtime-based staleness would
-   * also break live-but-slow holders). Tests inject a deterministic stub.
+   * Lock acquirer used to serialize host-side refresh across processes. The
+   * returned `release` callback is idempotent and tears down the kernel-side
+   * lock. Default: spawn `flock(1)` with the lockPath argument — this gives us
+   * `flock(2)` advisory locking, where the kernel:
+   *   (1) only permits one holder of the exclusive lock at a time,
+   *   (2) releases the lock automatically when the holder process exits (so a
+   *       crashed peer cannot leak a stale lock), and
+   *   (3) makes it impossible for a peer to remove our live lock — there is no
+   *       lockfile to unlink, only a kernel-managed lock on the file descriptor.
+   * Tests inject a deterministic stub.
    */
-  processAlive?: (pid: number) => boolean;
+  lockAcquire?: LockAcquire;
 }
+
+/**
+ * Acquire the cross-process refresh lock. The returned promise resolves to a
+ * `release` callback once the lock is held; on timeout / failure, the promise
+ * rejects with `Error("credential proxy: refresh lock acquire timeout")`.
+ * `release` is idempotent; calling it more than once is a no-op.
+ */
+export type LockAcquire = (timeoutMs: number) => Promise<() => Promise<void>>;
 
 interface Registration {
   sentinel: string;
@@ -198,9 +221,8 @@ export class CredentialProxy {
   private readonly upstream: UpstreamRequestor;
   private readonly refresher: () => Promise<void>;
   private readonly now: () => number;
-  private readonly lockPollMs: number;
   private readonly lockAcquireTimeoutMs: number;
-  private readonly processAlive: (pid: number) => boolean;
+  private readonly lockAcquire: LockAcquire;
   private override: HeaderOverride;
   private stopped = false;
   // In-process single-flight: when a refresh is in flight, every other caller
@@ -216,9 +238,8 @@ export class CredentialProxy {
     this.refresher = wiring.refresher;
     this.override = wiring.override;
     this.now = wiring.now;
-    this.processAlive = wiring.processAlive;
+    this.lockAcquire = wiring.lockAcquire;
     this.refreshMarginMs = tuning.refreshMarginMs;
-    this.lockPollMs = tuning.lockPollMs;
     this.lockAcquireTimeoutMs = tuning.lockAcquireTimeoutMs;
   }
 
@@ -326,108 +347,31 @@ export class CredentialProxy {
   }
 
   private async runRefreshUnderLock(): Promise<void> {
-    await mkdir(path.dirname(this.lockPath), { recursive: true });
-    const acquired = await this.acquireFileLock();
-    if (!acquired) {
-      // Lock acquire timed out. Do NOT spawn the refresher unserialized — that
-      // would race a live peer against the same `~/.claude/.credentials.json`
-      // and defeat the cross-process serialization the lock exists for. Fail
-      // closed: the caller (ensureFreshToken) catches and re-reads the cache,
-      // picking up whatever the lock-holding peer wrote during our wait — or
-      // returning the stale token (upstream then surfaces 401 normally) if
-      // the peer is still running.
-      log.warn('credential proxy: lock acquire timed out; skipping refresh', {
+    let release: (() => Promise<void>) | null = null;
+    try {
+      release = await this.lockAcquire(this.lockAcquireTimeoutMs);
+    } catch (err) {
+      // Acquire failed (timeout, flock missing, etc.). Do NOT spawn the
+      // refresher unserialized — that would race a live peer against the same
+      // `~/.claude/.credentials.json` and defeat the cross-process
+      // serialization the lock exists for. Fail closed: the caller
+      // (ensureFreshToken) catches and re-reads the cache, picking up whatever
+      // the lock-holding peer wrote during our wait — or returning the stale
+      // token (upstream then surfaces 401 normally) if the peer is still
+      // running.
+      log.warn('credential proxy: lock acquire failed; skipping refresh', {
         path: this.lockPath,
+        error: (err as Error).message,
       });
       throw new Error('credential proxy: refresh lock acquire timeout');
     }
     try {
       await this.refresher();
     } finally {
-      await this.releaseFileLock();
+      await release().catch((err) => {
+        log.warn('credential proxy: lock release error', { error: (err as Error).message });
+      });
     }
-  }
-
-  /**
-   * Cross-process advisory lock built on `O_CREAT | O_EXCL`. Each holder
-   * writes its PID into the lockfile; a contending acquirer reads the PID
-   * and uses `process.kill(pid, 0)` to ask the kernel whether that process
-   * still exists. Only an ESRCH (no-such-process) result authorizes breaking
-   * the lock — mtime-based heuristics are deliberately rejected because they
-   * can break a live-but-slow holder (a `claude -p ok` running longer than
-   * any chosen mtime threshold is alive, not abandoned).
-   *
-   * Returns true on acquire, false on timeout.
-   */
-  private async acquireFileLock(): Promise<boolean> {
-    const start = this.now();
-    let firstAttempt = true;
-    while (true) {
-      const created = await this.tryCreateLockfile();
-      if (created) return true;
-      const holder = await this.readLockHolder();
-      if (holder === 'gone') continue; // released between EEXIST and our read; retry create.
-      if (holder === 'dead') {
-        // Kernel confirmed the PID is gone. Safe to break.
-        await fsUnlink(this.lockPath).catch(() => undefined);
-        continue;
-      }
-      // 'alive' (holder still running) or 'unknown' (PID unparseable / file
-      // mid-write). Either way we wait — never break a lock without proof.
-      if (firstAttempt) {
-        log.debug('credential proxy: refresh lock held; waiting', { path: this.lockPath });
-        firstAttempt = false;
-      }
-      if (this.now() - start >= this.lockAcquireTimeoutMs) return false;
-      await sleep(this.lockPollMs);
-    }
-  }
-
-  /**
-   * Attempt the atomic create of the lockfile. Returns true on success
-   * (lock acquired by us), false on EEXIST (someone else holds it).
-   * Any other error is re-thrown.
-   */
-  private async tryCreateLockfile(): Promise<boolean> {
-    try {
-      // O_CREAT | O_EXCL via the 'wx' open flag: filesystem-atomic create.
-      const handle = await fsOpen(this.lockPath, 'wx', 0o600);
-      try {
-        await handle.writeFile(`${process.pid}\n`, 'utf8');
-      } finally {
-        await handle.close().catch(() => undefined);
-      }
-      return true;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
-      throw err;
-    }
-  }
-
-  private async releaseFileLock(): Promise<void> {
-    await fsUnlink(this.lockPath).catch(() => undefined);
-  }
-
-  /**
-   * Inspect the current lockfile to decide whether the holder is still
-   * running. Returns:
-   *   'gone'    — file vanished (released between our EEXIST and read).
-   *   'dead'    — kernel reports ESRCH for the recorded PID; safe to break.
-   *   'alive'   — kernel says the process exists; we must wait.
-   *   'unknown' — file unreadable or PID unparseable (e.g. mid-write race);
-   *               we must wait (never break a lock without proof).
-   */
-  private async readLockHolder(): Promise<'gone' | 'dead' | 'alive' | 'unknown'> {
-    let contents: string;
-    try {
-      contents = await readFile(this.lockPath, 'utf8');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'gone';
-      return 'unknown';
-    }
-    const pid = Number.parseInt(contents.trim(), 10);
-    if (!Number.isFinite(pid) || pid <= 0) return 'unknown';
-    return this.processAlive(pid) ? 'alive' : 'dead';
   }
 
   /**
@@ -555,56 +499,121 @@ function resolveCredentialProxyWiring(opts: CredentialProxyOptions): {
   refresher: () => Promise<void>;
   override: HeaderOverride;
   now: () => number;
-  processAlive: (pid: number) => boolean;
+  lockAcquire: LockAcquire;
 } {
+  const lockPath = opts.lockPath ?? path.join(os.homedir(), '.symphony', 'oauth', 'refresh.lock');
   return {
     credentialsPath: opts.credentialsPath ?? path.join(os.homedir(), '.claude', '.credentials.json'),
-    lockPath: opts.lockPath ?? path.join(os.homedir(), '.symphony', 'oauth', 'refresh.lock'),
+    lockPath,
     upstream: opts.upstream ?? defaultUpstream(),
     refresher: opts.refresher ?? defaultRefresher(),
     override: opts.override ?? NOOP_OVERRIDE,
     now: opts.now ?? (() => Date.now()),
-    processAlive: opts.processAlive ?? defaultProcessAlive,
+    lockAcquire: opts.lockAcquire ?? defaultFlockAcquire(lockPath),
   };
 }
 
 function resolveCredentialProxyTuning(opts: CredentialProxyOptions): {
   refreshMarginMs: number;
-  lockPollMs: number;
   lockAcquireTimeoutMs: number;
 } {
   return {
     refreshMarginMs: opts.refreshMarginMs ?? 60_000,
-    lockPollMs: opts.lockPollMs ?? 25,
     lockAcquireTimeoutMs: opts.lockAcquireTimeoutMs ?? 90_000,
   };
 }
 
 /**
- * Kernel-verified liveness check via the null-signal probe. `process.kill(pid, 0)`
- * delivers no signal but performs the usual permission/existence checks:
- *   - returns normally → the process exists and we're permitted to signal it
- *   - throws EPERM    → the process exists but we lack permission (still alive)
- *   - throws ESRCH    → no such process (provably dead — safe to break the lock)
- * Any other error is treated as "we cannot prove the holder is dead" → alive.
+ * Default cross-process lock: spawn `flock(1)` holding an exclusive lock on
+ * `lockPath`. The child shell prints `READY\n` on stdout once the kernel has
+ * granted the lock, then blocks on stdin via `exec cat`. Release closes the
+ * child's stdin: cat reads EOF, exits, the kernel releases the flock(2) lock
+ * automatically when the file descriptor is closed.
+ *
+ * The kernel guarantees we need from this lock:
+ *   - mutual exclusion: only one holder at a time across processes;
+ *   - automatic release on holder death (no stale-lock / PID-liveness
+ *     heuristics);
+ *   - ownership safety: a peer cannot delete our live lock (no lockfile to
+ *     unlink — only a kernel-managed lock on the open FD).
  */
-function defaultProcessAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EPERM') return true;
-    if (code === 'ESRCH') return false;
-    // Unknown errno — fail closed (treat as alive) so we never break a lock
-    // we can't prove is dead.
-    return true;
-  }
+function defaultFlockAcquire(lockPath: string): LockAcquire {
+  return async (timeoutMs: number) => {
+    await mkdir(path.dirname(lockPath), { recursive: true });
+    return spawnFlockHolder(lockPath, timeoutMs);
+  };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+async function spawnFlockHolder(lockPath: string, timeoutMs: number): Promise<() => Promise<void>> {
+  // `flock -x -o lockfile sh -c '...'`: blocks until the kernel grants LOCK_EX
+  // on the lockfile, then exec's the shell. The shell prints READY, then
+  // `exec cat` replaces the shell with cat which blocks on stdin (closing
+  // our pipe to it tells cat to exit, which lets flock's parent reap and
+  // exit, which closes the FD and releases the kernel lock).
+  //
+  // `-o` makes flock close the lock-holding FD in the child process before
+  // exec'ing the command, so the lock is held by *only* the flock parent.
+  // Without `-o` the child would inherit the FD and could leak the lock past
+  // the parent's death if the parent is killed before the child exits.
+  const child = spawn('flock', ['-x', '-o', lockPath, 'sh', '-c', 'echo READY; exec cat'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  try {
+    await waitForFlockReady(child, timeoutMs);
+  } catch (err) {
+    // We never saw READY: either flock is still waiting on the kernel lock
+    // (timeout case) or the child crashed before acquire. Kill it hard so the
+    // kernel never grants us a lock we won't release.
+    try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    throw err;
+  }
+  return makeFlockRelease(child);
+}
+
+function waitForFlockReady(child: ChildProcess, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('credential proxy: refresh lock acquire timeout'));
+    }, timeoutMs);
+    const settle = (err: Error | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve();
+    };
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBuf += chunk.toString('utf8');
+      if (stdoutBuf.includes('READY')) settle(null);
+    });
+    child.stderr?.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString('utf8'); });
+    child.once('error', (err) => settle(err));
+    child.once('exit', (code, signal) => {
+      settle(new Error(`flock exited before ready (code=${code}, signal=${signal}, stderr=${stderrBuf.trim()})`));
+    });
+  });
+}
+
+function makeFlockRelease(child: ChildProcess): () => Promise<void> {
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    try { child.stdin?.end(); } catch { /* ignore */ }
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    // Belt: if `cat` somehow doesn't exit on EOF, SIGTERM it after a delay so
+    // we don't leak the kernel lock indefinitely.
+    const sigtermTimer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+    }, 2_000);
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    clearTimeout(sigtermTimer);
+  };
 }
 
 function writeProxyError(res: ServerResponse, status: number, message: string): void {

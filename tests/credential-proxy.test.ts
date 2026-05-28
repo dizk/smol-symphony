@@ -8,6 +8,7 @@
 import { describe, it, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm, readFile, stat } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -330,8 +331,6 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
           spans.push({ start, end });
           void label;
         },
-        // Tight polling so the test completes quickly.
-        lockPollMs: 5,
         lockAcquireTimeoutMs: 10_000,
       });
     const proxyA = makeProxy('A', spansA, holdA);
@@ -386,7 +385,6 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
       lockPath,
       upstream: makeFakeUpstream(),
       refresher: async () => { ranA += 1; await holdA; },
-      lockPollMs: 5,
       lockAcquireTimeoutMs: 60_000,
     });
     const proxyB = new CredentialProxy({
@@ -394,7 +392,6 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
       lockPath,
       upstream: makeFakeUpstream(),
       refresher: async () => { ranB += 1; },
-      lockPollMs: 5,
       // B's acquire timeout is far less than A's hold time. With the buggy
       // (pre-fix) behavior, B would spawn its refresher anyway after timing
       // out. The test asserts the fixed behavior: B does NOT run refresher.
@@ -422,13 +419,22 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
     }
   });
 
-  it('breaks through a lockfile whose holder process is provably dead', async () => {
-    // If a previous holder crashed before unlinking the lockfile, the next
-    // acquire must detect the dead PID (kernel reports ESRCH) and force-clear
-    // the lockfile rather than blocking forever. This is the ONLY signal the
-    // proxy uses to authorize a break — mtime-based heuristics are rejected
-    // because they cannot distinguish "abandoned" from "slow-but-alive".
-    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-deadlock-'));
+  it('two contenders racing an abandoned lock serialize via kernel flock', async () => {
+    // Regression test for the codex review finding on the previous lockfile
+    // protocol: an `O_CREAT|O_EXCL` lockfile + `unlink`-to-break scheme is not
+    // ownership-safe. The reviewer's concrete sequence: if A and B both
+    // observe a dead-holder lockfile, A unlinks it and creates a new one;
+    // B's delayed unlink then removes A's *live* lock; B then creates its
+    // own and runs refresher concurrently with A.
+    //
+    // The fix is kernel-managed `flock(2)` via `flock(1)`: the lock state
+    // lives in the kernel's file table, not on the filesystem. There is no
+    // lockfile to delete; a peer cannot remove our live lock; the kernel
+    // releases on holder process death (so a "dead/abandoned" prior holder
+    // is handled automatically); and only one process can hold LOCK_EX at a
+    // time. Two contenders racing for a previously-abandoned lock must
+    // serialize through the kernel.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-abandoned-'));
     const credentialsPath = path.join(tmp, '.credentials.json');
     const lockPath = path.join(tmp, 'refresh.lock');
     await writeFile(
@@ -436,73 +442,57 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
       JSON.stringify({ claudeAiOauth: { accessToken: 'init', expiresAt: Date.now() + 3_600_000 } }),
       'utf8',
     );
-    // Pre-create the lockfile with a PID our injected liveness check reports dead.
-    const ghostPid = 999_999;
-    await writeFile(lockPath, `${ghostPid}\n`, 'utf8');
-    let ran = 0;
-    const proxy = new CredentialProxy({
-      credentialsPath,
-      lockPath,
-      upstream: makeFakeUpstream(),
-      refresher: async () => { ran += 1; },
-      processAlive: (pid) => pid !== ghostPid, // ghost is dead; everything else alive
-      lockPollMs: 5,
-      lockAcquireTimeoutMs: 5_000,
-    });
-    try {
-      await proxy.refreshNow();
-      assert.equal(ran, 1, 'refresher should run after breaking the dead-holder lock');
-    } finally {
-      await rm(tmp, { recursive: true, force: true });
-    }
-  });
 
-  it('does NOT break a lockfile whose holder PID is still alive', async () => {
-    // Regression test for the codex review finding: pre-fix, the proxy treated
-    // a lockfile whose mtime exceeded `lockStaleMs` as abandoned and unlinked
-    // it — even when the holder was still running its `claude -p ok` refresher.
-    // The fix replaces mtime heuristics with `process.kill(pid, 0)` — only an
-    // ESRCH authorizes a break. With a live PID reported in the lockfile, no
-    // amount of clock-skew or stale-mtime should let a second proxy break in.
-    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-alivelock-'));
-    const credentialsPath = path.join(tmp, '.credentials.json');
-    const lockPath = path.join(tmp, 'refresh.lock');
-    await writeFile(
-      credentialsPath,
-      JSON.stringify({ claudeAiOauth: { accessToken: 'init', expiresAt: Date.now() + 3_600_000 } }),
-      'utf8',
-    );
-    // Pre-create the lockfile with an "alive" PID and backdate its mtime so
-    // any mtime-based check would falsely conclude it's stale.
-    const livePid = 12_345;
-    await writeFile(lockPath, `${livePid}\n`, 'utf8');
-    const { utimes } = await import('node:fs/promises');
-    const ancient = new Date(Date.now() - 60 * 60_000); // 1 hour old
-    await utimes(lockPath, ancient, ancient);
+    // Step 1: spawn a "ghost" holder that acquires the kernel flock then is
+    // SIGKILL'd — simulating a previous symphony process that crashed mid-
+    // refresh. `-o` closes the lock FD in the child sleep process before
+    // exec, so the lock is held solely by the flock parent; SIGKILL'ing the
+    // parent therefore closes the only FD referencing the lock, and the
+    // kernel releases it immediately. (Without `-o` the orphan sleep would
+    // inherit the FD and the lock would persist past the SIGKILL.)
+    const ghost = spawn('flock', ['-x', '-o', lockPath, 'sleep', '60'], { stdio: 'ignore' });
+    // Give the kernel time to grant the ghost the lock.
+    await new Promise((r) => setTimeout(r, 100));
+    ghost.kill('SIGKILL');
+    await new Promise<void>((resolve) => ghost.once('exit', () => resolve()));
 
-    let ran = 0;
-    const proxy = new CredentialProxy({
-      credentialsPath,
-      lockPath,
-      upstream: makeFakeUpstream(),
-      refresher: async () => { ran += 1; },
-      processAlive: (pid) => pid === livePid, // holder is alive
-      lockPollMs: 5,
-      lockAcquireTimeoutMs: 150,
-    });
-    let err: Error | null = null;
+    // Step 2: two contenders race for the released lock. With the old
+    // unlink-based protocol, this is the exact sequence in which B could
+    // unlink A's live lock and both end up running refresher concurrently.
+    // With kernel flock(2), exactly one acquires at a time.
+    type Span = { start: number; end: number };
+    const spansA: Span[] = [];
+    const spansB: Span[] = [];
+    const makeProxy = (spans: Span[]): CredentialProxy =>
+      new CredentialProxy({
+        credentialsPath,
+        lockPath,
+        upstream: makeFakeUpstream(),
+        refresher: async () => {
+          const start = Date.now();
+          // 50ms of refresher "work" — enough for an interleaving to be
+          // observable on any system if the lock failed to serialize.
+          await new Promise((r) => setTimeout(r, 50));
+          spans.push({ start, end: Date.now() });
+        },
+        lockAcquireTimeoutMs: 10_000,
+      });
+    const proxyA = makeProxy(spansA);
+    const proxyB = makeProxy(spansB);
     try {
-      try {
-        await proxy.refreshNow();
-      } catch (e) {
-        err = e as Error;
-      }
-      assert.equal(ran, 0, 'refresher must NOT run while the holder PID is alive');
-      assert.ok(err, 'acquire should fail closed with a timeout');
-      assert.match(err!.message, /lock acquire timeout/);
-      // The lockfile must still be in place — we did not break a live holder's lock.
-      const stillThere = await readFile(lockPath, 'utf8');
-      assert.equal(stillThere.trim(), String(livePid));
+      await Promise.all([proxyA.refreshNow(), proxyB.refreshNow()]);
+      assert.equal(spansA.length, 1, 'A refresher ran exactly once');
+      assert.equal(spansB.length, 1, 'B refresher ran exactly once');
+      // Disjoint spans — one finished before the other started. With the
+      // pre-fix unlink-race this would fail because both refreshers could
+      // be running simultaneously.
+      const [a] = spansA;
+      const [b] = spansB;
+      const overlap = !(b!.end <= a!.start || b!.start >= a!.end);
+      assert.ok(
+        !overlap,
+        `expected refreshers to serialize; got overlapping spans A=${JSON.stringify(a)}, B=${JSON.stringify(b)}`,
+      );
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
