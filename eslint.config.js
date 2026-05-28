@@ -1,4 +1,4 @@
-// PROTOTYPE: functional-core / imperative-shell enforcement.
+// Functional-core / imperative-shell enforcement (errors, not warnings).
 //   shell files  -> complexity budgets (cap leaked logic; force decisions into the core)
 //   core files   -> purity rules (no IO imports, no IO globals, no clock/random)
 // Run: npx eslint src
@@ -35,26 +35,26 @@ export default [
   {
     files: shell,
     rules: {
-      complexity: ['warn', 10],
-      'max-depth': ['warn', 4],
-      'max-statements': ['warn', 20],
-      'max-lines-per-function': ['warn', { max: 80, skipComments: true }],
-      'max-nested-callbacks': ['warn', 4],
+      complexity: ['error', 10],
+      'max-depth': ['error', 4],
+      'max-statements': ['error', 20],
+      'max-lines-per-function': ['error', { max: 80, skipComments: true }],
+      'max-nested-callbacks': ['error', 4],
     },
   },
   // ---- functional core: stay pure ----
   {
     files: core,
     rules: {
-      'no-restricted-globals': ['warn', { name: 'process', message: 'core must not read process/env; inject config' },
+      'no-restricted-globals': ['error', { name: 'process', message: 'core must not read process/env; inject config' },
         { name: 'fetch', message: 'core must not do network IO; use an injected port' }],
-      'no-restricted-imports': ['warn', { paths: [
+      'no-restricted-imports': ['error', { paths: [
           { name: 'node:fs', message: 'no fs in core' }, { name: 'node:fs/promises', message: 'no fs in core' },
           { name: 'node:child_process', message: 'no process spawning in core' },
           { name: 'node:net', message: 'no net in core' }, { name: 'node:http', message: 'no http in core' },
           { name: 'node:crypto', message: 'no crypto IO in core' }, { name: 'node:timers/promises', message: 'no timers in core' },
         ], patterns: [{ group: ['*/util/process*', '*/agent/smolvm*', '*/acp-bridge*', '*/trackers/local*'], message: 'core must not import an adapter; use an injected port' }] }],
-      'no-restricted-syntax': ['warn',
+      'no-restricted-syntax': ['error',
         { selector: "NewExpression[callee.name='Date']", message: 'core must be deterministic; inject a clock (see pr.ts now())' },
         { selector: "MemberExpression[object.name='Date'][property.name='now']", message: 'inject a clock' },
         { selector: "MemberExpression[object.name='Math'][property.name='random']", message: 'core must be deterministic; inject randomness' },
