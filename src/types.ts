@@ -29,9 +29,13 @@ export interface WorkflowDefinition {
 // Per-state hook overrides. Any field set here replaces the workflow-level hook of
 // the same name when an issue is in this state at hook-fire time. `undefined` (key
 // absent) means "fall through to the workflow-level hook"; an explicit `null` means
-// "no hook for this state, even if workflow-level declares one" so a terminal state
-// can opt out of a global after_run that otherwise no-ops on it. `timeout_ms` is
+// "no hook for this state, even if workflow-level declares one". `timeout_ms` is
 // not overridable per state — it's a global safety bound, not behavior.
+//
+// `after_run` is intentionally absent: the post-attempt push + PR-create handoff
+// is a typed `actions:` block on the Done state now (push_branch +
+// create_pr_if_missing). The parser warns and drops `after_run` when an operator
+// still declares it; the three remaining hook kinds keep working.
 //
 // Deprecated for state-machine-mutating glue: prefer the `actions:` block on a state
 // (typed records, see src/actions/types.ts) over shell hooks for new work. A state
@@ -40,7 +44,6 @@ export interface WorkflowDefinition {
 export interface StateHooksConfig {
   after_create?: string | null;
   before_run?: string | null;
-  after_run?: string | null;
   before_remove?: string | null;
 }
 

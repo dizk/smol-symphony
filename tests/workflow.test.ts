@@ -232,13 +232,13 @@ describe('workflow states block', () => {
           Done: {
             role: 'terminal',
             hooks: {
-              after_run: 'echo done',
+              before_run: 'echo before',
               before_remove: 'echo cleanup',
             },
           },
           Cancelled: {
             role: 'terminal',
-            hooks: { after_run: null },
+            hooks: { before_remove: null },
           },
           Triage: { role: 'holding' },
         },
@@ -246,13 +246,36 @@ describe('workflow states block', () => {
       '/tmp/WORKFLOW.md',
     );
     assert.deepEqual(cfg.states.Done!.hooks, {
-      after_run: 'echo done',
+      before_run: 'echo before',
       before_remove: 'echo cleanup',
     });
     // Explicit null suppresses a workflow-level hook for that state.
-    assert.deepEqual(cfg.states.Cancelled!.hooks, { after_run: null });
+    assert.deepEqual(cfg.states.Cancelled!.hooks, { before_remove: null });
     // Omitted hooks block stays undefined so resolution falls through to workflow-level.
     assert.equal(cfg.states.Todo!.hooks, undefined);
+  });
+
+  it('drops a deprecated after_run hook value on the floor', () => {
+    // Issue 108: after_run is no longer a recognized hook kind — the Done-state
+    // push/PR-create handoff lives in `actions:` now. The parser warns + drops
+    // the value rather than threading it through to a runtime branch that no
+    // longer exists.
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active' },
+          Done: {
+            role: 'terminal',
+            hooks: { after_run: 'echo legacy', before_remove: 'echo keep' },
+          },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    // before_remove survives; after_run is stripped silently.
+    assert.deepEqual(cfg.states.Done!.hooks, { before_remove: 'echo keep' });
   });
 
   it('rejects a non-string non-null hook value', () => {
@@ -263,13 +286,13 @@ describe('workflow states block', () => {
             tracker: { kind: 'local', root: '/tmp/issues' },
             states: {
               Todo: { role: 'active' },
-              Done: { role: 'terminal', hooks: { after_run: 42 } },
+              Done: { role: 'terminal', hooks: { before_run: 42 } },
               Triage: { role: 'holding' },
             },
           },
           '/tmp/WORKFLOW.md',
         ),
-      /hooks\.after_run must be a string or null/,
+      /hooks\.before_run must be a string or null/,
     );
   });
 
@@ -281,7 +304,7 @@ describe('workflow states block', () => {
             tracker: { kind: 'local', root: '/tmp/issues' },
             states: {
               Todo: { role: 'active' },
-              Done: { role: 'terminal', hooks: ['after_run'] },
+              Done: { role: 'terminal', hooks: ['before_run'] },
               Triage: { role: 'holding' },
             },
           },
@@ -349,7 +372,6 @@ describe('resolveHooksForState', () => {
         hooks: {
           after_create: 'echo create',
           before_run: 'echo before',
-          after_run: 'echo workflow-after',
           before_remove: 'echo remove',
           timeout_ms: 60000,
         },
@@ -358,7 +380,8 @@ describe('resolveHooksForState', () => {
     );
     const resolved = resolveHooksForState(cfg, 'Todo');
     assert.equal(resolved.after_create, 'echo create');
-    assert.equal(resolved.after_run, 'echo workflow-after');
+    assert.equal(resolved.before_run, 'echo before');
+    assert.equal(resolved.before_remove, 'echo remove');
     assert.equal(resolved.timeout_ms, 60000);
   });
 
@@ -370,44 +393,44 @@ describe('resolveHooksForState', () => {
           Todo: { role: 'active' },
           Done: {
             role: 'terminal',
-            hooks: { after_run: 'echo state-after' },
+            hooks: { before_remove: 'echo state-remove' },
           },
           Triage: { role: 'holding' },
         },
         hooks: {
-          after_run: 'echo workflow-after',
           before_run: 'echo before',
+          before_remove: 'echo workflow-remove',
         },
       },
       '/tmp/WORKFLOW.md',
     );
     const todoHooks = resolveHooksForState(cfg, 'Todo');
     // Todo declares no hooks; falls through.
-    assert.equal(todoHooks.after_run, 'echo workflow-after');
+    assert.equal(todoHooks.before_remove, 'echo workflow-remove');
     const doneHooks = resolveHooksForState(cfg, 'Done');
-    // Done's after_run wins; before_run still falls through.
-    assert.equal(doneHooks.after_run, 'echo state-after');
+    // Done's before_remove wins; before_run still falls through.
+    assert.equal(doneHooks.before_remove, 'echo state-remove');
     assert.equal(doneHooks.before_run, 'echo before');
   });
 
   it('respects explicit null to suppress a workflow-level hook for a state', () => {
-    // Cancelled wants no patch-write/PR-create behavior, even though the workflow
-    // declares a default after_run. Setting after_run: null in Cancelled's hooks
-    // overrides the fallback rather than inheriting it.
+    // Cancelled wants no artifact-rescue behavior, even though the workflow
+    // declares a default before_remove. Setting before_remove: null in
+    // Cancelled's hooks overrides the fallback rather than inheriting it.
     const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
         states: {
           Todo: { role: 'active' },
-          Cancelled: { role: 'terminal', hooks: { after_run: null } },
+          Cancelled: { role: 'terminal', hooks: { before_remove: null } },
           Triage: { role: 'holding' },
         },
-        hooks: { after_run: 'echo workflow-after' },
+        hooks: { before_remove: 'echo workflow-remove' },
       },
       '/tmp/WORKFLOW.md',
     );
     const hooks = resolveHooksForState(cfg, 'Cancelled');
-    assert.equal(hooks.after_run, null);
+    assert.equal(hooks.before_remove, null);
   });
 
   it('matches state names case-insensitively', () => {
@@ -416,14 +439,14 @@ describe('resolveHooksForState', () => {
         tracker: { kind: 'local', root: '/tmp/issues' },
         states: {
           Todo: { role: 'active' },
-          Done: { role: 'terminal', hooks: { after_run: 'echo state' } },
+          Done: { role: 'terminal', hooks: { before_remove: 'echo state' } },
           Triage: { role: 'holding' },
         },
       },
       '/tmp/WORKFLOW.md',
     );
-    assert.equal(resolveHooksForState(cfg, 'done').after_run, 'echo state');
-    assert.equal(resolveHooksForState(cfg, 'DONE').after_run, 'echo state');
+    assert.equal(resolveHooksForState(cfg, 'done').before_remove, 'echo state');
+    assert.equal(resolveHooksForState(cfg, 'DONE').before_remove, 'echo state');
   });
 
   it('returns workflow-level hooks when the state name is undeclared', () => {
@@ -438,11 +461,11 @@ describe('resolveHooksForState', () => {
           Done: { role: 'terminal' },
           Triage: { role: 'holding' },
         },
-        hooks: { after_run: 'echo fallback' },
+        hooks: { before_remove: 'echo fallback' },
       },
       '/tmp/WORKFLOW.md',
     );
-    assert.equal(resolveHooksForState(cfg, 'Mystery').after_run, 'echo fallback');
+    assert.equal(resolveHooksForState(cfg, 'Mystery').before_remove, 'echo fallback');
   });
 });
 

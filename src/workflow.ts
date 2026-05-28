@@ -200,10 +200,17 @@ export function buildServiceConfig(
 
   // hooks (§4.3.4)
   const hooksRaw = getObject(raw, 'hooks');
+  // `after_run` is no longer a hook kind: the post-attempt push + PR-create handoff
+  // is now a typed Done-state `actions:` block (push_branch + create_pr_if_missing).
+  // A workflow that still declares it is honored as a no-op and logged so the
+  // operator can migrate to actions:.
+  if (asString(hooksRaw['after_run']) !== null) {
+    log.warn('hooks.after_run is deprecated and ignored; migrate to a Done-state actions: block', {});
+  }
   const hooks: HooksConfig = {
     after_create: asString(hooksRaw['after_create']),
     before_run: asString(hooksRaw['before_run']),
-    after_run: asString(hooksRaw['after_run']),
+    after_run: null,
     before_remove: asString(hooksRaw['before_remove']),
     timeout_ms: asInt(hooksRaw['timeout_ms'], 60_000),
   };
@@ -545,10 +552,18 @@ function parseStateHooksBlock(stateName: string, raw: unknown): StateHooksConfig
   }
   const m = raw as Record<string, unknown>;
   const out: StateHooksConfig = {};
+  // `after_run` is no longer a hook kind (the Done-state push + PR-create handoff
+  // is a typed `actions:` block now). A state that still declares it is warned and
+  // its value is dropped on the floor; the three remaining hook kinds keep working.
+  if (Object.prototype.hasOwnProperty.call(m, 'after_run')) {
+    log.warn(
+      'state hooks.after_run is deprecated and ignored; migrate to a Done-state actions: block',
+      { state: stateName },
+    );
+  }
   const fields: Array<keyof StateHooksConfig> = [
     'after_create',
     'before_run',
-    'after_run',
     'before_remove',
   ];
   for (const name of fields) {
@@ -623,7 +638,10 @@ export function resolveHooksForState(cfg: ServiceConfig, stateName: string): Hoo
   return {
     after_create: pick('after_create'),
     before_run: pick('before_run'),
-    after_run: pick('after_run'),
+    // `after_run` is no longer a live hook kind; the parser drops it. The field
+    // stays on HooksConfig so existing test fixtures and the workspace helper's
+    // method signature keep type-checking — it is permanently null at runtime.
+    after_run: null,
     before_remove: pick('before_remove'),
     timeout_ms: base.timeout_ms,
   };
@@ -647,7 +665,9 @@ export function findHooksAndActionsConflicts(
     const hooks = sc.hooks;
     if (!hooks) continue;
     const setFields: string[] = [];
-    for (const k of ['after_create', 'before_run', 'after_run', 'before_remove'] as const) {
+    // `after_run` is parsed-and-dropped (see parseStateHooksBlock); only the
+    // three live hook kinds can conflict with an `actions:` block now.
+    for (const k of ['after_create', 'before_run', 'before_remove'] as const) {
       if (Object.prototype.hasOwnProperty.call(hooks, k) && hooks[k] !== null && hooks[k] !== undefined) {
         setFields.push(k);
       }

@@ -15,27 +15,6 @@ export interface AttemptOutcome {
   turnsCompleted: number;
 }
 
-export type CleanupExecution = 'actions' | 'hook' | 'skip';
-
-export interface CleanupExecutionInput {
-  hasRunningEntry: boolean;
-  actionsLength: number;
-  hasAfterRunHook: boolean;
-}
-
-/** Cleanup branches: actions wins over hook (issue 36 AC2). */
-export function decideCleanupExecution(input: CleanupExecutionInput): CleanupExecution {
-  if (input.actionsLength > 0 && input.hasRunningEntry) return 'actions';
-  if (input.hasAfterRunHook) return 'hook';
-  return 'skip';
-}
-
-/** SYMPHONY_* env staging is only worth doing when the cleanup tail will read it. */
-export function shouldStageAfterRunEnv(input: CleanupExecutionInput): boolean {
-  if (!input.hasRunningEntry) return false;
-  return input.actionsLength > 0 || input.hasAfterRunHook;
-}
-
 export interface AttemptOutcomeInput {
   agentFailure: string | null;
   nonRoutedActionFailureReason: string | null;

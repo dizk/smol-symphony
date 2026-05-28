@@ -858,7 +858,7 @@ describe('hooks ∧ actions deprecation', () => {
           Todo: { role: 'active' },
           Done: {
             role: 'terminal',
-            hooks: { after_run: 'echo legacy' },
+            hooks: { before_remove: 'echo legacy' },
             actions: [{ kind: 'push_branch', remote: 'origin', ref: 'main' }],
           },
           Triage: { role: 'holding' },
@@ -869,7 +869,7 @@ describe('hooks ∧ actions deprecation', () => {
     const conflicts = findHooksAndActionsConflicts(cfg);
     assert.equal(conflicts.length, 1);
     assert.equal(conflicts[0]!.state, 'Done');
-    assert.deepEqual(conflicts[0]!.hook_fields, ['after_run']);
+    assert.deepEqual(conflicts[0]!.hook_fields, ['before_remove']);
   });
 
   it('does not flag states with only one of the two declared', () => {
