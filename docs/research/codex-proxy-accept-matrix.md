@@ -1,5 +1,22 @@
 # OpenAI / codex accept matrix for the credential-proxy (codex α)
 
+> **CORRECTION 2026-05-28 (live dispatch).** The §1/§5 assumption that setting
+> `OPENAI_API_KEY=<sentinel>` + `OPENAI_BASE_URL=<proxy>` alone makes codex-acp
+> "run in the SDK's high-confidence API-key code path" was wrong. A real codex
+> Review dispatch (issue 120) failed at session init with **`acp init failed:
+> "Authentication required"`** — codex-acp's init credential check requires a
+> `~/.codex/auth.json` FILE to *exist*, even when the env sentinel is present.
+> Fix (`stageCodexPlaceholderAuth` + the codex branch in `runner.ts`
+> `stageAdapterExtras`): stage a FAKE placeholder `auth.json` (`auth_mode:
+> apikey`, a `sk-symphony-placeholder` key, NO OAuth `tokens` block) purely to
+> satisfy that check. codex then uses the env `OPENAI_API_KEY` (= the real
+> per-dispatch sentinel, precedence over the file) as its bearer and the proxy
+> substitutes the real OpenAI credential at egress — so NO real token and NO
+> refresh token ever enters the VM. Re-verified live on issue 120: 17 codex
+> upstream calls through the proxy, Review→Done. The rows below remain
+> doc-derived for the billing-tell details; the channel/auth conclusion is now
+> superseded by this measured result.
+
 Status: research / decision. Mirrors `docs/research/credential-proxy-accept-matrix.md`
 (the Anthropic α, issue #112) for the codex / OpenAI side. Settles the four
 research questions issue #115 raises so the orchestrator can decide whether —

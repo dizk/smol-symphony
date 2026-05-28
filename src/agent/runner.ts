@@ -24,6 +24,7 @@ import {
   deriveAcpCommand,
   isKnownAdapter,
   stageClaudeIdentity,
+  stageCodexPlaceholderAuth,
   stageRuntimeFile,
   type AcpAdapterId,
   type ExtraGuestFile,
@@ -935,10 +936,15 @@ export class AgentRunner {
    * `~/.claude.json` identity (oauthAccount UUIDs only) copied to
    * `/root/.claude.json` before exec, so the proxy's host-side fingerprint seam
    * can compose a well-formed `metadata.user_id` if Anthropic re-activates its
-   * server-side check. Identity staging is best-effort: a missing host
-   * `~/.claude.json` is logged and the dispatch proceeds. codex stages no
-   * identity — OpenAI ships no third-party-client fingerprint check (see
-   * docs/research/codex-proxy-accept-matrix.md §1).
+   * server-side check. claude identity staging is best-effort: a missing host
+   * `~/.claude.json` is logged and the dispatch proceeds.
+   *
+   * codex also uses the proxy, but codex-acp's session-init check requires a
+   * `~/.codex/auth.json` FILE to exist (it fails "Authentication required" with
+   * only the env sentinel). So a FAKE placeholder auth.json (no real token) is
+   * staged to `/root/.codex/auth.json` purely to satisfy that check; codex then
+   * uses the env `OPENAI_API_KEY` sentinel as its bearer and the proxy
+   * substitutes the real credential at egress.
    */
   private async stageAdapterExtras(
     workspacePath: string,
@@ -947,17 +953,32 @@ export class AgentRunner {
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<ExtraGuestFile[]>> {
     const out: ExtraGuestFile[] = [...injected.runtimeExtraFiles];
-    if (profile.id !== 'claude') return { ok: true, value: out };
-    try {
-      const identity = await stageClaudeIdentity(workspacePath);
-      if (identity) {
-        out.push({ stagedRelPath: identity.relPath, guestPath: '/root/.claude.json' });
-      } else {
-        logger.warn('claude identity missing or malformed at host ~/.claude.json', {});
+    if (profile.id === 'claude') {
+      try {
+        const identity = await stageClaudeIdentity(workspacePath);
+        if (identity) {
+          out.push({ stagedRelPath: identity.relPath, guestPath: '/root/.claude.json' });
+        } else {
+          logger.warn('claude identity missing or malformed at host ~/.claude.json', {});
+        }
+      } catch (err) {
+        logger.error('identity staging failed', { error: (err as Error).message });
+        return failPhase('identity staging error');
       }
-    } catch (err) {
-      logger.error('identity staging failed', { error: (err as Error).message });
-      return failPhase('identity staging error');
+    } else if (profile.id === 'codex') {
+      // codex-acp's session-init credential check requires a ~/.codex/auth.json
+      // FILE to exist (it fails "Authentication required" with only the env
+      // sentinel). Stage a FAKE placeholder (no real token) so init passes; codex
+      // then uses the env OPENAI_API_KEY (= the proxy sentinel) as its bearer and
+      // the proxy substitutes the real credential. Synthetic content, so this
+      // never fails on a missing host file.
+      try {
+        const placeholder = await stageCodexPlaceholderAuth(workspacePath);
+        out.push({ stagedRelPath: placeholder.relPath, guestPath: '/root/.codex/auth.json' });
+      } catch (err) {
+        logger.error('codex placeholder auth staging failed', { error: (err as Error).message });
+        return failPhase('codex placeholder auth staging error');
+      }
     }
     return { ok: true, value: out };
   }

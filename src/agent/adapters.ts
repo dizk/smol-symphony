@@ -70,12 +70,16 @@ export interface StagedFileSpec {
  *  - `'forward-env'`: the adapter reads a credential env var forwarded verbatim
  *    into the VM via `smolvm.forward_env`. The proxy is not involved. No shipped
  *    adapter uses this today; it remains for adapters the proxy cannot serve.
- *
  * The runner dispatches on this field (not on `id`) so that proxy-capable
  * adapters route through the proxy and `forward-env` adapters proceed without
  * one — never crash-looping a dispatch for an adapter the proxy can't serve.
- * Issue #116 generalized `CredentialProxy` to an adapter-keyed upstream profile
- * and flipped codex to `'proxy'`; see `docs/research/codex-proxy-accept-matrix.md`.
+ * Both claude and codex are `'proxy'`. codex additionally needs a placeholder
+ * `~/.codex/auth.json` staged (see `stageCodexPlaceholderAuth`): a live dispatch
+ * showed codex-acp fails its session-init credential check with "Authentication
+ * required" when only the env sentinel is set and no auth.json file exists, even
+ * though it then uses the env `OPENAI_API_KEY` (= sentinel) as its request
+ * bearer. The placeholder is a fake (no real token) — the proxy substitutes the
+ * real OpenAI credential at egress. See `docs/research/codex-proxy-accept-matrix.md`.
  */
 export type CredentialStrategy = 'proxy' | 'forward-env';
 
@@ -159,13 +163,16 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   codex: {
     id: 'codex',
     binary: ['codex-acp'],
-    // The proxy substitutes a per-VM sentinel for the real OpenAI credential
-    // (an API key, or a ChatGPT-OAuth access token read from ~/.codex/auth.json —
-    // never the refresh token) on every upstream request. The VM only ever sees
-    // OPENAI_API_KEY=<sentinel> + OPENAI_BASE_URL=<proxy>, so it operates in the
-    // SDK's high-confidence API-key code path and never performs the OAuth
-    // handshake itself (the Q2 gating unknown is sidestepped — the handshake /
-    // refresh stays host-side). See docs/research/codex-proxy-accept-matrix.md.
+    // The proxy substitutes a per-VM sentinel for the real OpenAI credential on
+    // every request; the VM holds OPENAI_API_KEY=<sentinel> + OPENAI_BASE_URL=
+    // <proxy>, never a real token. BUT codex-acp's session-init credential check
+    // fails ("Authentication required") if no ~/.codex/auth.json FILE exists,
+    // even with the env sentinel present (a live dispatch proved this — #116
+    // staged only the env). So a fake placeholder auth.json is staged
+    // (stageCodexPlaceholderAuth) purely to satisfy that init check; codex then
+    // uses the env OPENAI_API_KEY (= sentinel, precedence over the file) as its
+    // bearer and the proxy swaps in the real credential. No real token, and no
+    // refresh token, ever enters the VM. See docs/research/codex-proxy-accept-matrix.md.
     credentialStrategy: 'proxy',
     proxyEnv: { baseUrlVar: 'OPENAI_BASE_URL', tokenVar: 'OPENAI_API_KEY' },
     // codex-acp takes config overrides via `-c key=value` where value is parsed as TOML
@@ -261,6 +268,32 @@ export async function stageClaudeIdentity(
 }
 
 /**
+ * Stage a FAKE placeholder `~/.codex/auth.json` into the workspace for the codex
+ * adapter. codex-acp's session-init credential check fails with "Authentication
+ * required" when no auth.json file exists, even though the per-dispatch sentinel
+ * is supplied via the `OPENAI_API_KEY` env var (a live dispatch proved this —
+ * #116 staged only the env). This file exists PURELY to satisfy that init check:
+ * it contains NO real credential — `OPENAI_API_KEY` is a sentinel-shaped
+ * placeholder and there is no OAuth `tokens` block — so codex falls through to
+ * the env `OPENAI_API_KEY` (= the real per-dispatch sentinel, which has
+ * precedence over the file) as its request bearer, and the host credential proxy
+ * substitutes the real OpenAI token at egress. No real token, and no refresh
+ * token, ever enters the VM.
+ *
+ * `auth_mode: 'apikey'` so codex takes the API-key path (the env sentinel),
+ * never an OAuth handshake. `last_refresh` is omitted (no OAuth tokens to age).
+ */
+export async function stageCodexPlaceholderAuth(
+  workspacePath: string,
+): Promise<StagedRuntimePaths> {
+  const placeholder = JSON.stringify({
+    OPENAI_API_KEY: 'sk-symphony-placeholder',
+    auth_mode: 'apikey',
+  });
+  return stageNamedFileUnder(workspacePath, 'credential', 'auth.json', placeholder);
+}
+
+/**
  * Pull just the identity fields out of the parsed `~/.claude.json`. Anything
  * outside `accountUuid`/`organizationUuid` is dropped — see
  * `stageClaudeIdentity`'s contract.
@@ -299,7 +332,7 @@ function pickStringField(obj: Record<string, unknown>, key: string): string | nu
  */
 async function stageNamedFileUnder(
   workspacePath: string,
-  subdir: 'runtime' | 'identity',
+  subdir: 'runtime' | 'identity' | 'credential',
   stagedName: string,
   content: string,
 ): Promise<StagedRuntimePaths> {
