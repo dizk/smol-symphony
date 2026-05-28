@@ -47,7 +47,11 @@ tracker:
 #                and the landing directory for `symphony.propose_issue`.
 #   adapter   (string, optional): override the workflow-level `acp.adapter` for
 #             agents dispatched in this state. Must be a known profile (claude,
-#             codex) and its host credential must be readable at startup.
+#             codex). claude has a single host credential file
+#             (~/.claude/.credentials.json) that is probed for readability at
+#             startup; codex has two valid sources (~/.codex/auth.json or
+#             OPENAI_API_KEY) and is validated lazily by the proxy on first
+#             request, so it is not startup-probed.
 #   model     (string, optional): override `acp.model` for this state.
 #             Blank or whitespace-only values normalize to "use the adapter
 #             default" (same as the workflow-level acp.model semantics).

@@ -50,9 +50,12 @@ agent:
   max_turns: 10
 
 acp:
-  # Host credential profile staged into each per-issue VM.
-  #   claude — reads ~/.claude/.credentials.json
-  #   codex  — reads ~/.codex/auth.json
+  # Adapter whose binary symphony launches inside each per-issue VM.
+  # Credentials never enter the VM: both adapters route inference through the
+  # host credential proxy, which reads the real key host-side and presents a
+  # per-VM sentinel (VM sees <PROVIDER>_BASE_URL=<proxy> + a sentinel token).
+  #   claude — proxy reads ~/.claude/.credentials.json
+  #   codex  — proxy reads ~/.codex/auth.json (or host OPENAI_API_KEY)
   adapter: claude
 
 smolvm:

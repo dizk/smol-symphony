@@ -1866,9 +1866,10 @@ interface SessionContext {
   runLog: RunLog | undefined;
   logger: ReturnType<typeof withIssue>;
   /**
-   * Credential-proxy sentinel for this claude dispatch (null for codex).
-   * Captured at session construction so `tearDownSession` can deregister it
-   * without reaching back into the AdapterRuntime.
+   * Credential-proxy sentinel for this dispatch — minted for `'proxy'`-strategy
+   * adapters (claude and codex), null for `'forward-env'` adapters. Captured at
+   * session construction so `tearDownSession` can deregister it without reaching
+   * back into the AdapterRuntime.
    */
   credentialSentinel: string | null;
 }

@@ -131,7 +131,8 @@ describe('adapters registry', () => {
   });
 
   it('deriveAcpCommand for codex also just execs the proxy (no credential staging)', () => {
-    // codex-acp reads OPENAI_API_KEY from smolvm.forward_env; nothing to stage.
+    // codex routes through the host credential proxy (sentinel + OPENAI_BASE_URL);
+    // it stages no identity file, so nothing crosses the boundary either.
     const cmd = deriveAcpCommand(ADAPTERS.codex);
     assert.equal(cmd, 'exec node /opt/symphony/vm-agent.mjs');
   });

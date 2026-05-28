@@ -228,9 +228,10 @@ const CLAUDE_BILLING_TELL_HEADERS: readonly string[] = [
 // OpenAI's billing tell. The exact subscription-vs-metered discriminator was
 // NOT measurable without a live ChatGPT-OAuth token (research Q4 /
 // docs/research/codex-proxy-accept-matrix.md §1), so this is the documented
-// `x-ratelimit-*` candidate family; whichever appear are logged. The Review
-// dispatch (codex, live) is the smoke that confirms which are real — update the
-// accept-matrix doc rows from DOC-DERIVED to measured once observed.
+// `x-ratelimit-*` candidate family; whichever appear are logged. Q4 is left as a
+// known limitation for #116: capturing the real discriminator needs a host with
+// a live ChatGPT-OAuth credential AND access to the proxy's `upstream ratelimit`
+// log line, tracked as follow-up #121.
 const CODEX_BILLING_TELL_HEADERS: readonly string[] = [
   'x-ratelimit-limit-requests',
   'x-ratelimit-remaining-requests',
