@@ -34,7 +34,12 @@ states:
   Todo:
     role: active
     adapter: claude
-    model: claude-opus-4-7
+    # Opus 4.8, 1M-context variant. The plain `claude-opus-4-7` is the 200K
+    # variant — a γ-class refactor dispatch hit two mid-turn compactions before
+    # reaching the edit phase; `[1m]` gives ~30x headroom and removes the stall.
+    # The suffix is Claude Code's model-selection convention, forwarded to the
+    # adapter via ANTHROPIC_MODEL. Review stays on codex (cross-model review).
+    model: claude-opus-4-8[1m]
     max_turns: 10
   Review:
     # Codex picks up the implementer's branch and approves or rejects. On
