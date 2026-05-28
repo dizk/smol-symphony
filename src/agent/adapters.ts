@@ -57,6 +57,27 @@ export interface StagedFileSpec {
   guestPath: string;
 }
 
+/**
+ * How symphony supplies upstream credentials to this adapter at dispatch time.
+ *
+ *  - `'proxy'`: the host credential proxy mints a per-dispatch sentinel; the
+ *    in-VM client dials the proxy (via the adapter's base-URL env var) with the
+ *    sentinel as its bearer, and the proxy substitutes the real upstream token
+ *    host-side on every request. No credential bytes — and crucially no refresh
+ *    token — ever enter the VM. claude uses this (see `src/agent/credential-proxy.ts`).
+ *  - `'forward-env'`: the adapter reads a credential env var (e.g.
+ *    `OPENAI_API_KEY`) forwarded verbatim into the VM via `smolvm.forward_env`.
+ *    The proxy is not involved. codex uses this today.
+ *
+ * The runner dispatches on this field (not on `id`) so that proxy-capable
+ * adapters route through the proxy and `forward-env` adapters proceed without
+ * one — never crash-looping a dispatch for an adapter the proxy can't serve.
+ * Extending the proxy to codex (issue #115) means generalizing
+ * `CredentialProxy` to an adapter-keyed upstream profile and flipping codex's
+ * strategy to `'proxy'`; see `docs/research/codex-proxy-accept-matrix.md`.
+ */
+export type CredentialStrategy = 'proxy' | 'forward-env';
+
 export interface AdapterProfile {
   id: AcpAdapterId;
   /**
@@ -65,6 +86,8 @@ export interface AdapterProfile {
    * commands (e.g. `['opencode', 'acp']`) compose without shell-injection risk.
    */
   binary: readonly string[];
+  /** How symphony supplies upstream credentials to this adapter. See {@link CredentialStrategy}. */
+  credentialStrategy: CredentialStrategy;
   /**
    * Map an `acp.model` string into the env vars / extra argv this adapter needs to
    * actually select the model. Called only when `acp.model` is non-null; profiles can
@@ -86,6 +109,9 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   claude: {
     id: 'claude',
     binary: ['claude-agent-acp'],
+    // Anthropic subscription OAuth lives only on the host; the proxy substitutes
+    // a per-VM sentinel for the real access token on every upstream request.
+    credentialStrategy: 'proxy',
     // claude-agent-acp reads ANTHROPIC_MODEL on startup (see acp-agent.js getAvailableModels:
     // ANTHROPIC_MODEL > settings.model > default). The adapter resolves aliases like
     // "opus" or "claude-sonnet-4-5" against the SDK's model list, so anything the user
@@ -112,6 +138,10 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   codex: {
     id: 'codex',
     binary: ['codex-acp'],
+    // codex-acp reads OPENAI_API_KEY from `smolvm.forward_env`. Extending the
+    // credential proxy to codex's ChatGPT-OAuth path is deferred (issue #115);
+    // see docs/research/codex-proxy-accept-matrix.md for the gating unknown.
+    credentialStrategy: 'forward-env',
     // codex-acp takes config overrides via `-c key=value` where value is parsed as TOML
     // (raw-string fallback on parse failure). We always emit a quoted TOML string so
     // model names containing dots or hyphens don't surprise the TOML parser.

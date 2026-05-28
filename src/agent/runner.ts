@@ -334,11 +334,12 @@ export class AgentRunner {
      */
     private actionSnapshotSink: ActionSnapshotSink | null = null,
     /**
-     * Host credential proxy (issue 113). Required for claude dispatches: the
-     * proxy mints per-dispatch sentinels that the in-VM claude-agent-acp
-     * uses as its upstream Bearer (substituted for the real Anthropic OAuth
-     * access token on every request). Symphony deregisters on teardown.
-     * Codex dispatches read `OPENAI_API_KEY` from `smolvm.forward_env` and
+     * Host credential proxy (issue 113). Required for adapters whose
+     * `credentialStrategy` is `'proxy'` (claude today): the proxy mints
+     * per-dispatch sentinels that the in-VM client uses as its upstream Bearer
+     * (substituted for the real OAuth access token on every request). Symphony
+     * deregisters on teardown. Adapters with `credentialStrategy: 'forward-env'`
+     * (codex today) read their credential env var from `smolvm.forward_env` and
      * never touch the proxy.
      */
     private credentialProxy: CredentialProxy | null = null,
@@ -880,12 +881,13 @@ export class AgentRunner {
    * (claude's identity file), and derive the final ACP launch command.
    * Pre-handshake failures unwind through the normal phase pipeline.
    *
-   * Credentials never enter the VM. For claude dispatches the in-VM client
-   * gets `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN=<sentinel>` from the
-   * host credential proxy (wired at exec time) plus a minimal `~/.claude.json`
-   * identity file for fingerprint stability. For codex the in-VM client
-   * reads `OPENAI_API_KEY` from the env forwarded by `smolvm.forward_env`;
-   * the proxy is not involved.
+   * Credentials never enter the VM. Dispatch is keyed on the adapter's
+   * `credentialStrategy`, not its id: a `'proxy'` adapter (claude) gets
+   * `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN=<sentinel>` from the host
+   * credential proxy (wired at exec time) plus a minimal `~/.claude.json`
+   * identity file for fingerprint stability; a `'forward-env'` adapter (codex)
+   * reads its credential env var (e.g. `OPENAI_API_KEY`) from the env forwarded
+   * by `smolvm.forward_env` and proceeds without the proxy.
    */
   private async prepareAdapterRuntime(
     workspacePath: string,
@@ -893,11 +895,16 @@ export class AgentRunner {
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<AdapterRuntime>> {
     const profile = ADAPTERS[resolved.adapter];
-    if (profile.id === 'claude' && !this.credentialProxy) {
+    if (profile.credentialStrategy === 'proxy' && !this.credentialProxy) {
       logger.error('credential proxy is not wired but adapter requires it', {
         adapter: profile.id,
       });
       return failPhase('credential proxy unavailable');
+    }
+    if (profile.credentialStrategy === 'forward-env') {
+      logger.info('adapter credentials forwarded via smolvm.forward_env; credential proxy not used', {
+        adapter: profile.id,
+      });
     }
     const injectedRes = await this.applyRuntimeInjectionsOrFail(workspacePath, profile, resolved, logger);
     if (!injectedRes.ok) return injectedRes;
@@ -922,10 +929,13 @@ export class AgentRunner {
 
   /**
    * Compose the per-adapter extra guest files: every staged file produced by
-   * runtime injections (model/effort knobs), plus — for claude — the minimal
-   * `~/.claude.json` identity (oauthAccount UUIDs only) copied to
-   * `/root/.claude.json` before exec. Identity staging is best-effort: a
+   * runtime injections (model/effort knobs), plus — for the proxy strategy
+   * (claude) — the minimal `~/.claude.json` identity (oauthAccount UUIDs only)
+   * copied to `/root/.claude.json` before exec, so the proxy's host-side
+   * fingerprint seam can compose a well-formed `metadata.user_id` if Anthropic
+   * re-activates its server-side check. Identity staging is best-effort: a
    * missing host `~/.claude.json` is logged and the dispatch proceeds.
+   * `forward-env` adapters (codex) stage no identity.
    */
   private async stageAdapterExtras(
     workspacePath: string,
@@ -934,7 +944,7 @@ export class AgentRunner {
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<ExtraGuestFile[]>> {
     const out: ExtraGuestFile[] = [...injected.runtimeExtraFiles];
-    if (profile.id !== 'claude') return { ok: true, value: out };
+    if (profile.credentialStrategy !== 'proxy') return { ok: true, value: out };
     try {
       const identity = await stageClaudeIdentity(workspacePath);
       if (identity) {
@@ -1082,17 +1092,17 @@ export class AgentRunner {
   }
 
   /**
-   * Mint a credential-proxy sentinel for claude dispatches. Sentinel
-   * registration happens AFTER VM start + bridge register so an early
+   * Mint a credential-proxy sentinel for `'proxy'`-strategy dispatches (claude).
+   * Sentinel registration happens AFTER VM start + bridge register so an early
    * failure doesn't leak a registry entry — the proxy's registry is
    * in-process, but a leaked entry would still be a loose end across the
-   * dispatch lifecycle.
+   * dispatch lifecycle. `'forward-env'` adapters (codex) get no sentinel.
    */
   private registerCredentialSentinel(
     issue: Issue,
     adapter: AdapterRuntime,
   ): { sentinel: string; baseUrl: string } | null {
-    if (adapter.profile.id !== 'claude' || !this.credentialProxy) return null;
+    if (adapter.profile.credentialStrategy !== 'proxy' || !this.credentialProxy) return null;
     return this.credentialProxy.register({ issueId: issue.id, identifier: issue.identifier });
   }
 
