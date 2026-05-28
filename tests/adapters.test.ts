@@ -8,6 +8,7 @@ import {
   isKnownAdapter,
   deriveAcpCommand,
   stageRuntimeFile,
+  stageCodexPlaceholderAuth,
 } from '../src/agent/adapters.js';
 import { validateDispatch } from '../src/workflow.js';
 import { validateDispatchIo } from '../src/workflow-loader.js';
@@ -305,6 +306,38 @@ describe('stageRuntimeFile', () => {
       await assert.rejects(() => stageRuntimeFile(ws, '../escape', 'x'), /stagedName/);
       await assert.rejects(() => stageRuntimeFile(ws, 'with space', 'x'), /stagedName/);
       await assert.rejects(() => stageRuntimeFile(ws, 'pipe|cmd', 'x'), /stagedName/);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('stageCodexPlaceholderAuth', () => {
+  it('stages a FAKE auth.json — no real token, no OAuth tokens block, no refresh_token', async () => {
+    // codex-acp's session-init credential check requires ~/.codex/auth.json to
+    // EXIST (it fails "Authentication required" with only the env sentinel). The
+    // placeholder satisfies that check WITHOUT carrying a real credential: codex
+    // then uses the env OPENAI_API_KEY sentinel as its bearer and the proxy
+    // substitutes the real token. This test locks the "no real secret in the VM"
+    // invariant (live-verified on issue 120: codex reviewed through the proxy
+    // with this placeholder; 17 codex upstream calls, Review→Done).
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-codex-'));
+    const ws = path.join(tmp, 'ws');
+    await mkdir(path.join(ws, '.git'), { recursive: true });
+    try {
+      const staged = await stageCodexPlaceholderAuth(ws);
+      assert.equal(staged.relPath, '.git/symphony-runtime/credential/auth.json');
+      const body = await readFile(staged.absPath, 'utf8');
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      assert.equal(parsed.auth_mode, 'apikey');
+      // No OAuth tokens block at all → no access_token / id_token / refresh_token.
+      assert.equal(parsed.tokens, undefined);
+      // Whatever the OPENAI_API_KEY placeholder is, it must not be a real key:
+      // the env sentinel (precedence) is the bearer the proxy actually validates.
+      assert.match(String(parsed.OPENAI_API_KEY), /placeholder/);
+      assert.doesNotMatch(body, /refresh_token/);
+      const st = await stat(staged.absPath);
+      assert.equal(st.mode & 0o777, 0o600);
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
