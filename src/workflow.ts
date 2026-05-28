@@ -251,8 +251,12 @@ export function buildServiceConfig(
 
   // acp (Symphony extension; see §4.3.6). `adapter` selects
   // one of symphony's known profiles (claude, codex); symphony auto-derives the launch
-  // command from the adapter profile and stages the host credential file into the
-  // workspace.
+  // command from the adapter profile. Credentials are NOT staged into the workspace:
+  // both shipped adapters route inference through the host credential proxy, so the VM
+  // only ever sees `<provider>_BASE_URL=<proxy>` + a per-dispatch sentinel token. The
+  // proxy swaps the sentinel for the real host credential request-side
+  // (`~/.claude/.credentials.json` for claude; `~/.codex/auth.json` access token or
+  // `OPENAI_API_KEY` for codex).
   //
   // `acp.bridge` configures the host-side TCP listener that the in-VM agent dials back
   // to for ACP traffic. The bridge replaced the smolvm-exec stdio path; see
@@ -341,9 +345,12 @@ export function buildServiceConfig(
     mem_mib: asInt(smolvmRaw['mem_mib'], 2048),
     net: smolvmRaw['net'] !== false,
     volumes,
-    // Default forwarded credentials cover all three shipped ACP adapters so workflows that
-    // do not override `smolvm.forward_env` still authenticate after the default-adapter
-    // switch to claude-agent-acp.
+    // `forward_env` is forwarded into the VM boot env, but the runner strips the active
+    // proxy adapter's credential var (`proxyEnv.tokenVar` — claude → ANTHROPIC_AUTH_TOKEN,
+    // codex → OPENAI_API_KEY) before boot, since both shipped adapters authenticate via the
+    // host credential proxy + sentinel rather than a forwarded key. So even if an operator
+    // lists `OPENAI_API_KEY` here, a real codex key never reaches a codex dispatch's VM.
+    // The defaults are retained for any future `forward-env`-strategy adapter an operator adds.
     forward_env: asStringList(smolvmRaw['forward_env'], [
       'OPENAI_API_KEY',
       'ANTHROPIC_API_KEY',
@@ -707,11 +714,14 @@ export function warnOnHooksAndActionsConflict(cfg: ServiceConfig): void {
 }
 
 // Dispatch preflight validation (structural, pure). The fs-touching probes —
-// `tracker.root` existence, `smolvm.smolfile` existence, per-state adapter
-// credential readability — live in the shell loader's `validateDispatchIo`,
-// which the orchestrator calls alongside this function. Keeping the structural
-// half pure means tests and the reload tick can re-run it cheaply on every
-// reconcile without re-hitting the disk.
+// `tracker.root` existence, `smolvm.smolfile` existence, and the claude host
+// credential file — live in the shell loader's `validateDispatchIo`, which the
+// orchestrator calls alongside this function. Only claude is startup-probed: it
+// has a single required host file (`~/.claude/.credentials.json`). codex routes
+// through the same proxy but has two valid sources (`~/.codex/auth.json` or
+// `OPENAI_API_KEY`), so the proxy validates it lazily on first request rather
+// than at load time. Keeping the structural half pure means tests and the reload
+// tick can re-run it cheaply on every reconcile without re-hitting the disk.
 export function validateDispatch(cfg: ServiceConfig): string | null {
   if (cfg.tracker.kind !== 'local') {
     return `unsupported_tracker_kind: ${cfg.tracker.kind || '<missing>'}`;

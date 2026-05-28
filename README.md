@@ -239,7 +239,7 @@ the adapter reaches for inside the VM:
 | Adapter   | Binary             | Credential surface                |
 | --------- | ------------------ | --------------------------------- |
 | `claude`  | `claude-agent-acp` | host loopback proxy + sentinel    |
-| `codex`   | `codex-acp`        | `OPENAI_API_KEY` via `forward_env`|
+| `codex`   | `codex-acp`        | host loopback proxy + sentinel    |
 
 `WORKFLOW.md`:
 
@@ -257,13 +257,19 @@ For `claude`, a per-VM identity file (organization + account UUIDs only,
 no tokens) is staged into the workspace runtime dir and copied to
 `~/.claude.json` inside the VM; requests reach Anthropic via the host
 loopback proxy that substitutes the real access token for the VM's
-sentinel. Set `command:` only to override (testing a forked adapter, a
-non-standard binary path).
+sentinel. For `codex`, no identity file is staged (OpenAI ships no
+third-party fingerprint check); the VM is launched with
+`OPENAI_BASE_URL=<proxy>` + `OPENAI_API_KEY=<sentinel>`, and the proxy
+substitutes the real OpenAI credential host-side. Set `command:` only to
+override (testing a forked adapter, a non-standard binary path).
 
-OAuth tokens **never enter the VM**. The host's
-`~/.claude/.credentials.json` is read only by the proxy on the host side;
-the VM sees `~/.claude.json` (identity-only) plus the sentinel value in
-its `Authorization` header.
+Credentials **never enter the VM** for either adapter. For `claude`, the
+host's `~/.claude/.credentials.json` is read only by the proxy on the host
+side; the VM sees `~/.claude.json` (identity-only) plus the sentinel value
+in its `Authorization` header. For `codex`, the host's `~/.codex/auth.json`
+(access token / `OPENAI_API_KEY`, **never** the refresh token) is read only
+by the proxy host-side; the real `OPENAI_API_KEY` is stripped from the
+forwarded VM boot env, so the VM holds only the sentinel.
 
 ## After-run handoff: pull request
 
@@ -288,10 +294,10 @@ commands.
 ## Trust posture
 
 Sandbox isolation comes from running each agent inside a smolvm microVM.
-The VM has no OAuth refresh tokens or long-lived access tokens: for
-`claude`, the host loopback proxy holds the real credential and swaps in
-the per-VM sentinel on every outbound request; for `codex`, only
-`OPENAI_API_KEY` is forwarded via `smolvm.forward_env`. The VM has no
+The VM has no OAuth refresh tokens or long-lived access tokens: for both
+`claude` and `codex`, the host loopback proxy holds the real credential
+and swaps in the per-VM sentinel on every outbound request, so no real
+Anthropic or OpenAI credential is present in the VM. The VM has no
 tracker filesystem access (the tracker is reached only through the MCP
 server) and stripped git remotes (set by `after_create`).
 

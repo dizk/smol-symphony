@@ -1,31 +1,41 @@
 // Host credential proxy — terminates per-dispatch sentinels on the host and
-// substitutes the real Anthropic OAuth access token before forwarding the
-// request to api.anthropic.com.
+// substitutes the real upstream access token before forwarding the request to
+// the adapter's upstream API. The proxy is adapter-keyed: each registration
+// records which adapter it serves, and per-request handling resolves the
+// matching `UpstreamProfile` (upstream host, credential reader, refresher,
+// billing-tell headers). claude → api.anthropic.com; codex → api.openai.com.
 //
 // Lifecycle mirrors AcpBridge (src/acp-bridge.ts):
 //
-//   1. Orchestrator calls `proxy.register({ issueId, identifier })` before the
-//      VM launches; the returned `sentinel` is staged into the VM env as
-//      ANTHROPIC_AUTH_TOKEN and `baseUrl` as ANTHROPIC_BASE_URL.
-//   2. The in-VM claude-agent-acp speaks Bearer-auth to the proxy. Each
-//      request: the proxy validates the inbound bearer against the registry,
-//      reads the live access token out of `~/.claude/.credentials.json`,
-//      strips inbound auth, attaches `Authorization: Bearer <real>`, and
-//      forwards to api.anthropic.com. The upstream response — including
-//      `anthropic-ratelimit-unified-*` headers and `anthropic-organization-id`
-//      — streams back unchanged so the in-VM runner sees the operator's
-//      Max-window consumption.
+//   1. Orchestrator calls `proxy.register({ issueId, identifier, adapterId })`
+//      before the VM launches; the returned `sentinel` is staged into the VM
+//      env as the adapter's token var (ANTHROPIC_AUTH_TOKEN / OPENAI_API_KEY)
+//      and `baseUrl` as its base-URL var (ANTHROPIC_BASE_URL / OPENAI_BASE_URL).
+//   2. The in-VM adapter speaks Bearer-auth to the proxy. Each request: the
+//      proxy validates the inbound bearer against the registry, resolves the
+//      registration's profile, reads the live access token out of that profile's
+//      credential file (`~/.claude/.credentials.json` /
+//      `~/.codex/auth.json`), strips inbound auth, attaches
+//      `Authorization: Bearer <real>`, and forwards to the profile's upstream
+//      host. The upstream response — including the profile's billing-tell
+//      headers (`anthropic-ratelimit-unified-*` / `x-ratelimit-*`) — streams
+//      back unchanged so the in-VM runner sees the operator's subscription
+//      consumption.
 //   3. On dispatch teardown the orchestrator calls `proxy.deregister(sentinel)`
 //      so the token no longer authorizes upstream traffic.
 //
-// The "only the host refreshes" invariant is structural: VMs have no
-// `refreshToken` on their filesystem under proxy mode. When the cached access
-// token is past its `expiresAt` (or within a small margin) the proxy spawns
-// `claude -p "ok"` on the host under a kernel-managed `flock(2)` advisory lock
-// (via `flock(1)`) so concurrent stale-cache callers — across processes —
+// The "only the host refreshes" invariant is structural: VMs never hold a
+// `refreshToken` under proxy mode. For claude (short ~8h TTL): when the cached
+// access token is past its `expiresAt` (or within a small margin) the proxy
+// spawns `claude -p "ok"` on the host under a kernel-managed `flock(2)` advisory
+// lock (via `flock(1)`) so concurrent stale-cache callers — across processes —
 // collapse into a single refresh. The host's own ticker (running on
 // `cfg.credentials.ticker_interval_ms`) keeps the cache warm during idle
 // periods so the first VM request after expiry doesn't pay the spawn latency.
+// For codex (long ~8-day TTL): the proxy does NOT drive refresh — it re-reads
+// `~/.codex/auth.json` on each request so a host-side rotation is picked up
+// automatically, while the refresh token stays host-side (research Q3 option c;
+// the OpenAI refresh dance is the eventual target but is deliberately deferred).
 //
 // Why `flock(1)` and not a homegrown lockfile protocol: the kernel owns the
 // lock state. Two contenders cannot both believe they hold the lock; the lock
@@ -50,17 +60,24 @@ import path from 'node:path';
 import os from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { log } from '../logging.js';
+import type { AcpAdapterId } from './adapter-names.js';
 
 export interface CredentialProxyRegistration {
-  /** Per-dispatch opaque sentinel. Staged into the VM as ANTHROPIC_AUTH_TOKEN. */
+  /** Per-dispatch opaque sentinel. Staged into the VM as the adapter's token var. */
   sentinel: string;
-  /** Base URL the in-VM client should dial. Staged as ANTHROPIC_BASE_URL. */
+  /** Base URL the in-VM client should dial. Staged as the adapter's base-URL var. */
   baseUrl: string;
 }
 
 export interface RegisterOpts {
   issueId: string;
   identifier: string;
+  /**
+   * Which adapter this dispatch is for. Selects the `UpstreamProfile` the proxy
+   * uses for every request under the minted sentinel. Defaults to `'claude'`
+   * for backward compatibility with callers that predate the codex profile.
+   */
+  adapterId?: AcpAdapterId;
 }
 
 /** Input to the header-override seam. The body has been fully buffered. */
@@ -88,6 +105,8 @@ export interface UpstreamRequestor {
 }
 
 export interface UpstreamRequestInput {
+  /** Upstream host to dial (e.g. api.anthropic.com / api.openai.com). */
+  host: string;
   method: string;
   pathname: string;
   headers: Record<string, string>;
@@ -101,16 +120,56 @@ export interface UpstreamResponse {
   body: AsyncIterable<Buffer>;
 }
 
-export interface CredentialProxyOptions {
-  /** Path to host claude credentials JSON. Default: ~/.claude/.credentials.json. */
+/** Access token plus its absolute expiry (ms since epoch), or null when unknown. */
+export interface TokenInfo {
+  accessToken: string;
+  expiresAtMs: number | null;
+}
+
+/**
+ * Per-adapter upstream strategy. The proxy holds one per adapter id and resolves
+ * the right one for each registration. Everything that was claude-specific —
+ * the upstream host, the credential reader, the refresher, and the billing-tell
+ * header set — lives here so a new adapter is a new profile, not a new branch.
+ */
+export interface UpstreamProfile {
+  adapterId: AcpAdapterId;
+  /** Upstream API host the proxy forwards to. */
+  upstreamHost: string;
+  /** Host file the live access token is read from on each request. */
+  credentialsPath: string;
+  /** Pure: pull the access token + expiry out of the parsed credential JSON. */
+  extractToken(parsed: unknown): TokenInfo | null;
+  /**
+   * Fallback credential read from the host environment when the file yields no
+   * token (codex: `OPENAI_API_KEY`). Returns null for adapters with no env path.
+   */
+  envFallback(): TokenInfo | null;
+  /** Drive a host-side refresh (claude: `claude -p`). Tests inject a stub. */
+  refresher: () => Promise<void>;
+  /** Response header names carrying the subscription billing tell, logged per response. */
+  billingTellHeaders: readonly string[];
+}
+
+/** Per-adapter override hook for tests / non-default deployments. */
+export interface UpstreamProfileOverride {
   credentialsPath?: string;
+  refresher?: () => Promise<void>;
+  upstreamHost?: string;
+}
+
+export interface CredentialProxyOptions {
+  /** Claude credential path shorthand. Equivalent to `profileOverrides.claude.credentialsPath`. */
+  credentialsPath?: string;
+  /** Per-adapter profile overrides (credential path, refresher, upstream host). */
+  profileOverrides?: Partial<Record<AcpAdapterId, UpstreamProfileOverride>>;
   /** Path to the cross-process lock file serializing host-side refreshes. */
   lockPath?: string;
   /** Refresh when (expiresAt - now) is below this many ms. Default 60_000. */
   refreshMarginMs?: number;
-  /** Upstream forwarder. Default: real api.anthropic.com over https. */
+  /** Upstream forwarder. Default: real https to `input.host`. */
   upstream?: UpstreamRequestor;
-  /** Refresher (default: spawn `claude -p "ok"`). Tests inject a stub. */
+  /** Claude refresher shorthand. Equivalent to `profileOverrides.claude.refresher`. */
   refresher?: () => Promise<void>;
   /** Header-override seam (default: pass-through). */
   override?: HeaderOverride;
@@ -151,9 +210,12 @@ interface Registration {
   sentinel: string;
   issueId: string;
   identifier: string;
+  adapterId: AcpAdapterId;
 }
 
-const REFRESH_HEADER_NAMES: readonly string[] = [
+// Anthropic's subscription billing tell: the unified-window ratelimit family +
+// org id. Logged per response so operators can observe Max-window consumption.
+const CLAUDE_BILLING_TELL_HEADERS: readonly string[] = [
   'anthropic-organization-id',
   'anthropic-ratelimit-unified-5h-status',
   'anthropic-ratelimit-unified-5h-reset',
@@ -163,20 +225,36 @@ const REFRESH_HEADER_NAMES: readonly string[] = [
   'anthropic-ratelimit-unified-7d-utilization',
 ];
 
+// OpenAI's billing tell. The exact subscription-vs-metered discriminator was
+// NOT measurable without a live ChatGPT-OAuth token (research Q4 /
+// docs/research/codex-proxy-accept-matrix.md §1), so this is the documented
+// `x-ratelimit-*` candidate family; whichever appear are logged. Q4 is left as a
+// known limitation for #116: capturing the real discriminator needs a host with
+// a live ChatGPT-OAuth credential AND access to the proxy's `upstream ratelimit`
+// log line, tracked as follow-up #121.
+const CODEX_BILLING_TELL_HEADERS: readonly string[] = [
+  'x-ratelimit-limit-requests',
+  'x-ratelimit-remaining-requests',
+  'x-ratelimit-reset-requests',
+  'x-ratelimit-limit-tokens',
+  'x-ratelimit-remaining-tokens',
+  'x-ratelimit-reset-tokens',
+];
+
 /**
- * Default upstream: forward via https to api.anthropic.com. The body is sent
- * as-is; the response stream is the IncomingMessage which `AsyncIterable`s
- * over chunks so callers can pipe SSE responses without buffering.
+ * Default upstream: forward via https to `input.host`. The body is sent as-is;
+ * the response stream is the IncomingMessage which `AsyncIterable`s over chunks
+ * so callers can pipe SSE responses without buffering.
  */
 function defaultUpstream(): UpstreamRequestor {
   return {
-    send: ({ method, pathname, headers, body }) =>
+    send: ({ host, method, pathname, headers, body }) =>
       new Promise<UpstreamResponse>((resolve, reject) => {
         const opts: HttpsRequestOptions = {
           method,
-          hostname: 'api.anthropic.com',
+          hostname: host,
           path: pathname,
-          headers: { ...headers, 'content-length': String(body.length), host: 'api.anthropic.com' },
+          headers: { ...headers, 'content-length': String(body.length), host },
         };
         const req = httpsRequest(opts, (res) => {
           resolve({
@@ -192,13 +270,13 @@ function defaultUpstream(): UpstreamRequestor {
 }
 
 /**
- * Default refresher: spawn `claude -p "ok"` and resolve when it exits. Claude
- * Code's own OAuth path detects the stale access token, refreshes against
+ * Default claude refresher: spawn `claude -p "ok"` and resolve when it exits.
+ * Claude Code's own OAuth path detects the stale access token, refreshes against
  * Anthropic, and atomically writes the rotated tuple back to
  * `~/.claude/.credentials.json`. Symphony never implements OAuth — Anthropic's
  * own client does.
  */
-function defaultRefresher(): () => Promise<void> {
+function defaultClaudeRefresher(): () => Promise<void> {
   return () =>
     new Promise<void>((resolve, reject) => {
       const p = spawn('claude', ['-p', 'ok'], { stdio: 'ignore' });
@@ -210,37 +288,58 @@ function defaultRefresher(): () => Promise<void> {
     });
 }
 
+/**
+ * Default codex refresher: none. codex access tokens are long-lived (~8 days),
+ * so the proxy leans on re-read-on-request rather than driving the OpenAI
+ * refresh dance (research Q3 option c). The host owns refresh via its own codex
+ * usage; the refresh token never reaches the proxy or the VM. This throws so a
+ * future expiry-driven refresh path fails loudly instead of silently spawning
+ * an unimplemented refresher — codex `extractToken` returns a null expiry, so it
+ * is never reached in normal operation.
+ */
+function defaultCodexRefresher(): () => Promise<void> {
+  return () =>
+    Promise.reject(
+      new Error('codex credential refresh is host-owned (long-TTL); the proxy does not refresh'),
+    );
+}
+
 export class CredentialProxy {
   private server: HttpServer | null = null;
   private boundPort: number | null = null;
   private boundHost: string | null = null;
   private readonly pending = new Map<string, Registration>();
-  private readonly credentialsPath: string;
+  private readonly profiles: Map<AcpAdapterId, UpstreamProfile>;
   private readonly lockPath: string;
   private readonly refreshMarginMs: number;
   private readonly upstream: UpstreamRequestor;
-  private readonly refresher: () => Promise<void>;
   private readonly now: () => number;
   private readonly lockAcquireTimeoutMs: number;
   private readonly lockAcquire: LockAcquire;
   private override: HeaderOverride;
   private stopped = false;
-  // In-process single-flight: when a refresh is in flight, every other caller
-  // awaits the same promise instead of racing into `claude -p`.
-  private refreshInFlight: Promise<void> | null = null;
+  // In-process single-flight, per adapter: when a refresh is in flight for an
+  // adapter, every other caller for that adapter awaits the same promise instead
+  // of racing into the refresher.
+  private readonly refreshInFlight = new Map<AcpAdapterId, Promise<void>>();
 
   constructor(opts: CredentialProxyOptions = {}) {
     const wiring = resolveCredentialProxyWiring(opts);
     const tuning = resolveCredentialProxyTuning(opts);
-    this.credentialsPath = wiring.credentialsPath;
+    this.profiles = wiring.profiles;
     this.lockPath = wiring.lockPath;
     this.upstream = wiring.upstream;
-    this.refresher = wiring.refresher;
     this.override = wiring.override;
     this.now = wiring.now;
     this.lockAcquire = wiring.lockAcquire;
     this.refreshMarginMs = tuning.refreshMarginMs;
     this.lockAcquireTimeoutMs = tuning.lockAcquireTimeoutMs;
+  }
+
+  private profileFor(adapterId: AcpAdapterId): UpstreamProfile {
+    const profile = this.profiles.get(adapterId);
+    if (!profile) throw new Error(`credential proxy: no upstream profile for adapter "${adapterId}"`);
+    return profile;
   }
 
   /**
@@ -295,18 +394,25 @@ export class CredentialProxy {
   }
 
   /**
-   * Mint a fresh sentinel and register it for `(issueId, identifier)`. The
-   * caller stages the result as `ANTHROPIC_AUTH_TOKEN=<sentinel>` and
-   * `ANTHROPIC_BASE_URL=<baseUrl>` in the VM launch env.
+   * Mint a fresh sentinel and register it for `(issueId, identifier, adapterId)`.
+   * The caller stages the result as the adapter's token + base-URL env vars in
+   * the VM launch env. `adapterId` selects the `UpstreamProfile` used for every
+   * request under this sentinel; it must be a profile the proxy knows.
    */
   register(opts: RegisterOpts): CredentialProxyRegistration {
     if (this.stopped) throw new Error('credential proxy is stopped');
     if (!this.server) throw new Error('credential proxy is not listening; call start() first');
     const baseUrl = this.baseUrl();
     if (!baseUrl) throw new Error('credential proxy has no bound URL');
+    const adapterId = opts.adapterId ?? 'claude';
+    this.profileFor(adapterId); // fail fast on an unknown adapter
     const sentinel = `sk-symphony-${randomBytes(24).toString('base64url')}`;
-    this.pending.set(sentinel, { sentinel, issueId: opts.issueId, identifier: opts.identifier });
-    log.debug('credential proxy registered', { issue_id: opts.issueId, issue_identifier: opts.identifier });
+    this.pending.set(sentinel, { sentinel, issueId: opts.issueId, identifier: opts.identifier, adapterId });
+    log.debug('credential proxy registered', {
+      issue_id: opts.issueId,
+      issue_identifier: opts.identifier,
+      adapter: adapterId,
+    });
     return { sentinel, baseUrl };
   }
 
@@ -332,21 +438,24 @@ export class CredentialProxy {
   }
 
   /**
-   * Spawn `claude -p "ok"` (or the injected refresher) under a host-side
-   * cross-process lock so concurrent symphony processes — and concurrent
-   * in-process callers — collapse into one refresh. Anthropic's own client
-   * owns OAuth: we just trigger it and re-read the rotated credential.
+   * Run the adapter's refresher under a host-side cross-process lock so
+   * concurrent symphony processes — and concurrent in-process callers — collapse
+   * into one refresh per adapter. The adapter's own client owns OAuth: we just
+   * trigger it and re-read the rotated credential. Defaults to `'claude'` so the
+   * ticker (`CredentialTicker`) keeps the short-TTL claude token warm.
    */
-  async refreshNow(): Promise<void> {
-    if (this.refreshInFlight) return this.refreshInFlight;
-    const p = this.runRefreshUnderLock().finally(() => {
-      this.refreshInFlight = null;
+  async refreshNow(adapterId: AcpAdapterId = 'claude'): Promise<void> {
+    const inflight = this.refreshInFlight.get(adapterId);
+    if (inflight) return inflight;
+    const profile = this.profileFor(adapterId);
+    const p = this.runRefreshUnderLock(profile).finally(() => {
+      this.refreshInFlight.delete(adapterId);
     });
-    this.refreshInFlight = p;
+    this.refreshInFlight.set(adapterId, p);
     return p;
   }
 
-  private async runRefreshUnderLock(): Promise<void> {
+  private async runRefreshUnderLock(profile: UpstreamProfile): Promise<void> {
     let release: (() => Promise<void>) | null = null;
     try {
       release = await this.lockAcquire(this.lockAcquireTimeoutMs);
@@ -366,7 +475,7 @@ export class CredentialProxy {
       throw new Error('credential proxy: refresh lock acquire timeout');
     }
     try {
-      await this.refresher();
+      await profile.refresher();
     } finally {
       await release().catch((err) => {
         log.warn('credential proxy: lock release error', { error: (err as Error).message });
@@ -375,17 +484,25 @@ export class CredentialProxy {
   }
 
   /**
-   * Read the cached access token. Returns the access token plus its
-   * `expiresAt` in milliseconds since epoch when present, so callers can
-   * decide whether a refresh is needed before forwarding the request.
+   * Read the cached access token for `profile`. Tries the profile's credential
+   * file first, then its env fallback (codex `OPENAI_API_KEY`). Returns the
+   * access token plus its `expiresAt` in milliseconds since epoch when present,
+   * so callers can decide whether a refresh is needed before forwarding.
    */
-  private async readCachedToken(): Promise<{ accessToken: string; expiresAtMs: number | null } | null> {
+  private async readCachedToken(profile: UpstreamProfile): Promise<TokenInfo | null> {
+    const fromFile = await this.readTokenFile(profile);
+    if (fromFile !== null) return fromFile;
+    return profile.envFallback();
+  }
+
+  private async readTokenFile(profile: UpstreamProfile): Promise<TokenInfo | null> {
     let raw: string;
     try {
-      raw = await readFile(this.credentialsPath, 'utf8');
+      raw = await readFile(profile.credentialsPath, 'utf8');
     } catch (err) {
       log.warn('credential proxy: cannot read credentials', {
-        path: this.credentialsPath,
+        adapter: profile.adapterId,
+        path: profile.credentialsPath,
         error: (err as Error).message,
       });
       return null;
@@ -394,30 +511,36 @@ export class CredentialProxy {
     try {
       parsed = JSON.parse(raw);
     } catch (err) {
-      log.warn('credential proxy: credentials JSON parse failed', { error: (err as Error).message });
+      log.warn('credential proxy: credentials JSON parse failed', {
+        adapter: profile.adapterId,
+        error: (err as Error).message,
+      });
       return null;
     }
-    return extractAccessToken(parsed);
+    return profile.extractToken(parsed);
   }
 
-  private async ensureFreshToken(): Promise<string | null> {
-    const cached = await this.readCachedToken();
+  private async ensureFreshToken(profile: UpstreamProfile): Promise<string | null> {
+    const cached = await this.readCachedToken(profile);
     if (cached === null) return null;
     if (cached.expiresAtMs === null || cached.expiresAtMs - this.now() > this.refreshMarginMs) {
       return cached.accessToken;
     }
     try {
-      await this.refreshNow();
+      await this.refreshNow(profile.adapterId);
     } catch (err) {
-      log.warn('credential proxy: refresh failed', { error: (err as Error).message });
+      log.warn('credential proxy: refresh failed', {
+        adapter: profile.adapterId,
+        error: (err as Error).message,
+      });
       // Failure includes the lock-acquire-timeout path: a peer is presumed to
       // be running the refresh under the file lock. Re-read the cache so we
       // pick up whatever the peer wrote during our wait; fall back to the
       // stale token if not yet rotated (upstream then surfaces 401 normally).
-      const postFail = await this.readCachedToken();
+      const postFail = await this.readCachedToken(profile);
       return postFail?.accessToken ?? cached.accessToken;
     }
-    const refreshed = await this.readCachedToken();
+    const refreshed = await this.readCachedToken(profile);
     return refreshed?.accessToken ?? cached.accessToken;
   }
 
@@ -438,7 +561,8 @@ export class CredentialProxy {
       writeProxyError(res, 401, 'unknown sentinel');
       return;
     }
-    const access = await this.ensureFreshToken();
+    const profile = this.profileFor(matched.adapterId);
+    const access = await this.ensureFreshToken(profile);
     if (!access) {
       writeProxyError(res, 503, 'credential proxy: no cached access token');
       return;
@@ -450,11 +574,12 @@ export class CredentialProxy {
       headers: collectHeaders(req),
       body,
     });
-    await this.forwardToUpstream(matched, req, res, rewritten, access);
+    await this.forwardToUpstream(matched, profile, req, res, rewritten, access);
   }
 
   private async forwardToUpstream(
     matched: Registration,
+    profile: UpstreamProfile,
     req: IncomingMessage,
     res: ServerResponse,
     rewritten: HeaderOverrideOutput,
@@ -462,15 +587,17 @@ export class CredentialProxy {
   ): Promise<void> {
     try {
       const upstream = await this.upstream.send({
+        host: profile.upstreamHost,
         method: req.method ?? 'GET',
         pathname: req.url ?? '/',
         headers: { ...rewritten.headers, authorization: `Bearer ${access}` },
         body: rewritten.body,
       });
-      forwardResponse(matched, upstream, res);
+      forwardResponse(matched, profile, upstream, res);
     } catch (err) {
       log.warn('credential proxy: upstream error', {
         issue_id: matched.issueId,
+        adapter: matched.adapterId,
         error: (err as Error).message,
       });
       if (!res.headersSent) writeProxyError(res, 502, 'upstream error');
@@ -493,24 +620,57 @@ export class CredentialProxy {
 // complexity budget, so defaults are applied in two thematic groups.
 
 function resolveCredentialProxyWiring(opts: CredentialProxyOptions): {
-  credentialsPath: string;
+  profiles: Map<AcpAdapterId, UpstreamProfile>;
   lockPath: string;
   upstream: UpstreamRequestor;
-  refresher: () => Promise<void>;
   override: HeaderOverride;
   now: () => number;
   lockAcquire: LockAcquire;
 } {
   const lockPath = opts.lockPath ?? path.join(os.homedir(), '.symphony', 'oauth', 'refresh.lock');
   return {
-    credentialsPath: opts.credentialsPath ?? path.join(os.homedir(), '.claude', '.credentials.json'),
+    profiles: buildUpstreamProfiles(opts),
     lockPath,
     upstream: opts.upstream ?? defaultUpstream(),
-    refresher: opts.refresher ?? defaultRefresher(),
     override: opts.override ?? NOOP_OVERRIDE,
     now: opts.now ?? (() => Date.now()),
     lockAcquire: opts.lockAcquire ?? defaultFlockAcquire(lockPath),
   };
+}
+
+/**
+ * Build the adapter-keyed upstream profiles, applying any per-adapter overrides.
+ * The top-level `credentialsPath` / `refresher` options are claude shorthands
+ * (kept for backward compatibility); explicit `profileOverrides.claude` wins.
+ */
+function buildUpstreamProfiles(opts: CredentialProxyOptions): Map<AcpAdapterId, UpstreamProfile> {
+  const claudeOv: UpstreamProfileOverride = {
+    credentialsPath: opts.credentialsPath,
+    refresher: opts.refresher,
+    ...opts.profileOverrides?.claude,
+  };
+  const codexOv = opts.profileOverrides?.codex ?? {};
+  const home = os.homedir();
+  const profiles = new Map<AcpAdapterId, UpstreamProfile>();
+  profiles.set('claude', {
+    adapterId: 'claude',
+    upstreamHost: claudeOv.upstreamHost ?? 'api.anthropic.com',
+    credentialsPath: claudeOv.credentialsPath ?? path.join(home, '.claude', '.credentials.json'),
+    extractToken: extractClaudeToken,
+    envFallback: () => null,
+    refresher: claudeOv.refresher ?? defaultClaudeRefresher(),
+    billingTellHeaders: CLAUDE_BILLING_TELL_HEADERS,
+  });
+  profiles.set('codex', {
+    adapterId: 'codex',
+    upstreamHost: codexOv.upstreamHost ?? 'api.openai.com',
+    credentialsPath: codexOv.credentialsPath ?? path.join(home, '.codex', 'auth.json'),
+    extractToken: extractCodexToken,
+    envFallback: codexEnvFallback,
+    refresher: codexOv.refresher ?? defaultCodexRefresher(),
+    billingTellHeaders: CODEX_BILLING_TELL_HEADERS,
+  });
+  return profiles;
 }
 
 function resolveCredentialProxyTuning(opts: CredentialProxyOptions): {
@@ -659,6 +819,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
  */
 function forwardResponse(
   matched: Registration,
+  profile: UpstreamProfile,
   upstream: UpstreamResponse,
   res: ServerResponse,
 ): void {
@@ -669,7 +830,7 @@ function forwardResponse(
     headers[k] = v;
   }
   res.writeHead(upstream.statusCode, headers);
-  logRateLimitHeaders(matched, upstream.headers);
+  logRateLimitHeaders(matched, profile, upstream.headers);
   void pipeBody(upstream.body, res);
 }
 
@@ -687,9 +848,13 @@ async function pipeBody(body: AsyncIterable<Buffer>, res: ServerResponse): Promi
   }
 }
 
-function logRateLimitHeaders(matched: Registration, headers: Record<string, string | string[]>): void {
+function logRateLimitHeaders(
+  matched: Registration,
+  profile: UpstreamProfile,
+  headers: Record<string, string | string[]>,
+): void {
   const observed: Record<string, string> = {};
-  for (const name of REFRESH_HEADER_NAMES) {
+  for (const name of profile.billingTellHeaders) {
     const v = headers[name];
     if (v === undefined) continue;
     observed[name] = Array.isArray(v) ? v.join(', ') : v;
@@ -698,17 +863,18 @@ function logRateLimitHeaders(matched: Registration, headers: Record<string, stri
     log.info('credential proxy: upstream ratelimit', {
       issue_id: matched.issueId,
       issue_identifier: matched.identifier,
+      adapter: matched.adapterId,
       ...observed,
     });
   }
 }
 
 /**
- * Pull `accessToken` and `expiresAt` out of the credentials JSON. The shape
- * `claude` writes is `{ claudeAiOauth: { accessToken, expiresAt, ... } }`,
+ * Pull `accessToken` and `expiresAt` out of the claude credentials JSON. The
+ * shape `claude` writes is `{ claudeAiOauth: { accessToken, expiresAt, ... } }`,
  * but we tolerate flat top-level fields too for forward compatibility.
  */
-function extractAccessToken(parsed: unknown): { accessToken: string; expiresAtMs: number | null } | null {
+function extractClaudeToken(parsed: unknown): TokenInfo | null {
   if (!parsed || typeof parsed !== 'object') return null;
   const root = parsed as Record<string, unknown>;
   const oauth = root['claudeAiOauth'];
@@ -718,6 +884,41 @@ function extractAccessToken(parsed: unknown): { accessToken: string; expiresAtMs
   if (typeof accessToken !== 'string' || accessToken.length === 0) return null;
   const expiresAtMs = coerceExpiresAtMs(candidate['expiresAt']);
   return { accessToken, expiresAtMs };
+}
+
+/**
+ * Pull the access token out of the codex `~/.codex/auth.json`. Two flavours live
+ * there (docs/research/codex-proxy-accept-matrix.md §1): a ChatGPT-OAuth
+ * `tokens.access_token` and an API-key `OPENAI_API_KEY`. We prefer the OAuth
+ * access token, then fall back to the API key. The `tokens.refresh_token` is
+ * NEVER read — it stays host-side so an in-VM agent cannot rotate (and thereby
+ * invalidate) the host's credential. `expiresAtMs` is null on purpose: codex
+ * tokens are long-lived (~8 days) and the proxy re-reads on each request rather
+ * than driving a refresh (research Q3 option c).
+ */
+function extractCodexToken(parsed: unknown): TokenInfo | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const root = parsed as Record<string, unknown>;
+  const access = codexAccessToken(root) ?? nonEmptyString(root['OPENAI_API_KEY']);
+  return access === null ? null : { accessToken: access, expiresAtMs: null };
+}
+
+/** Pull `tokens.access_token` (the ChatGPT-OAuth access token) out of auth.json. */
+function codexAccessToken(root: Record<string, unknown>): string | null {
+  const tokens = root['tokens'];
+  if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens)) return null;
+  return nonEmptyString((tokens as Record<string, unknown>)['access_token']);
+}
+
+function nonEmptyString(v: unknown): string | null {
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+/** Read `OPENAI_API_KEY` from the host environment as a codex credential fallback. */
+function codexEnvFallback(): TokenInfo | null {
+  const key = process.env['OPENAI_API_KEY'];
+  if (typeof key === 'string' && key.length > 0) return { accessToken: key, expiresAtMs: null };
+  return null;
 }
 
 function coerceExpiresAtMs(value: unknown): number | null {

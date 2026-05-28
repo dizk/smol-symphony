@@ -251,8 +251,9 @@ export class Orchestrator
    * `~/.claude/.credentials.json` (consumed by the credential proxy) is
    * missing. Per-state overrides can change the adapter, so the set is the
    * union of `cfg.acp.adapter` and every distinct `states.<name>.adapter`.
-   * The codex adapter has no host-file dependency — it relies on
-   * `OPENAI_API_KEY` forwarded via `smolvm.forward_env`.
+   * codex is not probed here: its credential has two valid sources (a
+   * `~/.codex/auth.json` token or an `OPENAI_API_KEY` env var), so the proxy
+   * validates it lazily on the first request rather than at startup.
    */
   private async assertAdapterCredentials(): Promise<void> {
     const ids = requiredAdapterIds(this.cfg, isKnownAdapter);

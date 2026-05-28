@@ -71,10 +71,12 @@ export function validateDispatchIo(cfg: ServiceConfig): string | null {
 
 function probeStateCredential(stateName: string, adapter: string | undefined): string | null {
   if (adapter === undefined || !isKnownAdapter(adapter)) return null;
-  // Only the claude adapter has a host-file dependency: the credential proxy
-  // reads `~/.claude/.credentials.json` on every upstream request to swap
-  // the live access token in for a per-VM sentinel. The codex adapter relies
-  // on `OPENAI_API_KEY` forwarded via `smolvm.forward_env` — no file probe.
+  // Only the claude adapter has a single host-file dependency we can probe at
+  // load time: the credential proxy reads `~/.claude/.credentials.json` on every
+  // upstream request to swap the live access token in for a per-VM sentinel.
+  // codex routes through the same proxy but has two valid credential sources
+  // (a `~/.codex/auth.json` token or an `OPENAI_API_KEY` env var), so the proxy
+  // validates it lazily at request time rather than via a startup file probe.
   if (adapter !== 'claude') return null;
   const credPath = hostClaudeCredentialPath();
   try {

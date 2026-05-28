@@ -90,11 +90,24 @@ describe('adapters registry', () => {
 
   it('declares the per-adapter credential strategy the runner dispatches on', () => {
     // The runner keys credential handling on `credentialStrategy`, not on `id`
-    // (issue #115). claude routes through the host credential proxy; codex
-    // forwards OPENAI_API_KEY via smolvm.forward_env. A 'forward-env' adapter
-    // must NOT crash-loop when the proxy is unwired — it just proceeds.
+    // (issue #115/#116). Both claude and codex now route through the host
+    // credential proxy. A 'forward-env' adapter must NOT crash-loop when the
+    // proxy is unwired — it just proceeds; none ship today.
     assert.equal(ADAPTERS.claude.credentialStrategy, 'proxy');
-    assert.equal(ADAPTERS.codex.credentialStrategy, 'forward-env');
+    assert.equal(ADAPTERS.codex.credentialStrategy, 'proxy');
+  });
+
+  it('proxy adapters declare the VM-facing base-URL + token env var names', () => {
+    // applyCredentialEnv stages reg.baseUrl/sentinel under these names so the
+    // in-VM client dials the proxy with the sentinel as its bearer (issue #116).
+    assert.deepEqual(ADAPTERS.claude.proxyEnv, {
+      baseUrlVar: 'ANTHROPIC_BASE_URL',
+      tokenVar: 'ANTHROPIC_AUTH_TOKEN',
+    });
+    assert.deepEqual(ADAPTERS.codex.proxyEnv, {
+      baseUrlVar: 'OPENAI_BASE_URL',
+      tokenVar: 'OPENAI_API_KEY',
+    });
   });
 
   it('isKnownAdapter narrows on supported ids only', () => {
@@ -118,7 +131,8 @@ describe('adapters registry', () => {
   });
 
   it('deriveAcpCommand for codex also just execs the proxy (no credential staging)', () => {
-    // codex-acp reads OPENAI_API_KEY from smolvm.forward_env; nothing to stage.
+    // codex routes through the host credential proxy (sentinel + OPENAI_BASE_URL);
+    // it stages no identity file, so nothing crosses the boundary either.
     const cmd = deriveAcpCommand(ADAPTERS.codex);
     assert.equal(cmd, 'exec node /opt/symphony/vm-agent.mjs');
   });

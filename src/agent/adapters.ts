@@ -3,10 +3,11 @@
 // Each profile encodes the executable inside the VM that speaks ACP, plus the
 // optional model/effort injection channels (env vars, extra argv, staged files)
 // the adapter natively understands. There is no per-adapter credential file
-// plumbing — credentials are no longer staged into the VM. The host
-// credential proxy substitutes a per-VM sentinel for the real upstream
-// Anthropic OAuth access token on every request; codex-acp reads
-// `OPENAI_API_KEY` out of `smolvm.forward_env`.
+// plumbing — credentials are no longer staged into the VM. The host credential
+// proxy substitutes a per-VM sentinel for the real upstream token on every
+// request (Anthropic OAuth for claude, an OpenAI API key or ChatGPT-OAuth
+// access token for codex); each proxy adapter declares its VM-facing base-URL
+// and token env var names via `proxyEnv`.
 //
 // To add a new adapter (e.g. opencode), populate the profile and add it to
 // ADAPTERS. Unprofiled adapters are not supported at runtime.
@@ -64,19 +65,32 @@ export interface StagedFileSpec {
  *    in-VM client dials the proxy (via the adapter's base-URL env var) with the
  *    sentinel as its bearer, and the proxy substitutes the real upstream token
  *    host-side on every request. No credential bytes — and crucially no refresh
- *    token — ever enter the VM. claude uses this (see `src/agent/credential-proxy.ts`).
- *  - `'forward-env'`: the adapter reads a credential env var (e.g.
- *    `OPENAI_API_KEY`) forwarded verbatim into the VM via `smolvm.forward_env`.
- *    The proxy is not involved. codex uses this today.
+ *    token — ever enter the VM. Both claude and codex use this (see
+ *    `src/agent/credential-proxy.ts`).
+ *  - `'forward-env'`: the adapter reads a credential env var forwarded verbatim
+ *    into the VM via `smolvm.forward_env`. The proxy is not involved. No shipped
+ *    adapter uses this today; it remains for adapters the proxy cannot serve.
  *
  * The runner dispatches on this field (not on `id`) so that proxy-capable
  * adapters route through the proxy and `forward-env` adapters proceed without
  * one — never crash-looping a dispatch for an adapter the proxy can't serve.
- * Extending the proxy to codex (issue #115) means generalizing
- * `CredentialProxy` to an adapter-keyed upstream profile and flipping codex's
- * strategy to `'proxy'`; see `docs/research/codex-proxy-accept-matrix.md`.
+ * Issue #116 generalized `CredentialProxy` to an adapter-keyed upstream profile
+ * and flipped codex to `'proxy'`; see `docs/research/codex-proxy-accept-matrix.md`.
  */
 export type CredentialStrategy = 'proxy' | 'forward-env';
+
+/**
+ * The VM-facing env var names a `'proxy'`-strategy adapter expects for the
+ * credential proxy. The runner stages `baseUrlVar=<proxy base URL>` and
+ * `tokenVar=<per-dispatch sentinel>` into the in-VM adapter env; the in-VM
+ * client then dials the proxy with the sentinel as its bearer. claude reads
+ * `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`; codex reads
+ * `OPENAI_BASE_URL`/`OPENAI_API_KEY`.
+ */
+export interface ProxyEnvVars {
+  baseUrlVar: string;
+  tokenVar: string;
+}
 
 export interface AdapterProfile {
   id: AcpAdapterId;
@@ -88,6 +102,12 @@ export interface AdapterProfile {
   binary: readonly string[];
   /** How symphony supplies upstream credentials to this adapter. See {@link CredentialStrategy}. */
   credentialStrategy: CredentialStrategy;
+  /**
+   * For `'proxy'`-strategy adapters: the VM-facing env var names the runner uses
+   * to stage the proxy base URL + sentinel. Required when `credentialStrategy`
+   * is `'proxy'`; unused for `'forward-env'`. See {@link ProxyEnvVars}.
+   */
+  proxyEnv?: ProxyEnvVars;
   /**
    * Map an `acp.model` string into the env vars / extra argv this adapter needs to
    * actually select the model. Called only when `acp.model` is non-null; profiles can
@@ -112,6 +132,7 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // Anthropic subscription OAuth lives only on the host; the proxy substitutes
     // a per-VM sentinel for the real access token on every upstream request.
     credentialStrategy: 'proxy',
+    proxyEnv: { baseUrlVar: 'ANTHROPIC_BASE_URL', tokenVar: 'ANTHROPIC_AUTH_TOKEN' },
     // claude-agent-acp reads ANTHROPIC_MODEL on startup (see acp-agent.js getAvailableModels:
     // ANTHROPIC_MODEL > settings.model > default). The adapter resolves aliases like
     // "opus" or "claude-sonnet-4-5" against the SDK's model list, so anything the user
@@ -138,10 +159,15 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   codex: {
     id: 'codex',
     binary: ['codex-acp'],
-    // codex-acp reads OPENAI_API_KEY from `smolvm.forward_env`. Extending the
-    // credential proxy to codex's ChatGPT-OAuth path is deferred (issue #115);
-    // see docs/research/codex-proxy-accept-matrix.md for the gating unknown.
-    credentialStrategy: 'forward-env',
+    // The proxy substitutes a per-VM sentinel for the real OpenAI credential
+    // (an API key, or a ChatGPT-OAuth access token read from ~/.codex/auth.json —
+    // never the refresh token) on every upstream request. The VM only ever sees
+    // OPENAI_API_KEY=<sentinel> + OPENAI_BASE_URL=<proxy>, so it operates in the
+    // SDK's high-confidence API-key code path and never performs the OAuth
+    // handshake itself (the Q2 gating unknown is sidestepped — the handshake /
+    // refresh stays host-side). See docs/research/codex-proxy-accept-matrix.md.
+    credentialStrategy: 'proxy',
+    proxyEnv: { baseUrlVar: 'OPENAI_BASE_URL', tokenVar: 'OPENAI_API_KEY' },
     // codex-acp takes config overrides via `-c key=value` where value is parsed as TOML
     // (raw-string fallback on parse failure). We always emit a quoted TOML string so
     // model names containing dots or hyphens don't surprise the TOML parser.
@@ -488,10 +514,10 @@ export interface ExtraGuestFile {
  * that can launch a process with env vars and reach the host loopback can run
  * this stack unchanged.
  *
- * Credentials are NOT staged into the VM. The host credential proxy
- * substitutes a per-VM sentinel for the real Anthropic OAuth access token on
- * every upstream request; codex-acp reads `OPENAI_API_KEY` from the env
- * forwarded by `smolvm.forward_env`.
+ * Credentials are NOT staged into the VM. The host credential proxy substitutes
+ * a per-VM sentinel for the real upstream token (Anthropic OAuth for claude,
+ * an OpenAI API key or ChatGPT-OAuth access token for codex) on every request;
+ * the VM only ever holds the sentinel + the adapter's base-URL env var.
  */
 export function deriveAcpCommand(
   profile: AdapterProfile,

@@ -48,9 +48,11 @@ import { defaultPredicateEnv } from '../actions/predicate-env.js';
 import type { ResourceSnapshot } from '../reconciler/index.js';
 import {
   classifyTurnOutcome,
+  computeForwardedEnv,
   decideAttemptOutcome,
   decideTurnContinuation,
   deriveActionContext,
+  proxyCredentialEnv,
   selectPromptKind,
 } from './runner-decisions.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
@@ -335,12 +337,12 @@ export class AgentRunner {
     private actionSnapshotSink: ActionSnapshotSink | null = null,
     /**
      * Host credential proxy (issue 113). Required for adapters whose
-     * `credentialStrategy` is `'proxy'` (claude today): the proxy mints
+     * `credentialStrategy` is `'proxy'` (claude and codex): the proxy mints
      * per-dispatch sentinels that the in-VM client uses as its upstream Bearer
-     * (substituted for the real OAuth access token on every request). Symphony
-     * deregisters on teardown. Adapters with `credentialStrategy: 'forward-env'`
-     * (codex today) read their credential env var from `smolvm.forward_env` and
-     * never touch the proxy.
+     * (substituted for the real OAuth access token / API key on every request,
+     * per the adapter's upstream profile). Symphony deregisters on teardown.
+     * Adapters with `credentialStrategy: 'forward-env'` read their credential
+     * env var from `smolvm.forward_env` and never touch the proxy.
      */
     private credentialProxy: CredentialProxy | null = null,
   ) {}
@@ -882,12 +884,12 @@ export class AgentRunner {
    * Pre-handshake failures unwind through the normal phase pipeline.
    *
    * Credentials never enter the VM. Dispatch is keyed on the adapter's
-   * `credentialStrategy`, not its id: a `'proxy'` adapter (claude) gets
-   * `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN=<sentinel>` from the host
-   * credential proxy (wired at exec time) plus a minimal `~/.claude.json`
-   * identity file for fingerprint stability; a `'forward-env'` adapter (codex)
-   * reads its credential env var (e.g. `OPENAI_API_KEY`) from the env forwarded
-   * by `smolvm.forward_env` and proceeds without the proxy.
+   * `credentialStrategy`, not its id: a `'proxy'` adapter (claude, codex) gets
+   * its `proxyEnv` base-URL + token-sentinel vars from the host credential proxy
+   * (wired at exec time); claude additionally stages a minimal `~/.claude.json`
+   * identity file for fingerprint stability. A `'forward-env'` adapter reads its
+   * credential env var from the env forwarded by `smolvm.forward_env` and
+   * proceeds without the proxy.
    */
   private async prepareAdapterRuntime(
     workspacePath: string,
@@ -929,13 +931,14 @@ export class AgentRunner {
 
   /**
    * Compose the per-adapter extra guest files: every staged file produced by
-   * runtime injections (model/effort knobs), plus — for the proxy strategy
-   * (claude) — the minimal `~/.claude.json` identity (oauthAccount UUIDs only)
-   * copied to `/root/.claude.json` before exec, so the proxy's host-side
-   * fingerprint seam can compose a well-formed `metadata.user_id` if Anthropic
-   * re-activates its server-side check. Identity staging is best-effort: a
-   * missing host `~/.claude.json` is logged and the dispatch proceeds.
-   * `forward-env` adapters (codex) stage no identity.
+   * runtime injections (model/effort knobs), plus — for claude — the minimal
+   * `~/.claude.json` identity (oauthAccount UUIDs only) copied to
+   * `/root/.claude.json` before exec, so the proxy's host-side fingerprint seam
+   * can compose a well-formed `metadata.user_id` if Anthropic re-activates its
+   * server-side check. Identity staging is best-effort: a missing host
+   * `~/.claude.json` is logged and the dispatch proceeds. codex stages no
+   * identity — OpenAI ships no third-party-client fingerprint check (see
+   * docs/research/codex-proxy-accept-matrix.md §1).
    */
   private async stageAdapterExtras(
     workspacePath: string,
@@ -944,7 +947,7 @@ export class AgentRunner {
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<ExtraGuestFile[]>> {
     const out: ExtraGuestFile[] = [...injected.runtimeExtraFiles];
-    if (profile.credentialStrategy !== 'proxy') return { ok: true, value: out };
+    if (profile.id !== 'claude') return { ok: true, value: out };
     try {
       const identity = await stageClaudeIdentity(workspacePath);
       if (identity) {
@@ -1092,21 +1095,31 @@ export class AgentRunner {
   }
 
   /**
-   * Mint a credential-proxy sentinel for `'proxy'`-strategy dispatches (claude).
-   * Sentinel registration happens AFTER VM start + bridge register so an early
-   * failure doesn't leak a registry entry — the proxy's registry is
-   * in-process, but a leaked entry would still be a loose end across the
-   * dispatch lifecycle. `'forward-env'` adapters (codex) get no sentinel.
+   * Mint a credential-proxy sentinel for `'proxy'`-strategy dispatches (claude
+   * and codex). Sentinel registration happens AFTER VM start + bridge register
+   * so an early failure doesn't leak a registry entry — the proxy's registry is
+   * in-process, but a leaked entry would still be a loose end across the dispatch
+   * lifecycle. The adapter id selects the proxy's upstream profile. `'forward-env'`
+   * adapters get no sentinel.
    */
   private registerCredentialSentinel(
     issue: Issue,
     adapter: AdapterRuntime,
   ): { sentinel: string; baseUrl: string } | null {
     if (adapter.profile.credentialStrategy !== 'proxy' || !this.credentialProxy) return null;
-    return this.credentialProxy.register({ issueId: issue.id, identifier: issue.identifier });
+    return this.credentialProxy.register({
+      issueId: issue.id,
+      identifier: issue.identifier,
+      adapterId: adapter.profile.id,
+    });
   }
 
-  /** Fold the credential-proxy env vars onto the adapter runtime env. */
+  /**
+   * Fold the credential-proxy env vars onto the adapter runtime env. The var
+   * names come from the adapter's `proxyEnv` (claude → ANTHROPIC_*, codex →
+   * OPENAI_*) so the in-VM client dials the proxy with the sentinel as its
+   * bearer. A `'proxy'`-strategy adapter without `proxyEnv` is a profile bug.
+   */
   private applyCredentialEnv(
     adapter: AdapterRuntime,
     reg: { sentinel: string; baseUrl: string } | null,
@@ -1116,8 +1129,7 @@ export class AgentRunner {
       ...adapter,
       runtimeEnv: {
         ...adapter.runtimeEnv,
-        ANTHROPIC_BASE_URL: reg.baseUrl,
-        ANTHROPIC_AUTH_TOKEN: reg.sentinel,
+        ...proxyCredentialEnv(adapter.profile.proxyEnv, adapter.profile.id, reg),
       },
     };
   }
@@ -1136,7 +1148,7 @@ export class AgentRunner {
     const bakedFrom = this.bakedArtifacts?.artifactPath() ?? null;
     return {
       mounts: this.buildVmMounts(workspacePath, resolved),
-      env: this.buildForwardedEnv(),
+      env: this.buildForwardedEnv(ADAPTERS[resolved.adapter]),
       ...this.buildVmSourceConfig(bakedFrom),
     };
   }
@@ -1157,13 +1169,20 @@ export class AgentRunner {
     return mounts;
   }
 
-  private buildForwardedEnv(): Record<string, string> {
-    const env: Record<string, string> = {};
-    for (const k of this.cfg.smolvm.forward_env) {
-      const v = process.env[k];
-      if (v && v.length > 0) env[k] = v;
-    }
-    return env;
+  /**
+   * Forward the configured `smolvm.forward_env` vars into the VM boot env, EXCEPT
+   * the dispatched proxy adapter's credential var. Under proxy mode the VM must
+   * never hold the real credential: the in-VM client receives a per-dispatch
+   * sentinel (via the exec env) instead, and the proxy substitutes the real token
+   * host-side. If the operator still lists e.g. `OPENAI_API_KEY` in `forward_env`
+   * (the default), leaving it in the boot env would plant the real key in the
+   * VM's PID-1 environment — readable via `/proc/1/environ` — defeating the proxy.
+   * So we drop `proxyEnv.tokenVar` for proxy adapters.
+   */
+  private buildForwardedEnv(profile: AdapterProfile): Record<string, string> {
+    const omit =
+      profile.credentialStrategy === 'proxy' ? profile.proxyEnv?.tokenVar : undefined;
+    return computeForwardedEnv(this.cfg.smolvm.forward_env, omit, (k) => process.env[k]);
   }
 
   private buildVmSourceConfig(
@@ -1821,10 +1840,9 @@ interface VmExecHandle {
   execStream: ExecStream;
   bridgeReg: AcpBridgeRegistration;
   /**
-   * Credential-proxy sentinel registered for this claude dispatch; null for
-   * codex dispatches (codex reads `OPENAI_API_KEY` from `smolvm.forward_env`
-   * and does not touch the proxy). Threaded onto the SessionContext so
-   * tearDownSession can deregister it.
+   * Credential-proxy sentinel registered for this `'proxy'`-strategy dispatch
+   * (claude, codex); null for `'forward-env'` dispatches that don't touch the
+   * proxy. Threaded onto the SessionContext so tearDownSession can deregister it.
    */
   credentialSentinel: string | null;
 }
@@ -1848,9 +1866,10 @@ interface SessionContext {
   runLog: RunLog | undefined;
   logger: ReturnType<typeof withIssue>;
   /**
-   * Credential-proxy sentinel for this claude dispatch (null for codex).
-   * Captured at session construction so `tearDownSession` can deregister it
-   * without reaching back into the AdapterRuntime.
+   * Credential-proxy sentinel for this dispatch — minted for `'proxy'`-strategy
+   * adapters (claude and codex), null for `'forward-env'` adapters. Captured at
+   * session construction so `tearDownSession` can deregister it without reaching
+   * back into the AdapterRuntime.
    */
   credentialSentinel: string | null;
 }

@@ -14,12 +14,13 @@ import type { AgentRunner } from '../src/agent/runner.js';
 import type { SmolvmClient } from '../src/agent/smolvm.js';
 import { Reconciler } from '../src/reconciler/index.js';
 
-// Startup credential contract under the credential-proxy architecture (#114):
-// the only adapter that requires a host-side file is `claude` (the loopback
-// proxy reads `~/.claude/.credentials.json`). The probe walks the union of
-// workflow-level and per-state adapters, but short-circuits unless `claude`
-// is referenced anywhere. Codex no longer has a host file — auth is forwarded
-// via `OPENAI_API_KEY` through `smolvm.forward_env`.
+// Startup credential contract under the credential-proxy architecture (#114/#116):
+// the only adapter whose host credential is probed at startup is `claude` — it has
+// a single required file (`~/.claude/.credentials.json`). The probe walks the union
+// of workflow-level and per-state adapters, but short-circuits unless `claude` is
+// referenced anywhere. codex also routes through the proxy, but has two valid
+// sources (`~/.codex/auth.json` or `OPENAI_API_KEY`), so the proxy validates it
+// lazily on first request rather than via a startup file probe.
 
 function makeTracker(): IssueTracker {
   return {
@@ -134,9 +135,9 @@ describe('Orchestrator startup credential check', () => {
   });
 
   it('starts cleanly when the claude credential is present (codex needs no host file)', async () => {
-    // Both adapters referenced; only the claude credential needs to be on
-    // the host. Codex auth is forwarded as `OPENAI_API_KEY` via
-    // `smolvm.forward_env`, so the startup probe ignores it.
+    // Both adapters referenced; only the claude credential is startup-probed.
+    // codex routes through the proxy with two valid sources validated lazily on
+    // first request, so the startup probe ignores it.
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-ok-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-ok-'));
     const prevHome = process.env.HOME;
