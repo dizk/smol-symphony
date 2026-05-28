@@ -1613,9 +1613,9 @@ export class AgentRunner {
 
   /**
    * Unwind a session: cancel the bridge registration, destroy the socket and
-   * kill the exec, deactivate MCP, run the per-state `actions:` block or
-   * legacy `hooks.after_run`, and emit the `vm_teardown_deferred` event so
-   * the reconciler `vm` resource (issue 52) can converge the now-orphan VM.
+   * kill the exec, deactivate MCP, run the per-state `actions:` block, and
+   * emit the `vm_teardown_deferred` event so the reconciler `vm` resource
+   * (issue 52) can converge the now-orphan VM.
    *
    * Returns the non-routed action failure reason, or null when the cleanup
    * succeeded or routed (so the caller can fold it into `decideAttemptOutcome`).
@@ -1705,7 +1705,7 @@ interface VmExecHandle {
  * Mutable context threaded through phases 5–8. `acpSocket` starts null and
  * is filled in once the bridge handshake completes; `tearDownSession` checks
  * for null before destroying so the post-bridge-fail path is a no-op for the
- * socket but still runs the bridge cancel + exec kill + after_run cleanup.
+ * socket but still runs the bridge cancel + exec kill + Done-state actions.
  */
 interface SessionContext {
   issue: Issue;

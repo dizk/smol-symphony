@@ -209,8 +209,8 @@ states:
 #
 # When `enabled: false` (or the block is absent) the autopilot is fully
 # inert: the resource is never constructed and the orchestrator's existing
-# Done-state behavior (workspace cleanup + after_run PR-create hook +
-# operator-merge) is unchanged.
+# Done-state behavior (workspace cleanup + the Done-state `actions:` block
+# that pushes the branch and opens the PR + operator-merge) is unchanged.
 #
 # Workspace lifecycle gotcha: when `enabled: true`, transitions into
 # `merge_state` no longer fire the standard terminal workspace cleanup. The
