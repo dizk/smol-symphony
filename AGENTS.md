@@ -66,6 +66,54 @@ heading. Treat that as one option, not a directive.
 
 Run all three before calling `symphony.transition` into a terminal state.
 
+## Filing tracker issues
+
+When asked to file an issue against this repo's own tracker (the local Markdown
+tracker at `~/.symphony/trackers/smol-symphony/<state>/`), POST to the running
+symphony HTTP server rather than hand-writing the file or guessing the next
+identifier:
+
+```
+curl -s -X POST http://127.0.0.1:8787/api/v1/issues \
+  -H "content-type: application/json" \
+  --data-binary @/tmp/issue.json
+```
+
+Body shape (from `decideCreateIssue` in `src/http-handlers.ts`):
+
+```json
+{
+  "title": "required, non-empty",
+  "state": "Todo",              // optional; defaults to first declared active state
+  "identifier": "108",          // optional; auto-picked as next free integer
+  "description": "markdown body, written below the YAML front matter",
+  "priority": 2,                // optional integer; omitted ⇒ no `priority:` key
+  "labels": ["refactor"],       // optional
+  "blocked_by": ["107"]         // optional
+}
+```
+
+State must be a declared non-terminal state (`active` or `holding`); terminals
+are closed to direct creation. The server stamps `created_at` / `updated_at`,
+allocates the next free numeric identifier when one isn't supplied, and writes
+`<tracker.root>/<state>/<identifier>.md`. Response is `201` with
+`{ path, identifier, state }`. Conflicts (duplicate identifier, bad state) come
+back as `400`/`409` with a typed error code.
+
+The HTTP server (`server.port` in `WORKFLOW.md`, currently `8787`) is unauthenticated
+inside the trusted tailscale boundary — no bearer, no CSRF on JSON POSTs from curl.
+If the server isn't running, hand-writing `~/.symphony/trackers/smol-symphony/<state>/<n>.md`
+with the same YAML front-matter shape (`id`, `identifier`, `title`, `created_at`,
+`updated_at`, optional `priority`/`labels`) is equivalent — see existing files
+under `Done/` for canonical examples.
+
+Issue bodies on this tracker follow a four-section shape: **Problem** (what's
+wrong / why now), **Change** (concrete edits, with file paths and line ranges
+where known), **allowed_paths** (the workspace scope the dispatched agent is
+permitted to touch), **Acceptance** (the checks that must pass before
+`symphony.transition` into a terminal state). Look at recent `Done/*.md` for the
+shape — these are the prompts the dispatched agent sees, so be specific.
+
 ## Don't write to generated state
 
 Skip these when staging commits unless the user asks:
