@@ -88,6 +88,15 @@ describe('adapters registry', () => {
     assert.deepEqual(ADAPTERS.codex.binary, ['codex-acp']);
   });
 
+  it('declares the per-adapter credential strategy the runner dispatches on', () => {
+    // The runner keys credential handling on `credentialStrategy`, not on `id`
+    // (issue #115). claude routes through the host credential proxy; codex
+    // forwards OPENAI_API_KEY via smolvm.forward_env. A 'forward-env' adapter
+    // must NOT crash-loop when the proxy is unwired — it just proceeds.
+    assert.equal(ADAPTERS.claude.credentialStrategy, 'proxy');
+    assert.equal(ADAPTERS.codex.credentialStrategy, 'forward-env');
+  });
+
   it('isKnownAdapter narrows on supported ids only', () => {
     assert.equal(isKnownAdapter('claude'), true);
     assert.equal(isKnownAdapter('codex'), true);
@@ -119,6 +128,7 @@ describe('adapters registry', () => {
       id: 'claude' as const,
       // Imagine a future profile with multi-token launch + a metacharacter slipping in.
       binary: ['opencode', 'acp', '; rm -rf /'] as const,
+      credentialStrategy: 'proxy' as const,
       modelInjection: () => ({}),
     };
     const cmd = deriveAcpCommand(evil);
@@ -137,6 +147,7 @@ describe('adapters registry', () => {
         deriveAcpCommand({
           id: 'claude',
           binary: [],
+          credentialStrategy: 'proxy',
           modelInjection: () => ({}),
         }),
       /empty binary launch vector/,
