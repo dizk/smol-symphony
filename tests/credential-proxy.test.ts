@@ -332,7 +332,6 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
         },
         // Tight polling so the test completes quickly.
         lockPollMs: 5,
-        lockStaleMs: 60_000,
         lockAcquireTimeoutMs: 10_000,
       });
     const proxyA = makeProxy('A', spansA, holdA);
@@ -388,7 +387,6 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
       upstream: makeFakeUpstream(),
       refresher: async () => { ranA += 1; await holdA; },
       lockPollMs: 5,
-      lockStaleMs: 60_000,
       lockAcquireTimeoutMs: 60_000,
     });
     const proxyB = new CredentialProxy({
@@ -397,7 +395,6 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
       upstream: makeFakeUpstream(),
       refresher: async () => { ranB += 1; },
       lockPollMs: 5,
-      lockStaleMs: 60_000,
       // B's acquire timeout is far less than A's hold time. With the buggy
       // (pre-fix) behavior, B would spawn its refresher anyway after timing
       // out. The test asserts the fixed behavior: B does NOT run refresher.
@@ -425,11 +422,13 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
     }
   });
 
-  it('breaks through a stale lockfile abandoned by a crashed holder', async () => {
+  it('breaks through a lockfile whose holder process is provably dead', async () => {
     // If a previous holder crashed before unlinking the lockfile, the next
-    // acquire must detect the stale lock (mtime older than lockStaleMs) and
-    // force-clear it rather than blocking forever.
-    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-stalelock-'));
+    // acquire must detect the dead PID (kernel reports ESRCH) and force-clear
+    // the lockfile rather than blocking forever. This is the ONLY signal the
+    // proxy uses to authorize a break — mtime-based heuristics are rejected
+    // because they cannot distinguish "abandoned" from "slow-but-alive".
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-deadlock-'));
     const credentialsPath = path.join(tmp, '.credentials.json');
     const lockPath = path.join(tmp, 'refresh.lock');
     await writeFile(
@@ -437,10 +436,48 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
       JSON.stringify({ claudeAiOauth: { accessToken: 'init', expiresAt: Date.now() + 3_600_000 } }),
       'utf8',
     );
-    // Pre-create the lockfile and backdate its mtime to look abandoned.
-    await writeFile(lockPath, '999999\n', 'utf8');
+    // Pre-create the lockfile with a PID our injected liveness check reports dead.
+    const ghostPid = 999_999;
+    await writeFile(lockPath, `${ghostPid}\n`, 'utf8');
+    let ran = 0;
+    const proxy = new CredentialProxy({
+      credentialsPath,
+      lockPath,
+      upstream: makeFakeUpstream(),
+      refresher: async () => { ran += 1; },
+      processAlive: (pid) => pid !== ghostPid, // ghost is dead; everything else alive
+      lockPollMs: 5,
+      lockAcquireTimeoutMs: 5_000,
+    });
+    try {
+      await proxy.refreshNow();
+      assert.equal(ran, 1, 'refresher should run after breaking the dead-holder lock');
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('does NOT break a lockfile whose holder PID is still alive', async () => {
+    // Regression test for the codex review finding: pre-fix, the proxy treated
+    // a lockfile whose mtime exceeded `lockStaleMs` as abandoned and unlinked
+    // it — even when the holder was still running its `claude -p ok` refresher.
+    // The fix replaces mtime heuristics with `process.kill(pid, 0)` — only an
+    // ESRCH authorizes a break. With a live PID reported in the lockfile, no
+    // amount of clock-skew or stale-mtime should let a second proxy break in.
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-alivelock-'));
+    const credentialsPath = path.join(tmp, '.credentials.json');
+    const lockPath = path.join(tmp, 'refresh.lock');
+    await writeFile(
+      credentialsPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: 'init', expiresAt: Date.now() + 3_600_000 } }),
+      'utf8',
+    );
+    // Pre-create the lockfile with an "alive" PID and backdate its mtime so
+    // any mtime-based check would falsely conclude it's stale.
+    const livePid = 12_345;
+    await writeFile(lockPath, `${livePid}\n`, 'utf8');
     const { utimes } = await import('node:fs/promises');
-    const ancient = new Date(Date.now() - 5 * 60_000); // 5 min old
+    const ancient = new Date(Date.now() - 60 * 60_000); // 1 hour old
     await utimes(lockPath, ancient, ancient);
 
     let ran = 0;
@@ -449,13 +486,23 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
       lockPath,
       upstream: makeFakeUpstream(),
       refresher: async () => { ran += 1; },
+      processAlive: (pid) => pid === livePid, // holder is alive
       lockPollMs: 5,
-      lockStaleMs: 30_000, // 30s threshold; the lockfile is 5 min old
-      lockAcquireTimeoutMs: 5_000,
+      lockAcquireTimeoutMs: 150,
     });
+    let err: Error | null = null;
     try {
-      await proxy.refreshNow();
-      assert.equal(ran, 1, 'refresher should run after breaking the stale lock');
+      try {
+        await proxy.refreshNow();
+      } catch (e) {
+        err = e as Error;
+      }
+      assert.equal(ran, 0, 'refresher must NOT run while the holder PID is alive');
+      assert.ok(err, 'acquire should fail closed with a timeout');
+      assert.match(err!.message, /lock acquire timeout/);
+      // The lockfile must still be in place — we did not break a live holder's lock.
+      const stillThere = await readFile(lockPath, 'utf8');
+      assert.equal(stillThere.trim(), String(livePid));
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }

@@ -35,7 +35,7 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest, type RequestOptions as HttpsRequestOptions } from 'node:https';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFile, mkdir, open as fsOpen, stat as fsStat, unlink as fsUnlink } from 'node:fs/promises';
+import { readFile, mkdir, open as fsOpen, unlink as fsUnlink } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -110,17 +110,18 @@ export interface CredentialProxyOptions {
   /** Polling interval (ms) while waiting on the cross-process lock. Default 25. */
   lockPollMs?: number;
   /**
-   * Lock files older than this (ms) are treated as abandoned by a crashed
-   * holder and force-cleared. Must comfortably exceed the worst-case refresher
-   * runtime (a `claude -p ok` round-trip). Default 180_000 (3 minutes).
-   */
-  lockStaleMs?: number;
-  /**
    * Hard cap on time spent waiting for the cross-process lock. Default 90_000
    * (90 seconds). Bounded so a pathological peer can't hang a VM request
-   * indefinitely; on timeout, the caller falls back to the stale cached token.
+   * indefinitely; on timeout, refreshNow fails closed (no refresher spawn).
    */
   lockAcquireTimeoutMs?: number;
+  /**
+   * Liveness check used to detect a dead lock holder. Default: `process.kill(pid, 0)`
+   * — the kernel reports ESRCH iff the holder process is gone, which is the only
+   * acceptable "proof the holder is gone" signal (mtime-based staleness would
+   * also break live-but-slow holders). Tests inject a deterministic stub.
+   */
+  processAlive?: (pid: number) => boolean;
 }
 
 interface Registration {
@@ -198,8 +199,8 @@ export class CredentialProxy {
   private readonly refresher: () => Promise<void>;
   private readonly now: () => number;
   private readonly lockPollMs: number;
-  private readonly lockStaleMs: number;
   private readonly lockAcquireTimeoutMs: number;
+  private readonly processAlive: (pid: number) => boolean;
   private override: HeaderOverride;
   private stopped = false;
   // In-process single-flight: when a refresh is in flight, every other caller
@@ -215,9 +216,9 @@ export class CredentialProxy {
     this.refresher = wiring.refresher;
     this.override = wiring.override;
     this.now = wiring.now;
+    this.processAlive = wiring.processAlive;
     this.refreshMarginMs = tuning.refreshMarginMs;
     this.lockPollMs = tuning.lockPollMs;
-    this.lockStaleMs = tuning.lockStaleMs;
     this.lockAcquireTimeoutMs = tuning.lockAcquireTimeoutMs;
   }
 
@@ -349,9 +350,12 @@ export class CredentialProxy {
 
   /**
    * Cross-process advisory lock built on `O_CREAT | O_EXCL`. Each holder
-   * writes its PID into the lockfile so a second process can detect a
-   * crashed predecessor; mtime-based staleness is the backstop when PID
-   * inspection fails (different host, PID reuse, etc.).
+   * writes its PID into the lockfile; a contending acquirer reads the PID
+   * and uses `process.kill(pid, 0)` to ask the kernel whether that process
+   * still exists. Only an ESRCH (no-such-process) result authorizes breaking
+   * the lock — mtime-based heuristics are deliberately rejected because they
+   * can break a live-but-slow holder (a `claude -p ok` running longer than
+   * any chosen mtime threshold is alive, not abandoned).
    *
    * Returns true on acquire, false on timeout.
    */
@@ -359,32 +363,44 @@ export class CredentialProxy {
     const start = this.now();
     let firstAttempt = true;
     while (true) {
-      try {
-        // O_CREAT | O_EXCL via the 'wx' open flag: filesystem-atomic create.
-        // If two processes race here, exactly one succeeds and the other
-        // gets EEXIST; we then poll until the holder releases or the file
-        // is detected stale.
-        const handle = await fsOpen(this.lockPath, 'wx', 0o600);
-        try {
-          await handle.writeFile(`${process.pid}\n`, 'utf8');
-        } finally {
-          await handle.close().catch(() => undefined);
-        }
-        return true;
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== 'EEXIST') throw err;
-        if (await this.lockHolderIsStale()) {
-          await fsUnlink(this.lockPath).catch(() => undefined);
-          continue;
-        }
-        if (firstAttempt) {
-          log.debug('credential proxy: refresh lock held; waiting', { path: this.lockPath });
-          firstAttempt = false;
-        }
-        if (this.now() - start >= this.lockAcquireTimeoutMs) return false;
-        await sleep(this.lockPollMs);
+      const created = await this.tryCreateLockfile();
+      if (created) return true;
+      const holder = await this.readLockHolder();
+      if (holder === 'gone') continue; // released between EEXIST and our read; retry create.
+      if (holder === 'dead') {
+        // Kernel confirmed the PID is gone. Safe to break.
+        await fsUnlink(this.lockPath).catch(() => undefined);
+        continue;
       }
+      // 'alive' (holder still running) or 'unknown' (PID unparseable / file
+      // mid-write). Either way we wait — never break a lock without proof.
+      if (firstAttempt) {
+        log.debug('credential proxy: refresh lock held; waiting', { path: this.lockPath });
+        firstAttempt = false;
+      }
+      if (this.now() - start >= this.lockAcquireTimeoutMs) return false;
+      await sleep(this.lockPollMs);
+    }
+  }
+
+  /**
+   * Attempt the atomic create of the lockfile. Returns true on success
+   * (lock acquired by us), false on EEXIST (someone else holds it).
+   * Any other error is re-thrown.
+   */
+  private async tryCreateLockfile(): Promise<boolean> {
+    try {
+      // O_CREAT | O_EXCL via the 'wx' open flag: filesystem-atomic create.
+      const handle = await fsOpen(this.lockPath, 'wx', 0o600);
+      try {
+        await handle.writeFile(`${process.pid}\n`, 'utf8');
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+      throw err;
     }
   }
 
@@ -392,16 +408,26 @@ export class CredentialProxy {
     await fsUnlink(this.lockPath).catch(() => undefined);
   }
 
-  private async lockHolderIsStale(): Promise<boolean> {
-    let mtimeMs: number;
+  /**
+   * Inspect the current lockfile to decide whether the holder is still
+   * running. Returns:
+   *   'gone'    — file vanished (released between our EEXIST and read).
+   *   'dead'    — kernel reports ESRCH for the recorded PID; safe to break.
+   *   'alive'   — kernel says the process exists; we must wait.
+   *   'unknown' — file unreadable or PID unparseable (e.g. mid-write race);
+   *               we must wait (never break a lock without proof).
+   */
+  private async readLockHolder(): Promise<'gone' | 'dead' | 'alive' | 'unknown'> {
+    let contents: string;
     try {
-      const st = await fsStat(this.lockPath);
-      mtimeMs = st.mtimeMs;
-    } catch {
-      // Vanished between the EEXIST and our stat — treat as released.
-      return true;
+      contents = await readFile(this.lockPath, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'gone';
+      return 'unknown';
     }
-    return this.now() - mtimeMs > this.lockStaleMs;
+    const pid = Number.parseInt(contents.trim(), 10);
+    if (!Number.isFinite(pid) || pid <= 0) return 'unknown';
+    return this.processAlive(pid) ? 'alive' : 'dead';
   }
 
   /**
@@ -529,6 +555,7 @@ function resolveCredentialProxyWiring(opts: CredentialProxyOptions): {
   refresher: () => Promise<void>;
   override: HeaderOverride;
   now: () => number;
+  processAlive: (pid: number) => boolean;
 } {
   return {
     credentialsPath: opts.credentialsPath ?? path.join(os.homedir(), '.claude', '.credentials.json'),
@@ -537,21 +564,43 @@ function resolveCredentialProxyWiring(opts: CredentialProxyOptions): {
     refresher: opts.refresher ?? defaultRefresher(),
     override: opts.override ?? NOOP_OVERRIDE,
     now: opts.now ?? (() => Date.now()),
+    processAlive: opts.processAlive ?? defaultProcessAlive,
   };
 }
 
 function resolveCredentialProxyTuning(opts: CredentialProxyOptions): {
   refreshMarginMs: number;
   lockPollMs: number;
-  lockStaleMs: number;
   lockAcquireTimeoutMs: number;
 } {
   return {
     refreshMarginMs: opts.refreshMarginMs ?? 60_000,
     lockPollMs: opts.lockPollMs ?? 25,
-    lockStaleMs: opts.lockStaleMs ?? 180_000,
     lockAcquireTimeoutMs: opts.lockAcquireTimeoutMs ?? 90_000,
   };
+}
+
+/**
+ * Kernel-verified liveness check via the null-signal probe. `process.kill(pid, 0)`
+ * delivers no signal but performs the usual permission/existence checks:
+ *   - returns normally → the process exists and we're permitted to signal it
+ *   - throws EPERM    → the process exists but we lack permission (still alive)
+ *   - throws ESRCH    → no such process (provably dead — safe to break the lock)
+ * Any other error is treated as "we cannot prove the holder is dead" → alive.
+ */
+function defaultProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EPERM') return true;
+    if (code === 'ESRCH') return false;
+    // Unknown errno — fail closed (treat as alive) so we never break a lock
+    // we can't prove is dead.
+    return true;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
