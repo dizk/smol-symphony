@@ -3,7 +3,24 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { closeLogFile, log, setLogFile } from '../src/logging.js';
+import { closeLogFile, log, setLogFile, setLogVerbose } from '../src/logging.js';
+
+// Capture everything written to process.stderr while `fn` runs, restoring the
+// real writer afterwards. Synchronous: log.* writes to stderr inline.
+function captureStderr(fn: () => void): string {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = '';
+  (process.stderr as unknown as { write: (chunk: string) => boolean }).write = (chunk: string) => {
+    captured += chunk;
+    return true;
+  };
+  try {
+    fn();
+  } finally {
+    (process.stderr as unknown as { write: typeof original }).write = original;
+  }
+  return captured;
+}
 
 // Drain the WriteStream by closing the file sink so buffered writes flush before we read.
 async function flushAndRead(filePath: string): Promise<string> {
@@ -117,5 +134,73 @@ describe('logging file sink', () => {
     assert.equal(opened, null);
     // The sink must not be installed; subsequent log calls go to stderr only.
     assert.doesNotThrow(() => log.info('after eisdir'));
+  });
+});
+
+describe('logging console routing (issue 118)', () => {
+  let tmpDir: string;
+  before(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'symphony-log-routing-'));
+  });
+  after(async () => {
+    await closeLogFile();
+    setLogVerbose(false);
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+  afterEach(async () => {
+    await closeLogFile();
+    // Reset both module-level knobs so one test cannot leak into the next.
+    setLogVerbose(false);
+    setLogFile(null);
+  });
+
+  it('routes structured logs to the file ONLY when a sink is active', async () => {
+    const file = path.join(tmpDir, 'sink-suppresses-stderr.log');
+    setLogFile(file);
+    const stderr = captureStderr(() => {
+      log.info('to file only', { issue_id: '7' });
+      log.warn('also to file only');
+    });
+    // Console stays clean — nothing duplicated to stderr.
+    assert.equal(stderr, '');
+    // …but the file captured both lines verbatim.
+    const text = await flushAndRead(file);
+    assert.match(text, / msg="to file only" issue_id=7/);
+    assert.match(text, / msg="also to file only"/);
+  });
+
+  it('--verbose mirrors structured logs to stderr alongside the file', async () => {
+    const file = path.join(tmpDir, 'sink-verbose.log');
+    setLogVerbose(true);
+    setLogFile(file);
+    const stderr = captureStderr(() => {
+      log.info('verbose line', { k: 'v' });
+    });
+    // Console gets the line back…
+    assert.match(stderr, / msg="verbose line" k=v/);
+    // …and the file still receives it (verbose adds stderr, never removes the file).
+    const text = await flushAndRead(file);
+    assert.match(text, / msg="verbose line" k=v/);
+  });
+
+  it('falls back to stderr when NO file sink is configured (nothing lost)', () => {
+    setLogFile(null);
+    const stderr = captureStderr(() => {
+      log.info('no sink fallback', { n: 1 });
+    });
+    assert.match(stderr, / msg="no sink fallback" n=1/);
+  });
+
+  it('falls back to stderr after the file sink fails to open', () => {
+    // A path whose parent is a regular file cannot be opened as a sink, so
+    // setLogFile returns null and the sink stays inactive — lines must keep
+    // reaching stderr rather than vanishing.
+    const blocker = path.join(tmpDir, 'routing-blocker');
+    writeFileSync(blocker, 'not a dir');
+    assert.equal(setLogFile(path.join(blocker, 'sink.log')), null);
+    const stderr = captureStderr(() => {
+      log.error('open failed fallback');
+    });
+    assert.match(stderr, / msg="open failed fallback"/);
   });
 });

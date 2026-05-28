@@ -13,6 +13,10 @@ export interface Cli {
   reconcileForce: boolean;
   /** When subcommand=rerun: name of the run_in_vm action to invalidate. */
   rerunCheck: string | null;
+  /** `--verbose` / `--foreground`: mirror structured logs to the console even
+   *  when the file sink is active (issue 118). Default routes logs to the file
+   *  only so the console shows just the startup banner. */
+  verbose: boolean;
 }
 
 export function parseCli(argv: string[]): Cli {
@@ -35,6 +39,7 @@ export function parseCli(argv: string[]): Cli {
   let port: number | null = null;
   let reconcileForce = false;
   let rerunCheck: string | null = null;
+  let verbose = false;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
     if (a === '--port' || a === '-p') {
@@ -72,16 +77,20 @@ export function parseCli(argv: string[]): Cli {
       rerunCheck = v;
     } else if (subcommand === 'rerun' && a.startsWith('--check=')) {
       rerunCheck = a.slice('--check='.length);
+    } else if (a === '--verbose' || a === '-v' || a === '--foreground') {
+      verbose = true;
     } else if (a === '-h' || a === '--help') {
       process.stdout.write(
-        `symphony [path-to-WORKFLOW.md] [--port PORT] [--reconcile-force]\n` +
+        `symphony [path-to-WORKFLOW.md] [--port PORT] [--reconcile-force] [--verbose]\n` +
           `symphony reconcile [path-to-WORKFLOW.md] [--force] [--port PORT]\n` +
           `symphony rerun --check=<name> [path-to-WORKFLOW.md]\n\n` +
           `If path is omitted, ./WORKFLOW.md is used.\n` +
           `\`reconcile --force\` (or the alias \`--reconcile-force\`) invalidates the\n` +
           `cached bake artifact and rebakes before dispatching.\n` +
           `\`rerun --check=<name>\` invalidates the named run_in_vm action's content-hash\n` +
-          `cache entry so the next dispatch into its state re-executes it.\n`,
+          `cache entry so the next dispatch into its state re-executes it.\n` +
+          `\`--verbose\` (alias \`--foreground\`, \`-v\`) mirrors structured logs to the\n` +
+          `console; by default they go to the log file only so the console stays clean.\n`,
       );
       process.exit(0);
     } else if (!workflow) {
@@ -97,5 +106,6 @@ export function parseCli(argv: string[]): Cli {
     port,
     reconcileForce,
     rerunCheck,
+    verbose,
   };
 }

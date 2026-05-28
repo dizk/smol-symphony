@@ -1,12 +1,19 @@
-// Structured key=value logging to stderr per SPEC.md §9.1.
+// Structured key=value logging per SPEC.md §9.1.
 // Sink failures do not crash the orchestrator (§9.2).
 //
-// Optional persistent file sink: when `setLogFile(path)` has been called, each
-// emitted line is appended to that file in addition to stderr. The on-disk
-// format matches the stderr format (one `key=value ...` line per event) so an
-// agent inspecting logs later sees the same shape it sees on stderr. File-sink
-// failures are swallowed (one stderr warning on first failure, then silent)
-// per §9.2 so a full disk or permission error can never crash the orchestrator.
+// Persistent file sink: when `setLogFile(path)` has been called, each emitted
+// line is appended to that file. The on-disk format matches the stderr format
+// (one `key=value ...` line per event) so an agent inspecting logs later sees
+// the same shape. File-sink failures are swallowed (one stderr warning on first
+// failure, then silent) per §9.2 so a full disk or permission error can never
+// crash the orchestrator.
+//
+// Console routing (issue 118): when a file sink is active, structured lines go
+// to the file ONLY — the operator console stays clean and shows just the
+// intentional stdout banner. stderr remains the fallback when no file sink is
+// configured (nothing is silently lost in a no-log-file setup), and
+// `setLogVerbose(true)` (the `--verbose` flag) forces lines back onto stderr
+// alongside the file for interactive debugging.
 
 import { closeSync, createWriteStream, mkdirSync, openSync, type WriteStream } from 'node:fs';
 import path from 'node:path';
@@ -19,6 +26,7 @@ const LEVEL_RANK: Record<Level, number> = { debug: 10, info: 20, warn: 30, error
 let fileSink: WriteStream | null = null;
 let fileSinkBroken = false;
 let fileSinkPath: string | null = null;
+let verbose = false;
 
 function quote(v: unknown): string {
   if (v === null || v === undefined) return '';
@@ -49,12 +57,29 @@ function writeFileSink(line: string): void {
 function emit(level: Level, msg: string, fields: Record<string, unknown> = {}) {
   if (LEVEL_RANK[level] < LEVEL_RANK[ENV_LEVEL]) return;
   const line = format(level, msg, fields) + '\n';
-  try {
-    process.stderr.write(line);
-  } catch {
-    // Spec §9.2: a failed sink must not crash the service.
+  // Route to stderr only when no working file sink is capturing the line
+  // (so a no-log-file setup loses nothing) or when --verbose was requested
+  // (interactive debugging). A broken sink counts as inactive so its dropped
+  // writes fall back to stderr rather than vanishing. See issue 118.
+  const fileSinkActive = fileSink !== null && !fileSinkBroken;
+  if (verbose || !fileSinkActive) {
+    try {
+      process.stderr.write(line);
+    } catch {
+      // Spec §9.2: a failed sink must not crash the service.
+    }
   }
   writeFileSink(line);
+}
+
+/**
+ * Force structured logs back onto stderr even when a file sink is active. The
+ * `--verbose` / `--foreground` flag flips this on for interactive debugging;
+ * the default (false) keeps the console clean by routing logs to the file only
+ * whenever a sink is configured. Idempotent.
+ */
+export function setLogVerbose(on: boolean): void {
+  verbose = on;
 }
 
 /**

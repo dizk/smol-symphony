@@ -86,6 +86,14 @@ Open the dashboard at `http://127.0.0.1:8787/`. Drop issues into
 `issues/Todo/` from the filesystem or the dashboard's `new issue` form;
 symphony dispatches them on the next poll.
 
+The console stays quiet: with the default log file configured, symphony prints
+a one-line-per-field startup banner (workflow, tracker root, dashboard URL,
+log-file path) and routes the structured `key=value` stream to
+`.symphony/logs/symphony.log` only. `tail -f` that file to follow the detail.
+Pass `--verbose` (alias `--foreground`) to mirror the structured stream back to
+the console for interactive debugging. With no log file configured (the
+`SYMPHONY_LOG_FILE=""` override), the structured stream stays on stderr.
+
 ### From a checkout
 
 If you're hacking on symphony itself:

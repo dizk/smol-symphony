@@ -41,7 +41,7 @@ import { AcpBridge } from '../acp-bridge.js';
 import { CredentialProxy } from '../agent/credential-proxy.js';
 import { CredentialTicker } from '../agent/credential-ticker.js';
 import { GhCliPrApi, Reconciler } from '../reconciler/index.js';
-import { closeLogFile, log, setLogFile } from '../logging.js';
+import { closeLogFile, log, setLogFile, setLogVerbose } from '../logging.js';
 import type { ServiceConfig, WorkflowDefinition } from '../types.js';
 import type { WorkflowSource } from '../workflow.js';
 
@@ -640,8 +640,43 @@ async function checkMcpPrecondition(opts: {
   }
 }
 
+/**
+ * Human-facing startup summary on stdout. Once a file sink is active (the
+ * default), this is the only orchestrator-side console output: structured
+ * `log.*` lines are routed to the log file, so the operator sees just this
+ * banner — what's running, where the dashboard is, and where the detailed log
+ * stream went. `--verbose` additionally mirrors the structured stream to the
+ * console. The companion `symphony started` structured line carries the same
+ * facts into the log file (and onto stderr under --verbose).
+ */
+function printStartupBanner(opts: {
+  workflowPath: string;
+  trackerRoot: string | null;
+  host: string;
+  http: { port: number } | null;
+  logFile: string | null;
+}): void {
+  const { workflowPath, trackerRoot, host, http, logFile } = opts;
+  // Map wildcard bind addresses to a clickable loopback host for the URL.
+  const displayHost = host === '0.0.0.0' || host === '::' ? 'localhost' : host;
+  const dashboard =
+    http === null ? '(disabled — pass --port or set server.port)' : `http://${displayHost}:${http.port}/`;
+  const logs =
+    logFile === null ? '(disabled — structured logs on stderr)' : `${logFile}  (tail -f to follow)`;
+  process.stdout.write(
+    `symphony\n` +
+      `  workflow      ${workflowPath}\n` +
+      `  tracker root  ${trackerRoot ?? '<unset>'}\n` +
+      `  dashboard     ${dashboard}\n` +
+      `  logs          ${logs}\n`,
+  );
+}
+
 async function main() {
   const cli = parseCli(process.argv.slice(2));
+  // --verbose / --foreground: mirror structured logs to the console even when
+  // the file sink is active. Set before any log.* call so every line honors it.
+  setLogVerbose(cli.verbose);
   const workflowPath = path.resolve(cli.workflow);
   await handlePreflight(cli, workflowPath);
 
@@ -671,7 +706,19 @@ async function main() {
     tracker_root: config.tracker.root,
     log_file: logFile ?? '<disabled>',
     poll_interval_ms: config.polling.interval_ms,
-    http_port: cli.port ?? config.server.port,
+    // Actually-bound port (differs from the requested port with --port 0); null
+    // when no HTTP listener is configured.
+    http_port: http?.port ?? null,
+  });
+  // Clean human-facing summary on stdout. With a file sink active (the default)
+  // the structured line above goes to the log file only, so this banner is what
+  // the operator sees on the console (issue 118).
+  printStartupBanner({
+    workflowPath,
+    trackerRoot: config.tracker.root,
+    host: config.server.host,
+    http,
+    logFile,
   });
 
   const shutdown = async (signal: string) => {

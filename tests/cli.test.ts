@@ -45,6 +45,21 @@ describe('parseCli', () => {
     assert.equal(cli.subcommand, 'serve');
     assert.equal(cli.reconcileForce, true);
   });
+
+  it('defaults verbose to false', () => {
+    assert.equal(parseCli([]).verbose, false);
+  });
+
+  it('parses --verbose, -v, and --foreground as the same flag', () => {
+    assert.equal(parseCli(['--verbose']).verbose, true);
+    assert.equal(parseCli(['-v']).verbose, true);
+    assert.equal(parseCli(['--foreground']).verbose, true);
+    // Still pairs with a workflow path / other flags without consuming them.
+    const cli = parseCli(['/tmp/W.md', '--verbose', '--port', '8080']);
+    assert.equal(cli.verbose, true);
+    assert.equal(cli.workflow, '/tmp/W.md');
+    assert.equal(cli.port, 8080);
+  });
 });
 
 describe('symphony reconcile with a missing workflow', () => {
