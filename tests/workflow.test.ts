@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -608,9 +608,9 @@ describe('workflow states validation', () => {
     // probes for does not exist. validateDispatchIo calls hostClaudeCredentialPath()
     // for any state pinned to the claude adapter; the probe uses os.homedir()
     // (which reads $HOME) at call time. The fs probe lives in the shell loader;
-    // the pure structural validateDispatch no longer touches the disk. The
-    // codex adapter has no host-file dependency under the proxy architecture,
-    // so non-claude states bypass the probe entirely.
+    // the pure structural validateDispatch no longer touches the disk. codex is
+    // probed too, but via its own sources (auth.json token / OPENAI_API_KEY) —
+    // covered by the dedicated codex cases below.
     await withTrackerRoot(async (root) => {
       const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-'));
       const prevHome = process.env.HOME;
@@ -663,6 +663,108 @@ describe('workflow states validation', () => {
       } finally {
         if (prevHome === undefined) delete process.env.HOME;
         else process.env.HOME = prevHome;
+        await rm(fakeHome, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('rejects a per-state codex adapter when neither auth.json nor OPENAI_API_KEY is present', async () => {
+    // Empty fake HOME (no `~/.codex/auth.json`) and OPENAI_API_KEY unset: codex
+    // routes through the proxy with two valid sources, so the probe fails only
+    // when BOTH are absent.
+    await withTrackerRoot(async (root) => {
+      const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-codex-'));
+      const prevHome = process.env.HOME;
+      const prevKey = process.env.OPENAI_API_KEY;
+      process.env.HOME = fakeHome;
+      delete process.env.OPENAI_API_KEY;
+      try {
+        const cfg = buildServiceConfig(
+          {
+            tracker: { kind: 'local', root },
+            states: {
+              Todo: { role: 'active', adapter: 'codex' },
+              Done: { role: 'terminal' },
+              Triage: { role: 'holding' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        );
+        assert.equal(validateDispatch(cfg), null);
+        const err = validateDispatchIo(cfg);
+        assert.match(err ?? '', /adapter "codex" requires a host credential/);
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = prevKey;
+        await rm(fakeHome, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('accepts a per-state codex adapter satisfied by OPENAI_API_KEY alone', async () => {
+    await withTrackerRoot(async (root) => {
+      const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-codex-env-'));
+      const prevHome = process.env.HOME;
+      const prevKey = process.env.OPENAI_API_KEY;
+      process.env.HOME = fakeHome;
+      process.env.OPENAI_API_KEY = 'sk-env-codex';
+      try {
+        const cfg = buildServiceConfig(
+          {
+            tracker: { kind: 'local', root },
+            states: {
+              Todo: { role: 'active', adapter: 'codex' },
+              Done: { role: 'terminal' },
+              Triage: { role: 'holding' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        );
+        assert.equal(validateDispatch(cfg), null);
+        assert.equal(validateDispatchIo(cfg), null);
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = prevKey;
+        await rm(fakeHome, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('accepts a per-state codex adapter satisfied by a ~/.codex/auth.json token', async () => {
+    await withTrackerRoot(async (root) => {
+      const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-codex-file-'));
+      const prevHome = process.env.HOME;
+      const prevKey = process.env.OPENAI_API_KEY;
+      process.env.HOME = fakeHome;
+      delete process.env.OPENAI_API_KEY;
+      try {
+        await mkdir(path.join(fakeHome, '.codex'), { recursive: true });
+        await writeFile(
+          path.join(fakeHome, '.codex', 'auth.json'),
+          JSON.stringify({ tokens: { access_token: 'codex-oauth-token' } }),
+        );
+        const cfg = buildServiceConfig(
+          {
+            tracker: { kind: 'local', root },
+            states: {
+              Todo: { role: 'active', adapter: 'codex' },
+              Done: { role: 'terminal' },
+              Triage: { role: 'holding' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        );
+        assert.equal(validateDispatch(cfg), null);
+        assert.equal(validateDispatchIo(cfg), null);
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = prevKey;
         await rm(fakeHome, { recursive: true, force: true });
       }
     });

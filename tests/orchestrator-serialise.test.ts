@@ -127,7 +127,12 @@ async function stageCreds(fakeHome: string): Promise<void> {
   await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
   await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
   await mkdir(path.join(fakeHome, '.codex'), { recursive: true });
-  await writeFile(path.join(fakeHome, '.codex', 'auth.json'), '{}');
+  // A real token so the codex startup probe (#120) passes: an empty `{}`
+  // yields no token and the proxy would 503, so the probe rejects it too.
+  await writeFile(
+    path.join(fakeHome, '.codex', 'auth.json'),
+    JSON.stringify({ tokens: { access_token: 'codex-oauth-token' } }),
+  );
 }
 
 async function buildCfg(
