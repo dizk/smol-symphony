@@ -249,7 +249,9 @@ Coding-agent launch is mediated by the Agent Client Protocol. The runtime
 selects an adapter profile and runs it inside the per-issue sandbox; the host
 opens an authenticated TCP bridge that the in-sandbox proxy dials back over
 to carry ACP frames. See `WORKFLOW.template.md` (`acp:` section) for the full
-annotated field list.
+annotated field list. Adapter credentials are handled out of band of this
+config — there is no credential-mode knob; see §6.3 for the host credential
+proxy and identity-staging contract.
 
 Fields read by the runtime:
 
@@ -499,6 +501,81 @@ Behavior:
 5. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note: workspaces are intentionally preserved after successful runs.
+
+### 6.3 Credential Handling (Host Proxy + Identity Staging)
+
+This section is normative for the `claude` adapter; `codex` is covered at the
+end. The governing property: **no OAuth credential bytes ever enter a VM.**
+The operator's `~/.claude/.credentials.json` (and the `refreshToken` /
+`accessToken` it holds) is owned solely by the host; a VM filesystem MUST NOT
+contain that file, a `refreshToken`, or an `accessToken` field at any point
+during a dispatch.
+
+**Host credential proxy.** All Anthropic API traffic from an in-VM
+`claude-agent-acp` MUST be mediated by a host-side credential proxy (reference
+implementation: `src/agent/credential-proxy.ts`). The proxy listens on host
+loopback; the VM reaches it transparently via the same guest→host loopback
+path the ACP bridge (§4.3.6) uses. The in-VM
+client never holds a real token — it authenticates to the proxy with a
+per-dispatch sentinel, and the proxy substitutes the real access token
+host-side before forwarding to `api.anthropic.com`.
+
+**Per-dispatch sentinel registry.** For each `claude` dispatch the runtime:
+
+1. Mints an opaque per-dispatch sentinel and registers it against
+   `(issueId, identifier)` in the proxy's in-memory registry. Registration
+   MUST happen after VM start + bridge register so an early failure cannot
+   leak a registry entry.
+2. Stages the sentinel as `ANTHROPIC_AUTH_TOKEN` and the proxy's reachable URL
+   as `ANTHROPIC_BASE_URL` in the VM launch env. These are the only
+   credential-shaped values the VM receives, and the sentinel authorizes
+   nothing upstream on its own.
+3. On every inbound request the proxy validates the presented bearer against
+   the registry using a constant-time comparison; an unknown sentinel is
+   rejected (401). On a match the proxy strips the inbound auth, attaches
+   `Authorization: Bearer <real access token>`, forwards to
+   `api.anthropic.com`, and streams the response back unchanged (including the
+   `anthropic-ratelimit-unified-*` and `anthropic-organization-id` headers, so
+   the operator's Max-window consumption is observable).
+4. On dispatch teardown the runtime deregisters the sentinel; subsequent
+   requests under it are rejected.
+
+**"Only the host refreshes" invariant.** Only the host process reads or
+rotates `~/.claude/.credentials.json`. When the cached access token is at or
+past its `expiresAt` (within a small margin) the proxy triggers a refresh by
+spawning the operator's own Claude client (`claude -p`), which performs the
+OAuth exchange and atomically rewrites the credential tuple — symphony never
+implements OAuth itself and never writes credential bytes. Concurrent refresh
+attempts (in-process and cross-process) MUST collapse to a single refresh:
+the reference implementation serializes them under a kernel `flock(2)`
+advisory lock so the kernel owns mutual exclusion and releases automatically
+on holder death. A host-side ticker keeps the cache warm during idle periods
+so the first VM request after expiry does not pay refresh latency. Because the
+refresh token lives only on the host, a multi-hour fleet run needs zero
+in-VM re-login and a VM that outlives the access-token TTL keeps working.
+
+**Identity vs. credential distinction.** A VM IS staged with a *sanitized
+identity file*, distinct from the credential file:
+
+- **Staged (identity, not credentials):** a minimal `~/.claude.json`
+  containing only `oauthAccount.accountUuid` and
+  `oauthAccount.organizationUuid`. The runtime extracts just those two UUIDs
+  from the host's `~/.claude.json`, writes them into the workspace runtime
+  tree (§5.3 staging root, `identity/` subdir), and copies the file to
+  `~/.claude.json` inside the VM. Its sole purpose is to let the in-VM client
+  emit a well-formed `metadata.user_id` (defensive against server-side OAuth
+  fingerprint validation). It carries no `refreshToken`, no `accessToken`, no
+  credential bytes. If the host has no `oauthAccount`, staging is skipped.
+- **Never staged (credentials):** the credential file
+  `~/.claude/.credentials.json` and the token bytes it holds. There is no
+  file-staging path that copies it into a VM, and no runtime directory that
+  holds it host-side for staging.
+
+**Codex.** The `codex` adapter is not proxied. Its auth flows via
+`OPENAI_API_KEY` forwarded into the VM through `smolvm.forward_env`; the host
+does not probe for or hold a codex credential file. Only adapters that
+resolve to `claude` (workflow- or state-level) require the proxy and the host
+`~/.claude/.credentials.json` to be present at startup.
 
 ## 7. Issue Tracker Integration Contract
 
