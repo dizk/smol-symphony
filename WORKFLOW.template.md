@@ -80,19 +80,20 @@ tracker:
 #             than a workflow-wide default — flip it on for a dedicated eval
 #             state, not for the routine implement/review flow. Default: false.
 #   hooks     (map, optional): per-state overrides for the workflow-level `hooks:`
-#             block. Each of `after_create`, `before_run`, `after_run`, and
-#             `before_remove` is optional; an omitted key inherits the
-#             workflow-level hook, an explicit `null` suppresses it for this
-#             state, and a string replaces it. Resolution is by the issue's
-#             state at hook-fire time — when the agent calls
-#             `symphony.transition`, after_run and before_remove are resolved
-#             against the POST-transition state, so a terminal-state's hook can
-#             drive a state-specific handoff (e.g. Done opens a PR; Merge runs
-#             an auto-merge; Cancelled opts out entirely with `after_run: null`).
-#             The shared `timeout_ms` is not overridable per state.
+#             block. Each of `after_create`, `before_run`, and `before_remove`
+#             is optional; an omitted key inherits the workflow-level hook, an
+#             explicit `null` suppresses it for this state, and a string
+#             replaces it. Resolution is by the issue's state at hook-fire time
+#             — when the agent calls `symphony.transition`, `before_remove` is
+#             resolved against the POST-transition state so a terminal-state's
+#             hook can drive a state-specific artifact rescue. The shared
+#             `timeout_ms` is not overridable per state. The Done-state push +
+#             PR-create handoff lives in `actions:` (below); `hooks.after_run`
+#             is no longer a recognized kind and a workflow that declares it
+#             gets a startup warning + the value dropped on the floor.
 #
 #             DEPRECATED for new work: prefer `actions:` (below) over shell
-#             hooks for the after_run handoff. A state that declares both
+#             hooks for state-specific glue. A state that declares both
 #             `hooks:` and `actions:` runs `actions:` and logs a startup-time
 #             deprecation warning naming the hook fields that were ignored.
 #   actions   (list, optional): typed action DAG (issue 36, reconciler v2).
@@ -174,11 +175,6 @@ states:
     #     title_from: $pr_title
     #     body_from: $pr_body_file
     #     if: $repo
-    #
-    # Legacy hook form (deprecated; runs only when no `actions:` is set):
-    # hooks:
-    #   after_run: |
-    #     # state-specific PR-create logic here
   Cancelled:
     role: terminal
   Triage:
@@ -213,8 +209,8 @@ states:
 #
 # When `enabled: false` (or the block is absent) the autopilot is fully
 # inert: the resource is never constructed and the orchestrator's existing
-# Done-state behavior (workspace cleanup + after_run PR-create hook +
-# operator-merge) is unchanged.
+# Done-state behavior (workspace cleanup + the Done-state `actions:` block
+# that pushes the branch and opens the PR + operator-merge) is unchanged.
 #
 # Workspace lifecycle gotcha: when `enabled: true`, transitions into
 # `merge_state` no longer fire the standard terminal workspace cleanup. The
@@ -281,7 +277,7 @@ workspace:
 #   channel: "hook"    — stdout/stderr chunk from a host-side hook, plus a final
 #                        `kind: "result"` line (exit_code, signal, timed_out).
 #                        `hook` field names which hook: after_create | before_run
-#                        | after_run | before_remove.
+#                        | before_remove.
 #   channel: "system"  — orchestrator lifecycle events (attempt_started,
 #                        attempt_ended, reconciliation_terminating, etc.).
 #
@@ -318,45 +314,16 @@ logs:
 # is to plumb tracker root / repo / base via env so the same workflow file
 # works against multiple checkouts.
 #
-# Additionally, the orchestrator pre-stages a small `SYMPHONY_*` env contract
-# for `after_run` hooks specifically, so the hook script doesn't have to parse
-# the issue file or recompute the branch name itself. These keys are merged on
-# top of the inherited process env for the hook invocation only (the host's
-# own process env is not mutated):
-#
-#   SYMPHONY_ISSUE_ID      — the dispatched issue's identifier (e.g. `42`).
-#   SYMPHONY_BRANCH        — the per-issue working branch (`agent/<id>`), the
-#                            same name the built-in workspace setup checked out.
-#   SYMPHONY_BASE_BRANCH   — base branch the work targets. Mirrors the built-in
-#                            workspace setup's `${SYMPHONY_BASE_BRANCH:-main}`
-#                            default: if the operator did not export it, the
-#                            host stages `main`, so the hook can run under
-#                            `set -u` and reference it directly without an
-#                            inline shell default.
-#   SYMPHONY_PR_TITLE      — issue title already prefixed with the id (e.g.
-#                            `42: Fix the thing`). Falls back to the bare id
-#                            when the issue title is blank.
-#   SYMPHONY_PR_BODY_FILE  — absolute path to a temp file containing the
-#                            current issue body (read fresh from the tracker
-#                            after any `symphony.transition` notes have been
-#                            appended). Pass to `gh pr create --body-file` to
-#                            sidestep `E2BIG` and quoting headaches that come
-#                            with large bodies on argv. The orchestrator
-#                            creates the file before the hook runs and
-#                            removes it after the hook returns.
-#
-# These keys are only staged for `after_run`. `after_create`, `before_run`, and
-# `before_remove` see only the inherited process env (plus PWD). If the
-# orchestrator cannot stage them (e.g. the tracker file became unreadable),
-# the hook still runs but the `SYMPHONY_PR_*` keys will be unset — write hook
-# scripts defensively (`set -u` + an `[ -n "${SYMPHONY_REPO:-}" ] || exit 0`
-# guard is the common pattern).
+# `after_run` is not a hook kind any more: the Done-state push + PR-create
+# handoff is a typed `actions:` block (see `states.Done.actions` above). The
+# action executor exposes the same context — `$branch`, `$base_branch`,
+# `$pr_title`, `$pr_body_file` — that the old hook read from `SYMPHONY_*` env
+# vars. A workflow that still declares `hooks.after_run` (workflow-level or
+# per-state) is warned at startup and the value is dropped on the floor.
 #
 # Per-state overrides: any state can declare its own `hooks:` block under
 # `states.<name>.hooks` that overrides individual fields here for issues in
-# that state. Useful when terminal states should branch behavior — e.g. Done
-# opens a PR while a sibling Merge state opens it and auto-merges. See the
-# `states:` block above for details.
+# that state. See the `states:` block above for details.
 # ─────────────────────────────────────────────────────────────────────────────
 hooks:
   # timeout_ms (int): max wall time for a single hook invocation.
@@ -398,11 +365,10 @@ hooks:
     set -eu
     # ... pre-turn checks ...
 
-  # after_run (string | null): runs after each turn, regardless of outcome.
-  # Inspect cwd or the tracker to decide whether work is complete. Default: null.
-  after_run: |
-    set -eu
-    # ... post-turn handoff (push, format-patch, …) ...
+  # NOTE: `after_run` is no longer a hook kind. The post-attempt handoff (push
+  # branch, open PR) lives in `states.Done.actions:` as typed records — see
+  # the `states:` block above for the canonical pair (push_branch +
+  # create_pr_if_missing).
 
   # before_remove (string | null): runs before the workspace directory is
   # deleted. Use to extract artifacts you want to keep. Default: null.

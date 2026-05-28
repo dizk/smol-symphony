@@ -48,11 +48,9 @@ import type { ResourceSnapshot } from '../reconciler/index.js';
 import {
   classifyTurnOutcome,
   decideAttemptOutcome,
-  decideCleanupExecution,
   decideTurnContinuation,
   deriveActionContext,
   selectPromptKind,
-  shouldStageAfterRunEnv,
 } from './runner-decisions.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { RunLog } from '../runlog.js';
@@ -103,13 +101,15 @@ function resolveCleanupState(issue: Issue, runningEntry: RunningEntry | undefine
   return runningEntry?.issue.state ?? issue.state;
 }
 
-// Stage the env vars + body file the Done state's after_run hook consumes (SYMPHONY_*).
-// Reads the current issue file from <tracker_root>/<state>/<identifier>.md so any
-// transition notes appended by `symphony.transition` ride through into the PR body;
-// falls back to the in-memory description if the file isn't reachable (no tracker root
-// pinned, or read failure). Returns the env map and a cleanup closure the caller MUST
-// run after the hook completes, so the temp file is removed promptly.
-export async function buildAfterRunHookEnv(
+// Stage the SYMPHONY_* env vars + temp body file consumed by the Done-state
+// `actions:` block (push_branch + create_pr_if_missing). Reads the current
+// issue file from <tracker_root>/<state>/<identifier>.md so any transition
+// notes appended by `symphony.transition` ride through into the PR body; falls
+// back to the in-memory description if the file isn't reachable (no tracker
+// root pinned, or read failure). Returns the env map and a cleanup closure the
+// caller MUST run after the actions complete, so the temp file is removed
+// promptly.
+async function stageActionContextEnv(
   entry: RunningEntry,
 ): Promise<{ env: Record<string, string>; cleanup: () => Promise<void> }> {
   const issue = entry.issue;
@@ -122,8 +122,8 @@ export async function buildAfterRunHookEnv(
       const text = await readFile(issuePath, 'utf8');
       body = parseFrontMatterLenient(text).body;
     } catch {
-      // Fall back to the dispatch-time description; the hook still works, it just
-      // won't see notes the agent appended during the run.
+      // Fall back to the dispatch-time description; the action still fires, it
+      // just won't see notes the agent appended during the run.
     }
   }
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'symphony-pr-body-'));
@@ -137,10 +137,8 @@ export async function buildAfterRunHookEnv(
     }
   };
   const title = issue.title.trim();
-  // Mirror after_create's `${SYMPHONY_BASE_BRANCH:-main}` default so an operator who only
-  // exported SYMPHONY_REPO (the documented PR-mode setup in AGENTS.md) still gets a usable
-  // --base value. Staging here means the hook script can run under `set -u` and reference
-  // $SYMPHONY_BASE_BRANCH directly without an inline shell default.
+  // Mirror after_create's `${SYMPHONY_BASE_BRANCH:-main}` default so an
+  // operator who only exported SYMPHONY_REPO still gets a usable --base value.
   const baseBranch = process.env.SYMPHONY_BASE_BRANCH;
   const env: Record<string, string> = {
     SYMPHONY_ISSUE_ID: issue.id,
@@ -568,77 +566,19 @@ export class AgentRunner {
   }
 
   /**
-   * Stage the SYMPHONY_* env + temp body file for the post-attempt
-   * actions/hook, if the gate says one will read it. Returns the env map
-   * (or undefined) plus a cleanup closure the caller MUST run; on staging
-   * failure the closure is a no-op and the warning is logged here so the
-   * shell stays under budget.
+   * Cleanup: run the per-state `actions:` block (push_branch +
+   * create_pr_if_missing on Done is the canonical example). Stages the
+   * SYMPHONY_* env vars + temp body file the action context consumes via
+   * `deriveActionContext` (so $pr_body_file points at the post-transition
+   * body), and tears them down via `finally`. Returns the non-routed action
+   * failure reason, or null when the cleanup succeeded / rerouted / was
+   * skipped (no actions declared or no running entry).
+   *
+   * The shell `hooks.after_run` arm that lived here historically is gone —
+   * the parser drops `after_run` from the hooks: surface and the Done-state
+   * handoff is a typed `actions:` block now.
    */
-  private async stageCleanupEnv(
-    decisionInput: { hasRunningEntry: boolean; actionsLength: number; hasAfterRunHook: boolean },
-    runningEntry: RunningEntry | undefined,
-    logger: ReturnType<typeof withIssue>,
-  ): Promise<{ extraEnv: Record<string, string> | undefined; cleanup: () => Promise<void> }> {
-    const noop = async (): Promise<void> => undefined;
-    if (!shouldStageAfterRunEnv(decisionInput)) return { extraEnv: undefined, cleanup: noop };
-    try {
-      const built = await buildAfterRunHookEnv(runningEntry!);
-      return { extraEnv: built.env, cleanup: built.cleanup };
-    } catch (err) {
-      logger.warn('after_run env staging failed; running hook without SYMPHONY_PR_* vars', {
-        error: (err as Error).message,
-      });
-      return { extraEnv: undefined, cleanup: noop };
-    }
-  }
-
-  /**
-   * Run the per-state `actions:` block (issue 36 AC2 — wins over `hooks.after_run`).
-   * Returns the non-routed action failure reason, or null when the actions
-   * succeeded or reroute fired (routed failures are intentional — the agent's
-   * work is done; the issue lives on in the routed state).
-   */
-  private async executeCleanupActions(
-    cleanupState: string,
-    cleanupActions: readonly WorkflowAction[],
-    runningEntry: RunningEntry,
-    workspacePath: string,
-    vmReady: boolean,
-    vmName: string,
-    extraEnv: Record<string, string> | undefined,
-    hookCapture: (hook: string) => HookCapture | undefined,
-    runLog: RunLog | undefined,
-  ): Promise<string | null> {
-    // run_in_vm goes through the per-issue VM's exec channel. The VM is still
-    // alive here — destroy is deferred to the reconciler after runAttempt
-    // returns. The `vmReady` guard mirrors the bring-up gate.
-    const runInVm: RunInVmExecutor | undefined = vmReady
-      ? this.buildVmRunInVm(vmName, runLog)
-      : undefined;
-    const actionResult = await this.runStateActions(
-      cleanupState,
-      cleanupActions,
-      runningEntry,
-      workspacePath,
-      extraEnv,
-      hookCapture('actions'),
-      runInVm,
-    );
-    if (!actionResult.ok && !actionResult.route_to) {
-      return actionResult.reason ?? 'unknown';
-    }
-    return null;
-  }
-
-  /**
-   * Cleanup: dispatch the per-state `actions:` block or the legacy
-   * `hooks.after_run` shell, gated on `decideCleanupExecution`. Stages the
-   * SYMPHONY_* env vars + temp body file once for whichever branch runs and
-   * tears them down via the `finally`. Returns the non-routed action failure
-   * reason (or null when the cleanup succeeded / routed-failed / was skipped)
-   * so the caller can fold it into the attempt outcome.
-   */
-  private async runCleanupActionsOrHook(
+  private async runCleanupActions(
     issue: Issue,
     cleanupState: string,
     runningEntry: RunningEntry | undefined,
@@ -649,38 +589,36 @@ export class AgentRunner {
     runLog: RunLog | undefined,
   ): Promise<string | null> {
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
-    const cleanupHooks = resolveHooksForState(this.cfg, cleanupState);
     const cleanupActions = resolveActionsForState(this.cfg, cleanupState);
-    const decisionInput = {
-      hasRunningEntry: runningEntry !== undefined,
-      actionsLength: cleanupActions?.length ?? 0,
-      hasAfterRunHook: Boolean(cleanupHooks.after_run),
-    };
-    const cleanupExec = decideCleanupExecution(decisionInput);
-    const staged = await this.stageCleanupEnv(decisionInput, runningEntry, logger);
+    if (!runningEntry || !cleanupActions || cleanupActions.length === 0) return null;
+    let staged: { extraEnv: Record<string, string> | undefined; cleanup: () => Promise<void> };
     try {
-      // decideCleanupExecution guarantees runningEntry + non-empty cleanupActions
-      // when it returns 'actions', so the `!`s are sound.
-      if (cleanupExec === 'actions') {
-        return await this.executeCleanupActions(
-          cleanupState,
-          cleanupActions!,
-          runningEntry!,
-          workspacePath,
-          vmReady,
-          vmName,
-          staged.extraEnv,
-          hookCapture,
-          runLog,
-        );
-      }
-      if (cleanupExec === 'hook') {
-        await this.workspaces.runAfterRunBestEffort(
-          workspacePath,
-          cleanupHooks,
-          hookCapture('after_run'),
-          staged.extraEnv,
-        );
+      const built = await stageActionContextEnv(runningEntry);
+      staged = { extraEnv: built.env, cleanup: built.cleanup };
+    } catch (err) {
+      logger.warn('action-context env staging failed; running actions without SYMPHONY_PR_* vars', {
+        error: (err as Error).message,
+      });
+      staged = { extraEnv: undefined, cleanup: async (): Promise<void> => undefined };
+    }
+    try {
+      // run_in_vm goes through the per-issue VM's exec channel. The VM is still
+      // alive here — destroy is deferred to the reconciler after runAttempt
+      // returns. The `vmReady` guard mirrors the bring-up gate.
+      const runInVm: RunInVmExecutor | undefined = vmReady
+        ? this.buildVmRunInVm(vmName, runLog)
+        : undefined;
+      const actionResult = await this.runStateActions(
+        cleanupState,
+        cleanupActions,
+        runningEntry,
+        workspacePath,
+        staged.extraEnv,
+        hookCapture('actions'),
+        runInVm,
+      );
+      if (!actionResult.ok && !actionResult.route_to) {
+        return actionResult.reason ?? 'unknown';
       }
       return null;
     } finally {
@@ -736,7 +674,7 @@ export class AgentRunner {
       await this.setupWorkspace(issue, initialHooks, hookCapture, runLog, logger),
     );
     const adapter = this.unwrap(
-      await this.prepareAdapterRuntime(ws.workspace.path, resolved, initialHooks, hookCapture, logger),
+      await this.prepareAdapterRuntime(ws.workspace.path, resolved, logger),
     );
     const bridge = this.unwrap(this.validateAcpBridge(logger));
     const vm = this.unwrap(
@@ -746,8 +684,6 @@ export class AgentRunner {
         workspacePath: ws.workspace.path,
         adapter,
         acpReachUrl: bridge.acpReachUrl,
-        initialHooks,
-        hookCapture,
         runLog,
         logger,
       }),
@@ -926,17 +862,14 @@ export class AgentRunner {
 
   /**
    * Stage the credential, apply model/effort runtime injections, and derive
-   * the final ACP launch command. Behavior-preserving quirk: the
-   * runtime-injection failure path falls back to `this.cfg.hooks` (workflow
-   * level) instead of `initialHooks` (per-state) for `after_run`. The
-   * credential-staging failure path uses `initialHooks` like every other
-   * pre-handshake failure.
+   * the final ACP launch command. Pre-handshake failures unwind through the
+   * normal phase pipeline — there is no shell `after_run` cleanup to fire any
+   * more (the Done-state push/PR work runs as typed `actions:` on a successful
+   * cleanup pass, not on early dispatch error).
    */
   private async prepareAdapterRuntime(
     workspacePath: string,
     resolved: ResolvedDispatchConfig,
-    initialHooks: ReturnType<typeof resolveHooksForState>,
-    hookCapture: (h: string) => HookCapture | undefined,
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<AdapterRuntime>> {
     const profile = ADAPTERS[resolved.adapter];
@@ -948,11 +881,6 @@ export class AgentRunner {
         adapter: profile.id,
         error: (err as Error).message,
       });
-      await this.workspaces.runAfterRunBestEffort(
-        workspacePath,
-        initialHooks,
-        hookCapture('after_run'),
-      );
       return failPhase('credential staging error');
     }
     let injected: { runtimeEnv: Record<string, string>; runtimeArgs: string[]; runtimeExtraFiles: ExtraGuestFile[] };
@@ -963,13 +891,6 @@ export class AgentRunner {
         adapter: profile.id,
         error: (err as Error).message,
       });
-      // `this.cfg.hooks` (not `initialHooks`) is intentional — preserves the
-      // prior contract on this specific failure path. See issue 103 brief.
-      await this.workspaces.runAfterRunBestEffort(
-        workspacePath,
-        this.cfg.hooks,
-        hookCapture('after_run'),
-      );
       return failPhase('runtime injection staging error');
     }
     const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, injected.runtimeExtraFiles);
@@ -1074,29 +995,14 @@ export class AgentRunner {
     workspacePath: string;
     adapter: AdapterRuntime;
     acpReachUrl: string;
-    initialHooks: ReturnType<typeof resolveHooksForState>;
-    hookCapture: (h: string) => HookCapture | undefined;
     runLog: RunLog | undefined;
     logger: ReturnType<typeof withIssue>;
   }): Promise<PhaseResult<VmExecHandle>> {
     const vmName = this.vmNameFor(args.issue);
     const startInputs = this.buildVmStartInputs(args.workspacePath, args.resolved);
-    const startRes = await this.startVmOrFail(
-      vmName,
-      startInputs,
-      args.workspacePath,
-      args.initialHooks,
-      args.hookCapture,
-      args.logger,
-    );
+    const startRes = await this.startVmOrFail(vmName, startInputs, args.workspacePath, args.logger);
     if (!startRes.ok) return startRes;
-    const regRes = await this.registerBridgeOrFail(
-      args.issue,
-      args.workspacePath,
-      args.initialHooks,
-      args.hookCapture,
-      args.logger,
-    );
+    const regRes = await this.registerBridgeOrFail(args.issue, args.logger);
     if (!regRes.ok) return regRes;
     const execStream = this.launchExecStream(
       vmName,
@@ -1167,8 +1073,6 @@ export class AgentRunner {
     vmName: string,
     inputs: VmStartInputs,
     workspacePath: string,
-    initialHooks: ReturnType<typeof resolveHooksForState>,
-    hookCapture: (h: string) => HookCapture | undefined,
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<void>> {
     try {
@@ -1191,20 +1095,12 @@ export class AgentRunner {
       // the reconciler `vm` resource's job (issue 52). Returning here drops
       // the running entry; the reaper kick in `onWorkerExit` converges the
       // now-orphan VM.
-      await this.workspaces.runAfterRunBestEffort(
-        workspacePath,
-        initialHooks,
-        hookCapture('after_run'),
-      );
       return failPhase('smolvm bring-up error');
     }
   }
 
   private async registerBridgeOrFail(
     issue: Issue,
-    workspacePath: string,
-    initialHooks: ReturnType<typeof resolveHooksForState>,
-    hookCapture: (h: string) => HookCapture | undefined,
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<{ bridgeReg: AcpBridgeRegistration }>> {
     try {
@@ -1213,14 +1109,7 @@ export class AgentRunner {
     } catch (err) {
       logger.error('acp bridge register failed', { error: (err as Error).message });
       // VM is live but the bridge is gone; teardown is the reconciler `vm`
-      // resource's job. Await after_run so the failure path preserves the
-      // pre-refactor ordering — the attempt does not return (and the worker
-      // lifecycle does not advance) until cleanup hooks have run.
-      await this.workspaces.runAfterRunBestEffort(
-        workspacePath,
-        initialHooks,
-        hookCapture('after_run'),
-      );
+      // resource's job.
       return failPhase('acp bridge register failed');
     }
   }
@@ -1724,9 +1613,9 @@ export class AgentRunner {
 
   /**
    * Unwind a session: cancel the bridge registration, destroy the socket and
-   * kill the exec, deactivate MCP, run the per-state `actions:` block or
-   * legacy `hooks.after_run`, and emit the `vm_teardown_deferred` event so
-   * the reconciler `vm` resource (issue 52) can converge the now-orphan VM.
+   * kill the exec, deactivate MCP, run the per-state `actions:` block, and
+   * emit the `vm_teardown_deferred` event so the reconciler `vm` resource
+   * (issue 52) can converge the now-orphan VM.
    *
    * Returns the non-routed action failure reason, or null when the cleanup
    * succeeded or routed (so the caller can fold it into `decideAttemptOutcome`).
@@ -1736,7 +1625,7 @@ export class AgentRunner {
     await this.awaitExecExit(ctx.execStream);
     this.deactivateMcpForEntry(ctx.runningEntry);
     ctx.logger.debug('agent runner cleanup', { reason });
-    const nonRouted = await this.runCleanupActionsOrHook(
+    const nonRouted = await this.runCleanupActions(
       ctx.issue,
       resolveCleanupState(ctx.issue, ctx.runningEntry),
       ctx.runningEntry,
@@ -1816,7 +1705,7 @@ interface VmExecHandle {
  * Mutable context threaded through phases 5–8. `acpSocket` starts null and
  * is filled in once the bridge handshake completes; `tearDownSession` checks
  * for null before destroying so the post-bridge-fail path is a no-op for the
- * socket but still runs the bridge cancel + exec kill + after_run cleanup.
+ * socket but still runs the bridge cancel + exec kill + Done-state actions.
  */
 interface SessionContext {
   issue: Issue;

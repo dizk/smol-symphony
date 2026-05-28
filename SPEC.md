@@ -224,11 +224,14 @@ supported kind.
   workspace directory is newly created. Failure aborts workspace creation.
 - `before_run` (multiline shell script, OPTIONAL) — runs before each agent
   attempt. Failure aborts the current attempt.
-- `after_run` (multiline shell script, OPTIONAL) — runs after each agent
-  attempt. Failure is logged but ignored.
 - `before_remove` (multiline shell script, OPTIONAL) — runs before workspace
   deletion if the directory exists. Failure is logged but ignored.
 - `timeout_ms` (integer, OPTIONAL, default `60000`) — applies to all hooks.
+
+The post-attempt push + PR-create handoff is a typed Done-state `actions:`
+block (push_branch + create_pr_if_missing). `hooks.after_run` is not a
+recognized kind any more; a workflow that still declares it gets a startup
+warning and the value is dropped.
 
 #### 4.3.5 `agent` (object)
 
@@ -402,7 +405,7 @@ Failure handling:
 
 ### 5.4 Workspace Hooks
 
-Supported hooks: `hooks.after_create`, `hooks.before_run`, `hooks.after_run`,
+Supported hooks: `hooks.after_create`, `hooks.before_run`,
 `hooks.before_remove`.
 
 Execution contract:
@@ -417,7 +420,6 @@ Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
 - `before_run` failure or timeout is fatal to the current run attempt.
-- `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 
 ### 5.5 Safety Invariants
