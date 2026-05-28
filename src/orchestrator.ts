@@ -24,6 +24,7 @@ import { writeIssueFile, pickHoldingState } from './issues.js';
 import type { ResourceSnapshot } from './reconciler/index.js';
 import type { ProposeFollowupSink } from './actions/index.js';
 import type { AgentRunner } from './agent/runner.js';
+import { resolveDispatchConfig } from './agent/runner.js';
 import {
   codexCredentialAvailable,
   codexMissingCredentialMessage,
@@ -722,6 +723,7 @@ export class Orchestrator
       steering_requested: false,
       steering_question: null,
       steering_context: null,
+      last_transition: null,
     };
     this.running.set(issue.id, entry);
     const logger = withIssue({ issue_id: issue.id, issue_identifier: issue.identifier });
@@ -734,6 +736,9 @@ export class Orchestrator
         issue_title: issue.title,
         workspace_path: workspacePath,
         tracker_root: trackerRootAtDispatch,
+        // Pin the per-state turn budget so the run-summary reducer can report
+        // turns-used-vs-budget without re-resolving config (issue 123).
+        max_turns: this.resolveStateMaxTurns(issue.state),
       });
     }
     logger.info('agent attempt started', { attempt });
@@ -765,6 +770,37 @@ export class Orchestrator
     }
   }
 
+  /**
+   * Resolve the per-state turn budget for the run log's `attempt_started`
+   * event. Returns null on any resolution failure (unknown state) — the
+   * summary reducer treats a null budget as "unknown", never an error.
+   */
+  private resolveStateMaxTurns(state: string): number | null {
+    try {
+      return resolveDispatchConfig(this.cfg, state).max_turns;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Record the end-of-attempt lifecycle events: the `transition` the agent (or
+   * an action reroute) performed during this attempt, if any, followed by
+   * `attempt_ended`. Both feed the run-summary reducer (issue 123); recording
+   * the transition here — once per attempt, off the hot path — is what makes
+   * the state path, rejection notes, and terminal outcome reconstructable.
+   */
+  private recordAttemptEnd(
+    runLog: RunLog | undefined,
+    entry: RunningEntry,
+    ok: boolean,
+    reason: string,
+    turnsCompleted: number,
+  ): void {
+    if (entry.last_transition) runLog?.system('transition', { ...entry.last_transition });
+    runLog?.system('attempt_ended', { ok, reason, turns_completed: turnsCompleted });
+  }
+
   private closeRunLog(
     issueId: string,
     fields?: Record<string, unknown>,
@@ -778,6 +814,10 @@ export class Orchestrator
     const rl = this.runLogs.get(issueId);
     if (!rl) return;
     if (fields) rl.system('runlog_closed', fields);
+    // Emit the compact per-issue run summary (issue 123) at the terminal unwind,
+    // when the lifecycle accumulator holds the full trajectory. Pure over
+    // in-memory state, so it precedes (and does not depend on) the stream flush.
+    rl.writeSummary();
     this.runLogs.delete(issueId);
     void rl.close();
   }
@@ -805,7 +845,7 @@ export class Orchestrator
       reason = (err as Error).message;
       logger.error('worker threw', { error: reason });
     }
-    runLog?.system('attempt_ended', { ok, reason, turns_completed: turnsCompleted });
+    this.recordAttemptEnd(runLog, entry, ok, reason, turnsCompleted);
     this.onWorkerExit(issue.id, ok, reason, entry);
   }
 

@@ -78,7 +78,8 @@ tracker:
 #                 every state directory)
 #               • `logs.root`    → `/symphony/logs`   (per-issue JSONL run-log
 #                 transcripts captured by RunLog — ACP frames, stderr, hooks,
-#                 system events)
+#                 system events — plus the compact `<key>.summary.json` outcome
+#                 records the reflector reads; see the `logs:` block below)
 #             Either mount is skipped silently if the corresponding root is
 #             unset. Smolvm has a small per-VM mount cap (the workspace itself
 #             already consumes one slot), so this is opt-in per state rather
@@ -283,8 +284,40 @@ workspace:
 #                        `kind: "result"` line (exit_code, signal, timed_out).
 #                        `hook` field names which hook: after_create | before_run
 #                        | before_remove.
-#   channel: "system"  — orchestrator lifecycle events (attempt_started,
-#                        attempt_ended, reconciliation_terminating, etc.).
+#   channel: "system"  — orchestrator lifecycle events (attempt_started — which
+#                        also carries the per-state `max_turns` budget,
+#                        attempt_ended, transition, reconciliation_terminating,
+#                        etc.). The `transition` event records each state move
+#                        (from_state, to_state, notes, actor, terminal,
+#                        rerouted) so the trajectory is reconstructable.
+#
+# Per-issue run summary (for the sleep-cycle reflector): alongside each
+# `<root>/<key>.jsonl`, the orchestrator writes a compact, versioned
+# `<root>/<key>.summary.json` at the issue's terminal unwind. It is a pure
+# REDUCTION over the lifecycle (`system`) events already in the JSONL — no extra
+# hot-path logging — so a reflection turn can read dozens of summaries without
+# re-parsing multi-MB frame logs. Fields (schema_version 1):
+#   • state_path        — distinct states visited, terminal appended
+#                         (e.g. ["Todo","Review","Todo","Review","Done"]);
+#   • attempts          — total dispatched attempts;
+#   • per_state[]       — {state, attempts, turns_used, max_turns,
+#                         budget_exhausted, wall_clock_ms};
+#   • review_rejections + rejection_notes[] — count and each reviewer kick-back's
+#                         notes (a non-reroute transition back to the INITIAL
+#                         implementing state, i.e. a Review→Todo rework);
+#   • turn_budget_exhausted, timeouts[] (stall / prompt_timeout / transport);
+#   • conflict_routes[] — PR-autopilot / action reroutes (rebase churn);
+#   • terminal_state + terminal_outcome (completed | cancelled | incomplete);
+#   • pr_number / pr_url (best-effort, scraped from the Done-state actions
+#                         stdout; null when unavailable);
+#   • first/last_event_at, wall_clock_ms_total, generated_at.
+# Graceful absence / backfill: the summary is best-effort. Issues that closed
+# BEFORE this feature shipped have no `*.summary.json`; a write failure or a
+# mid-issue process restart (the in-memory accumulator only sees post-restart
+# attempts) can leave it missing or partial. The reflector MUST treat an absent
+# or partial summary as "no signal for this issue" and fall back to the raw
+# JSONL (or skip the issue) — never as an error. No backfill job is run; old
+# issues simply carry no summary.
 #
 # Orchestrator-side: a single `<root>/symphony.log` (created on demand) gets
 # every structured log line symphony emits — workflow loads, dispatch

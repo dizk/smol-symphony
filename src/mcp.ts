@@ -444,6 +444,16 @@ export class McpRegistry {
     // the pre-transition state and a terminal-state hook (e.g. Done's PR-create)
     // would never fire.
     active.entry.issue.state = canonicalName ?? result.toState;
+    // Stash the transition so the orchestrator shell can fold it into the run
+    // log as a `transition` lifecycle event after the attempt unwinds (issue
+    // 123). Pure here — no IO; the run-log write happens host-side.
+    active.entry.last_transition = {
+      from_state: result.fromState,
+      to_state: canonicalName ?? result.toState,
+      notes,
+      actor,
+      terminal: targetIsTerminal,
+    };
     return result;
   }
 

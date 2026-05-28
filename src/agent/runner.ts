@@ -581,6 +581,17 @@ export class AgentRunner {
     }
     entry.cleanup_workspace_on_exit = false;
     entry.issue.state = targetState;
+    // Record the conflict reroute so the run-summary reducer can surface it as
+    // PR-autopilot rebase churn (issue 123). `rerouted` distinguishes it from a
+    // normal handoff so it never counts as a review rejection.
+    entry.last_transition = {
+      from_state: fromState,
+      to_state: targetState,
+      notes,
+      actor: entry.resolved_actor,
+      terminal: false,
+      rerouted: true,
+    };
   }
 
   /**
