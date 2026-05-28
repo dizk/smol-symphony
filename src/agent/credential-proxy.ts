@@ -328,20 +328,17 @@ export class CredentialProxy {
     await mkdir(path.dirname(this.lockPath), { recursive: true });
     const acquired = await this.acquireFileLock();
     if (!acquired) {
-      // Could not acquire within timeout — proceed without the lock rather
-      // than failing the request. The caller will return whatever token is
-      // in the cache; in the worst case the upstream rejects with 401 and
-      // the in-VM runner surfaces that as a normal auth error.
-      log.warn('credential proxy: lock acquire timed out; refreshing without serialization', {
+      // Lock acquire timed out. Do NOT spawn the refresher unserialized — that
+      // would race a live peer against the same `~/.claude/.credentials.json`
+      // and defeat the cross-process serialization the lock exists for. Fail
+      // closed: the caller (ensureFreshToken) catches and re-reads the cache,
+      // picking up whatever the lock-holding peer wrote during our wait — or
+      // returning the stale token (upstream then surfaces 401 normally) if
+      // the peer is still running.
+      log.warn('credential proxy: lock acquire timed out; skipping refresh', {
         path: this.lockPath,
       });
-      try {
-        await this.refresher();
-      } catch (err) {
-        log.warn('credential proxy: unserialized refresh failed', { error: (err as Error).message });
-        throw err;
-      }
-      return;
+      throw new Error('credential proxy: refresh lock acquire timeout');
     }
     try {
       await this.refresher();
@@ -443,10 +440,12 @@ export class CredentialProxy {
       await this.refreshNow();
     } catch (err) {
       log.warn('credential proxy: refresh failed', { error: (err as Error).message });
-      // Fall through to return the stale token rather than failing the request
-      // closed — the upstream will respond with 401 if the token is actually
-      // dead, and the in-VM runner already handles that.
-      return cached.accessToken;
+      // Failure includes the lock-acquire-timeout path: a peer is presumed to
+      // be running the refresh under the file lock. Re-read the cache so we
+      // pick up whatever the peer wrote during our wait; fall back to the
+      // stale token if not yet rotated (upstream then surfaces 401 normally).
+      const postFail = await this.readCachedToken();
+      return postFail?.accessToken ?? cached.accessToken;
     }
     const refreshed = await this.readCachedToken();
     return refreshed?.accessToken ?? cached.accessToken;

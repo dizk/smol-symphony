@@ -363,6 +363,68 @@ describe('CredentialProxy: expired cache + single-flight refresh', () => {
     }
   });
 
+  it('does not run its own refresher when the lock acquire times out', async () => {
+    // Regression test for the codex review finding: previously, on lock-acquire
+    // timeout the proxy fell through and ran its refresher anyway, defeating
+    // the cross-process serialization. With the fix, a second proxy whose
+    // acquire times out while a peer still holds the lock must NOT spawn its
+    // refresher; refreshNow() throws so ensureFreshToken can fall back to
+    // re-reading the cache (whatever the peer rotated to, or stale).
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-locktimeout-'));
+    const credentialsPath = path.join(tmp, '.credentials.json');
+    const lockPath = path.join(tmp, 'refresh.lock');
+    await writeFile(
+      credentialsPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: 'init', expiresAt: Date.now() + 3_600_000 } }),
+      'utf8',
+    );
+    let releaseA: (() => void) | null = null;
+    const holdA = new Promise<void>((resolve) => { releaseA = resolve; });
+    let ranA = 0;
+    let ranB = 0;
+    const proxyA = new CredentialProxy({
+      credentialsPath,
+      lockPath,
+      upstream: makeFakeUpstream(),
+      refresher: async () => { ranA += 1; await holdA; },
+      lockPollMs: 5,
+      lockStaleMs: 60_000,
+      lockAcquireTimeoutMs: 60_000,
+    });
+    const proxyB = new CredentialProxy({
+      credentialsPath,
+      lockPath,
+      upstream: makeFakeUpstream(),
+      refresher: async () => { ranB += 1; },
+      lockPollMs: 5,
+      lockStaleMs: 60_000,
+      // B's acquire timeout is far less than A's hold time. With the buggy
+      // (pre-fix) behavior, B would spawn its refresher anyway after timing
+      // out. The test asserts the fixed behavior: B does NOT run refresher.
+      lockAcquireTimeoutMs: 150,
+    });
+    try {
+      // A acquires the lock and blocks inside its refresher on holdA.
+      const refreshA = proxyA.refreshNow();
+      await new Promise((r) => setTimeout(r, 30));
+      // B attempts to refresh; must time out without invoking its refresher.
+      let bErr: Error | null = null;
+      try {
+        await proxyB.refreshNow();
+      } catch (err) {
+        bErr = err as Error;
+      }
+      assert.equal(ranA, 1, 'A refresher ran once');
+      assert.equal(ranB, 0, 'B refresher must NOT run concurrently with A holding the lock');
+      assert.ok(bErr, 'B should surface the lock-acquire timeout as an error');
+      assert.match(bErr!.message, /lock acquire timeout/);
+      releaseA!();
+      await refreshA;
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
   it('breaks through a stale lockfile abandoned by a crashed holder', async () => {
     // If a previous holder crashed before unlinking the lockfile, the next
     // acquire must detect the stale lock (mtime older than lockStaleMs) and
