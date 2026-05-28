@@ -154,34 +154,13 @@ export interface AgentConfig {
 
 // ACP adapter configuration. `adapter` selects one of symphony's known adapter profiles
 // (currently `claude` and `codex`); the profile encodes the binary symphony launches
-// inside the VM and the credential file it copies in from the host. Symphony always
-// auto-derives the launch command (scrub guest cred dir + stage credential + exec the
-// in-VM proxy); operators who need a custom shape fork scripts/vm-agent.mjs.
+// inside the VM. Credentials never enter the VM: the host credential proxy substitutes
+// a per-VM sentinel for the real Anthropic OAuth access token on every upstream
+// request, and codex-acp reads `OPENAI_API_KEY` from the env forwarded via
+// `smolvm.forward_env`. Operators who need a custom launch shape fork
+// scripts/vm-agent.mjs.
 export interface AcpConfig {
   adapter: string;
-  /**
-   * How the host hands credentials to the in-VM adapter (issue 113).
-   *
-   *   • `file`  — the historical path: the entire host credential file is
-   *     read, sensitive fields stripped (claude: `refreshToken`), and
-   *     written into the workspace runtime dir. The bash prelude in
-   *     `deriveAcpCommand` copies it into the adapter's expected guest path.
-   *   • `proxy` — symphony binds a host credential proxy on loopback. Each
-   *     dispatch is registered with a per-VM sentinel; the proxy validates
-   *     inbound sentinels, substitutes the real upstream access token, and
-   *     forwards to api.anthropic.com. The VM gets `ANTHROPIC_BASE_URL`
-   *     pointing at the proxy plus `ANTHROPIC_AUTH_TOKEN=<sentinel>` and a
-   *     minimal `~/.claude.json` identity file (oauthAccount UUIDs only).
-   *     Refresh stays host-side: the host's own `claude -p` ticker rotates
-   *     `~/.claude/.credentials.json`; the proxy reads the current token on
-   *     every request. VMs hold no `refreshToken` or `accessToken` on
-   *     filesystem, so they cannot rotate-poison the operator's interactive
-   *     `claude` session.
-   *
-   * Defaults to `file` during the transition window; flip to `proxy` once
-   * the proxy lands. Per-workflow knob so operators opt in.
-   */
-  credentials_mode: 'file' | 'proxy';
   /**
    * Optional model selector forwarded to the adapter. Each adapter profile decides how
    * to surface it (env var for claude-agent-acp's ANTHROPIC_MODEL; `-c model="..."` argv
@@ -323,10 +302,10 @@ export interface PrAutopilotConfig {
 }
 
 /**
- * Host-side credential lifecycle (issue 113). Only consulted when
- * `acp.credentials_mode === 'proxy'`. The bind host/port for the credential
- * proxy plus the ticker interval that proactively spawns `claude -p "ok"` to
- * keep the host's cached access token warm during idle periods.
+ * Host-side credential lifecycle (issue 113). The bind host/port for the
+ * credential proxy plus the ticker interval that proactively spawns
+ * `claude -p "ok"` to keep the host's cached access token warm during idle
+ * periods.
  */
 export interface CredentialsConfig {
   /** Host the credential proxy binds on. Default: 127.0.0.1 (host-only). */

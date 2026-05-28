@@ -1,34 +1,20 @@
 // Registry of ACP adapters symphony knows how to launch end-to-end.
 //
-// Each profile encodes everything symphony needs to ship a working adapter into the
-// per-issue smolvm without per-workflow bash boilerplate:
+// Each profile encodes the executable inside the VM that speaks ACP, plus the
+// optional model/effort injection channels (env vars, extra argv, staged files)
+// the adapter natively understands. There is no per-adapter credential file
+// plumbing — credentials are no longer staged into the VM. The host
+// credential proxy substitutes a per-VM sentinel for the real upstream
+// Anthropic OAuth access token on every request; codex-acp reads
+// `OPENAI_API_KEY` out of `smolvm.forward_env`.
 //
-//   - hostCredentialPath : the file on the host (relative to $HOME) that authenticates
-//                          the adapter. Symphony reads this and stages it into the
-//                          workspace before VM boot.
-//   - guestCredentialPath: the absolute path inside the VM where the adapter expects
-//                          to find that file. Symphony's auto-generated acp launch
-//                          command copies the staged file here at startup.
-//   - binary             : the executable inside the VM that speaks ACP.
-//
-// To add a new adapter (e.g. opencode), populate the profile and add it to ADAPTERS.
-// Unprofiled adapters are not supported at runtime — symphony always auto-stages the
-// host credential and execs the in-VM proxy.
-//
-// IMPORTANT: every host path here is treated as private. Symphony reads the file,
-// stages a copy into the workspace, and chmods the copy to 0600. The original host
-// file is never exposed via a bind mount.
+// To add a new adapter (e.g. opencode), populate the profile and add it to
+// ADAPTERS. Unprofiled adapters are not supported at runtime.
 
-import { constants as fsConstants } from 'node:fs';
-import { access, copyFile, mkdir, chmod, lstat, readFile, rm, realpath, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import {
-  HOST_CREDENTIAL_PATHS,
-  hostCredentialAbsPathForId,
-  isKnownAdapter,
-  type AcpAdapterId,
-} from './adapter-names.js';
+import { isKnownAdapter, type AcpAdapterId } from './adapter-names.js';
 
 // Re-export the names registry so orchestrator-side callers can keep importing
 // `isKnownAdapter` / `AcpAdapterId` from this module. The canonical home is
@@ -45,8 +31,9 @@ export { isKnownAdapter, type AcpAdapterId };
  *
  * `stagedFiles` entries declare both the staging-dir filename and the absolute guest
  * path the in-VM launch command must copy them to. The runner stages each file like
- * a credential (same staging-root logic, same symlink defenses) and `deriveAcpCommand`
- * emits an additional `cp` line per file before exec'ing the proxy.
+ * the identity file (same staging-root logic, same symlink defenses) and
+ * `deriveAcpCommand` emits a `mkdir -p` + `cp` line per file before exec'ing the
+ * proxy.
  */
 export interface ModelInjection {
   env?: Record<string, string>;
@@ -59,9 +46,9 @@ export type EffortInjection = ModelInjection;
 
 export interface StagedFileSpec {
   /**
-   * File name inside the workspace runtime staging dir. Must be unique vs the
-   * credential file (named `<adapter-id>`) and vs any other staged file for the same
-   * attempt — collisions would silently overwrite earlier writes.
+   * File name inside the workspace runtime staging dir. Must be unique vs any other
+   * staged file for the same attempt — collisions would silently overwrite earlier
+   * writes.
    */
   stagedName: string;
   /** UTF-8 content to write. */
@@ -72,19 +59,6 @@ export interface StagedFileSpec {
 
 export interface AdapterProfile {
   id: AcpAdapterId;
-  /** Path under $HOME on the host where the credential file lives. */
-  hostCredentialPath: string;
-  /** Absolute path inside the VM where the adapter expects to find the credential. */
-  guestCredentialPath: string;
-  /**
-   * JSON property names to strip from the credential (recursively, at any depth)
-   * before staging it into the VM. For OAuth adapters this drops the long-lived
-   * `refreshToken` so an in-VM agent cannot refresh — and thereby rotate — the
-   * host's shared token, which would invalidate the host's own copy and force a
-   * host `/login`. When set, the credential is parsed, stripped, and re-written
-   * instead of byte-copied. See issue 77 (credential rotation poisoning).
-   */
-  stripCredentialFields?: readonly string[];
   /**
    * ACP adapter launch command, split into argv. Each token is shell-quoted before
    * being emitted into the `bash -lc` string, so future profiles with multi-token
@@ -111,13 +85,6 @@ export interface AdapterProfile {
 export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   claude: {
     id: 'claude',
-    hostCredentialPath: HOST_CREDENTIAL_PATHS.claude,
-    guestCredentialPath: '/root/.claude/.credentials.json',
-    // Strip the OAuth refresh token before the credential enters the VM. OAuth
-    // refresh tokens rotate on use; if a VM agent refreshes the shared token it
-    // invalidates the host's copy and forces a host `/login`. The VM only needs
-    // the (short-lived) access token, re-staged each attempt. Issue 77.
-    stripCredentialFields: ['refreshToken'],
     binary: ['claude-agent-acp'],
     // claude-agent-acp reads ANTHROPIC_MODEL on startup (see acp-agent.js getAvailableModels:
     // ANTHROPIC_MODEL > settings.model > default). The adapter resolves aliases like
@@ -128,7 +95,7 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // `resolveSettings` walks `$CLAUDE_CONFIG_DIR/settings.json`, `<cwd>/.claude/settings.json`,
     // etc.) and applies it via `query.applyFlagSettings`. There is no ANTHROPIC_EFFORT env var
     // and the wrapper does not expose a CLI flag, so the only reachable channel from symphony
-    // is a settings.json staged next to the credential and copied to /root/.claude/settings.json
+    // is a settings.json staged next to the identity file and copied to /root/.claude/settings.json
     // before the proxy execs the adapter. Valid values are `low|medium|high|xhigh|max`, gated
     // per-model by claude-agent-acp's `supportedEffortLevels`; symphony lets the adapter reject
     // invalid choices rather than mirroring the gate.
@@ -144,8 +111,6 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   },
   codex: {
     id: 'codex',
-    hostCredentialPath: HOST_CREDENTIAL_PATHS.codex,
-    guestCredentialPath: '/root/.codex/auth.json',
     binary: ['codex-acp'],
     // codex-acp takes config overrides via `-c key=value` where value is parsed as TOML
     // (raw-string fallback on parse failure). We always emit a quoted TOML string so
@@ -158,25 +123,21 @@ export function profileFor(id: AcpAdapterId): AdapterProfile {
   return ADAPTERS[id];
 }
 
-/** Absolute path on the host where the adapter's credential file lives. */
-export function hostCredentialAbsPath(profile: AdapterProfile): string {
-  return hostCredentialAbsPathForId(profile.id);
-}
-
 /**
- * Compute where in the workspace symphony will stage the adapter's credential.
+ * Where in the workspace symphony stages adapter runtime files (identity,
+ * settings.json, …).
  *
  * Strategy by workspace shape (resolved at stage time, not by this helper):
- *   - `.git/` is a directory  → `<ws>/.git/symphony-runtime/credentials/<id>`
+ *   - `.git/` is a directory  → `<ws>/.git/symphony-runtime/<subdir>/<name>`
  *     Files under `.git/` are git's private area; `git add`/`git status` never
- *     recurse into it, so even an agent that runs `git add -A` cannot commit
- *     the credential. No `info/exclude` games needed.
- *   - `.git` does not exist   → `<ws>/.symphony-runtime/credentials/<id>`
+ *     recurse into it, so the file is structurally untrackable. No
+ *     `info/exclude` games needed.
+ *   - `.git` does not exist   → `<ws>/.symphony-runtime/<subdir>/<name>`
  *     There's no git in this workspace, so no commit/add semantics to worry
  *     about. Falls back to a workspace-root path.
  *   - `.git` is a file (linked worktree) → refused at stage time. The
  *     per-worktree gitdir lives outside the workspace mount, so symphony
- *     cannot place the credential where the in-VM agent can see it without
+ *     cannot place the file where the in-VM agent can see it without
  *     re-introducing the working-tree-leak risk. Linked worktrees are
  *     unsupported under the TCP bridge transport; use a non-linked workspace
  *     clone or fork scripts/vm-agent.mjs.
@@ -185,146 +146,8 @@ export function hostCredentialAbsPath(profile: AdapterProfile): string {
  * works as-is in the in-VM acp launch command, regardless of host OS path
  * separator.
  */
-export interface StagedCredentialPaths {
-  /** Absolute path on the host (where stageCredential actually writes). */
-  absPath: string;
-  /** POSIX path relative to workspacePath (used in the in-VM launch command). */
-  relPath: string;
-}
-
-/** Verify the host credential file exists and is readable. Used at startup validation. */
-export async function assertHostCredentialReadable(profile: AdapterProfile): Promise<void> {
-  const p = hostCredentialAbsPath(profile);
-  try {
-    await access(p, fsConstants.R_OK);
-  } catch (err) {
-    throw new Error(
-      `adapter "${profile.id}" requires a host credential at ${p}, but it is missing or unreadable: ${
-        (err as Error).message
-      }`,
-    );
-  }
-}
-
-/**
- * Copy the host's credential file into the workspace's runtime staging area, chmod 600.
- * Re-runs every attempt so a host-side token rotation is picked up automatically.
- *
- * Defense layers, in order:
- *   1. `resolveStagingLocation` picks a path OUTSIDE the working tree when git is
- *      present (`.git/symphony-runtime/...`) so `git add -A`, a tracked file at
- *      `.symphony-runtime/`, or a `.gitignore` negation cannot expose the secret.
- *      Linked worktrees are refused (see resolveStagingLocation comment).
- *   2. `ensureRealDir` walks each parent we materialize and refuses if any exists
- *      as a symlink or non-directory.
- *   3. `rm + copyFile(COPYFILE_EXCL)` closes the local race on the leaf path:
- *      after explicit cleanup, the create is strict and fails if anything raced
- *      back in.
- *   4. Post-write `realpath` check confirms the file landed at the expected
- *      absolute path. On mismatch (a parent was swapped for a symlink between
- *      ensureRealDir and copyFile), we unlink the staging path itself — which
- *      removes a symlink without following it — and refuse. We deliberately do
- *      NOT touch whatever the symlink resolved to, since that file is by
- *      definition attacker-chosen.
- */
-/**
- * Deep-copy `value`, dropping every property named in `fields` at any depth. Used to
- * remove secrets (the OAuth `refreshToken`) from a credential before it is staged into
- * a VM, without disturbing the rest of the credential shape. Issue 77.
- */
-function stripJsonFields(value: unknown, fields: readonly string[]): unknown {
-  if (Array.isArray(value)) return value.map((v) => stripJsonFields(v, fields));
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (fields.includes(k)) continue;
-      out[k] = stripJsonFields(v, fields);
-    }
-    return out;
-  }
-  return value;
-}
-
-/**
- * Materialize the credential at `dst` (0600). Adapters with `stripCredentialFields`
- * get a parsed-and-stripped JSON copy (secrets like `refreshToken` removed); everything
- * else, and any non-JSON credential, is byte-copied. `flag: 'wx'` / COPYFILE_EXCL give
- * the same exclusive-create race protection; the caller's realpath check still applies.
- * Issue 77.
- */
-async function writeStagedCredential(
-  src: string,
-  dst: string,
-  profile: AdapterProfile,
-): Promise<void> {
-  const strip = profile.stripCredentialFields;
-  let sanitized: string | null = null;
-  if (strip && strip.length > 0) {
-    const raw = await readFile(src, 'utf8');
-    try {
-      sanitized = JSON.stringify(stripJsonFields(JSON.parse(raw), strip));
-    } catch {
-      sanitized = null; // not JSON (e.g. a test fixture) — fall back to a raw copy
-    }
-  }
-  if (sanitized !== null) {
-    await writeFile(dst, sanitized, { mode: 0o600, flag: 'wx' });
-  } else {
-    await copyFile(src, dst, fsConstants.COPYFILE_EXCL);
-  }
-  await chmod(dst, 0o600);
-}
-
-export async function stageCredential(
-  workspacePath: string,
-  profile: AdapterProfile,
-): Promise<StagedCredentialPaths> {
-  const src = hostCredentialAbsPath(profile);
-  const { stagingRootAbs, stagingRootRel } = await resolveStagingLocation(workspacePath);
-  const credsDir = path.join(stagingRootAbs, 'credentials');
-  await ensureRealDir(stagingRootAbs);
-  await ensureRealDir(credsDir);
-
-  const dst = path.join(credsDir, profile.id);
-  await rm(dst, { force: true, recursive: false });
-  await writeStagedCredential(src, dst, profile);
-
-  const expectedReal = path.join(
-    await realpath(workspacePath),
-    stagingRootRel,
-    'credentials',
-    profile.id,
-  );
-  const actualReal = await realpath(dst);
-  if (actualReal !== expectedReal) {
-    // Unlinking dst removes the symlink itself (does not follow). Leaked
-    // credential at actualReal is left in place because we cannot prove
-    // ownership; operator must inspect.
-    await rm(dst, { force: true }).catch(() => undefined);
-    throw new Error(
-      `staging path redirected: wrote to ${actualReal}, expected ${expectedReal}. ` +
-        `A symlink raced in during staging; manually inspect and remove any leaked ` +
-        `credential at the actual path before retrying.`,
-    );
-  }
-
-  const relPath = path.posix.join(stagingRootRel, 'credentials', profile.id);
-  return { absPath: dst, relPath };
-}
-
-/**
- * Write an arbitrary content file into the same staging dir as the credential. Used
- * for adapter runtime files (today: claude's settings.json carrying `effortLevel`).
- * Reuses `resolveStagingLocation` + `ensureRealDir` + the symlink-replace dance from
- * `stageCredential` so a planted symlink at the leaf cannot redirect the write.
- *
- * Caller picks `stagedName`; collisions with the credential file (named `<adapter-id>`)
- * or with other staged files for the same attempt would silently overwrite. The
- * registry's `effortInjection` returns adapter-prefixed names (e.g. `claude-settings.json`)
- * to keep the namespace cleanly partitioned.
- */
 export interface StagedRuntimePaths {
-  /** Absolute path on the host (where stageRuntimeFile actually writes). */
+  /** Absolute path on the host (where the writer actually wrote). */
   absPath: string;
   /** POSIX path relative to workspacePath (used in the in-VM launch command). */
   relPath: string;
@@ -335,7 +158,7 @@ export async function stageRuntimeFile(
   stagedName: string,
   content: string,
 ): Promise<StagedRuntimePaths> {
-  return stageNamedFileUnder(workspacePath, 'credentials', stagedName, content);
+  return stageNamedFileUnder(workspacePath, 'runtime', stagedName, content);
 }
 
 /**
@@ -411,13 +234,16 @@ function pickStringField(obj: Record<string, unknown>, key: string): string | nu
 }
 
 /**
- * Shared implementation for the credentials/runtime/identity staging paths.
- * Writes `content` into `<staging-root>/<subdir>/<stagedName>` with the same
- * symlink/race defenses as `stageCredential`.
+ * Shared implementation for the runtime/identity staging paths. Writes
+ * `content` into `<staging-root>/<subdir>/<stagedName>` (0600) with the same
+ * symlink/race defenses we previously used for the credential file: explicit
+ * cleanup of the leaf, exclusive create via `flag: 'wx'`, and a post-write
+ * `realpath` check to detect a symlink that raced into a parent between
+ * `ensureRealDir` and the write.
  */
 async function stageNamedFileUnder(
   workspacePath: string,
-  subdir: 'credentials' | 'identity',
+  subdir: 'runtime' | 'identity',
   stagedName: string,
   content: string,
 ): Promise<StagedRuntimePaths> {
@@ -452,9 +278,10 @@ async function stageNamedFileUnder(
 }
 
 /**
- * Decide where to stage credentials based on workspace shape. See StagedCredentialPaths
- * for the policy. Returns absolute + relative (POSIX, relative to workspacePath)
- * paths to the staging root directory; the caller composes `credentials/<id>` under it.
+ * Decide where to stage runtime files based on workspace shape. See
+ * StagedRuntimePaths for the policy. Returns absolute + relative (POSIX,
+ * relative to workspacePath) paths to the staging root directory; the caller
+ * composes `<subdir>/<name>` under it.
  */
 async function resolveStagingLocation(workspacePath: string): Promise<{
   stagingRootAbs: string;
@@ -471,8 +298,8 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
       // repository discovery walks up the directory tree, so a workspace at e.g.
       // `<parent>/.symphony/workspaces/X` with no own `.git` ends up inside
       // `<parent>/.git`. A `git add -A` (from a host-side hook, or from any
-      // process with the host filesystem visible) would then stage the
-      // credential in the parent's index. Detect that and refuse.
+      // process with the host filesystem visible) would then stage the file in
+      // the parent's index. Detect that and refuse.
       //
       // Resolve symlinks first: git's discovery follows the resolved path, so
       // walking the lexical `workspacePath` would miss an ancestor `.git` that
@@ -485,7 +312,7 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
         resolvedWorkspace = await realpath(workspacePath);
       } catch (resolveErr) {
         throw new Error(
-          `cannot auto-stage credentials: workspace ${workspacePath} could not be resolved ` +
+          `cannot auto-stage runtime files: workspace ${workspacePath} could not be resolved ` +
             `(realpath failed: ${(resolveErr as Error).message}). Refusing to stage without a ` +
             `canonical path; fix the workspace.`,
         );
@@ -493,7 +320,7 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
       const ancestor = await findAncestorGit(resolvedWorkspace);
       if (ancestor !== null) {
         throw new Error(
-          `cannot auto-stage credentials: workspace ${workspacePath} has no .git of its own ` +
+          `cannot auto-stage runtime files: workspace ${workspacePath} has no .git of its own ` +
             `but is inside an ancestor git repo at ${ancestor}. Create a nested clone ` +
             `(e.g. via hooks.after_create).`,
         );
@@ -507,9 +334,9 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
   }
   if (gitSt.isDirectory()) {
     // Normal clone: stage inside `.git/`, which is outside the working tree.
-    // Git never recurses into `.git/` for `add`/`status`, so the credential is
+    // Git never recurses into `.git/` for `add`/`status`, so the file is
     // structurally untrackable — no `info/exclude` games needed, and a tracked
-    // `.symphony-runtime/credentials/<id>` at workspace root cannot interfere.
+    // `.symphony-runtime/...` at workspace root cannot interfere.
     return {
       stagingRootAbs: path.join(workspacePath, '.git', 'symphony-runtime'),
       stagingRootRel: path.posix.join('.git', 'symphony-runtime'),
@@ -518,21 +345,21 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
   if (gitSt.isFile()) {
     // Linked worktree: .git is a pointer file at /<worktree>/.git -> per-worktree
     // gitdir (typically /<main>/.git/worktrees/<name>/). The per-worktree gitdir
-    // lives outside the workspace mount, so symphony cannot place the credential
+    // lives outside the workspace mount, so symphony cannot place the file
     // there and still have the in-VM agent reach it. Any worktree-internal path
     // is inside the working tree, where `.gitignore` negation or a tracked file
-    // could still expose the secret to `git add -A`. Linked worktrees are
+    // could still expose state to `git add -A`. Linked worktrees are
     // currently unsupported — use a non-linked workspace clone (e.g.
-    // `git clone --local`) or fork scripts/vm-agent.mjs to stage credentials in
-    // whatever shape your worktree layout needs.
+    // `git clone --local`) or fork scripts/vm-agent.mjs to stage runtime
+    // files in whatever shape your worktree layout needs.
     throw new Error(
-      `cannot auto-stage credentials in a linked worktree (.git at ${gitPath} is a file). ` +
+      `cannot auto-stage runtime files in a linked worktree (.git at ${gitPath} is a file). ` +
         `Linked worktrees are unsupported under the ACP TCP bridge transport; use a ` +
         `non-linked workspace clone or fork scripts/vm-agent.mjs.`,
     );
   }
   throw new Error(
-    `cannot auto-stage credentials: ${gitPath} is neither a directory nor a file ` +
+    `cannot auto-stage runtime files: ${gitPath} is neither a directory nor a file ` +
       `(symlink, device, or other unexpected entry).`,
   );
 }
@@ -599,75 +426,54 @@ async function ensureRealDir(p: string): Promise<void> {
 }
 
 /**
- * Build the bash command symphony will exec inside the VM. Wipes the adapter's state
- * directory, re-creates it, copies the staged credential (`stagedRelPath`, a POSIX path
- * relative to the in-VM cwd which equals the workspace mount) into place, chmods it, and
- * execs the in-VM proxy at `/opt/symphony/vm-agent.mjs`. The proxy reads its config —
- * SYMPHONY_ACP_URL, SYMPHONY_ACP_TOKEN, SYMPHONY_ADAPTER_BIN, SYMPHONY_ADAPTER_ARGS —
- * from the environment that symphony sets on the `smolvm exec` invocation, dials the
- * host's TCP ACP bridge, and spawns the adapter with kernel pipes.
+ * Additional file to copy into the VM before exec'ing the proxy. Carries
+ * runtime knobs that surface through files: claude's identity (~/.claude.json)
+ * and the settings.json that holds `effortLevel`. `stagedRelPath` is the POSIX
+ * path within the workspace mount (relative to the in-VM cwd) and `guestPath`
+ * is the absolute destination in the VM.
  *
- * Why TCP through a proxy: smolvm-exec's stdin pump does not reliably wake the in-VM
- * reader for kernel events unless host stdin keeps writing. Piping ACP frames through
- * smolvm-exec stdio caused the adapter to hang after the first session/update. The TCP
- * bridge (see src/acp-bridge.ts) bypasses that pump entirely and decouples symphony from
- * any specific sandbox tech — any sandbox that can launch a process with env vars and
- * reach the host loopback can run this stack unchanged.
- *
- * Wiping `guestDir` (e.g. `/root/.claude` or `/root/.codex`) on every exec is defense in
- * depth: the per-issue VM is destroyed after each attempt already, but a freshly-baked
- * image may carry state from build verification steps (e.g. `claude --version` writes
- * settings to /root/.claude). The scrub guarantees a clean slate. The VM's workspace
- * mount is separate from `guestDir`, so this scrub never touches operator data.
- *
- * Every interpolated path is run through shQuote so future profiles with spaces or
- * metacharacters compose safely. `stagedRelPath` comes from `stageCredential`, which
- * picks a path outside the working tree when git is present.
- */
-/**
- * Additional file to copy into the VM before exec'ing the proxy. Used by adapter
- * runtime knobs that surface through files (today: claude's settings.json for the
- * `effortLevel` knob). `stagedRelPath` is the POSIX path within the workspace mount
- * (relative to the in-VM cwd) and `guestPath` is the absolute destination in the VM.
- *
- * deriveAcpCommand emits `mkdir -p $(dirname guestPath)` defensively in case the
- * destination directory is outside the credential's guestDir; for the common case
- * (claude's settings.json next to its credential at /root/.claude/) the prior
- * `mkdir -p` of guestDir already covers it, but the extra mkdir is idempotent.
+ * deriveAcpCommand emits `mkdir -p $(dirname guestPath)` before each cp so the
+ * destination directory exists regardless of whether the adapter's VM image
+ * pre-creates it.
  */
 export interface ExtraGuestFile {
   stagedRelPath: string;
   guestPath: string;
 }
 
+/**
+ * Build the bash command symphony will exec inside the VM. For each staged
+ * extra file: `mkdir -p` the destination directory, `cp` the file into place,
+ * `chmod 600`. Then exec the in-VM proxy at `/opt/symphony/vm-agent.mjs`. The
+ * proxy reads its config — SYMPHONY_ACP_URL, SYMPHONY_ACP_TOKEN,
+ * SYMPHONY_ADAPTER_BIN, SYMPHONY_ADAPTER_ARGS — from the environment that
+ * symphony sets on the `smolvm exec` invocation, dials the host's TCP ACP
+ * bridge, and spawns the adapter with kernel pipes.
+ *
+ * Why TCP through a proxy: smolvm-exec's stdin pump does not reliably wake the
+ * in-VM reader for kernel events unless host stdin keeps writing. Piping ACP
+ * frames through smolvm-exec stdio caused the adapter to hang after the first
+ * session/update. The TCP bridge (see src/acp-bridge.ts) bypasses that pump
+ * entirely and decouples symphony from any specific sandbox tech — any sandbox
+ * that can launch a process with env vars and reach the host loopback can run
+ * this stack unchanged.
+ *
+ * Credentials are NOT staged into the VM. The host credential proxy
+ * substitutes a per-VM sentinel for the real Anthropic OAuth access token on
+ * every upstream request; codex-acp reads `OPENAI_API_KEY` from the env
+ * forwarded by `smolvm.forward_env`.
+ */
 export function deriveAcpCommand(
   profile: AdapterProfile,
-  stagedRelPath: string | null,
   extraFiles: readonly ExtraGuestFile[] = [],
 ): string {
   if (profile.binary.length === 0) {
     throw new Error(`adapter "${profile.id}" has an empty binary launch vector`);
   }
-  const guestDir = path.posix.dirname(profile.guestCredentialPath);
-  // Wipe and recreate the guest state dir regardless of whether we're staging a
-  // credential file: under proxy mode (issue 113) the credential is replaced
-  // by an upstream Bearer-sentinel and the VM has no `.credentials.json` at
-  // all. The wipe is defense in depth against any state baked into the image
-  // (e.g. `claude --version` during build verification touches /root/.claude).
-  const steps: string[] = [
-    `rm -rf ${shQuote(guestDir)}`,
-    `mkdir -p ${shQuote(guestDir)}`,
-  ];
-  if (stagedRelPath !== null) {
-    const guestPath = profile.guestCredentialPath;
-    steps.push(`cp ${shQuote(stagedRelPath)} ${shQuote(guestPath)}`);
-    steps.push(`chmod 600 ${shQuote(guestPath)}`);
-  }
+  const steps: string[] = [];
   for (const f of extraFiles) {
     const extraDir = path.posix.dirname(f.guestPath);
-    if (extraDir !== guestDir) {
-      steps.push(`mkdir -p ${shQuote(extraDir)}`);
-    }
+    steps.push(`mkdir -p ${shQuote(extraDir)}`);
     steps.push(`cp ${shQuote(f.stagedRelPath)} ${shQuote(f.guestPath)}`);
     steps.push(`chmod 600 ${shQuote(f.guestPath)}`);
   }

@@ -125,38 +125,6 @@ describe('workflow', () => {
     assert.equal(cfg.acp.model, 'claude-opus-4-7');
   });
 
-  it('defaults credentials_mode to "file" and parses an explicit "proxy" opt-in (issue 113)', () => {
-    const defaulted = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
-        acp: { adapter: 'claude' },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(defaulted.acp.credentials_mode, 'file');
-    const proxied = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
-        acp: { adapter: 'claude', credentials_mode: 'proxy' },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(proxied.acp.credentials_mode, 'proxy');
-    // Unknown values fall back to file so a typo doesn't silently leak
-    // credentials through a half-configured proxy.
-    const typo = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
-        acp: { adapter: 'claude', credentials_mode: 'proxie' },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(typo.acp.credentials_mode, 'file');
-  });
-
   it('parses the credentials block (proxy bind host/port + ticker interval) (issue 113)', () => {
     const cfg = buildServiceConfig(
       {
@@ -636,11 +604,13 @@ describe('workflow states validation', () => {
   });
 
   it('rejects per-state adapter whose host credential is missing', async () => {
-    // Point HOME at an empty tmp dir so the cred file the validator probes for
-    // does not exist. validateDispatchIo uses hostCredentialAbsPathForId, which
-    // calls os.homedir() (reads $HOME) at call time. The fs probe lives in the
-    // shell loader; the pure structural validateDispatch no longer touches the
-    // disk.
+    // Point HOME at an empty tmp dir so the credential file the validator
+    // probes for does not exist. validateDispatchIo calls hostClaudeCredentialPath()
+    // for any state pinned to the claude adapter; the probe uses os.homedir()
+    // (which reads $HOME) at call time. The fs probe lives in the shell loader;
+    // the pure structural validateDispatch no longer touches the disk. The
+    // codex adapter has no host-file dependency under the proxy architecture,
+    // so non-claude states bypass the probe entirely.
     await withTrackerRoot(async (root) => {
       const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-fake-home-'));
       const prevHome = process.env.HOME;

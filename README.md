@@ -68,8 +68,10 @@ Prerequisites:
   reason). Point `smolvm.smolfile` at the one you want, or copy it to the
   project root and adjust the `volumes` path noted in its header.
 - For the default `acp.adapter: claude`: a credentials file at
-  `~/.claude/.credentials.json` on the host (symphony reads and stages it; the
-  host directory is **not** bind-mounted into the VM).
+  `~/.claude/.credentials.json` on the host. Symphony reads it only on the
+  host side: a loopback proxy substitutes the real OAuth access token for a
+  per-VM sentinel on every request. The credential file itself is never
+  staged into the VM.
 
 Run, against an existing workflow file in the current directory:
 
@@ -223,13 +225,13 @@ without any mount or special host alias.
 ## ACP — adapter registry
 
 One ACP client (symphony's `agent/acp.ts`), two shipped adapter profiles.
-Each profile encodes the binary symphony launches and the host credential
-file it stages into the workspace before exec:
+Each profile encodes the binary symphony launches and the credential path
+the adapter reaches for inside the VM:
 
-| Adapter   | Binary             | Host credential file              |
+| Adapter   | Binary             | Credential surface                |
 | --------- | ------------------ | --------------------------------- |
-| `claude`  | `claude-agent-acp` | `~/.claude/.credentials.json`     |
-| `codex`   | `codex-acp`        | `~/.codex/auth.json`              |
+| `claude`  | `claude-agent-acp` | host loopback proxy + sentinel    |
+| `codex`   | `codex-acp`        | `OPENAI_API_KEY` via `forward_env`|
 
 `WORKFLOW.md`:
 
@@ -242,16 +244,18 @@ acp:
   stall_timeout_ms: 300000
 ```
 
-Selecting an adapter is enough — symphony auto-derives the launch command
-that stages the credential into the workspace's runtime dir and copies it
-into the adapter's expected guest path before exec. Set `command:` only to
-override (testing a forked adapter, a non-standard binary path); doing so
-opts out of automatic credential staging.
+Selecting an adapter is enough — symphony auto-derives the launch command.
+For `claude`, a per-VM identity file (organization + account UUIDs only,
+no tokens) is staged into the workspace runtime dir and copied to
+`~/.claude.json` inside the VM; requests reach Anthropic via the host
+loopback proxy that substitutes the real access token for the VM's
+sentinel. Set `command:` only to override (testing a forked adapter, a
+non-standard binary path).
 
-Credentials are **never bind-mounted from the host**. Symphony copies the
-single credential file into a per-workspace location (under `.git/` when
-the workspace has its own clone, else `.symphony-runtime/`) and refuses to
-operate on workspaces inside the credential file's ancestor repo.
+OAuth tokens **never enter the VM**. The host's
+`~/.claude/.credentials.json` is read only by the proxy on the host side;
+the VM sees `~/.claude.json` (identity-only) plus the sentinel value in
+its `Authorization` header.
 
 ## After-run handoff: pull request
 
@@ -276,10 +280,12 @@ commands.
 ## Trust posture
 
 Sandbox isolation comes from running each agent inside a smolvm microVM.
-The VM has no network credentials (only the agent's API key is forwarded
-via `smolvm.forward_env`), no tracker filesystem access (the tracker is
-reached only through the MCP server), and stripped git remotes (set by
-`after_create`).
+The VM has no OAuth refresh tokens or long-lived access tokens: for
+`claude`, the host loopback proxy holds the real credential and swaps in
+the per-VM sentinel on every outbound request; for `codex`, only
+`OPENAI_API_KEY` is forwarded via `smolvm.forward_env`. The VM has no
+tracker filesystem access (the tracker is reached only through the MCP
+server) and stripped git remotes (set by `after_create`).
 
 Within the ACP session, the orchestrator follows SPEC §6.1's "high-trust"
 posture:

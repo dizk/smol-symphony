@@ -24,7 +24,6 @@ import {
   deriveAcpCommand,
   isKnownAdapter,
   stageClaudeIdentity,
-  stageCredential,
   stageRuntimeFile,
   type AcpAdapterId,
   type ExtraGuestFile,
@@ -335,11 +334,12 @@ export class AgentRunner {
      */
     private actionSnapshotSink: ActionSnapshotSink | null = null,
     /**
-     * Host credential proxy (issue 113). Only required when
-     * `cfg.acp.credentials_mode === 'proxy'`; in `file` mode the runner stages
-     * the full credential file as before and never touches the proxy. The
-     * proxy mints per-dispatch sentinels that the in-VM client uses as its
-     * upstream Bearer; symphony deregisters on teardown.
+     * Host credential proxy (issue 113). Required for claude dispatches: the
+     * proxy mints per-dispatch sentinels that the in-VM claude-agent-acp
+     * uses as its upstream Bearer (substituted for the real Anthropic OAuth
+     * access token on every request). Symphony deregisters on teardown.
+     * Codex dispatches read `OPENAI_API_KEY` from `smolvm.forward_env` and
+     * never touch the proxy.
      */
     private credentialProxy: CredentialProxy | null = null,
   ) {}
@@ -876,17 +876,16 @@ export class AgentRunner {
   // -------------------------------------------------------------------------
 
   /**
-   * Stage credentials (file or proxy mode), apply model/effort runtime
-   * injections, and derive the final ACP launch command. Pre-handshake
-   * failures unwind through the normal phase pipeline.
+   * Apply model/effort runtime injections, stage any per-adapter extra files
+   * (claude's identity file), and derive the final ACP launch command.
+   * Pre-handshake failures unwind through the normal phase pipeline.
    *
-   * Mode dispatch (issue 113):
-   *   • `file`  — historical path: stage the host credential file (with
-   *     `refreshToken` stripped for claude) and `cp` it into the adapter's
-   *     guest path before exec.
-   *   • `proxy` — stage only the minimal identity file `~/.claude.json` and
-   *     wire ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN to the host
-   *     credential proxy's per-VM sentinel. The VM holds no token bytes.
+   * Credentials never enter the VM. For claude dispatches the in-VM client
+   * gets `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN=<sentinel>` from the
+   * host credential proxy (wired at exec time) plus a minimal `~/.claude.json`
+   * identity file for fingerprint stability. For codex the in-VM client
+   * reads `OPENAI_API_KEY` from the env forwarded by `smolvm.forward_env`;
+   * the proxy is not involved.
    */
   private async prepareAdapterRuntime(
     workspacePath: string,
@@ -894,67 +893,20 @@ export class AgentRunner {
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<AdapterRuntime>> {
     const profile = ADAPTERS[resolved.adapter];
-    if (this.cfg.acp.credentials_mode === 'proxy') {
-      return this.prepareProxyAdapterRuntime(workspacePath, profile, resolved, logger);
-    }
-    return this.prepareFileAdapterRuntime(workspacePath, profile, resolved, logger);
-  }
-
-  private async prepareFileAdapterRuntime(
-    workspacePath: string,
-    profile: AdapterProfile,
-    resolved: ResolvedDispatchConfig,
-    logger: ReturnType<typeof withIssue>,
-  ): Promise<PhaseResult<AdapterRuntime>> {
-    let staged: Awaited<ReturnType<typeof stageCredential>>;
-    try {
-      staged = await stageCredential(workspacePath, profile);
-    } catch (err) {
-      logger.error('credential staging failed', { adapter: profile.id, error: (err as Error).message });
-      return failPhase('credential staging error');
-    }
-    const injectedRes = await this.applyRuntimeInjectionsOrFail(workspacePath, profile, resolved, logger);
-    if (!injectedRes.ok) return injectedRes;
-    const injected = injectedRes.value;
-    const effectiveAcpCommand = deriveAcpCommand(profile, staged.relPath, injected.runtimeExtraFiles);
-    return {
-      ok: true,
-      value: {
-        profile,
-        adapterBin: profile.binary[0]!,
-        effectiveAcpCommand,
-        effectiveAdapterArgs: [...profile.binary.slice(1), ...injected.runtimeArgs],
-        runtimeEnv: injected.runtimeEnv,
-        credentialSentinel: null,
-        needsCredentialProxy: false,
-      },
-    };
-  }
-
-  private async prepareProxyAdapterRuntime(
-    workspacePath: string,
-    profile: AdapterProfile,
-    resolved: ResolvedDispatchConfig,
-    logger: ReturnType<typeof withIssue>,
-  ): Promise<PhaseResult<AdapterRuntime>> {
-    if (profile.id !== 'claude') {
-      logger.error('credentials_mode=proxy supports only the claude adapter today', {
+    if (profile.id === 'claude' && !this.credentialProxy) {
+      logger.error('credential proxy is not wired but adapter requires it', {
         adapter: profile.id,
       });
-      return failPhase('credentials_mode proxy requires claude adapter');
-    }
-    if (!this.credentialProxy) {
-      logger.error('credentials_mode=proxy but no credential proxy is wired', {});
       return failPhase('credential proxy unavailable');
     }
     const injectedRes = await this.applyRuntimeInjectionsOrFail(workspacePath, profile, resolved, logger);
     if (!injectedRes.ok) return injectedRes;
-    const extraFiles = await this.stageProxyExtras(workspacePath, injectedRes.value, logger);
-    if (!extraFiles.ok) return extraFiles;
+    const extraFilesRes = await this.stageAdapterExtras(workspacePath, profile, injectedRes.value, logger);
+    if (!extraFilesRes.ok) return extraFilesRes;
     // Sentinel registration is deferred to `bringUpVmAndExec` — we don't want
     // a sentinel sitting in the registry if VM start fails. The runtime env
     // and command are sealed at exec time.
-    const effectiveAcpCommand = deriveAcpCommand(profile, null, extraFiles.value);
+    const effectiveAcpCommand = deriveAcpCommand(profile, extraFilesRes.value);
     return {
       ok: true,
       value: {
@@ -964,29 +916,31 @@ export class AgentRunner {
         effectiveAdapterArgs: [...profile.binary.slice(1), ...injectedRes.value.runtimeArgs],
         runtimeEnv: injectedRes.value.runtimeEnv,
         credentialSentinel: null,
-        needsCredentialProxy: true,
       },
     };
   }
 
   /**
-   * Stage the minimal `~/.claude.json` identity (oauthAccount UUIDs only) and
-   * append it to the extra guest files list so the bash prelude copies it to
+   * Compose the per-adapter extra guest files: every staged file produced by
+   * runtime injections (model/effort knobs), plus — for claude — the minimal
+   * `~/.claude.json` identity (oauthAccount UUIDs only) copied to
    * `/root/.claude.json` before exec. Identity staging is best-effort: a
    * missing host `~/.claude.json` is logged and the dispatch proceeds.
    */
-  private async stageProxyExtras(
+  private async stageAdapterExtras(
     workspacePath: string,
+    profile: AdapterProfile,
     injected: { runtimeExtraFiles: ExtraGuestFile[] },
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<ExtraGuestFile[]>> {
     const out: ExtraGuestFile[] = [...injected.runtimeExtraFiles];
+    if (profile.id !== 'claude') return { ok: true, value: out };
     try {
       const identity = await stageClaudeIdentity(workspacePath);
       if (identity) {
         out.push({ stagedRelPath: identity.relPath, guestPath: '/root/.claude.json' });
       } else {
-        logger.warn('credentials_mode=proxy: ~/.claude.json identity missing or malformed', {});
+        logger.warn('claude identity missing or malformed at host ~/.claude.json', {});
       }
     } catch (err) {
       logger.error('identity staging failed', { error: (err as Error).message });
@@ -1128,17 +1082,17 @@ export class AgentRunner {
   }
 
   /**
-   * Mint a credential-proxy sentinel for this dispatch when adapter prep
-   * flagged proxy mode. Sentinel registration happens AFTER VM start +
-   * bridge register so an early failure doesn't leak a registry entry — the
-   * proxy's registry is in-process, but a leaked entry would still be a
-   * loose end across the dispatch lifecycle.
+   * Mint a credential-proxy sentinel for claude dispatches. Sentinel
+   * registration happens AFTER VM start + bridge register so an early
+   * failure doesn't leak a registry entry — the proxy's registry is
+   * in-process, but a leaked entry would still be a loose end across the
+   * dispatch lifecycle.
    */
   private registerCredentialSentinel(
     issue: Issue,
     adapter: AdapterRuntime,
   ): { sentinel: string; baseUrl: string } | null {
-    if (!adapter.needsCredentialProxy || !this.credentialProxy) return null;
+    if (adapter.profile.id !== 'claude' || !this.credentialProxy) return null;
     return this.credentialProxy.register({ issueId: issue.id, identifier: issue.identifier });
   }
 
@@ -1836,18 +1790,12 @@ interface AdapterRuntime {
   effectiveAdapterArgs: string[];
   runtimeEnv: Record<string, string>;
   /**
-   * Credential-proxy sentinel minted at adapter prep when
-   * `acp.credentials_mode === 'proxy'`. Null in file mode. Stashed on the
+   * Credential-proxy sentinel minted at adapter prep. Always null at this
+   * point — sentinel registration is deferred to `bringUpVmAndExec` so an
+   * early dispatch failure can't leak a registry entry. Stashed on the
    * SessionContext so tearDownSession can deregister it.
    */
   credentialSentinel: string | null;
-  /**
-   * True when the runner should register a sentinel with the credential
-   * proxy at VM exec time (proxy mode). Sentinel registration is deferred
-   * until VM start succeeds so an early dispatch failure can't leak a
-   * registry entry.
-   */
-  needsCredentialProxy: boolean;
 }
 
 interface VmStartInputs {
@@ -1863,9 +1811,10 @@ interface VmExecHandle {
   execStream: ExecStream;
   bridgeReg: AcpBridgeRegistration;
   /**
-   * Credential-proxy sentinel registered for this dispatch (proxy mode); null
-   * in file mode. Threaded onto the SessionContext so tearDownSession can
-   * deregister it.
+   * Credential-proxy sentinel registered for this claude dispatch; null for
+   * codex dispatches (codex reads `OPENAI_API_KEY` from `smolvm.forward_env`
+   * and does not touch the proxy). Threaded onto the SessionContext so
+   * tearDownSession can deregister it.
    */
   credentialSentinel: string | null;
 }
@@ -1889,9 +1838,9 @@ interface SessionContext {
   runLog: RunLog | undefined;
   logger: ReturnType<typeof withIssue>;
   /**
-   * Credential-proxy sentinel for this dispatch (proxy mode only). Captured
-   * at session construction so `tearDownSession` can deregister it without
-   * reaching back into the AdapterRuntime.
+   * Credential-proxy sentinel for this claude dispatch (null for codex).
+   * Captured at session construction so `tearDownSession` can deregister it
+   * without reaching back into the AdapterRuntime.
    */
   credentialSentinel: string | null;
 }

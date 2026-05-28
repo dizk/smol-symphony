@@ -14,12 +14,12 @@ import type { AgentRunner } from '../src/agent/runner.js';
 import type { SmolvmClient } from '../src/agent/smolvm.js';
 import { Reconciler } from '../src/reconciler/index.js';
 
-// Phase 2 contract for orchestrator startup: the credential check is no longer
-// just `cfg.acp.adapter`, it has to walk the union of the workflow-level adapter
-// and every distinct adapter declared on any state. A workflow that pins claude
-// at the top level but assigns codex to its Review state must fail startup
-// loudly if codex's host credential is missing — otherwise the operator gets a
-// confusing per-issue failure inside the VM instead of a clean error at boot.
+// Startup credential contract under the credential-proxy architecture (#114):
+// the only adapter that requires a host-side file is `claude` (the loopback
+// proxy reads `~/.claude/.credentials.json`). The probe walks the union of
+// workflow-level and per-state adapters, but short-circuits unless `claude`
+// is referenced anywhere. Codex no longer has a host file — auth is forwarded
+// via `OPENAI_API_KEY` through `smolvm.forward_env`.
 
 function makeTracker(): IssueTracker {
   return {
@@ -95,28 +95,21 @@ async function buildCfgAndDef(
 }
 
 describe('Orchestrator startup credential check', () => {
-  it('iterates over every per-state adapter and fails when one credential is missing', async () => {
-    // Set up a fake $HOME that contains the claude credential but not the
-    // codex one. A workflow that declares a Review state on codex should then
-    // surface the missing-codex-credential as a startup error, not silently
-    // succeed because the workflow-level acp.adapter (claude) is OK.
+  it('fails startup when the claude credential is missing for a workflow that references claude', async () => {
+    // Empty fake $HOME — `~/.claude/.credentials.json` is absent. A workflow
+    // that pins claude on any state must surface the missing-host-credential
+    // as a startup error rather than letting the proxy fail mid-dispatch.
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-'));
     const prevHome = process.env.HOME;
     process.env.HOME = fakeHome;
     try {
-      // Stage the claude credential so the workflow-level acp.adapter probe
-      // passes; leave codex absent so the per-state probe is the one that
-      // trips.
-      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
-      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
-
       const { cfg, def } = await buildCfgAndDef(
         {
-          acp: { adapter: 'claude' },
+          acp: { adapter: 'codex' },
           states: {
-            Todo: { role: 'active', adapter: 'claude' },
-            Review: { role: 'active', adapter: 'codex' },
+            Todo: { role: 'active', adapter: 'codex' },
+            Review: { role: 'active', adapter: 'claude' },
             Done: { role: 'terminal' },
             Triage: { role: 'holding' },
           },
@@ -129,7 +122,7 @@ describe('Orchestrator startup credential check', () => {
         () => orch.start(),
         (err: unknown) =>
           err instanceof Error &&
-          /codex/.test(err.message) &&
+          /claude/.test(err.message) &&
           /credential/.test(err.message),
       );
     } finally {
@@ -140,10 +133,10 @@ describe('Orchestrator startup credential check', () => {
     }
   });
 
-  it('starts cleanly when credentials for every referenced adapter are present', async () => {
-    // Same workflow as above but with both credentials staged. Orchestrator
-    // should reach the post-credential-check workspace + VM reap path and
-    // resolve without throwing.
+  it('starts cleanly when the claude credential is present (codex needs no host file)', async () => {
+    // Both adapters referenced; only the claude credential needs to be on
+    // the host. Codex auth is forwarded as `OPENAI_API_KEY` via
+    // `smolvm.forward_env`, so the startup probe ignores it.
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-home-ok-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-tracker-ok-'));
     const prevHome = process.env.HOME;
@@ -151,8 +144,6 @@ describe('Orchestrator startup credential check', () => {
     try {
       await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
       await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
-      await mkdir(path.join(fakeHome, '.codex'), { recursive: true });
-      await writeFile(path.join(fakeHome, '.codex', 'auth.json'), '{}');
 
       const { cfg, def } = await buildCfgAndDef(
         {

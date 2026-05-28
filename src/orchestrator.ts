@@ -24,7 +24,8 @@ import { writeIssueFile, pickHoldingState } from './issues.js';
 import type { ResourceSnapshot } from './reconciler/index.js';
 import type { ProposeFollowupSink } from './actions/index.js';
 import type { AgentRunner } from './agent/runner.js';
-import { ADAPTERS, assertHostCredentialReadable, isKnownAdapter, type AcpAdapterId } from './agent/adapters.js';
+import { hostClaudeCredentialPath, isKnownAdapter } from './agent/adapter-names.js';
+import { accessSync, constants as fsConstants } from 'node:fs';
 import { activeStateNames, terminalStateNames } from './issues.js';
 import {
   buildIssueDetailDto,
@@ -246,25 +247,23 @@ export class Orchestrator
   }
 
   /**
-   * Fail fast when an adapter symphony will dispatch to has no readable host
-   * credential. Per-state overrides can change the adapter, so the set is the
+   * Fail fast when symphony will dispatch to claude but the host's
+   * `~/.claude/.credentials.json` (consumed by the credential proxy) is
+   * missing. Per-state overrides can change the adapter, so the set is the
    * union of `cfg.acp.adapter` and every distinct `states.<name>.adapter`.
-   * validateDispatch re-checks credentials in its own walk, but this is the
-   * operator-visible failure point — surface it for every adapter, not just
-   * the workflow-level default.
+   * The codex adapter has no host-file dependency — it relies on
+   * `OPENAI_API_KEY` forwarded via `smolvm.forward_env`.
    */
   private async assertAdapterCredentials(): Promise<void> {
     const ids = requiredAdapterIds(this.cfg, isKnownAdapter);
-    for (const id of ids) {
-      try {
-        await assertHostCredentialReadable(ADAPTERS[id as AcpAdapterId]);
-      } catch (err) {
-        log.error('startup credential check failed', {
-          adapter: id,
-          error: (err as Error).message,
-        });
-        throw new WorkflowError('missing_host_credential', (err as Error).message);
-      }
+    if (!ids.has('claude')) return;
+    const credPath = hostClaudeCredentialPath();
+    try {
+      accessSync(credPath, fsConstants.R_OK);
+    } catch (err) {
+      const msg = `adapter "claude" requires a host credential at ${credPath}, but it is missing or unreadable: ${(err as Error).message}`;
+      log.error('startup credential check failed', { adapter: 'claude', error: msg });
+      throw new WorkflowError('missing_host_credential', msg);
     }
   }
 
