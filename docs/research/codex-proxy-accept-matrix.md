@@ -7,14 +7,15 @@ and how — to extend the host credential proxy to the codex adapter.
 
 **Important provenance caveat.** The Anthropic matrix (#112) was measured
 *live* against `https://api.anthropic.com/v1/messages` from a host holding an
-active Claude Max credential. **This doc could NOT be measured live by the
-implementer**: the implementing environment has no OpenAI API key, no
-ChatGPT-subscription `~/.codex/auth.json`, and no outbound credential. Every row
-below is therefore **doc-derived** — synthesised from OpenAI / codex
-documentation, the `codex-rs` source behaviour described in those docs,
+active Claude Max credential. **The accept-matrix rows below could NOT be
+measured live by the implementer**: the implementing environment has no OpenAI
+API key, no ChatGPT-subscription `~/.codex/auth.json`, and no outbound
+credential. The rows are therefore **doc-derived** — synthesised from OpenAI /
+codex documentation, the `codex-rs` source behaviour described in those docs,
 well-established OpenAI API conventions, and the 2026-05-28 web research pass
-recorded in the issue body. Rows that would require a live token to confirm are
-marked **`DOC-DERIVED (needs live confirm)`**.
+recorded in the issue body — **except** for the inference-through-proxy path,
+which is now **measured** (see implementation status). Rows that still require a
+live token to confirm are marked **`DOC-DERIVED (needs live confirm)`**.
 
 **Implementation status (issue #116).** The generalization (§6 follow-up steps
 2–4) has landed and `codex.credentialStrategy` is flipped to `'proxy'`. The
@@ -22,14 +23,28 @@ load-bearing Q2 risk (codex-acp honoring the base URL for the *OAuth handshake*)
 is **sidestepped by design**: the VM only ever receives
 `OPENAI_API_KEY=<sentinel>` + `OPENAI_BASE_URL=<proxy>`, so codex-acp runs in the
 SDK's high-confidence API-key code path (§5 / Q4) and never performs the OAuth
-handshake itself — that, and refresh, stay host-side. The live confirm is now
-performed by the **Review dispatch itself**: the reviewer is codex, so a
-successful Review run *is* the smoke test that codex-acp honors `OPENAI_BASE_URL`
-for inference through the proxy. The remaining rows below should be updated from
-`DOC-DERIVED` to measured once the reviewer observes the real billing-tell
-header in the proxy's `credential proxy: upstream ratelimit` log line.
+handshake itself — that, and refresh, stay host-side.
 
-Captured: 2026-05-28. Implemented: issue #116.
+- **Q2 inference path — MEASURED (confirmed).** The Review dispatch for #116 ran
+  through this proxy under codex and authenticated successfully, which *is* the
+  smoke test that codex-acp honors `OPENAI_BASE_URL` for inference and that the
+  sentinel→real-credential swap works end to end. Row 1's inference path is
+  confirmed.
+- **Q4 billing-tell header — UNMEASURED (known limitation).** Capturing the
+  real OpenAI subscription-vs-metered response-header tell requires reading the
+  host proxy's `credential proxy: upstream ratelimit` log line on a host with a
+  live ChatGPT-OAuth credential. The implementer has no such credential, and the
+  reviewer (codex) confirmed inference works but **could not reach that host log
+  line from the review workspace**. So the `x-ratelimit-*` candidate set in
+  `CODEX_BILLING_TELL_HEADERS` (`src/agent/credential-proxy.ts`) remains a
+  best-guess candidate list, not a measured tell. This is carried as an
+  explicit, accepted limitation of #116; the live measurement is tracked as
+  follow-up issue #121. Until #121 lands, the proxy logs whichever
+  `x-ratelimit-*` headers OpenAI returns but makes **no** reliable
+  "subscription vs metered" assertion.
+
+Captured: 2026-05-28. Implemented: issue #116 (Q4 billing-tell deferred to a
+follow-up).
 
 ---
 
@@ -45,7 +60,7 @@ mode). Token bytes redacted as `<API_KEY>` / `<CHATGPT_ACCESS_TOKEN>` /
 
 | # | Credential source | Auth header | HTTP (expected) | Billing routing | Confidence |
 | - | ----------------- | ----------- | --------------- | --------------- | ---------- |
-| 1 | `OPENAI_API_KEY` (API-key mode) | `Authorization: Bearer <API_KEY>` | 200 | Metered pay-as-you-go (OpenAI API billing) | **High** — this is the documented OpenAI REST convention; the SDK uses `Authorization: Bearer <key>` and honors `base_url`. |
+| 1 | `OPENAI_API_KEY` (API-key mode) | `Authorization: Bearer <API_KEY>` | 200 | Metered pay-as-you-go (OpenAI API billing) | **High — inference path MEASURED.** The documented OpenAI REST convention (SDK uses `Authorization: Bearer <key>` and honors `base_url`); confirmed by the #116 Review dispatch running successfully through the proxy under codex. |
 | 2 | `tokens.access_token` (ChatGPT-OAuth) | `Authorization: Bearer <CHATGPT_ACCESS_TOKEN>` | 200 | ChatGPT subscription (Plus/Pro/Business), **not** metered API | **Medium** — OpenAI's CI/CD auth docs describe codex authenticating with the ChatGPT-OAuth access token as a Bearer; the subscription-vs-API split is documented, but the exact request shape was not measured here. `DOC-DERIVED (needs live confirm)`. |
 | 3 | `tokens.refresh_token` | (never sent to `/v1/*`) | n/a | n/a | **High** — the refresh token is only ever presented to OpenAI's OAuth token endpoint, never to the inference API. It is exactly what we keep off the VM. |
 | 4 | `OPENAI_API_KEY` | `x-api-key: <API_KEY>` | 401 (expected) | n/a | **Medium** — OpenAI's REST API uses `Authorization: Bearer`, not `x-api-key` (that is an Anthropic convention). Listed to mirror the Anthropic matrix's channel disambiguation. `DOC-DERIVED`. |
@@ -77,11 +92,15 @@ mode). Token bytes redacted as `<API_KEY>` / `<CHATGPT_ACCESS_TOKEN>` /
   look for on a live ChatGPT-OAuth call are the `x-ratelimit-*` family
   (`x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`,
   `x-ratelimit-limit-tokens`, …) and any `x-ratelimit-*` variant that differs
-  between subscription and metered traffic. **This is an explicit gap**: the
-  codex-proxy implementation slice must capture the real subscription tell from
-  a live call before it can log/forward it the way the Anthropic proxy logs the
-  unified-5h headers. Until then there is no reliable "is this subscription or
-  metered" assertion the proxy can make.
+  between subscription and metered traffic. **This is an explicit, accepted gap
+  in #116** (see the implementation-status note above): neither the implementer
+  (no live OpenAI credential) nor the #116 reviewer (could not reach the host
+  proxy's `credential proxy: upstream ratelimit` log line) could capture the
+  real subscription tell. The proxy logs whichever `x-ratelimit-*` headers
+  OpenAI returns (`CODEX_BILLING_TELL_HEADERS` in
+  `src/agent/credential-proxy.ts`), but until the live measurement lands as
+  follow-up issue #121 there is no reliable "is this subscription or metered"
+  assertion the proxy can make.
 
 ---
 
@@ -225,10 +244,15 @@ slice of a future codex-proxy implementation.
 > refresher per §4 option c), the per-dispatch env now picks
 > `OPENAI_BASE_URL`/`OPENAI_API_KEY` from the adapter's `proxyEnv`, the real
 > credential var is stripped from the VM boot env, and
-> `codex.credentialStrategy` is flipped to `'proxy'`. The live confirm (Q2
-> inference-through-proxy + the Q4 billing-tell header) is performed by the
-> Review dispatch, since the reviewer is codex. The original deferral rationale
-> is preserved below for the record.
+> `codex.credentialStrategy` is flipped to `'proxy'`. The Q2
+> inference-through-proxy confirm is performed by the Review dispatch itself
+> (the reviewer is codex, so a successful Review run *is* that smoke test). The
+> Q4 billing-tell header measurement is **not** delivered by #116 — it needs a
+> host with a live ChatGPT-OAuth credential and access to the proxy's
+> `credential proxy: upstream ratelimit` log line, which neither the implementer
+> nor the reviewer had; it is carried as a known limitation and tracked as
+> follow-up issue #121. The original deferral rationale is preserved below for
+> the record.
 
 
 

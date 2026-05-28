@@ -571,11 +571,22 @@ identity file*, distinct from the credential file:
   file-staging path that copies it into a VM, and no runtime directory that
   holds it host-side for staging.
 
-**Codex.** The `codex` adapter is not proxied. Its auth flows via
-`OPENAI_API_KEY` forwarded into the VM through `smolvm.forward_env`; the host
-does not probe for or hold a codex credential file. Only adapters that
-resolve to `claude` (workflow- or state-level) require the proxy and the host
-`~/.claude/.credentials.json` to be present at startup.
+**Codex.** The `codex` adapter is also proxied (issue #116). It reuses the
+same per-dispatch sentinel registry as `claude`, but with an adapter-keyed
+upstream profile: the proxy forwards to `api.openai.com`, reads the live
+credential from the host's `~/.codex/auth.json` (`tokens.access_token` or
+`OPENAI_API_KEY`, with an `OPENAI_API_KEY` env fallback) and attaches it as
+`Authorization: Bearer`. The VM is launched with `OPENAI_BASE_URL=<proxy>` and
+`OPENAI_API_KEY=<sentinel>`, and the runtime strips the real `OPENAI_API_KEY`
+from the forwarded VM boot env so no real OpenAI credential reaches the VM.
+The proxy MUST NEVER read or forward the codex `refresh_token`. Because codex
+access tokens are long-lived (~8 days), the proxy currently re-reads on expiry
+rather than driving the OpenAI refresh dance itself (the host remains the sole
+refresher); a host-owned refresh path is a deferred follow-up. No identity file
+is staged for codex (OpenAI ships no third-party fingerprint check). Only
+adapters that resolve to `claude` require the host `~/.claude/.credentials.json`
+at startup; a `codex` state requires `~/.codex/auth.json` (or `OPENAI_API_KEY`)
+on the host instead.
 
 ## 7. Issue Tracker Integration Contract
 

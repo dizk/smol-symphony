@@ -430,24 +430,33 @@ acp:
   # adapter (string): one of symphony's known profiles. Default: 'claude'.
   #   claude   — claude-agent-acp. Routes through the host credential proxy;
   #              no credential file enters the VM.
-  #   codex    — codex-acp. Reads `OPENAI_API_KEY` from `smolvm.forward_env`;
-  #              no credential file enters the VM.
+  #   codex    — codex-acp. Also routes through the host credential proxy
+  #              (issue 116); no credential file — and no real OPENAI_API_KEY —
+  #              enters the VM.
   adapter: claude
 
-  # Credentials never enter the VM (issue 113). For claude, symphony binds a
-  # host credential proxy on `credentials.proxy_*` (defaults: 127.0.0.1 with
-  # an ephemeral port). On each dispatch the proxy mints a per-VM sentinel;
-  # the VM is launched with ANTHROPIC_BASE_URL pointed at the proxy and
-  # ANTHROPIC_AUTH_TOKEN=<sentinel>. The proxy validates each inbound
-  # sentinel, swaps in the live access token read from
-  # ~/.claude/.credentials.json (refreshing host-side via `claude -p "ok"`
-  # under flock when the cache is stale), and forwards to api.anthropic.com.
-  # The VM gets a minimal ~/.claude.json staged for identity only — NO
-  # refreshToken, NO accessToken on the VM filesystem.
+  # Credentials never enter the VM (issue 113; codex generalized in 116). On
+  # each dispatch the host credential proxy (`credentials.proxy_*`, default
+  # 127.0.0.1 + ephemeral port) mints a per-VM sentinel; the VM is launched
+  # with the adapter's base-URL env var pointed at the proxy and its
+  # token env var set to the sentinel. The proxy validates each inbound
+  # sentinel, swaps in the live upstream credential host-side, and forwards
+  # to the adapter's upstream.
   #
-  # For codex, no host-file dependency exists under the proxy architecture;
-  # codex-acp picks up `OPENAI_API_KEY` from the env forwarded via
-  # `smolvm.forward_env`.
+  # For claude: VM gets ANTHROPIC_BASE_URL=<proxy> + ANTHROPIC_AUTH_TOKEN=<sentinel>;
+  # the proxy reads the live access token from ~/.claude/.credentials.json
+  # (refreshing host-side via `claude -p "ok"` under flock when the cache is
+  # stale) and forwards to api.anthropic.com. A minimal ~/.claude.json is
+  # staged for identity only — NO refreshToken, NO accessToken on the VM.
+  #
+  # For codex: VM gets OPENAI_BASE_URL=<proxy> + OPENAI_API_KEY=<sentinel>;
+  # the proxy reads the live credential (`tokens.access_token` or
+  # `OPENAI_API_KEY` from ~/.codex/auth.json, with an OPENAI_API_KEY env
+  # fallback — NEVER the refresh token) and forwards to api.openai.com. The
+  # real OPENAI_API_KEY is intentionally stripped from the forwarded VM boot
+  # env so it cannot land in the VM's PID-1 environment; codex-acp runs in
+  # API-key mode against the proxy and never performs the OAuth handshake
+  # in-VM (that, and refresh, stay host-side).
 
   # model (string | null): optional model selector forwarded to the chosen adapter.
   # Each adapter profile knows how to surface it natively:
@@ -599,6 +608,10 @@ smolvm:
 
   # forward_env (string[]): host env vars forwarded into the VM exec.
   # Default: [OPENAI_API_KEY, ANTHROPIC_API_KEY]
+  # NOTE: for a proxy adapter (claude, codex) the runner strips that adapter's
+  # credential var (e.g. OPENAI_API_KEY for codex) from the forwarded boot env
+  # per dispatch and substitutes the per-VM sentinel via the credential proxy,
+  # so listing it here does NOT plant the real key in the VM's PID-1 env.
   forward_env:
     - OPENAI_API_KEY
     - ANTHROPIC_API_KEY

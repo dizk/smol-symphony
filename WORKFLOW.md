@@ -187,10 +187,14 @@ acp:
   # escape hatch under the TCP bridge transport — the launch shape is fixed;
   # fork scripts/vm-agent.mjs if you need to customize what the proxy spawns.
   adapter: claude
-  # Credentials never enter the VM (issue 113). The host credential proxy
-  # substitutes a per-VM sentinel for the real Anthropic OAuth access token on
-  # every upstream request; codex-acp reads `OPENAI_API_KEY` out of
-  # `smolvm.forward_env`.
+  # Credentials never enter the VM (issue 113; codex generalized in 116). The
+  # host credential proxy substitutes a per-VM sentinel for the real upstream
+  # credential on every request: for claude, the Anthropic OAuth access token;
+  # for codex (the Review state's adapter), the OpenAI credential read from
+  # ~/.codex/auth.json (access token or OPENAI_API_KEY, never the refresh
+  # token). The codex VM is launched with OPENAI_BASE_URL=<proxy> +
+  # OPENAI_API_KEY=<sentinel>; the real OPENAI_API_KEY is stripped from the
+  # forwarded VM boot env, so no real OpenAI credential lands in the VM.
   # Reasoning effort forwarded to claude-agent-acp via a staged settings.json
   # (`{"effortLevel": "xhigh"}`) copied into /root/.claude/settings.json before the
   # adapter starts. xhigh is the second-highest tier under Opus 4.7 (max is the top
@@ -240,6 +244,10 @@ smolvm:
   # by symphony; the tracker is reached only through the symphony MCP server.
   volumes:
     - { host: ./scripts, guest: /opt/symphony, readonly: true }
+  # forward_env is a generic passthrough, but for a proxy adapter (claude, codex)
+  # the runner strips that adapter's credential var from the forwarded boot env
+  # per dispatch and substitutes the per-VM sentinel via the credential proxy —
+  # so listing OPENAI_API_KEY here does NOT plant the real key in a codex VM.
   forward_env:
     - OPENAI_API_KEY
     - ANTHROPIC_API_KEY
