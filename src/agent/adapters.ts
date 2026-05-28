@@ -21,6 +21,7 @@
 
 import { constants as fsConstants } from 'node:fs';
 import { access, copyFile, mkdir, chmod, lstat, readFile, rm, realpath, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import {
   HOST_CREDENTIAL_PATHS,
@@ -334,29 +335,108 @@ export async function stageRuntimeFile(
   stagedName: string,
   content: string,
 ): Promise<StagedRuntimePaths> {
+  return stageNamedFileUnder(workspacePath, 'credentials', stagedName, content);
+}
+
+/**
+ * Stage the host's claude identity into the workspace runtime tree. Reads
+ * `~/.claude.json`, extracts only the operator's `oauthAccount.accountUuid`
+ * and `oauthAccount.organizationUuid`, and writes a minimal JSON file at
+ * `<workspace>/.git/symphony-runtime/identity/claude.json` (or the
+ * `.symphony-runtime/` fallback when the workspace has no `.git/`). The
+ * in-VM claude-agent-acp reads these fields to compose a well-formed
+ * `metadata.user_id` on every upstream call so a future re-activation of
+ * Anthropic's server-side fingerprint check doesn't break dispatch.
+ *
+ * Defensive shape: NO token strings, NO `device_id`/`session_id` (those are
+ * per-process — the in-VM client mints fresh ones on first run), NO local
+ * config (prompt-history pointers, theme, recent paths). Identity only. See
+ * the integration test in tests/credential-proxy.test.ts which greps the
+ * staged file for `accessToken`/`refreshToken` substrings.
+ *
+ * When `~/.claude.json` is missing or contains no `oauthAccount` we skip the
+ * staging (returning null) rather than fail the dispatch — the proxy seam
+ * is defense in depth, not a hard gate on running.
+ */
+export async function stageClaudeIdentity(
+  workspacePath: string,
+): Promise<StagedRuntimePaths | null> {
+  const src = path.join(homedir(), '.claude.json');
+  let raw: string;
+  try {
+    raw = await readFile(src, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const account = extractOauthAccountIdentity(parsed);
+  if (!account) return null;
+  const content = JSON.stringify({ oauthAccount: account });
+  return stageNamedFileUnder(workspacePath, 'identity', 'claude.json', content);
+}
+
+/**
+ * Pull just the identity fields out of the parsed `~/.claude.json`. Anything
+ * outside `accountUuid`/`organizationUuid` is dropped — see
+ * `stageClaudeIdentity`'s contract.
+ */
+function extractOauthAccountIdentity(
+  parsed: unknown,
+): { accountUuid: string; organizationUuid: string } | null {
+  const acct = pickObjectField(parsed, 'oauthAccount');
+  if (!acct) return null;
+  const accountUuid = pickStringField(acct, 'accountUuid');
+  const organizationUuid = pickStringField(acct, 'organizationUuid');
+  if (accountUuid === null || organizationUuid === null) return null;
+  return { accountUuid, organizationUuid };
+}
+
+function pickObjectField(value: unknown, key: string): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const v = (value as Record<string, unknown>)[key];
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  return v as Record<string, unknown>;
+}
+
+function pickStringField(obj: Record<string, unknown>, key: string): string | null {
+  const v = obj[key];
+  if (typeof v !== 'string' || v.length === 0) return null;
+  return v;
+}
+
+/**
+ * Shared implementation for the credentials/runtime/identity staging paths.
+ * Writes `content` into `<staging-root>/<subdir>/<stagedName>` with the same
+ * symlink/race defenses as `stageCredential`.
+ */
+async function stageNamedFileUnder(
+  workspacePath: string,
+  subdir: 'credentials' | 'identity',
+  stagedName: string,
+  content: string,
+): Promise<StagedRuntimePaths> {
   if (!/^[A-Za-z0-9._-]+$/.test(stagedName)) {
     throw new Error(
-      `stageRuntimeFile: stagedName ${JSON.stringify(stagedName)} contains characters outside ` +
+      `stageNamedFileUnder: stagedName ${JSON.stringify(stagedName)} contains characters outside ` +
         `[A-Za-z0-9._-]; refuse to compose into the staging path.`,
     );
   }
   const { stagingRootAbs, stagingRootRel } = await resolveStagingLocation(workspacePath);
-  const credsDir = path.join(stagingRootAbs, 'credentials');
+  const subDir = path.join(stagingRootAbs, subdir);
   await ensureRealDir(stagingRootAbs);
-  await ensureRealDir(credsDir);
+  await ensureRealDir(subDir);
 
-  const dst = path.join(credsDir, stagedName);
+  const dst = path.join(subDir, stagedName);
   await rm(dst, { force: true, recursive: false });
-  // writeFile follows a symlink at the leaf path; we already rm'd it above, but a race
-  // could plant a new one. Use the same realpath check the credential staging does.
   await writeFile(dst, content, { mode: 0o600, flag: 'wx' });
 
-  const expectedReal = path.join(
-    await realpath(workspacePath),
-    stagingRootRel,
-    'credentials',
-    stagedName,
-  );
+  const expectedReal = path.join(await realpath(workspacePath), stagingRootRel, subdir, stagedName);
   const actualReal = await realpath(dst);
   if (actualReal !== expectedReal) {
     await rm(dst, { force: true }).catch(() => undefined);
@@ -367,7 +447,7 @@ export async function stageRuntimeFile(
     );
   }
 
-  const relPath = path.posix.join(stagingRootRel, 'credentials', stagedName);
+  const relPath = path.posix.join(stagingRootRel, subdir, stagedName);
   return { absPath: dst, relPath };
 }
 
@@ -562,20 +642,27 @@ export interface ExtraGuestFile {
 
 export function deriveAcpCommand(
   profile: AdapterProfile,
-  stagedRelPath: string,
+  stagedRelPath: string | null,
   extraFiles: readonly ExtraGuestFile[] = [],
 ): string {
   if (profile.binary.length === 0) {
     throw new Error(`adapter "${profile.id}" has an empty binary launch vector`);
   }
   const guestDir = path.posix.dirname(profile.guestCredentialPath);
-  const guestPath = profile.guestCredentialPath;
+  // Wipe and recreate the guest state dir regardless of whether we're staging a
+  // credential file: under proxy mode (issue 113) the credential is replaced
+  // by an upstream Bearer-sentinel and the VM has no `.credentials.json` at
+  // all. The wipe is defense in depth against any state baked into the image
+  // (e.g. `claude --version` during build verification touches /root/.claude).
   const steps: string[] = [
     `rm -rf ${shQuote(guestDir)}`,
     `mkdir -p ${shQuote(guestDir)}`,
-    `cp ${shQuote(stagedRelPath)} ${shQuote(guestPath)}`,
-    `chmod 600 ${shQuote(guestPath)}`,
   ];
+  if (stagedRelPath !== null) {
+    const guestPath = profile.guestCredentialPath;
+    steps.push(`cp ${shQuote(stagedRelPath)} ${shQuote(guestPath)}`);
+    steps.push(`chmod 600 ${shQuote(guestPath)}`);
+  }
   for (const f of extraFiles) {
     const extraDir = path.posix.dirname(f.guestPath);
     if (extraDir !== guestDir) {

@@ -38,6 +38,8 @@ import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
+import { CredentialProxy } from '../agent/credential-proxy.js';
+import { CredentialTicker } from '../agent/credential-ticker.js';
 import { GhCliPrApi, Reconciler } from '../reconciler/index.js';
 import { closeLogFile, log, setLogFile } from '../logging.js';
 import type { ServiceConfig, WorkflowDefinition } from '../types.js';
@@ -247,12 +249,35 @@ async function loadAndValidateConfig(workflowPath: string): Promise<LoadedConfig
   return { src, definition, config, envLogFile, logFile };
 }
 
+/**
+ * Build the host credential proxy + ticker (issue 113), gated on
+ * `acp.credentials_mode: proxy`. In file mode (the default) both are null;
+ * the runner stages the credential file as before and never touches the
+ * proxy.
+ */
+function buildCredentialPipeline(config: ServiceConfig): {
+  credentialProxy: CredentialProxy | null;
+  credentialTicker: CredentialTicker | null;
+} {
+  if (config.acp.credentials_mode !== 'proxy') {
+    return { credentialProxy: null, credentialTicker: null };
+  }
+  const credentialProxy = new CredentialProxy();
+  const credentialTicker = new CredentialTicker({
+    intervalMs: config.credentials.ticker_interval_ms,
+    proxy: credentialProxy,
+  });
+  return { credentialProxy, credentialTicker };
+}
+
 interface OrchestratorGraph {
   tracker: LocalMarkdownTracker;
   workspaces: WorkspaceManager;
   smolvm: SmolvmClient;
   mcp: McpRegistry;
   acpBridge: AcpBridge;
+  credentialProxy: CredentialProxy | null;
+  credentialTicker: CredentialTicker | null;
   reconciler: Reconciler;
   runner: AgentRunner;
   orch: Orchestrator;
@@ -306,6 +331,7 @@ async function buildOrchestratorGraph(opts: {
   // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
   // bind failure surfaces before we accept any dispatches.
   const acpBridge = new AcpBridge();
+  const { credentialProxy, credentialTicker } = buildCredentialPipeline(config);
   // Reconciler (issues 32, 33, 34). Owns the bake artifact lifecycle so the
   // Smolfile's apt + npm install is paid once per Smolfile-content change
   // instead of per dispatch (issue 32), reaps stray `symphony-*` VMs +
@@ -346,6 +372,7 @@ async function buildOrchestratorGraph(opts: {
     // /api/v1/snapshot under reconciler.resources so the dashboard sees
     // "Done.actions: …" alongside the bake/vm/workspace resources.
     { recordActionResult: (id, snap) => orch.recordActionResult(id, snap) },
+    credentialProxy,
   );
   orch = new Orchestrator(config, definition, src, tracker, workspaces, runner, undefined, reconciler);
   wirePostConstructionProviders({ reconciler, orch });
@@ -369,6 +396,8 @@ async function buildOrchestratorGraph(opts: {
     smolvm,
     mcp,
     acpBridge,
+    credentialProxy,
+    credentialTicker,
     reconciler,
     runner,
     orch,
@@ -489,9 +518,36 @@ async function startTransports(opts: {
       { src },
     );
   }
+  await startCredentialProxyOrFail(config, graph, src);
   const http = await bindHttpServer({ config, graph, cli, src, workflowPath });
   await checkMcpPrecondition({ config, graph, src, http });
   return { http };
+}
+
+/**
+ * Bind the host credential proxy (issue 113) when proxy mode is on, then
+ * start the host ticker. Both no-op when `acp.credentials_mode === 'file'`.
+ * A bind failure here is fatal for proxy mode — without the proxy, in-VM
+ * dispatches would fail closed at first upstream request.
+ */
+async function startCredentialProxyOrFail(
+  config: ServiceConfig,
+  graph: OrchestratorGraph,
+  src: WorkflowSource,
+): Promise<void> {
+  if (!graph.credentialProxy) return;
+  try {
+    await graph.credentialProxy.start(
+      config.credentials.proxy_bind_host,
+      config.credentials.proxy_bind_port,
+    );
+  } catch (err) {
+    await bailStartup(
+      `error: failed to bind credential proxy on ${config.credentials.proxy_bind_host}:${config.credentials.proxy_bind_port}: ${(err as Error).message}\n`,
+      { src },
+    );
+  }
+  graph.credentialTicker?.start();
 }
 
 /**
@@ -628,6 +684,8 @@ async function main() {
     log.info('shutdown requested', { signal });
     await graph.orch.stop();
     await graph.acpBridge.stop().catch(() => undefined);
+    graph.credentialTicker?.stop();
+    if (graph.credentialProxy) await graph.credentialProxy.stop().catch(() => undefined);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
     await closeLogFile().catch(() => undefined);

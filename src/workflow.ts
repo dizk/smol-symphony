@@ -20,6 +20,7 @@ import type {
   ServerConfig,
   McpConfig,
   PrAutopilotConfig,
+  CredentialsConfig,
 } from './types.js';
 import { log } from './logging.js';
 import { isKnownAdapter } from './agent/adapter-names.js';
@@ -262,8 +263,17 @@ export function buildServiceConfig(
   const modelTrimmed = modelRaw === null ? null : modelRaw.trim();
   const effortRaw = asString(acpRaw['effort']);
   const effortTrimmed = effortRaw === null ? null : effortRaw.trim();
+  // Issue 113: credentials_mode `proxy` routes through the host credential
+  // proxy; `file` (default during transition) stages the full credential into
+  // the workspace as before. Unknown values fall back to `file` so a typo
+  // doesn't silently leak credentials into the VM via a half-configured
+  // proxy mode.
+  const credentialsModeRaw = asString(acpRaw['credentials_mode']);
+  const credentialsMode: 'file' | 'proxy' =
+    credentialsModeRaw === 'proxy' ? 'proxy' : 'file';
   const acp: AcpConfig = {
     adapter: asString(acpRaw['adapter']) ?? 'claude',
+    credentials_mode: credentialsMode,
     model: modelTrimmed && modelTrimmed.length > 0 ? modelTrimmed : null,
     effort: effortTrimmed && effortTrimmed.length > 0 ? effortTrimmed : null,
     shell: asString(acpRaw['shell']) ?? 'bash',
@@ -277,6 +287,17 @@ export function buildServiceConfig(
       reach_url: asString(bridgeRaw['reach_url']),
       connect_timeout_ms: asInt(bridgeRaw['connect_timeout_ms'], 30_000),
     },
+  };
+
+  // credentials extension (issue 113). Only consulted when
+  // `acp.credentials_mode === 'proxy'`. Defaults work out of the box for the
+  // common case: bind on 127.0.0.1 with an ephemeral port, run the host
+  // ticker every 6 hours.
+  const credentialsRaw = getObject(raw, 'credentials');
+  const credentials: CredentialsConfig = {
+    proxy_bind_host: asString(credentialsRaw['proxy_bind_host']) ?? '127.0.0.1',
+    proxy_bind_port: asInt(credentialsRaw['proxy_bind_port'], 0),
+    ticker_interval_ms: asInt(credentialsRaw['ticker_interval_ms'], 6 * 60 * 60 * 1000),
   };
 
   // smolvm extension
@@ -429,6 +450,7 @@ export function buildServiceConfig(
     server,
     mcp,
     pr_autopilot: prAutopilot,
+    credentials,
     states,
   };
 }

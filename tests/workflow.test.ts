@@ -125,6 +125,63 @@ describe('workflow', () => {
     assert.equal(cfg.acp.model, 'claude-opus-4-7');
   });
 
+  it('defaults credentials_mode to "file" and parses an explicit "proxy" opt-in (issue 113)', () => {
+    const defaulted = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        acp: { adapter: 'claude' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(defaulted.acp.credentials_mode, 'file');
+    const proxied = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        acp: { adapter: 'claude', credentials_mode: 'proxy' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(proxied.acp.credentials_mode, 'proxy');
+    // Unknown values fall back to file so a typo doesn't silently leak
+    // credentials through a half-configured proxy.
+    const typo = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        acp: { adapter: 'claude', credentials_mode: 'proxie' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(typo.acp.credentials_mode, 'file');
+  });
+
+  it('parses the credentials block (proxy bind host/port + ticker interval) (issue 113)', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        credentials: {
+          proxy_bind_host: '0.0.0.0',
+          proxy_bind_port: 9999,
+          ticker_interval_ms: 600_000,
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.credentials.proxy_bind_host, '0.0.0.0');
+    assert.equal(cfg.credentials.proxy_bind_port, 9999);
+    assert.equal(cfg.credentials.ticker_interval_ms, 600_000);
+    const defaults = buildServiceConfig(
+      { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(defaults.credentials.proxy_bind_host, '127.0.0.1');
+    assert.equal(defaults.credentials.proxy_bind_port, 0);
+    assert.equal(defaults.credentials.ticker_interval_ms, 6 * 60 * 60 * 1000);
+  });
+
   it('treats empty acp.model as unset (null)', () => {
     // Explicit empty string in YAML should not pin the adapter to "" — that would
     // break adapters that look up the model by name. Normalize to null so the adapter
