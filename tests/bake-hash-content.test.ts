@@ -46,6 +46,24 @@ describe('hashPathContent', () => {
     assert.notEqual(await hashPathContent(dir), before);
   });
 
+  it('follows a symlinked ROOT path (smolvm resolves it; cp -a copies its contents)', async () => {
+    const real = await mkdtemp(path.join(os.tmpdir(), 'symphony-hashreal-'));
+    await writeFile(path.join(real, 'vm-agent.mjs'), 'v1\n');
+    const link = path.join(os.tmpdir(), `symphony-hashlink-${path.basename(real)}`);
+    await symlink(real, link);
+    try {
+      // Hashing the symlinked root equals hashing the resolved dir (root followed).
+      assert.equal(await hashPathContent(link), await hashPathContent(real));
+      // Editing the target through the symlink changes the digest (not stale).
+      const before = await hashPathContent(link);
+      await writeFile(path.join(real, 'vm-agent.mjs'), 'v2\n');
+      assert.notEqual(await hashPathContent(link), before);
+    } finally {
+      await rm(link, { force: true });
+      await rm(real, { recursive: true, force: true });
+    }
+  });
+
   it('yields a stable marker for a missing path', async () => {
     const a = await hashPathContent(path.join(dir, 'does-not-exist'));
     const b = await hashPathContent(path.join(dir, 'also-missing'));

@@ -59,10 +59,14 @@ acp:
   adapter: claude
 
 smolvm:
-  # Per-issue microVM. Pick exactly one of \`image\`, \`from\`, or \`smolfile\`,
-  # and add a \`volumes\` entry that bind-mounts smol-symphony's in-VM proxy at
-  # /opt/symphony/vm-agent.mjs inside the guest. See WORKFLOW.template.md and
-  # the canonical Smolfile in the smol-symphony repo for a worked example.
+  # Per-issue microVM. Pick exactly one of \`image\`, \`from\`, or \`smolfile\`.
+  # smol-symphony's in-VM proxy (/opt/symphony/vm-agent.mjs) must be present in
+  # the guest: the canonical Smolfile BAKES scripts/ into the image (an init
+  # \`cp\` from a bake-time scratch mount), so NO runtime \`volumes\` entry is
+  # needed. Leave \`volumes\` empty — especially if any state sets
+  # \`eval_mode: true\`, since its two read-only mounts plus the workspace already
+  # fill smolvm/libkrun's 3-mount cap. See WORKFLOW.template.md and the canonical
+  # Smolfile in the smol-symphony repo for a worked example.
   #
   # smolfile: ./Smolfile
   cpus: 2

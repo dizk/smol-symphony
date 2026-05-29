@@ -498,10 +498,32 @@ export class BakeResource {
  * editing a baked file (e.g. `scripts/vm-agent.mjs`) forces a re-bake. Folds in
  * file/dir modes and directory structure (not just file bytes) so metadata-only
  * changes `cp -a` preserves — `chmod +x`, an added empty dir — also invalidate
- * the cache. Exported for tests. */
+ * the cache. Exported for tests.
+ *
+ * The ROOT path is followed if it is a symlink (`stat`): smolvm resolves a
+ * symlinked `[dev].volumes` host path when it mounts it, and `cp -a <root>/.`
+ * copies the resolved target's contents — so the digest must reflect the target,
+ * not the link text. NESTED entries are walked with `lstat` (see foldPathInto)
+ * so an interior symlink is preserved as a link, exactly as `cp -a` preserves it.
+ */
 export async function hashPathContent(absPath: string): Promise<string> {
   const h = createHash('sha256');
-  await foldPathInto(h, absPath, '');
+  let st;
+  try {
+    st = await stat(absPath); // follow a symlinked root
+  } catch {
+    h.update('\0absent\0');
+    return h.digest('hex');
+  }
+  if (st.isDirectory()) {
+    h.update(`\0root-dir\0${st.mode.toString(8)}\0`);
+    for (const name of (await readdir(absPath)).sort()) {
+      await foldPathInto(h, path.join(absPath, name), name);
+    }
+  } else if (st.isFile()) {
+    h.update(`\0root-file\0${st.mode.toString(8)}\0`);
+    h.update(await readFile(absPath));
+  }
   return h.digest('hex');
 }
 

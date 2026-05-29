@@ -53,8 +53,10 @@ Prerequisites:
 - A `Smolfile` describing the per-issue VM. The repo ships one at the root that
   starts from `node:24-bookworm-slim`, installs base CLI tooling, npm-installs
   every ACP-capable coding agent (`claude-agent-acp`, `codex-acp`, `opencode`),
-  and bind-mounts `scripts/` as `/opt/symphony` so the in-VM stdio proxy lives
-  at `/opt/symphony/vm-agent.mjs` without a per-VM copy step. `WORKFLOW.md`'s
+  and bakes `scripts/` into the image at `/opt/symphony` (a bake-time `cp` from a
+  scratch mount) so the in-VM stdio proxy at `/opt/symphony/vm-agent.mjs` ships in
+  the artifact with no runtime mount — keeping a dispatch within smolvm/libkrun's
+  3-mount cap so an `eval_mode` state can add its two read-only mounts. `WORKFLOW.md`'s
   `smolvm.smolfile` points at it; symphony's reconciler bakes the Smolfile into
   a cached `.smolmachine` artifact under `~/.cache/symphony/actions/bake/<sha256>`
   on first run, then hands `--from <cache>` to `smolvm machine create` on every
