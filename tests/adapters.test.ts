@@ -272,6 +272,74 @@ describe('adapters registry', () => {
   });
 });
 
+describe('codex proxyProviderArgs (issue 127: force HTTPS provider through the proxy)', () => {
+  const reg = { baseUrl: 'http://127.0.0.1:5000', tokenVar: 'OPENAI_API_KEY' };
+
+  it('claude declares no proxyProviderArgs (its only transport honors the base-URL env var)', () => {
+    // claude-agent-acp talks HTTPS to ANTHROPIC_BASE_URL, so the proxy is in the
+    // path without any provider override. Only codex needs to be forced off its
+    // WebSocket Responses transport.
+    assert.equal(ADAPTERS.claude.proxyProviderArgs, undefined);
+  });
+
+  it('pins an explicit HTTPS provider routed through the proxy base_url + /v1', () => {
+    const args = ADAPTERS.codex.proxyProviderArgs!(reg);
+    assert.deepEqual(args, [
+      '-c', 'model_provider="symphony-proxy"',
+      '-c', 'model_providers.symphony-proxy.name="Symphony credential proxy"',
+      '-c', 'model_providers.symphony-proxy.base_url="http://127.0.0.1:5000/v1"',
+      '-c', 'model_providers.symphony-proxy.env_key="OPENAI_API_KEY"',
+      '-c', 'model_providers.symphony-proxy.wire_api="responses"',
+      '-c', 'model_providers.symphony-proxy.supports_websockets=false',
+    ]);
+  });
+
+  it('disables the WebSocket transport as a raw TOML bool, not a quoted string', () => {
+    // The whole bug (#127): codex's Responses API defaults to a
+    // wss://api.openai.com/v1/responses WebSocket that bypasses the proxy and
+    // leaks the sentinel raw. supports_websockets=false (a TOML boolean, NOT the
+    // string "false") kills that attempt.
+    const args = ADAPTERS.codex.proxyProviderArgs!(reg);
+    assert.ok(args.includes('model_providers.symphony-proxy.supports_websockets=false'));
+    assert.ok(
+      !args.some((a) => a.includes('supports_websockets="false"')),
+      'supports_websockets must be a TOML bool, not a string',
+    );
+  });
+
+  it('appends /v1 to the proxy base URL (the proxy returns host:port WITHOUT /v1)', () => {
+    // credential-proxy.ts returns http://host:port with no /v1 suffix; the
+    // provider base_url must carry it so codex POSTs /v1/responses to the proxy.
+    const args = ADAPTERS.codex.proxyProviderArgs!(reg);
+    const idx = args.findIndex((a) => a.startsWith('model_providers.symphony-proxy.base_url='));
+    assert.equal(
+      args[idx],
+      'model_providers.symphony-proxy.base_url="http://127.0.0.1:5000/v1"',
+    );
+  });
+
+  it('tolerates a trailing slash on the proxy base URL without doubling', () => {
+    const args = ADAPTERS.codex.proxyProviderArgs!({ ...reg, baseUrl: 'http://127.0.0.1:5000/' });
+    const idx = args.findIndex((a) => a.startsWith('model_providers.symphony-proxy.base_url='));
+    assert.equal(
+      args[idx],
+      'model_providers.symphony-proxy.base_url="http://127.0.0.1:5000/v1"',
+    );
+  });
+
+  it('uses the supplied token env var for env_key so the sentinel stays the bearer', () => {
+    // env_key tells codex which env var holds the API key; OPENAI_API_KEY is
+    // already staged to the per-dispatch sentinel, which the proxy validates and
+    // swaps for the real OpenAI credential. Derived from the profile's proxyEnv,
+    // not hard-coded.
+    const args = ADAPTERS.codex.proxyProviderArgs!({
+      ...reg,
+      tokenVar: ADAPTERS.codex.proxyEnv!.tokenVar,
+    });
+    assert.ok(args.includes('model_providers.symphony-proxy.env_key="OPENAI_API_KEY"'));
+  });
+});
+
 describe('stageRuntimeFile', () => {
   it('writes content into runtime/ subdir under .git/symphony-runtime/, 0600', async () => {
     // Runtime files (e.g. claude's settings.json for effortLevel) land under the
