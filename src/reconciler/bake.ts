@@ -7,7 +7,7 @@
 // via `smolvm machine create --from <cache_path>` instead of `--smolfile <path>`,
 // skipping the per-start init pay.
 
-import { readFile, stat, readdir, unlink } from 'node:fs/promises';
+import { readFile, stat, lstat, readlink, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -495,9 +495,17 @@ async function hashPathContent(absPath: string): Promise<string> {
 async function foldPathInto(h: Hash, absPath: string, rel: string): Promise<void> {
   let st;
   try {
-    st = await stat(absPath);
+    // lstat (not stat) so we do NOT follow symlinks — matching `cp -a`, which
+    // preserves the link rather than its target. Following would let the cache
+    // key depend on un-baked files and let a symlink cycle recurse forever.
+    st = await lstat(absPath);
   } catch {
     h.update(`\0absent\0${rel}`);
+    return;
+  }
+  if (st.isSymbolicLink()) {
+    h.update(`\0symlink\0${rel}\0`);
+    h.update(await readlink(absPath));
     return;
   }
   if (st.isDirectory()) {

@@ -26,14 +26,17 @@ memory = 4096
 net = true
 
 [dev]
-# Mount the host scripts/ dir as /opt/symphony in the guest read-only so the
-# in-VM stdio proxy at /opt/symphony/vm-agent.mjs (referenced by
-# deriveAcpCommand) is always the same file the host has on disk — no
-# separate copy step, no drift. Path is resolved relative to *this* Smolfile;
-# `..` walks from `templates/` back up to the project root. If you copy this
-# file to the project root as `Smolfile`, change the host side to
-# `./scripts:/opt/symphony:ro` to match.
-volumes = ["../scripts:/opt/symphony:ro"]
+# scripts/ (the in-VM stdio proxy /opt/symphony/vm-agent.mjs, referenced by
+# deriveAcpCommand) is BAKED INTO the image: mounted read-only at a scratch
+# path during bake, then copied into /opt/symphony by the `cp` init step below
+# so the packed `--from` artifact carries it with NO runtime mount. That keeps
+# dispatch within smolvm/libkrun's 3-virtio-fs-mount cap (so an eval_mode state
+# can add /symphony/issues + /symphony/logs without hitting krun -22). The
+# reconciler's bake hash folds in scripts/ content, so editing vm-agent.mjs
+# forces a re-bake. Path is resolved relative to *this* Smolfile; `..` walks
+# from `templates/` to the project root. If you copy this file to the project
+# root as `Smolfile`, change the host side to `./scripts:/opt/symphony-src:ro`.
+volumes = ["../scripts:/opt/symphony-src:ro"]
 
 # Layer order:
 #   1. Base apt tooling (git, ripgrep, curl, build-essential — cargo needs a
@@ -46,6 +49,9 @@ volumes = ["../scripts:/opt/symphony:ro"]
 #      installs — symphony's adapter registry expects to find these on $PATH
 #      inside the VM regardless of project language.
 init = [
+    # Bake the host scripts/ (mounted at the scratch path above) into the rootfs.
+    "mkdir -p /opt/symphony",
+    "cp -a /opt/symphony-src/. /opt/symphony/",
     "apt-get update -q",
     "apt-get install -y --no-install-recommends git ripgrep ca-certificates curl build-essential pkg-config",
     "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",

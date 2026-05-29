@@ -820,11 +820,13 @@ smolvm:
 
   # volumes (list): additional host:guest bind mounts. smolvm/libkrun caps a VM
   # at 3 virtio-fs mounts (a 4th makes `krun_start_enter` return -22), and the
-  # workspace already consumes one slot — so keep this list to AT MOST one entry
-  # if any state sets `eval_mode: true` (eval_mode adds two read-only mounts,
-  # /symphony/issues + /symphony/logs). Prefer baking static tooling into the
-  # image (as the canonical Smolfile does for scripts/) over a runtime mount.
-  # Each entry: { host: path, guest: path, readonly?: bool }. Default: [].
+  # workspace already consumes one slot. If ANY state sets `eval_mode: true`,
+  # leave this list EMPTY: eval_mode adds two read-only mounts (/symphony/issues
+  # + /symphony/logs), so workspace (1) + those (2) = 3 already fills the cap and
+  # a single entry here would be the 4th mount that trips krun -22. Otherwise you
+  # have at most one free slot. Prefer baking static tooling into the image (as
+  # the canonical Smolfile does for scripts/) over a runtime mount. Each entry:
+  # { host: path, guest: path, readonly?: bool }. Default: [].
   volumes:
     - host: ~/.cache/npm
       guest: /root/.npm
