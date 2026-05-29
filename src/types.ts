@@ -150,6 +150,17 @@ export interface AgentConfig {
    * `memory_admission_enabled` is true.
    */
   host_memory_reserve_mib: number;
+  /**
+   * Circuit breaker (issue 128). After this many CONSECUTIVE dispatch attempts
+   * fail with the same normalized reason, the orchestrator stops retrying the
+   * issue and routes it to a holding state for a human to inspect — instead of
+   * looping forever on a deterministically-failing dispatch (a persistent
+   * `401 invalid_api_key` once looped ~324 attempts over ~13h, booting a VM
+   * every ~2 min). The streak resets the moment an attempt fails with a
+   * different reason or exits cleanly, so transient/varied failures still
+   * retry under the normal backoff. `0` disables the breaker entirely.
+   */
+  circuit_breaker_threshold: number;
 }
 
 // ACP adapter configuration. `adapter` selects one of symphony's known adapter profiles
