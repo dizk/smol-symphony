@@ -14,7 +14,8 @@ jobs:
           fetch-depth: 0 # full history
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Gondolin (the VM substrate) requires Node >=23.6; match the host runtime.
+          node-version: '24'
           cache: npm
       - run: npm ci
       - run: npm run typecheck
