@@ -484,9 +484,11 @@ export class BakeResource {
  * hashes its bytes; a directory is walked in sorted order, folding each entry's
  * relative path + bytes into one sha256. A missing path folds a stable "absent"
  * marker (the bake itself surfaces the real error). Used by the bake hash so
- * editing a baked file (e.g. `scripts/vm-agent.mjs`) forces a re-bake.
- */
-async function hashPathContent(absPath: string): Promise<string> {
+ * editing a baked file (e.g. `scripts/vm-agent.mjs`) forces a re-bake. Folds in
+ * file/dir modes and directory structure (not just file bytes) so metadata-only
+ * changes `cp -a` preserves — `chmod +x`, an added empty dir — also invalidate
+ * the cache. Exported for tests. */
+export async function hashPathContent(absPath: string): Promise<string> {
   const h = createHash('sha256');
   await foldPathInto(h, absPath, '');
   return h.digest('hex');
@@ -509,13 +511,18 @@ async function foldPathInto(h: Hash, absPath: string, rel: string): Promise<void
     return;
   }
   if (st.isDirectory()) {
+    // Mark the dir itself (with its mode) so adding/removing an even-empty
+    // directory, or a chmod on one, changes the digest — `cp -a` preserves both.
+    h.update(`\0dir\0${rel}\0${st.mode.toString(8)}\0`);
     for (const name of (await readdir(absPath)).sort()) {
       await foldPathInto(h, path.join(absPath, name), rel ? `${rel}/${name}` : name);
     }
     return;
   }
   if (st.isFile()) {
-    h.update(`\0file\0${rel}\0`);
+    // Include the mode: `cp -a` preserves it, so a metadata-only change like
+    // `chmod +x` alters the baked image even when the bytes are identical.
+    h.update(`\0file\0${rel}\0${st.mode.toString(8)}\0`);
     h.update(await readFile(absPath));
   }
 }
