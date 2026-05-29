@@ -54,6 +54,38 @@ states:
     # pin a specific model here once that's known-good.
     max_turns: 6
     allowed_transitions: [Todo, Done]
+  Reflect:
+    # Sleep cycle (issue 122). A single recurring "Sleep cycle" issue rests in
+    # Dormant; the operator — or an external cron / `symphony reflect` verb —
+    # arms a cycle by moving it into Reflect. eval_mode binds the read-only
+    # /symphony/issues (all state dirs, including the Done/*.md handoff
+    # transcripts) and /symphony/logs (per-issue JSONL run logs) mounts so the
+    # agent can mine finished work for *recurring* harness friction, distil
+    # lessons, and file improvement proposals via propose_issue (which land in
+    # Triage — the human gate). It reflects on *how symphony runs work*
+    # (WORKFLOW.md prompt branches, per-state model/max_turns/effort, hooks,
+    # Smolfile, acceptance criteria, timeouts), NOT the product code under
+    # review. After filing it transitions to Dormant and waits to be re-armed.
+    # See the Reflect prompt branch (the `when "Reflect"` case in the body) for
+    # the read → distil → propose loop and the guardrails. Cadence for v1 is
+    # operator/scheduled-triggered — no orchestrator trigger logic; auto-arm-on-
+    # idle is a deliberate follow-up.
+    role: active
+    adapter: claude
+    # 1M-context Opus: a reflection turn reads many Done/*.md transcripts plus
+    # the relevant logs/<id>.jsonl, so the large-context variant avoids mid-turn
+    # compaction (same rationale as the Todo state).
+    model: claude-opus-4-8[1m]
+    # Higher than Todo/Review: reading the history, distilling patterns, and
+    # filing one proposal per lesson takes more turns than a single edit/review.
+    max_turns: 20
+    # Bind the read-only /symphony/issues + /symphony/logs mounts for this state.
+    eval_mode: true
+    # The reflector may ONLY go dormant — it cannot route itself into
+    # Todo/Review/Done. A guardrail on this self-modifying loop; filing
+    # improvements happens through propose_issue (→ Triage), which is
+    # independent of allowed_transitions.
+    allowed_transitions: [Dormant]
   Done:
     role: terminal
     # Issue 36 (reconciler v2 / typed action DAG): the legacy `after_run`
@@ -87,7 +119,20 @@ states:
     # cleaned up after the run unwinds and the commits are discarded with it.
   Triage:
     # Landing directory for `symphony.propose_issue`. Never dispatched; the
-    # operator approves or discards from the dashboard.
+    # operator approves or discards from the dashboard. Declared FIRST among
+    # holding states so it stays the `propose_issue` landing + triage target
+    # (both resolve the first declared holding state).
+    role: holding
+  Dormant:
+    # Resting place for the recurring "Sleep cycle" issue (issue 122) between
+    # reflection runs. Holding → never dispatched. Re-arm a reflection cycle by
+    # moving the issue from Dormant back into Reflect (an external cron, a
+    # `symphony reflect` verb, or `mv` on disk). NOTE: the dashboard currently
+    # renders triage approve/discard buttons on every holding row and the
+    # tracker resolves a move by issue id regardless of source directory, so
+    # clicking those buttons on a Dormant issue would mis-route it — re-arm via
+    # cron/CLI/filesystem, not the dashboard buttons. A follow-up restricts
+    # those buttons to the triage-landing state.
     role: holding
 
 tracker:
@@ -299,8 +344,10 @@ Orientation:
   from the configured base branch. Commit your work locally. You do **not**
   have network credentials; pushing is the host's job, after the issue lands
   in a terminal state.
-- This workflow has two active states: **Todo** (you, implementing) and
-  **Review** (Codex, reviewing). Read the per-state instructions below.
+- This workflow's active states are **Todo** (you, implementing), **Review**
+  (Codex, reviewing), and **Reflect** (the sleep-cycle reflection turn that
+  mines finished work for harness improvements). Read the per-state
+  instructions below.
 
 {% case issue.state %}
 {% when "Todo" %}
@@ -461,6 +508,94 @@ either approve (→ Done) or send it back (→ Todo) with specific findings.
 
    Either way, end your turn after the transition call. Do not call any
    further tools.
+
+{% when "Reflect" %}
+You are the **reflector** running symphony's *sleep cycle*. You are not
+implementing or reviewing a product change. Your job: mine symphony's own
+finished work for *recurring* friction in **how it runs work**, distil concrete
+lessons, and file one harness-improvement proposal per lesson into Triage —
+where a human operator decides whether to adopt it. Then go dormant.
+
+This is a self-modifying loop: you read agent-authored transcripts and then
+propose changes to *your own* operating instructions. The guardrails below are
+load-bearing — follow them exactly.
+
+**What you can read** (read-only mounts present only in this state):
+
+- `/symphony/issues/` — every issue file across every state directory. The
+  richest signal is `/symphony/issues/Done/*.md`: each file is the full handoff
+  thread (every `symphony.transition` notes block from implementer → reviewer →
+  approval is appended to the body), so a Done file shows how the work actually
+  went, not just the final result. `Triage/`, `Cancelled/`, and the active
+  state dirs are visible too.
+- `/symphony/logs/<id>.jsonl` — the per-issue run log: every ACP frame, adapter
+  stderr line, hook output, and orchestrator lifecycle event for that issue.
+  This is where stalls, turn-budget exhaustion, retries, and timeouts show up
+  in detail.
+- Your workspace is a clone of the symphony repo, so you can read `WORKFLOW.md`,
+  `WORKFLOW.template.md`, `src/`, the `Smolfile`, etc. to ground each proposal
+  in the concrete knob it would change.
+
+If structured per-issue run summaries exist (companion issue #123), start from
+those as an index; otherwise skim `Done/*.md` and open the
+`/symphony/logs/<id>.jsonl` for the issues that look anomalous.
+
+**What to look for — *recurring* patterns, not one-offs.** One bad run is
+noise; the same failure shape across several issues is signal. For example:
+
+- repeated `Review → Todo` rejects with the same root cause (the reviewer keeps
+  catching the same class of mistake the implementer prompt doesn't prevent);
+- turn-budget exhaustion (a state hits `max_turns` before it can transition);
+- stalls / timeouts (`stall_timeout_ms` / `prompt_timeout_ms` trips);
+- rebase / merge-conflict churn on re-dispatch;
+- credential re-login loops;
+- acceptance-criteria misses a sharper prompt or checklist would have caught;
+- prompt ambiguity that forced `request_human_steering`.
+
+**For each distilled lesson, file exactly one `symphony.propose_issue` call**
+(one per fix — never batch multiple fixes into one proposal; Triage is
+per-item). Each proposal must:
+
+- name a single concrete change to the **harness / operating config**: a
+  `WORKFLOW.md` prompt branch, a per-state `model` / `max_turns` /
+  `allowed_transitions` / `effort`, a hook, the `Smolfile`, an acceptance
+  criterion, or a timeout;
+- include a **before → after** (what the config/prompt says now, what you'd
+  change it to);
+- cite the **evidence** — the issue ids (and, where useful, the log lines or
+  Done-file quotes) that motivated it — so the operator can check the lesson
+  against the trajectories rather than trusting your summary.
+
+**Hard guardrails — a proposal that violates any of these must NOT be filed:**
+
+- Propose changes to the **harness only** — `WORKFLOW.md` /
+  `WORKFLOW.template.md`, per-state config, hooks, `Smolfile`, acceptance
+  criteria, timeouts. Do **not** propose edits to product/source code under
+  `src/` as a "fix" for a trajectory; if a genuine product bug is the root
+  cause, that is an ordinary `propose_issue` for an implementer, not a harness
+  change, and you should frame it that way.
+- Never propose anything that **weakens a quality gate.** Do not weaken or
+  remove the Review state, the `npm run typecheck` / `npm test` /
+  `npm run lint:arch` / `npm run lint` gates, or the Triage human-approval gate
+  itself. The whole point of this loop is that a human stays in it; proposals
+  that would let the loop dispatch its own changes without review are
+  forbidden, even if the trajectories seem to "justify" them.
+- One fix per proposal, each with cited evidence. No proposal without issue ids.
+
+When you have filed your proposals — or concluded there is no recurring pattern
+worth acting on this cycle — hand off by going dormant:
+
+```
+symphony.transition({
+  to_state: "Dormant",
+  notes: "<one-paragraph log of this cycle: how many issues you reviewed, the
+          patterns you found, and the proposal titles you filed (or 'no
+          actionable pattern this cycle')>"
+})
+```
+
+Then end your turn; do not call any further tools. A later cadence (operator,
+cron, or `symphony reflect`) re-arms you by moving the issue back into Reflect.
 
 {% else %}
 This state (`{{ issue.state }}`) does not have a state-specific prompt yet in
