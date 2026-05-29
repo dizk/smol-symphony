@@ -33,8 +33,14 @@ volumes = ["./scripts:/opt/symphony:ro"]
 # transport behavior, which is exactly what broke codex review against the
 # credential proxy in issue #127 (the WebSocket Responses transport bypassed the
 # proxy and leaked the per-dispatch sentinel to OpenAI). Bump these deliberately.
+#
+# opencode (opencode-ai) is PINNED for the same reason (issue #130): the opencode
+# proxy adapter depends on opencode's `opencode acp` config-merge + custom-provider
+# + `{env:VAR}` interpolation + model-selection behavior, all of which an unpinned
+# rebake could silently change. Bump deliberately and re-verify against
+# docs/research/opencode-copilot-accept-matrix.md.
 init = [
     "apt-get update -q",
     "apt-get install -y --no-install-recommends git ripgrep ca-certificates curl",
-    "npm install -g --no-audit --no-fund @openai/codex@0.135.0 @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp@0.15.0 opencode-ai",
+    "npm install -g --no-audit --no-fund @openai/codex@0.135.0 @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp@0.15.0 opencode-ai@1.15.12",
 ]

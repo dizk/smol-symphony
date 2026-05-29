@@ -9,9 +9,20 @@ import {
   deriveAcpCommand,
   stageRuntimeFile,
   stageCodexPlaceholderAuth,
+  stageOpencodeConfig,
+  buildOpencodeConfig,
+  OPENCODE_CONFIG_GUEST_PATH,
+  OPENCODE_PROXY_PROVIDER_ID,
+  OPENCODE_DEFAULT_COPILOT_MODEL,
 } from '../src/agent/adapters.js';
 import { validateDispatch } from '../src/workflow.js';
 import { validateDispatchIo } from '../src/workflow-loader.js';
+import {
+  hostOpencodeCredentialPath,
+  opencodeCredentialAvailable,
+  opencodeGithubTokenFromAuth,
+  opencodeGithubTokenFromEnv,
+} from '../src/agent/adapter-names.js';
 import type { ServiceConfig } from '../src/types.js';
 
 function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
@@ -90,6 +101,21 @@ describe('adapters registry', () => {
     assert.deepEqual(ADAPTERS.codex.binary, ['codex-acp']);
   });
 
+  it('exposes the opencode profile (binary, proxy strategy, proxyEnv)', () => {
+    assert.ok(ADAPTERS.opencode);
+    assert.deepEqual(ADAPTERS.opencode.binary, ['opencode', 'acp']);
+    assert.equal(ADAPTERS.opencode.credentialStrategy, 'proxy');
+    assert.deepEqual(ADAPTERS.opencode.proxyEnv, {
+      baseUrlVar: 'OPENCODE_PROXY_BASE_URL',
+      tokenVar: 'OPENCODE_PROXY_TOKEN',
+    });
+    // opencode picks the model from the staged opencode.json, not via an env/argv
+    // channel, so modelInjection is inert and there is no transport override.
+    assert.deepEqual(ADAPTERS.opencode.modelInjection('gpt-4o'), {});
+    assert.equal(ADAPTERS.opencode.effortInjection, undefined);
+    assert.equal(ADAPTERS.opencode.proxyProviderArgs, undefined);
+  });
+
   it('declares the per-adapter credential strategy the runner dispatches on', () => {
     // The runner keys credential handling on `credentialStrategy`, not on `id`
     // (issue #115/#116). Both claude and codex now route through the host
@@ -115,7 +141,8 @@ describe('adapters registry', () => {
   it('isKnownAdapter narrows on supported ids only', () => {
     assert.equal(isKnownAdapter('claude'), true);
     assert.equal(isKnownAdapter('codex'), true);
-    assert.equal(isKnownAdapter('opencode'), false);
+    assert.equal(isKnownAdapter('opencode'), true);
+    assert.equal(isKnownAdapter('gemini'), false);
     assert.equal(isKnownAdapter('unknown'), false);
     assert.equal(isKnownAdapter(''), false);
   });
@@ -413,6 +440,113 @@ describe('stageCodexPlaceholderAuth', () => {
   });
 });
 
+describe('opencode credential helpers (issue 130)', () => {
+  it('reads the durable GitHub token from the github-copilot `refresh` field', () => {
+    const auth = {
+      'github-copilot': { type: 'oauth', refresh: 'gho_durable', access: 'short-lived-copilot', expires: 123 },
+    };
+    // `refresh` (the durable token) is preferred over `access` (opencode's cached
+    // Copilot token) — the proxy must exchange the durable token, not reuse the cache.
+    assert.equal(opencodeGithubTokenFromAuth(auth), 'gho_durable');
+  });
+
+  it('returns null when the auth.json has no github-copilot entry', () => {
+    assert.equal(opencodeGithubTokenFromAuth({ anthropic: { type: 'oauth', refresh: 'x' } }), null);
+    assert.equal(opencodeGithubTokenFromAuth(null), null);
+    assert.equal(opencodeGithubTokenFromAuth('not an object'), null);
+  });
+
+  it('honors the env precedence COPILOT_GITHUB_TOKEN > GH_TOKEN > GITHUB_TOKEN', () => {
+    assert.equal(
+      opencodeGithubTokenFromEnv({ COPILOT_GITHUB_TOKEN: 'a', GH_TOKEN: 'b', GITHUB_TOKEN: 'c' }),
+      'a',
+    );
+    assert.equal(opencodeGithubTokenFromEnv({ GH_TOKEN: 'b', GITHUB_TOKEN: 'c' }), 'b');
+    assert.equal(opencodeGithubTokenFromEnv({ GITHUB_TOKEN: 'c' }), 'c');
+    assert.equal(opencodeGithubTokenFromEnv({}), null);
+  });
+
+  it('opencodeCredentialAvailable accepts a file token, an env token, or neither', () => {
+    const fileText = JSON.stringify({ 'github-copilot': { type: 'oauth', refresh: 'gho_x' } });
+    assert.equal(opencodeCredentialAvailable(fileText, {}), true);
+    assert.equal(opencodeCredentialAvailable(null, { GH_TOKEN: 'gho_env' }), true);
+    assert.equal(opencodeCredentialAvailable(null, {}), false);
+    assert.equal(opencodeCredentialAvailable('not json', {}), false);
+  });
+
+  it('hostOpencodeCredentialPath honors XDG_DATA_HOME', () => {
+    const prev = process.env.XDG_DATA_HOME;
+    try {
+      process.env.XDG_DATA_HOME = '/custom/xdg';
+      assert.equal(hostOpencodeCredentialPath(), '/custom/xdg/opencode/auth.json');
+    } finally {
+      if (prev === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prev;
+    }
+  });
+});
+
+describe('buildOpencodeConfig (issue 130: custom Copilot provider via the proxy)', () => {
+  it('declares the symphony-copilot provider pointed at the proxy via {env:…}', () => {
+    const cfg = JSON.parse(buildOpencodeConfig(null)) as Record<string, any>;
+    const provider = cfg.provider?.[OPENCODE_PROXY_PROVIDER_ID];
+    assert.ok(provider, 'expected the symphony-copilot provider');
+    assert.equal(provider.npm, '@ai-sdk/openai-compatible');
+    // The base URL + apiKey read the proxy env vars opencode interpolates.
+    assert.equal(provider.options.baseURL, '{env:OPENCODE_PROXY_BASE_URL}');
+    assert.equal(provider.options.apiKey, '{env:OPENCODE_PROXY_TOKEN}');
+  });
+
+  it('the {env:…} var names match the opencode profile proxyEnv exactly (no drift)', () => {
+    // If these diverge, the in-VM opencode reads empty base URL / apiKey and the
+    // provider silently fails. Lock them together.
+    const cfg = JSON.parse(buildOpencodeConfig(null)) as Record<string, any>;
+    const opts = cfg.provider[OPENCODE_PROXY_PROVIDER_ID].options;
+    assert.equal(opts.baseURL, `{env:${ADAPTERS.opencode.proxyEnv!.baseUrlVar}}`);
+    assert.equal(opts.apiKey, `{env:${ADAPTERS.opencode.proxyEnv!.tokenVar}}`);
+  });
+
+  it('pins the default Copilot model when no model is configured', () => {
+    const cfg = JSON.parse(buildOpencodeConfig(null)) as Record<string, any>;
+    assert.equal(cfg.model, `${OPENCODE_PROXY_PROVIDER_ID}/${OPENCODE_DEFAULT_COPILOT_MODEL}`);
+    // The default model is declared in the provider's models map (required: opencode
+    // never hits <baseURL>/models for a custom provider).
+    assert.ok(OPENCODE_DEFAULT_COPILOT_MODEL in cfg.provider[OPENCODE_PROXY_PROVIDER_ID].models);
+  });
+
+  it('selects the configured model and adds it to the advertised models map', () => {
+    const cfg = JSON.parse(buildOpencodeConfig('claude-sonnet-4.5')) as Record<string, any>;
+    assert.equal(cfg.model, `${OPENCODE_PROXY_PROVIDER_ID}/claude-sonnet-4.5`);
+    assert.ok('claude-sonnet-4.5' in cfg.provider[OPENCODE_PROXY_PROVIDER_ID].models);
+  });
+
+  it('carries no secret — only {env:…} references, never a real token', () => {
+    const text = buildOpencodeConfig('gpt-4o');
+    assert.doesNotMatch(text, /gho_|ghu_|sk-/);
+    assert.match(text, /\{env:OPENCODE_PROXY_TOKEN\}/);
+  });
+});
+
+describe('stageOpencodeConfig', () => {
+  it('stages opencode.json under runtime/, 0600, with the built config', async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-stage-opencode-'));
+    const ws = path.join(tmp, 'ws');
+    await mkdir(path.join(ws, '.git'), { recursive: true });
+    try {
+      const staged = await stageOpencodeConfig(ws, 'gpt-4o');
+      assert.equal(staged.relPath, '.git/symphony-runtime/runtime/opencode.json');
+      const body = await readFile(staged.absPath, 'utf8');
+      assert.equal(body, buildOpencodeConfig('gpt-4o'));
+      const st = await stat(staged.absPath);
+      assert.equal(st.mode & 0o777, 0o600);
+      // Sanity: the guest path the runner copies it to is opencode's global config.
+      assert.equal(OPENCODE_CONFIG_GUEST_PATH, '/root/.config/opencode/opencode.json');
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('validateDispatch', () => {
   it('passes when adapter is known and local tracker root exists', () => {
     const cfg = bareCfg({ adapter: 'claude' });
@@ -427,11 +561,11 @@ describe('validateDispatch', () => {
   it('rejects when adapter is unknown', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
-      const cfg = bareCfg({ adapter: 'opencode' });
+      const cfg = bareCfg({ adapter: 'gemini' });
       cfg.tracker.root = root;
       const err = validateDispatch(cfg);
       assert.ok(err, 'expected validation error');
-      assert.match(err!, /opencode/);
+      assert.match(err!, /gemini/);
       assert.match(err!, /known profile/);
     } finally {
       await rm(root, { recursive: true, force: true });

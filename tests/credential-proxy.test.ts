@@ -13,7 +13,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   CredentialProxy,
+  type CopilotTokenExchange,
   type HeaderOverride,
+  type TokenInfo,
   type UpstreamRequestor,
   type UpstreamResponse,
 } from '../src/agent/credential-proxy.js';
@@ -853,9 +855,192 @@ describe('CredentialProxy: adapter-keyed upstream profiles (codex)', () => {
   it('register() rejects an unknown adapter id', async () => {
     await boot({ codexAuth: { tokens: { access_token: 'x' } } });
     assert.throws(
-      () => proxy!.register({ issueId: 'i', identifier: '1', adapterId: 'opencode' as never }),
+      () => proxy!.register({ issueId: 'i', identifier: '1', adapterId: 'gemini' as never }),
       /no upstream profile for adapter/,
     );
+  });
+});
+
+describe('CredentialProxy: opencode GitHub Copilot profile (issue 130)', () => {
+  let tmp = '';
+  let proxy: CredentialProxy | null = null;
+  let upstream: FakeUpstream;
+  let base = '';
+  let exchangeCalls = 0;
+  let lastGithubToken: string | null = null;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  afterEach(async () => {
+    if (proxy) {
+      await proxy.stop();
+      proxy = null;
+    }
+    if (tmp) {
+      await rm(tmp, { recursive: true, force: true });
+      tmp = '';
+    }
+    for (const k of ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN']) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+  });
+
+  // Boot a proxy whose opencode profile reads `auth.json` from a temp file and
+  // runs an INJECTED exchange (no api.github.com call). The exchange records its
+  // input (the durable GitHub token) + call count so tests can assert the
+  // sentinel→Copilot-token swap and the cache behavior.
+  async function bootOpencode(opts: {
+    authJson?: Record<string, unknown> | null;
+    now?: () => number;
+    exchangeResult?: (call: number) => TokenInfo;
+    envGithubToken?: { name: 'COPILOT_GITHUB_TOKEN' | 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string };
+  }): Promise<void> {
+    tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-opencode-'));
+    const credentialsPath = path.join(tmp, 'auth.json');
+    if (opts.authJson) await writeFile(credentialsPath, JSON.stringify(opts.authJson), 'utf8');
+    for (const k of ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'] as const) {
+      savedEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+    if (opts.envGithubToken) process.env[opts.envGithubToken.name] = opts.envGithubToken.value;
+    exchangeCalls = 0;
+    lastGithubToken = null;
+    const exchange: CopilotTokenExchange = async (gh) => {
+      exchangeCalls += 1;
+      lastGithubToken = gh;
+      const now = opts.now ? opts.now() : Date.now();
+      return opts.exchangeResult
+        ? opts.exchangeResult(exchangeCalls)
+        : { accessToken: `copilot-token-${exchangeCalls}`, expiresAtMs: now + 25 * 60_000 };
+    };
+    upstream = makeFakeUpstream();
+    proxy = new CredentialProxy({
+      upstream,
+      lockPath: path.join(tmp, 'refresh.lock'),
+      now: opts.now,
+      profileOverrides: { opencode: { credentialsPath, copilotExchange: exchange } },
+    });
+    await proxy.start('127.0.0.1', 0);
+    base = `http://127.0.0.1:${proxy.port()}`;
+  }
+
+  const COPILOT_AUTH = {
+    'github-copilot': { type: 'oauth', refresh: 'gho_durable_github_token', access: 'stale-copilot', expires: 0 },
+  };
+
+  it('exchanges the durable GitHub token for a Copilot token and forwards THAT as the bearer', async () => {
+    await bootOpencode({ authJson: COPILOT_AUTH });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'opencode' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{"ok":true}') });
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}`, 'content-type': 'application/json' },
+      body: '{"model":"gpt-4o"}',
+    });
+    assert.equal(res.status, 200);
+    const call = upstream.calls[0]!;
+    assert.equal(call.host, 'api.githubcopilot.com');
+    assert.equal(call.pathname, '/chat/completions');
+    // The exchange ran with the DURABLE github token read from auth.json `refresh`.
+    assert.equal(lastGithubToken, 'gho_durable_github_token');
+    // The upstream bearer is the EXCHANGED Copilot token, never the github token.
+    assert.equal(call.headers['authorization'], 'Bearer copilot-token-1');
+    // The durable GitHub OAuth token must NEVER reach upstream.
+    assert.equal(JSON.stringify(call).includes('gho_durable_github_token'), false);
+  });
+
+  it('injects the GitHub Copilot editor headers (copilot-integration-id load-bearing) at egress', async () => {
+    await bootOpencode({ authJson: COPILOT_AUTH });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'opencode' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    // The in-VM @ai-sdk/openai-compatible client sends none of these — the proxy supplies them.
+    await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '{}',
+    });
+    const call = upstream.calls[0]!;
+    assert.equal(call.headers['copilot-integration-id'], 'vscode-chat');
+    assert.equal(call.headers['editor-version'], 'vscode/1.95.0');
+    assert.equal(call.headers['editor-plugin-version'], 'copilot-chat/0.26.7');
+    assert.equal(call.headers['user-agent'], 'GitHubCopilotChat/0.26.7');
+    assert.equal(call.headers['openai-intent'], 'conversation-panel');
+    assert.equal(call.headers['x-github-api-version'], '2025-04-01');
+  });
+
+  it('caches the Copilot token: a second request does not re-exchange', async () => {
+    const now = 1_000_000;
+    await bootOpencode({ authJson: COPILOT_AUTH, now: () => now });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'opencode' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    await fetch(`${base}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${reg.sentinel}` }, body: '{}' });
+    await fetch(`${base}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${reg.sentinel}` }, body: '{}' });
+    assert.equal(exchangeCalls, 1, 'exchange must run once; the cached Copilot token serves the 2nd request');
+    assert.equal(upstream.calls[1]!.headers['authorization'], 'Bearer copilot-token-1');
+  });
+
+  it('re-exchanges before expiry (TTL-margin refresh → no mid-session 401)', async () => {
+    // First exchange mints a token expiring in 30s; the 60s refresh margin means
+    // the next request treats it as stale and re-exchanges.
+    let clock = 5_000_000;
+    await bootOpencode({
+      authJson: COPILOT_AUTH,
+      now: () => clock,
+      exchangeResult: (call) => ({ accessToken: `copilot-token-${call}`, expiresAtMs: clock + 30_000 }),
+    });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'opencode' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    await fetch(`${base}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${reg.sentinel}` }, body: '{}' });
+    // Advance past the refresh margin (token expires at clock0+30s, margin 60s).
+    clock += 1_000;
+    await fetch(`${base}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${reg.sentinel}` }, body: '{}' });
+    assert.equal(exchangeCalls, 2, 'a near-expiry cached token must be re-exchanged before forwarding');
+    assert.equal(upstream.calls[1]!.headers['authorization'], 'Bearer copilot-token-2');
+  });
+
+  it('falls back to the COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN env var when auth.json is absent', async () => {
+    await bootOpencode({ envGithubToken: { name: 'GH_TOKEN', value: 'gho_from_env' } }); // no auth.json file
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'opencode' });
+    upstream.nextResponse({ statusCode: 200, headers: {}, body: jsonBody('{}') });
+    await fetch(`${base}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${reg.sentinel}` }, body: '{}' });
+    assert.equal(lastGithubToken, 'gho_from_env');
+    assert.equal(upstream.calls[0]!.headers['authorization'], 'Bearer copilot-token-1');
+  });
+
+  it('503s an opencode dispatch when neither auth.json nor a GitHub token env var is present', async () => {
+    await bootOpencode({}); // no auth.json, no env
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'opencode' });
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '{}',
+    });
+    assert.equal(res.status, 503);
+    assert.equal(upstream.calls.length, 0);
+    assert.equal(exchangeCalls, 0, 'no exchange when there is no GitHub token to exchange');
+  });
+
+  it('forwards the Copilot billing-tell headers back to the in-VM client', async () => {
+    await bootOpencode({ authJson: COPILOT_AUTH });
+    const reg = proxy!.register({ issueId: 'i1', identifier: '1', adapterId: 'opencode' });
+    upstream.nextResponse({
+      statusCode: 200,
+      headers: {
+        'content-type': 'application/json',
+        'x-ratelimit-remaining-requests': '42',
+        'x-github-request-id': 'req-xyz',
+      },
+      body: jsonBody('{}'),
+    });
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '{}',
+    });
+    assert.equal(res.headers.get('x-ratelimit-remaining-requests'), '42');
+    assert.equal(res.headers.get('x-github-request-id'), 'req-xyz');
   });
 });
 

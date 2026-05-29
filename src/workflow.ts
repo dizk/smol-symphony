@@ -264,13 +264,14 @@ export function buildServiceConfig(
   };
 
   // acp (Symphony extension; see §4.3.6). `adapter` selects
-  // one of symphony's known profiles (claude, codex); symphony auto-derives the launch
-  // command from the adapter profile. Credentials are NOT staged into the workspace:
-  // both shipped adapters route inference through the host credential proxy, so the VM
+  // one of symphony's known profiles (claude, codex, opencode); symphony auto-derives the
+  // launch command from the adapter profile. Credentials are NOT staged into the workspace:
+  // every shipped adapter routes inference through the host credential proxy, so the VM
   // only ever sees `<provider>_BASE_URL=<proxy>` + a per-dispatch sentinel token. The
   // proxy swaps the sentinel for the real host credential request-side
   // (`~/.claude/.credentials.json` for claude; `~/.codex/auth.json` access token or
-  // `OPENAI_API_KEY` for codex).
+  // `OPENAI_API_KEY` for codex; the GitHub Copilot token exchanged from
+  // `~/.local/share/opencode/auth.json` for opencode).
   //
   // `acp.bridge` configures the host-side TCP listener that the in-VM agent dials back
   // to for ACP traffic. The bridge replaced the smolvm-exec stdio path; see
@@ -782,7 +783,7 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   const statesError = validateStates(cfg.states);
   if (statesError) return statesError;
   if (!isKnownAdapter(cfg.acp.adapter)) {
-    return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex`;
+    return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex, opencode`;
   }
   // smolvm artifact source is one of image / from / smolfile. The smolvm CLI itself
   // would also reject conflicting flags, but failing here gives the operator a clear
@@ -940,7 +941,7 @@ function validateStates(states: Record<string, StateConfig>): string | null {
       }
     }
     if (cfg.adapter !== undefined && !isKnownAdapter(cfg.adapter)) {
-      return `state "${name}": adapter "${cfg.adapter}" is not a known profile; use one of: claude, codex`;
+      return `state "${name}": adapter "${cfg.adapter}" is not a known profile; use one of: claude, codex, opencode`;
     }
   }
   return null;
