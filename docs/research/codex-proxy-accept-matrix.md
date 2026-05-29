@@ -1,5 +1,26 @@
 # OpenAI / codex accept matrix for the credential-proxy (codex α)
 
+> **CORRECTION 2026-05-29 (live measurement — Row 2 was WRONG).** Row 2 below
+> (a ChatGPT-OAuth `tokens.access_token` as `Authorization: Bearer` →
+> **200 on `api.openai.com/v1/responses`**) was `DOC-DERIVED (needs live confirm)`
+> and is now **measured false**. A real codex Review routed through the proxy to
+> `api.openai.com/v1/responses` **401s** with `"Missing scopes:
+> api.responses.write"`. The ChatGPT-OAuth access token's JWT carries only
+> `scp: [openid, profile, email, offline_access]` (a ChatGPT **Plus** token) —
+> it has **no** platform-API scope. OpenAI splits the subscription off the
+> metered API: native codex (auth_mode=chatgpt) actually talks to
+> **`chatgpt.com/backend-api/codex/responses`** with a **`chatgpt-account-id`**
+> header (the `tokens.account_id`), NOT `api.openai.com`. Verified end-to-end:
+> the same request over plain HTTPS to that backend with that header returns 200.
+> So the proxy must, for a ChatGPT-OAuth credential, swap host → `chatgpt.com`,
+> rewrite `/v1/*` → `/backend-api/codex/*`, and add `chatgpt-account-id`. Routing
+> keys on the credential being OAuth (not on the account id's presence). API-key
+> credentials (`OPENAI_API_KEY`) keep the metered `api.openai.com/v1` route
+> (Row 1 — that path is genuinely fine). Implemented in
+> `src/agent/credential-proxy.ts` (`extractCodexToken` → `chatgptOAuth` /
+> `chatgptAccountId`; `codexUpstreamRoute`; `buildUpstreamRequest`). The §1 table
+> below keeps Row 2's original wording for provenance; this block supersedes it.
+
 > **CORRECTION 2026-05-28 (live dispatch).** The §1/§5 assumption that setting
 > `OPENAI_API_KEY=<sentinel>` + `OPENAI_BASE_URL=<proxy>` alone makes codex-acp
 > "run in the SDK's high-confidence API-key code path" was wrong. A real codex
@@ -78,7 +99,7 @@ mode). Token bytes redacted as `<API_KEY>` / `<CHATGPT_ACCESS_TOKEN>` /
 | # | Credential source | Auth header | HTTP (expected) | Billing routing | Confidence |
 | - | ----------------- | ----------- | --------------- | --------------- | ---------- |
 | 1 | `OPENAI_API_KEY` (API-key mode) | `Authorization: Bearer <API_KEY>` | 200 | Metered pay-as-you-go (OpenAI API billing) | **High — inference path MEASURED.** The documented OpenAI REST convention (SDK uses `Authorization: Bearer <key>` and honors `base_url`); confirmed by the #116 Review dispatch running successfully through the proxy under codex. |
-| 2 | `tokens.access_token` (ChatGPT-OAuth) | `Authorization: Bearer <CHATGPT_ACCESS_TOKEN>` | 200 | ChatGPT subscription (Plus/Pro/Business), **not** metered API | **Medium** — OpenAI's CI/CD auth docs describe codex authenticating with the ChatGPT-OAuth access token as a Bearer; the subscription-vs-API split is documented, but the exact request shape was not measured here. `DOC-DERIVED (needs live confirm)`. |
+| 2 | `tokens.access_token` (ChatGPT-OAuth) | `Authorization: Bearer <CHATGPT_ACCESS_TOKEN>` | ~~200~~ → **401** on `api.openai.com/v1`; **200** only on `chatgpt.com/backend-api/codex` + `chatgpt-account-id` | ChatGPT subscription (Plus/Pro/Business), **not** metered API | **MEASURED 2026-05-29 — original "200 on api.openai.com" DISPROVEN** (see correction block at top). The token has no `api.responses.write` scope; it is honored only on the ChatGPT backend. |
 | 3 | `tokens.refresh_token` | (never sent to `/v1/*`) | n/a | n/a | **High** — the refresh token is only ever presented to OpenAI's OAuth token endpoint, never to the inference API. It is exactly what we keep off the VM. |
 | 4 | `OPENAI_API_KEY` | `x-api-key: <API_KEY>` | 401 (expected) | n/a | **Medium** — OpenAI's REST API uses `Authorization: Bearer`, not `x-api-key` (that is an Anthropic convention). Listed to mirror the Anthropic matrix's channel disambiguation. `DOC-DERIVED`. |
 
