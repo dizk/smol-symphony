@@ -62,6 +62,27 @@ export interface AcpBridgeRegistration {
 export interface AcpBridgeOptions {
   /** Per-connection deadline for receiving the bearer line. Defaults to 10 s. */
   authTimeoutMs?: number;
+  /**
+   * When true, `start()` REFUSES to bind to a non-loopback host — a hard guard that
+   * the bridge is reachable only via the host loopback. The Gondolin transport
+   * passes this: its ACP channel is raw mapped TCP (the guest dials a synthetic name
+   * tunnelled to `127.0.0.1:<port>` via `tcp.hosts`), so a wider bind (e.g.
+   * `0.0.0.0`) would expose the bearer-gated control channel to the host LAN with no
+   * benefit. Default false keeps the existing smolvm dispatch behavior unchanged
+   * (it binds whatever host config supplies, typically the QEMU slirp gateway).
+   */
+  loopbackOnly?: boolean;
+}
+
+/**
+ * Loopback host literals `start()` accepts under `loopbackOnly`. We match the exact
+ * IPv4 loopback `127.0.0.1`, the whole `127.0.0.0/8` range textually, the IPv6
+ * loopback `::1`, and the `localhost` name. A `0.0.0.0`/`::`/LAN-IP/hostname bind is
+ * rejected — those are wider than loopback.
+ */
+function isLoopbackHost(host: string): boolean {
+  if (host === '::1' || host === 'localhost') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 export class AcpBridge {
@@ -82,9 +103,11 @@ export class AcpBridge {
   private preAuthSockets = new Set<Socket>();
   private stopped = false;
   private readonly authTimeoutMs: number;
+  private readonly loopbackOnly: boolean;
 
   constructor(opts: AcpBridgeOptions = {}) {
     this.authTimeoutMs = opts.authTimeoutMs ?? 10_000;
+    this.loopbackOnly = opts.loopbackOnly ?? false;
   }
 
   /**
@@ -94,6 +117,12 @@ export class AcpBridge {
    */
   async start(host: string, port: number): Promise<void> {
     if (this.server) return;
+    if (this.loopbackOnly && !isLoopbackHost(host)) {
+      throw new Error(
+        `acp bridge: loopbackOnly is set but host ${JSON.stringify(host)} is not a ` +
+          `loopback address; refusing to bind a bearer-gated control channel wider than loopback`,
+      );
+    }
     this.server = createServer((socket) => this.handleConnection(socket));
     await new Promise<void>((resolve, reject) => {
       const onError = (err: Error) => {
