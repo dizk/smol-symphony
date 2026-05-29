@@ -355,7 +355,11 @@ export function makeGithubExchangePathGuard(): NonNullable<HttpHooks['onRequest'
     }
     if (url.hostname !== COPILOT_EXCHANGE_HOST) return; // other hosts: untouched
     const method = request.method.toUpperCase();
-    if (method === 'GET' && url.pathname === COPILOT_EXCHANGE_PATH) return; // permit
+    // Permit ONLY the exact exchange endpoint with NO query string. The legitimate
+    // host-side exchange (`defaultCopilotExchange`) sends a bare path; a
+    // `?…`-variant is neither needed nor trusted, so requiring an empty search
+    // keeps the allow condition as narrow as the real call (codex review).
+    if (method === 'GET' && url.pathname === COPILOT_EXCHANGE_PATH && url.search === '') return; // permit
     log.warn('credential-secrets: blocked non-exchange request to github exchange host', {
       host: url.hostname,
       method,
@@ -505,6 +509,12 @@ export class CredentialSecretRegistry {
   // Latest known value per adapter, used to seed a freshly-created manager.
   private readonly cachedValue = new Map<AcpAdapterId, string>();
   private seq = 0;
+  // Per-adapter rotation counter, bumped on every `pushToAll(adapterId, …)`.
+  // `register` snapshots its adapter's counter across the async `readToken` so it
+  // can detect a rotation FOR THAT ADAPTER that landed mid-read and avoid
+  // clobbering the fresher value with its own stale read. Per-adapter (not global)
+  // so a rotation for a *different* adapter never makes a cold entry skip seeding.
+  private readonly cacheSeq = new Map<AcpAdapterId, number>();
   private readonly readToken: (adapterId: AcpAdapterId) => Promise<TokenInfo | null>;
   private readonly refresh: (adapterId: AcpAdapterId) => Promise<void>;
   private readonly now: () => number;
@@ -547,12 +557,9 @@ export class CredentialSecretRegistry {
     };
     this.entries.set(key, entry);
 
-    // Seed: prefer a freshly-read token (also refreshes the cache + schedules the
-    // proactive tick); fall back to the cached value if the read yields nothing.
+    const seqBefore = this.cacheSeq.get(args.adapterId) ?? 0;
     const token = await this.safeReadToken(args.adapterId);
-    const seedValue = token?.accessToken ?? this.cachedValue.get(args.adapterId) ?? '';
-    if (token?.accessToken) this.cachedValue.set(args.adapterId, token.accessToken);
-    this.applyToEntry(key, entry, seedValue);
+    this.seedUnlessRotated(key, entry, args.adapterId, seqBefore, token);
     if (token?.expiresAtMs != null) this.scheduleProactive(key, entry, token.expiresAtMs);
 
     return {
@@ -585,6 +592,7 @@ export class CredentialSecretRegistry {
    */
   pushToAll(adapterId: AcpAdapterId, value: string): void {
     this.cachedValue.set(adapterId, value);
+    this.cacheSeq.set(adapterId, (this.cacheSeq.get(adapterId) ?? 0) + 1);
     for (const [key, entry] of [...this.entries]) {
       if (entry.adapterId !== adapterId) continue;
       this.applyToEntry(key, entry, value);
@@ -618,6 +626,28 @@ export class CredentialSecretRegistry {
         this.scheduleProactive(key, entry, token.expiresAtMs);
       }
     }
+  }
+
+  /**
+   * Seed a freshly-registered entry from its read token — UNLESS a rotation for
+   * the same adapter landed during the async read (codex review). The entry is
+   * inserted synchronously before `register`'s await, so a concurrent
+   * `pushToAll(adapterId, …)` already applied the fresher value to it; re-applying
+   * our older read would both regress the live value and revoke the fresher one
+   * (gondolin revokes the old value whenever the new differs). The sequence is
+   * per-adapter, so a rotation for a *different* adapter never starves this seed.
+   */
+  private seedUnlessRotated(
+    key: string,
+    entry: RegistryEntry,
+    adapterId: AcpAdapterId,
+    seqBefore: number,
+    token: TokenInfo | null,
+  ): void {
+    if ((this.cacheSeq.get(adapterId) ?? 0) !== seqBefore) return;
+    const seedValue = token?.accessToken ?? this.cachedValue.get(adapterId) ?? '';
+    if (token?.accessToken) this.cachedValue.set(adapterId, token.accessToken);
+    this.applyToEntry(key, entry, seedValue);
   }
 
   private applyToEntry(key: string, entry: RegistryEntry, value: string): void {

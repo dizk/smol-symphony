@@ -138,6 +138,12 @@ describe('makeGithubExchangePathGuard — durable-token-oracle guard', () => {
     assert.equal((out as Response).status, 403);
   });
 
+  it('blocks a query-string variant of the exchange path (codex review)', () => {
+    const out = guard(new Request('https://api.github.com/copilot_internal/v2/token?x=1', { method: 'GET' }));
+    assert.ok(out instanceof Response);
+    assert.equal((out as Response).status, 403);
+  });
+
   it('leaves other hosts untouched', () => {
     const out = guard(new Request('https://api.githubcopilot.com/chat/completions', { method: 'POST' }));
     assert.equal(out, undefined);
@@ -266,5 +272,64 @@ describe('CredentialSecretRegistry — fan-out', () => {
     await reg.refreshAdapter('claude');
     assert.equal(refreshed, 1);
     assert.equal(m.updates.at(-1)!.value, 'post-refresh');
+  });
+
+  it('register does not clobber a rotation that lands during its async read (codex review)', async () => {
+    // readToken stays pending until we unblock it, simulating a slow host read.
+    let resolveRead!: (t: TokenInfo | null) => void;
+    const readGate = new Promise<TokenInfo | null>((r) => {
+      resolveRead = r;
+    });
+    const reg = new CredentialSecretRegistry({
+      readToken: () => readGate,
+      refresh: async () => {},
+      setTimer: () => ({}) as unknown as NodeJS.Timeout,
+      clearTimer: () => {},
+      now: () => 0,
+    });
+    const m = makeFakeManager();
+    // register() inserts the entry, then suspends on the slow read.
+    const registering = reg.register({
+      manager: m,
+      secretName: 'ANTHROPIC_AUTH_TOKEN',
+      adapterId: 'claude',
+    });
+    // A rotation lands DURING the read and applies the fresh value to the live entry.
+    reg.pushToAll('claude', 'fresh-rotated');
+    // Now the read resolves with a STALE value; register must NOT apply it over the
+    // rotation (doing so would regress the value and revoke the fresh token).
+    resolveRead({ accessToken: 'stale-read', expiresAtMs: null });
+    await registering;
+    assert.equal(m.updates.at(-1)!.value, 'fresh-rotated');
+    assert.ok(!m.updates.some((u) => u.value === 'stale-read'), 'stale read must not be applied');
+    assert.equal(reg.size(), 1);
+  });
+
+  it('a rotation for a DIFFERENT adapter during register still seeds the cold entry (codex review)', async () => {
+    // Per-adapter cacheSeq: a codex push must not make a claude register skip its seed.
+    let resolveRead!: (t: TokenInfo | null) => void;
+    const readGate = new Promise<TokenInfo | null>((r) => {
+      resolveRead = r;
+    });
+    const reg = new CredentialSecretRegistry({
+      readToken: () => readGate,
+      refresh: async () => {},
+      setTimer: () => ({}) as unknown as NodeJS.Timeout,
+      clearTimer: () => {},
+      now: () => 0,
+    });
+    const claudeM = makeFakeManager();
+    const registering = reg.register({
+      manager: claudeM,
+      secretName: 'ANTHROPIC_AUTH_TOKEN',
+      adapterId: 'claude',
+    });
+    // An UNRELATED rotation (codex) lands during the claude read.
+    reg.pushToAll('codex', 'codex-rotated');
+    // The claude read resolves; its value must still be applied (the codex push
+    // never touched the claude entry, so seeding must NOT be skipped).
+    resolveRead({ accessToken: 'claude-seed', expiresAtMs: null });
+    await registering;
+    assert.equal(claudeM.updates.at(-1)!.value, 'claude-seed');
   });
 });
