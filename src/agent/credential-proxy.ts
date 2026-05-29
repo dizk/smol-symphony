@@ -3,7 +3,9 @@
 // the adapter's upstream API. The proxy is adapter-keyed: each registration
 // records which adapter it serves, and per-request handling resolves the
 // matching `UpstreamProfile` (upstream host, credential reader, refresher,
-// billing-tell headers). claude → api.anthropic.com; codex → api.openai.com.
+// billing-tell headers). claude → api.anthropic.com; codex → api.openai.com;
+// opencode → api.githubcopilot.com (with a host-side GitHub→Copilot token
+// exchange — see the opencode profile block near the bottom of this file).
 //
 // Lifecycle mirrors AcpBridge (src/acp-bridge.ts):
 //
@@ -60,7 +62,12 @@ import path from 'node:path';
 import os from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { log } from '../logging.js';
-import type { AcpAdapterId } from './adapter-names.js';
+import {
+  hostOpencodeCredentialPath,
+  opencodeGithubTokenFromAuth,
+  opencodeGithubTokenFromEnv,
+  type AcpAdapterId,
+} from './adapter-names.js';
 
 export interface CredentialProxyRegistration {
   /** Per-dispatch opaque sentinel. Staged into the VM as the adapter's token var. */
@@ -178,6 +185,15 @@ export interface UpstreamProfile {
   envFallback(): TokenInfo | null;
   /** Drive a host-side refresh (claude: `claude -p`). Tests inject a stub. */
   refresher: () => Promise<void>;
+  /**
+   * Static headers injected at egress on every forwarded request, regardless of
+   * the inbound headers. opencode uses this for the GitHub Copilot editor
+   * headers (`Editor-Version`, `Copilot-Integration-Id`, …) that
+   * `api.githubcopilot.com` requires but the in-VM `@ai-sdk/openai-compatible`
+   * client does not send. These WIN over inbound headers but a per-request
+   * `upstreamRoute`'s `extraHeaders` win over these. Absent for claude/codex.
+   */
+  egressHeaders?: Record<string, string>;
   /** Response header names carrying the subscription billing tell, logged per response. */
   billingTellHeaders: readonly string[];
   /**
@@ -189,11 +205,26 @@ export interface UpstreamProfile {
   upstreamRoute?(token: TokenInfo): UpstreamRoute | null;
 }
 
+/**
+ * Exchange a durable GitHub OAuth token for a short-lived GitHub Copilot token
+ * (POST/GET `api.github.com/copilot_internal/v2/token`). Returns the Copilot
+ * token + its expiry. Injectable so opencode-profile tests don't hit the
+ * network. The exchange HOST (api.github.com) is distinct from the inference
+ * upstreamHost (api.githubcopilot.com).
+ */
+export type CopilotTokenExchange = (githubToken: string) => Promise<TokenInfo>;
+
 /** Per-adapter override hook for tests / non-default deployments. */
 export interface UpstreamProfileOverride {
   credentialsPath?: string;
   refresher?: () => Promise<void>;
   upstreamHost?: string;
+  /**
+   * opencode only: inject the GitHub→Copilot token exchange so tests can run
+   * the cache-populating refresher without hitting api.github.com. Ignored by
+   * claude/codex.
+   */
+  copilotExchange?: CopilotTokenExchange;
 }
 
 export interface CredentialProxyOptions {
@@ -681,29 +712,36 @@ function buildUpstreamProfiles(opts: CredentialProxyOptions): Map<AcpAdapterId, 
     refresher: opts.refresher,
     ...opts.profileOverrides?.claude,
   };
-  const codexOv = opts.profileOverrides?.codex ?? {};
-  const home = os.homedir();
   const profiles = new Map<AcpAdapterId, UpstreamProfile>();
-  profiles.set('claude', {
+  profiles.set('claude', buildClaudeProfile(claudeOv));
+  profiles.set('codex', buildCodexProfile(opts.profileOverrides?.codex ?? {}));
+  profiles.set('opencode', buildOpencodeProfile(opts.profileOverrides?.opencode ?? {}));
+  return profiles;
+}
+
+function buildClaudeProfile(ov: UpstreamProfileOverride): UpstreamProfile {
+  return {
     adapterId: 'claude',
-    upstreamHost: claudeOv.upstreamHost ?? 'api.anthropic.com',
-    credentialsPath: claudeOv.credentialsPath ?? path.join(home, '.claude', '.credentials.json'),
+    upstreamHost: ov.upstreamHost ?? 'api.anthropic.com',
+    credentialsPath: ov.credentialsPath ?? path.join(os.homedir(), '.claude', '.credentials.json'),
     extractToken: extractClaudeToken,
     envFallback: () => null,
-    refresher: claudeOv.refresher ?? defaultClaudeRefresher(),
+    refresher: ov.refresher ?? defaultClaudeRefresher(),
     billingTellHeaders: CLAUDE_BILLING_TELL_HEADERS,
-  });
-  profiles.set('codex', {
+  };
+}
+
+function buildCodexProfile(ov: UpstreamProfileOverride): UpstreamProfile {
+  return {
     adapterId: 'codex',
-    upstreamHost: codexOv.upstreamHost ?? 'api.openai.com',
-    credentialsPath: codexOv.credentialsPath ?? path.join(home, '.codex', 'auth.json'),
+    upstreamHost: ov.upstreamHost ?? 'api.openai.com',
+    credentialsPath: ov.credentialsPath ?? path.join(os.homedir(), '.codex', 'auth.json'),
     extractToken: extractCodexToken,
     envFallback: codexEnvFallback,
-    refresher: codexOv.refresher ?? defaultCodexRefresher(),
+    refresher: ov.refresher ?? defaultCodexRefresher(),
     billingTellHeaders: CODEX_BILLING_TELL_HEADERS,
     upstreamRoute: codexUpstreamRoute,
-  });
-  return profiles;
+  };
 }
 
 function resolveCredentialProxyTuning(opts: CredentialProxyOptions): {
@@ -854,7 +892,12 @@ function buildUpstreamRequest(
     host: route?.host ?? profile.upstreamHost,
     method: req.method ?? 'GET',
     pathname: route ? route.rewritePath(inboundPath) : inboundPath,
-    headers: { ...rewritten.headers, ...route?.extraHeaders, authorization: `Bearer ${token.accessToken}` },
+    headers: {
+      ...rewritten.headers,
+      ...profile.egressHeaders,
+      ...route?.extraHeaders,
+      authorization: `Bearer ${token.accessToken}`,
+    },
     body: rewritten.body,
   };
 }
@@ -1029,6 +1072,228 @@ function coerceExpiresAtMs(value: unknown): number | null {
     if (Number.isFinite(n)) return n;
     const parsedDate = Date.parse(value);
     if (Number.isFinite(parsedDate)) return parsedDate;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// opencode / GitHub Copilot upstream profile (issue 130).
+//
+// Unlike claude/codex (where the credential FILE holds the bearer the proxy
+// forwards), opencode's auth.json holds a DURABLE GitHub OAuth token that
+// `api.githubcopilot.com` does NOT accept. The proxy must exchange it host-side
+// for a short-lived (~30 min) Copilot token at
+// `api.github.com/copilot_internal/v2/token`, cache that token in memory, and
+// forward it as the bearer plus the Copilot editor headers. The durable GitHub
+// OAuth token never becomes the bearer and never enters the VM.
+//
+// The exchange reuses the existing refresh machinery: a profile-owned cache
+// holds the Copilot token, `extractToken` returns it (or a deliberately-expired
+// COLD stub when uncached so `ensureFreshToken` runs the exchange before the
+// first forward), and the exchange runs as the profile's `refresher` (under the
+// shared flock + in-process single-flight, with the TTL-margin check firing it
+// before expiry → no mid-session 401). The GitHub token is read-only here (the
+// mint does not rotate it), so concurrent exchanges are safe — there is no
+// single-use-rotation hazard like codex's OAuth refresh.
+// See docs/research/opencode-copilot-accept-matrix.md.
+
+const COPILOT_EXCHANGE_HOST = 'api.github.com';
+const COPILOT_EXCHANGE_PATH = '/copilot_internal/v2/token';
+const COPILOT_INFERENCE_HOST = 'api.githubcopilot.com';
+
+// A VS Code Copilot Chat identity. The in-VM `@ai-sdk/openai-compatible` client
+// sends none of these, so the proxy supplies the full set real-world Copilot
+// proxies (ericc-ch/copilot-api, litellm) send — the "safer choice" over
+// opencode's own minimal set per docs/research/opencode-copilot-accept-matrix.md.
+// Pinned version values DRIFT (GitHub rolls editor/plugin versions forward); these
+// reflect a recent VS Code Copilot Chat release and are DOC-DERIVED.
+const COPILOT_EDITOR_VERSION = 'vscode/1.95.0';
+const COPILOT_PLUGIN_VERSION = 'copilot-chat/0.26.7';
+const COPILOT_USER_AGENT = 'GitHubCopilotChat/0.26.7';
+const COPILOT_GH_API_VERSION = '2025-04-01';
+
+/**
+ * GitHub Copilot inference headers `api.githubcopilot.com/chat/completions`
+ * expects. DOC-DERIVED (docs/research/opencode-copilot-accept-matrix.md).
+ * `copilot-integration-id: vscode-chat` is the load-bearing one — GitHub rejects
+ * an unrecognised value; the editor/user-agent headers identify the "editor" to
+ * Copilot's telemetry and widen the model allowlist. Lowercase keys (HTTP
+ * headers are case-insensitive and the proxy normalises inbound headers to
+ * lowercase, so these merge cleanly over the inbound set).
+ */
+const COPILOT_EGRESS_HEADERS: Record<string, string> = {
+  'copilot-integration-id': 'vscode-chat',
+  'editor-version': COPILOT_EDITOR_VERSION,
+  'editor-plugin-version': COPILOT_PLUGIN_VERSION,
+  'user-agent': COPILOT_USER_AGENT,
+  'openai-intent': 'conversation-panel',
+  'x-github-api-version': COPILOT_GH_API_VERSION,
+};
+
+/**
+ * Headers for the GitHub→Copilot token exchange (api.github.com). The editor +
+ * user-agent identity is sent, but NOT `copilot-integration-id` — real clients
+ * (ericc-ch/copilot-api `githubHeaders()`) omit it on the exchange call (it
+ * belongs on the inference call). The GitHub OAuth token is added as
+ * `Authorization: token <…>` at request time.
+ */
+const COPILOT_EXCHANGE_HEADERS: Record<string, string> = {
+  accept: 'application/json',
+  'editor-version': COPILOT_EDITOR_VERSION,
+  'editor-plugin-version': COPILOT_PLUGIN_VERSION,
+  'user-agent': COPILOT_USER_AGENT,
+  'x-github-api-version': COPILOT_GH_API_VERSION,
+};
+
+// GitHub Copilot's billing-tell response headers. UNMEASURED candidate set (no
+// live Copilot credential on the implementer's host — see the accept-matrix
+// doc); whichever appear are logged, but there is no reliable subscription-vs-
+// metered assertion until a live measurement lands.
+const COPILOT_BILLING_TELL_HEADERS: readonly string[] = [
+  'x-ratelimit-limit-requests',
+  'x-ratelimit-remaining-requests',
+  'x-ratelimit-limit-tokens',
+  'x-ratelimit-remaining-tokens',
+  'x-github-request-id',
+];
+
+/**
+ * Cold stub returned by the opencode profile's token reader when no Copilot
+ * token is cached yet but a GitHub token IS available: its zero expiry makes
+ * `ensureFreshToken` treat it as stale and run the exchange refresher before
+ * the first upstream forward. Its (empty) accessToken is never the bearer on
+ * the happy path — the refresh populates the real token first. It is only ever
+ * forwarded if the exchange itself fails, which then surfaces as an upstream
+ * auth error (the correct outcome when the host cannot mint a Copilot token).
+ */
+const COPILOT_COLD_STUB: TokenInfo = { accessToken: '', expiresAtMs: 0 };
+
+/**
+ * Build the opencode upstream profile. Closes over an in-memory cache of the
+ * exchanged Copilot token; `exchange` (injectable for tests) performs the
+ * GitHub→Copilot mint.
+ */
+function buildOpencodeProfile(ov: UpstreamProfileOverride): UpstreamProfile {
+  const credentialsPath = ov.credentialsPath ?? hostOpencodeCredentialPath();
+  const exchange = ov.copilotExchange ?? defaultCopilotExchange();
+  // Mutable cache of the short-lived Copilot token (the durable GitHub token
+  // stays on the host and never lands here as the bearer).
+  const cache: { token: TokenInfo | null } = { token: null };
+  const cachedOrStub = (githubToken: string | null): TokenInfo | null => {
+    if (cache.token !== null) return cache.token;
+    return githubToken !== null ? COPILOT_COLD_STUB : null;
+  };
+  return {
+    adapterId: 'opencode',
+    upstreamHost: ov.upstreamHost ?? COPILOT_INFERENCE_HOST,
+    credentialsPath,
+    // `parsed` is opencode's auth.json. We read it only to detect that a
+    // GitHub token EXISTS (so a cold cache forces a refresh vs a 503); the
+    // token bytes never become the bearer — the cached Copilot token does.
+    extractToken: (parsed) => cachedOrStub(opencodeGithubTokenFromAuth(parsed)),
+    envFallback: () => cachedOrStub(opencodeGithubTokenFromEnv(process.env)),
+    refresher: makeCopilotRefresher(credentialsPath, exchange, cache),
+    egressHeaders: COPILOT_EGRESS_HEADERS,
+    billingTellHeaders: COPILOT_BILLING_TELL_HEADERS,
+  };
+}
+
+/**
+ * The opencode refresher: read the durable GitHub token (auth.json first, then
+ * the COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN env fallback), exchange it for
+ * a Copilot token, and store the result in `cache`. Throws when no GitHub token
+ * is resolvable so the failure surfaces (rather than silently caching null).
+ */
+function makeCopilotRefresher(
+  credentialsPath: string,
+  exchange: CopilotTokenExchange,
+  cache: { token: TokenInfo | null },
+): () => Promise<void> {
+  return async () => {
+    const githubToken = await readOpencodeGithubToken(credentialsPath);
+    if (githubToken === null) {
+      throw new Error(
+        'opencode: no GitHub Copilot token available to exchange (auth.json + env both empty)',
+      );
+    }
+    cache.token = await exchange(githubToken);
+  };
+}
+
+/** Read the durable GitHub OAuth token: opencode auth.json first, then env. */
+async function readOpencodeGithubToken(credentialsPath: string): Promise<string | null> {
+  try {
+    const raw = await readFile(credentialsPath, 'utf8');
+    const fromFile = opencodeGithubTokenFromAuth(JSON.parse(raw));
+    if (fromFile !== null) return fromFile;
+  } catch {
+    // File missing / unreadable / bad JSON — fall through to the env fallback.
+  }
+  return opencodeGithubTokenFromEnv(process.env);
+}
+
+/**
+ * Default GitHub→Copilot token exchange: `GET api.github.com/copilot_internal/v2/token`
+ * with `Authorization: token <gho_…>` (GitHub's classic-token scheme, NOT
+ * Bearer) and the editor headers. Parses `{ token, expires_at }` — `expires_at`
+ * is unix SECONDS, converted to ms. DOC-DERIVED request/response shape.
+ */
+function defaultCopilotExchange(): CopilotTokenExchange {
+  return (githubToken) =>
+    new Promise<TokenInfo>((resolve, reject) => {
+      const opts: HttpsRequestOptions = {
+        method: 'GET',
+        hostname: COPILOT_EXCHANGE_HOST,
+        path: COPILOT_EXCHANGE_PATH,
+        headers: {
+          // GitHub's classic-token scheme (`token <…>`), NOT Bearer.
+          authorization: `token ${githubToken}`,
+          ...COPILOT_EXCHANGE_HEADERS,
+        },
+      };
+      const req = httpsRequest(opts, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          const status = res.statusCode ?? 0;
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (status < 200 || status >= 300) {
+            reject(new Error(`copilot token exchange failed: HTTP ${status}`));
+            return;
+          }
+          resolve(parseCopilotExchangeResponse(text));
+        });
+      });
+      req.once('error', reject);
+      req.end();
+    });
+}
+
+/** Parse the copilot_internal/v2/token response into a TokenInfo. */
+function parseCopilotExchangeResponse(text: string): TokenInfo {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`copilot token exchange: malformed JSON (${(err as Error).message})`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('copilot token exchange: response is not an object');
+  }
+  const root = parsed as Record<string, unknown>;
+  const token = root['token'];
+  if (typeof token !== 'string' || token.length === 0) {
+    throw new Error('copilot token exchange: response missing "token"');
+  }
+  return { accessToken: token, expiresAtMs: coerceCopilotExpiry(root['expires_at']) };
+}
+
+/** Copilot `expires_at` is unix SECONDS; convert to ms (null when absent/odd). */
+function coerceCopilotExpiry(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value * 1000;
+  if (typeof value === 'string') {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n * 1000;
   }
   return null;
 }

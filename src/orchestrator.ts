@@ -30,7 +30,10 @@ import {
   codexMissingCredentialMessage,
   hostClaudeCredentialPath,
   hostCodexCredentialPath,
+  hostOpencodeCredentialPath,
   isKnownAdapter,
+  opencodeCredentialAvailable,
+  opencodeMissingCredentialMessage,
 } from './agent/adapter-names.js';
 import { accessSync, constants as fsConstants, readFileSync } from 'node:fs';
 import { activeStateNames, terminalStateNames } from './issues.js';
@@ -267,13 +270,16 @@ export class Orchestrator
    * change the adapter, so the set is the union of `cfg.acp.adapter` and every
    * distinct `states.<name>.adapter`. claude needs `~/.claude/.credentials.json`;
    * codex needs either a `~/.codex/auth.json` token or an `OPENAI_API_KEY` env
-   * var. A missing credential surfaces here as a clear startup error rather than
-   * an opaque per-request proxy failure mid-dispatch.
+   * var; opencode needs either a `github-copilot` token in
+   * `~/.local/share/opencode/auth.json` or a COPILOT_GITHUB_TOKEN/GH_TOKEN/
+   * GITHUB_TOKEN env var. A missing credential surfaces here as a clear startup
+   * error rather than an opaque per-request proxy failure mid-dispatch.
    */
   private async assertAdapterCredentials(): Promise<void> {
     const ids = requiredAdapterIds(this.cfg, isKnownAdapter);
     if (ids.has('claude')) this.assertClaudeCredential();
     if (ids.has('codex')) this.assertCodexCredential();
+    if (ids.has('opencode')) this.assertOpencodeCredential();
   }
 
   private assertClaudeCredential(): void {
@@ -297,6 +303,19 @@ export class Orchestrator
     if (codexCredentialAvailable(authText, process.env)) return;
     const msg = codexMissingCredentialMessage();
     log.error('startup credential check failed', { adapter: 'codex', error: msg });
+    throw new WorkflowError('missing_host_credential', msg);
+  }
+
+  private assertOpencodeCredential(): void {
+    let authText: string | null = null;
+    try {
+      authText = readFileSync(hostOpencodeCredentialPath(), 'utf8');
+    } catch {
+      authText = null;
+    }
+    if (opencodeCredentialAvailable(authText, process.env)) return;
+    const msg = opencodeMissingCredentialMessage();
+    log.error('startup credential check failed', { adapter: 'opencode', error: msg });
     throw new WorkflowError('missing_host_credential', msg);
   }
 
