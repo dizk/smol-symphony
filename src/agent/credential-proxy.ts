@@ -284,7 +284,9 @@ interface Registration {
 
 // Anthropic's subscription billing tell: the unified-window ratelimit family +
 // org id. Logged per response so operators can observe Max-window consumption.
-const CLAUDE_BILLING_TELL_HEADERS: readonly string[] = [
+// Exported so the dormant `credential-secrets` module can reuse the same
+// billing-tell header set in its `onResponse` hook (no logic change).
+export const CLAUDE_BILLING_TELL_HEADERS: readonly string[] = [
   'anthropic-organization-id',
   'anthropic-ratelimit-unified-5h-status',
   'anthropic-ratelimit-unified-5h-reset',
@@ -301,7 +303,8 @@ const CLAUDE_BILLING_TELL_HEADERS: readonly string[] = [
 // known limitation for #116: capturing the real discriminator needs a host with
 // a live ChatGPT-OAuth credential AND access to the proxy's `upstream ratelimit`
 // log line, tracked as follow-up #121.
-const CODEX_BILLING_TELL_HEADERS: readonly string[] = [
+// Exported so `credential-secrets` reuses the same billing-tell set (no logic change).
+export const CODEX_BILLING_TELL_HEADERS: readonly string[] = [
   'x-ratelimit-limit-requests',
   'x-ratelimit-remaining-requests',
   'x-ratelimit-reset-requests',
@@ -345,7 +348,7 @@ function defaultUpstream(): UpstreamRequestor {
  * `~/.claude/.credentials.json`. Symphony never implements OAuth — Anthropic's
  * own client does.
  */
-function defaultClaudeRefresher(): () => Promise<void> {
+export function defaultClaudeRefresher(): () => Promise<void> {
   return () =>
     new Promise<void>((resolve, reject) => {
       const p = spawn('claude', ['-p', 'ok'], { stdio: 'ignore' });
@@ -768,7 +771,7 @@ function resolveCredentialProxyTuning(opts: CredentialProxyOptions): {
  *   - ownership safety: a peer cannot delete our live lock (no lockfile to
  *     unlink — only a kernel-managed lock on the open FD).
  */
-function defaultFlockAcquire(lockPath: string): LockAcquire {
+export function defaultFlockAcquire(lockPath: string): LockAcquire {
   return async (timeoutMs: number) => {
     await mkdir(path.dirname(lockPath), { recursive: true });
     return spawnFlockHolder(lockPath, timeoutMs);
@@ -972,7 +975,7 @@ function logRateLimitHeaders(
  * shape `claude` writes is `{ claudeAiOauth: { accessToken, expiresAt, ... } }`,
  * but we tolerate flat top-level fields too for forward compatibility.
  */
-function extractClaudeToken(parsed: unknown): TokenInfo | null {
+export function extractClaudeToken(parsed: unknown): TokenInfo | null {
   if (!parsed || typeof parsed !== 'object') return null;
   const root = parsed as Record<string, unknown>;
   const oauth = root['claudeAiOauth'];
@@ -994,7 +997,7 @@ function extractClaudeToken(parsed: unknown): TokenInfo | null {
  * tokens are long-lived (~8 days) and the proxy re-reads on each request rather
  * than driving a refresh (research Q3 option c).
  */
-function extractCodexToken(parsed: unknown): TokenInfo | null {
+export function extractCodexToken(parsed: unknown): TokenInfo | null {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
   const root = parsed as Record<string, unknown>;
   const tokens = codexTokensObject(root);
@@ -1059,7 +1062,7 @@ function nonEmptyString(v: unknown): string | null {
 }
 
 /** Read `OPENAI_API_KEY` from the host environment as a codex credential fallback. */
-function codexEnvFallback(): TokenInfo | null {
+export function codexEnvFallback(): TokenInfo | null {
   const key = process.env['OPENAI_API_KEY'];
   if (typeof key === 'string' && key.length > 0) return { accessToken: key, expiresAtMs: null };
   return null;
@@ -1097,9 +1100,11 @@ function coerceExpiresAtMs(value: unknown): number | null {
 // single-use-rotation hazard like codex's OAuth refresh.
 // See docs/research/opencode-copilot-accept-matrix.md.
 
-const COPILOT_EXCHANGE_HOST = 'api.github.com';
-const COPILOT_EXCHANGE_PATH = '/copilot_internal/v2/token';
-const COPILOT_INFERENCE_HOST = 'api.githubcopilot.com';
+// Exported so `credential-secrets` reuses the exact host/path constants for its
+// `allowedHosts` + the `api.github.com` path-allowlist guard (no logic change).
+export const COPILOT_EXCHANGE_HOST = 'api.github.com';
+export const COPILOT_EXCHANGE_PATH = '/copilot_internal/v2/token';
+export const COPILOT_INFERENCE_HOST = 'api.githubcopilot.com';
 
 // A VS Code Copilot Chat identity. The in-VM `@ai-sdk/openai-compatible` client
 // sends none of these, so the proxy supplies the full set real-world Copilot
@@ -1121,7 +1126,7 @@ const COPILOT_GH_API_VERSION = '2025-04-01';
  * headers are case-insensitive and the proxy normalises inbound headers to
  * lowercase, so these merge cleanly over the inbound set).
  */
-const COPILOT_EGRESS_HEADERS: Record<string, string> = {
+export const COPILOT_EGRESS_HEADERS: Record<string, string> = {
   'copilot-integration-id': 'vscode-chat',
   'editor-version': COPILOT_EDITOR_VERSION,
   'editor-plugin-version': COPILOT_PLUGIN_VERSION,
@@ -1149,7 +1154,7 @@ const COPILOT_EXCHANGE_HEADERS: Record<string, string> = {
 // live Copilot credential on the implementer's host — see the accept-matrix
 // doc); whichever appear are logged, but there is no reliable subscription-vs-
 // metered assertion until a live measurement lands.
-const COPILOT_BILLING_TELL_HEADERS: readonly string[] = [
+export const COPILOT_BILLING_TELL_HEADERS: readonly string[] = [
   'x-ratelimit-limit-requests',
   'x-ratelimit-remaining-requests',
   'x-ratelimit-limit-tokens',
@@ -1238,7 +1243,7 @@ async function readOpencodeGithubToken(credentialsPath: string): Promise<string 
  * Bearer) and the editor headers. Parses `{ token, expires_at }` — `expires_at`
  * is unix SECONDS, converted to ms. DOC-DERIVED request/response shape.
  */
-function defaultCopilotExchange(): CopilotTokenExchange {
+export function defaultCopilotExchange(): CopilotTokenExchange {
   return (githubToken) =>
     new Promise<TokenInfo>((resolve, reject) => {
       const opts: HttpsRequestOptions = {
