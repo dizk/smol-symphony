@@ -85,6 +85,8 @@ tracker:
 #             already consumes one slot), so this is opt-in per state rather
 #             than a workflow-wide default — flip it on for a dedicated eval
 #             state, not for the routine implement/review flow. Default: false.
+#             The canonical consumer is the "sleep cycle" reflection pattern —
+#             see the SLEEP CYCLE section below the states block.
 #   hooks     (map, optional): per-state overrides for the workflow-level `hooks:`
 #             block. Each of `after_create`, `before_run`, and `before_remove`
 #             is optional; an omitted key inherits the workflow-level hook, an
@@ -185,6 +187,85 @@ states:
     role: terminal
   Triage:
     role: holding
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLEEP CYCLE — a reflection state that mines finished work for harness
+# improvements (issue 122). Optional, opt-in pattern; layered on top of the
+# states block above. The shipped smol-symphony WORKFLOW.md wires it for the
+# dogfooding (symphony-on-symphony) setup.
+#
+# The idea: every dispatch starts from the same static prompt + config, no
+# matter what the last 100 issues taught us about where agents stall, get
+# rejected, burn their turn budget, or fight the harness. A periodic
+# "reflection" turn closes that feedback loop — it reads completed-task history
+# (the read-only mounts `eval_mode` exposes), distils *recurring* friction, and
+# files improvement proposals against the HARNESS (this WORKFLOW.md's prompt
+# branches and per-state model/max_turns/allowed_transitions/effort, hooks, the
+# Smolfile, acceptance criteria, timeouts) — never the product code under
+# review. Proposals land in Triage via `propose_issue`, so a human stays the
+# gate. This is the "self-improving agent" pattern aimed at the harness rather
+# than the product.
+#
+# Two states implement it:
+#
+#   Reflect (role: active, eval_mode: true):
+#     - eval_mode binds /symphony/issues (all state dirs, incl. the Done/*.md
+#       handoff transcripts) + /symphony/logs (per-issue JSONL run logs)
+#       read-only into the VM. No extra mount plumbing — it reuses the existing
+#       eval_mode mounts.
+#     - Give it a capable adapter/model (large context helps: a reflection turn
+#       reads many transcripts + logs) and a higher max_turns than your
+#       implement/review states.
+#     - allowed_transitions: [Dormant] — the reflector may ONLY go dormant. It
+#       cannot route itself into the implement/review/done flow. Filing
+#       improvements goes through propose_issue (→ Triage), which is independent
+#       of allowed_transitions.
+#     - The prompt body's `when "Reflect"` branch encodes the
+#       read → distil → propose loop and the GUARDRAILS below.
+#
+#   Dormant (role: holding):
+#     - Resting place for the single recurring "Sleep cycle" issue between runs.
+#       Holding → never dispatched. Declare it AFTER your Triage state so Triage
+#       stays the first holding state (the `propose_issue` landing + triage
+#       approve/discard target both resolve the FIRST declared holding state).
+#     - Dashboard caveat: the dashboard currently renders triage approve/discard
+#       buttons on every holding row, and the tracker resolves a move by issue
+#       id regardless of source directory — so clicking those buttons on a
+#       Dormant issue would mis-route it. Re-arm via cron/CLI/filesystem, not the
+#       dashboard buttons.
+#
+# GUARDRAILS (this is a self-modifying loop — keep the human in it):
+#   - Output is proposals into Triage (holding, never auto-dispatched). The
+#     operator approves/discards. Do not bypass this gate.
+#   - Constrain the proposal surface to harness config. Forbid any proposal that
+#     weakens the Review state, the test/lint gates, or the Triage gate itself.
+#   - Each proposal must cite the issue ids that motivated it, so the operator
+#     checks the lesson against the evidence rather than the reflector's summary.
+#
+# CADENCE (v1 — operator/scheduled-triggered, no orchestrator trigger logic):
+#   A single recurring issue (e.g. titled "Sleep cycle") oscillates Reflect ↔
+#   Dormant. The operator drops it into Reflect (dashboard, or `mv` on disk), or
+#   an external cron / a `symphony reflect` verb arms it. After it files
+#   proposals it transitions to Dormant and waits to be re-armed. Auto-arm on
+#   idle (no active issues) or after N transitions into Done is a deliberate
+#   follow-up, out of scope for v1.
+#
+# Example states to add (names are yours to choose):
+#
+#   states:
+#     # ... your active/terminal states ...
+#     Reflect:
+#       role: active
+#       adapter: claude
+#       model: claude-opus-4-8[1m]   # large context for reading transcripts
+#       max_turns: 20                # higher than implement/review
+#       eval_mode: true
+#       allowed_transitions: [Dormant]
+#     Triage:
+#       role: holding                # declared before Dormant
+#     Dormant:
+#       role: holding
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
 # pr_autopilot — arm GitHub auto-merge when a terminal-state PR is
