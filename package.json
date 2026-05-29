@@ -50,7 +50,8 @@
     "test": "node --test --import tsx tests/*.test.ts",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "lint": "eslint src --max-warnings 0",
-    "lint:arch": "depcruise src --ts-config tsconfig.json --ignore-known"
+    "lint:arch": "depcruise src --ts-config tsconfig.json --ignore-known",
+    "build:image": "bash images/agents/build-image-oci.sh"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.22.1",

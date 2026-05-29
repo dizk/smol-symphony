@@ -1,0 +1,39 @@
+# Agent rootfs for the Gondolin VM substrate.
+#
+# This is the glibc base for Gondolin's OCI-rootfs build path. It replaces the
+# old per-issue smolvm bake (Smolfile + `[dev].init` apt/npm on every dispatch):
+# the agents are baked ONCE here, the image is built ONCE (see build-image-oci.sh),
+# and the runner boots it by tag/digest. Base is `node:24-bookworm-slim` — the same
+# image the prod Smolfile used — so the agent CLIs (esp. opencode) install via their
+# normal glibc platform binaries, sidestepping the Alpine/musl + chroot postinstall
+# issues we hit in the spike.
+#
+# NOTE: `scripts/vm-agent.mjs` is NOT baked in here (unlike the Smolfile, which had
+# to `cp` it into /opt/symphony to dodge smolvm's 3-mount virtio-fs cap). Gondolin's
+# VFS is programmable, so the runner mounts scripts/ at runtime — no bake needed.
+#
+# NOTE: Gondolin injects its MITM CA into the guest at boot, so this image needs no
+# CA setup (spike-verified: TLS-MITM CA trusted out-of-the-box).
+#
+# Agent CLI pins MUST match the prod Smolfile set. codex + codex-acp + opencode are
+# pinned deliberately: an unpinned bump can silently change codex's Responses-API
+# transport (the #127 wss bypass that leaked the proxy sentinel) or opencode's
+# acp/custom-provider behavior (#130). Bump these consciously, not by drift.
+FROM node:24-bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git ripgrep ca-certificates curl bash openssh-client \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-audit --no-fund \
+      @openai/codex@0.135.0 \
+      @anthropic-ai/claude-code \
+      @agentclientprotocol/claude-agent-acp \
+      @zed-industries/codex-acp@0.15.0 \
+      opencode-ai@1.15.12
+
+# Fail the build loudly if any adapter CLI is missing.
+RUN for b in claude claude-agent-acp codex codex-acp opencode; do \
+      command -v "$b" >/dev/null || { echo "MISSING: $b"; exit 1; }; \
+    done && echo "ALL-AGENT-CLIS-OK"
