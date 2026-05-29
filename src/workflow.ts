@@ -240,6 +240,18 @@ export function buildServiceConfig(
       'agent.host_memory_reserve_mib must be a non-negative integer',
     );
   }
+  // Circuit breaker (issue 128). Default 5: after five consecutive identical
+  // failures the orchestrator stops retrying and routes the issue to a holding
+  // state. 0 disables the breaker; 1 would trip on the first failure (no retry
+  // ever), which is rarely wanted, so the parser rejects it as a likely
+  // misconfiguration — use 0 to disable or >= 2 to bound the loop.
+  const circuitBreakerThreshold = asInt(agentRaw['circuit_breaker_threshold'], 5);
+  if (circuitBreakerThreshold < 0 || circuitBreakerThreshold === 1) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      'agent.circuit_breaker_threshold must be 0 (disabled) or an integer >= 2',
+    );
+  }
   const agent: AgentConfig = {
     max_concurrent_agents: asInt(agentRaw['max_concurrent_agents'], 10),
     max_turns: maxTurns,
@@ -247,6 +259,7 @@ export function buildServiceConfig(
     max_concurrent_agents_by_state: asMapStrPosInt(agentRaw['max_concurrent_agents_by_state']),
     memory_admission_enabled: memoryAdmissionEnabled,
     host_memory_reserve_mib: hostMemoryReserveMib,
+    circuit_breaker_threshold: circuitBreakerThreshold,
   };
 
   // acp (Symphony extension; see §4.3.6). `adapter` selects

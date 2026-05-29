@@ -55,6 +55,7 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
       max_concurrent_agents_by_state: {},
       memory_admission_enabled: false,
       host_memory_reserve_mib: 2048,
+      circuit_breaker_threshold: 5,
     },
     acp: {
       adapter: 'claude',

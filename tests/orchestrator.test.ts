@@ -765,3 +765,256 @@ describe('Orchestrator VM lifecycle reaping', () => {
     }
   });
 });
+
+describe('Orchestrator circuit breaker (issue 128)', () => {
+  it('routes an issue to a holding state after K consecutive identical failures and stops retrying', async () => {
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb-tracker-'));
+    const logsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb-logs-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          agent: {
+            max_concurrent_agents: 1,
+            memory_admission_enabled: false,
+            circuit_breaker_threshold: 3,
+            // Fail-retry backoff is min(10000 * 2^(n-1), maxBackoff); a tiny cap
+            // makes the retries fire ~immediately so the loop reaches the
+            // threshold within the test's time budget.
+            max_retry_backoff_ms: 5,
+          },
+          polling: { interval_ms: 20 },
+          logs: { root: logsRoot },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+
+      // Active-state-filtered fake tracker. `moveIssueToState` mutates the
+      // in-memory state so a moved (holding) issue stops being a candidate,
+      // mirroring the local tracker — this is what makes the trip restart-safe.
+      let current: Issue = {
+        id: 'cb1', identifier: 'cb1', title: 'cb', description: null, priority: null,
+        state: 'Todo', branch_name: null, url: null, labels: [], blocked_by: [],
+        created_at: null, updated_at: null,
+      };
+      const moves: Array<{ toState: string; fromState?: string; notes?: string }> = [];
+      const tracker: IssueTracker = {
+        async fetchCandidateIssues(): Promise<CandidateFetchResult> {
+          const issues = current.state.toLowerCase() === 'todo' ? [{ ...current }] : [];
+          return { issues, root: trackerRoot };
+        },
+        async fetchIssuesByStates(names: string[]): Promise<Issue[]> {
+          const set = new Set(names.map((s) => s.toLowerCase()));
+          return set.has(current.state.toLowerCase()) ? [{ ...current }] : [];
+        },
+        async fetchIssueStatesByIds(ids: string[]): Promise<Issue[]> {
+          return ids.includes(current.id) ? [{ ...current }] : [];
+        },
+        currentRoot(): string | null {
+          return trackerRoot;
+        },
+        async moveIssueToState(issueId, toState, opts) {
+          moves.push({ toState, fromState: opts?.fromState, notes: opts?.notes });
+          const fromState = current.state;
+          current = { ...current, state: toState };
+          return { fromState, toState, newPath: path.join(trackerRoot, toState, `${issueId}.md`) };
+        },
+      };
+
+      let dispatchCount = 0;
+      const runner = {
+        vmNameFor: (i: Issue) => `symphony-${i.identifier}`,
+        async runAttempt(): Promise<RunAttemptResult> {
+          dispatchCount++;
+          // Same failure class every attempt, but with a varying request id to
+          // prove normalization collapses the volatile token — the breaker must
+          // still treat these as identical and accumulate toward the trip.
+          return {
+            ok: false,
+            reason: `agent turn refusal: 401 invalid_api_key (req_${dispatchCount}abc)`,
+            threadId: null,
+            turnsCompleted: 0,
+          };
+        },
+      } as unknown as AgentRunner;
+
+      const fakeWorkspaces = {
+        workspacePathFor: (identifier: string) => path.join(trackerRoot, 'ws', identifier),
+        async ensureFor() {
+          return { path: path.join(trackerRoot, 'ws'), workspace_key: 'cb1', created_now: true };
+        },
+        async remove(): Promise<void> {
+          /* no-op */
+        },
+      } as unknown as WorkspaceManager;
+
+      const orch = new Orchestrator(
+        cfg,
+        def,
+        { onChange: () => () => undefined, current: () => ({} as any), stop: async () => undefined } as unknown as WorkflowSource,
+        tracker,
+        fakeWorkspaces,
+        runner,
+      );
+      await orch.start();
+
+      // Wait for the breaker to trip (the single move into the holding state).
+      const deadline = Date.now() + 3_000;
+      while (moves.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(moves.length, 1, 'breaker should route the issue exactly once');
+      assert.equal(moves[0]!.toState, 'Triage');
+      assert.equal(moves[0]!.fromState, 'Todo');
+      assert.match(moves[0]!.notes ?? '', /Circuit breaker tripped/);
+      assert.match(moves[0]!.notes ?? '', /3 consecutive attempts/);
+      assert.equal(
+        dispatchCount,
+        3,
+        `breaker should trip on the 3rd identical failure; saw ${dispatchCount} dispatches`,
+      );
+      assert.equal(current.state, 'Triage', 'issue should now live in the holding state');
+
+      // No further dispatches after the trip — give the loop time to misbehave.
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(dispatchCount, 3, 'no dispatch should occur after the breaker trips');
+
+      await orch.stop();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+      await rm(logsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not trip when failures differ each attempt (streak resets)', async () => {
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb2-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb2-tracker-'));
+    const logsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb2-logs-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          agent: {
+            max_concurrent_agents: 1,
+            memory_admission_enabled: false,
+            circuit_breaker_threshold: 3,
+            max_retry_backoff_ms: 5,
+          },
+          polling: { interval_ms: 20 },
+          logs: { root: logsRoot },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+
+      const current: Issue = {
+        id: 'cb2', identifier: 'cb2', title: 'cb2', description: null, priority: null,
+        state: 'Todo', branch_name: null, url: null, labels: [], blocked_by: [],
+        created_at: null, updated_at: null,
+      };
+      const moves: string[] = [];
+      const tracker: IssueTracker = {
+        async fetchCandidateIssues(): Promise<CandidateFetchResult> {
+          return { issues: [{ ...current }], root: trackerRoot };
+        },
+        async fetchIssuesByStates(names: string[]): Promise<Issue[]> {
+          const set = new Set(names.map((s) => s.toLowerCase()));
+          return set.has(current.state.toLowerCase()) ? [{ ...current }] : [];
+        },
+        async fetchIssueStatesByIds(ids: string[]): Promise<Issue[]> {
+          return ids.includes(current.id) ? [{ ...current }] : [];
+        },
+        currentRoot(): string | null {
+          return trackerRoot;
+        },
+        async moveIssueToState(_id, toState) {
+          moves.push(toState);
+          return { fromState: 'Todo', toState, newPath: '' };
+        },
+      };
+
+      let dispatchCount = 0;
+      const runner = {
+        vmNameFor: (i: Issue) => `symphony-${i.identifier}`,
+        async runAttempt(): Promise<RunAttemptResult> {
+          dispatchCount++;
+          // A DIFFERENT failure class each attempt: the normalized reasons never
+          // match two in a row, so the streak resets and the breaker never trips.
+          const reasons = [
+            'smolvm bring-up error',
+            'before_run hook error',
+            'acp bridge register failed',
+            'workspace error',
+            'identity staging error',
+          ];
+          return {
+            ok: false,
+            reason: reasons[dispatchCount % reasons.length]!,
+            threadId: null,
+            turnsCompleted: 0,
+          };
+        },
+      } as unknown as AgentRunner;
+
+      const fakeWorkspaces = {
+        workspacePathFor: (identifier: string) => path.join(trackerRoot, 'ws', identifier),
+        async ensureFor() {
+          return { path: path.join(trackerRoot, 'ws'), workspace_key: 'cb2', created_now: true };
+        },
+        async remove(): Promise<void> {
+          /* no-op */
+        },
+      } as unknown as WorkspaceManager;
+
+      const orch = new Orchestrator(
+        cfg,
+        def,
+        { onChange: () => () => undefined, current: () => ({} as any), stop: async () => undefined } as unknown as WorkflowSource,
+        tracker,
+        fakeWorkspaces,
+        runner,
+      );
+      await orch.start();
+
+      // Let several retries accumulate; with distinct reasons the streak resets
+      // each time and the breaker must never route the issue.
+      const deadline = Date.now() + 500;
+      while (dispatchCount < 6 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.ok(dispatchCount >= 6, `expected the loop to keep retrying; saw ${dispatchCount}`);
+      assert.deepEqual(moves, [], 'breaker must not route when failures differ each attempt');
+
+      await orch.stop();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+      await rm(logsRoot, { recursive: true, force: true });
+    }
+  });
+});

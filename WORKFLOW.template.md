@@ -546,6 +546,20 @@ agent:
   # workloads; lower on dedicated worker hosts. Default: 2048.
   host_memory_reserve_mib: 2048
 
+  # circuit_breaker_threshold (int): after this many CONSECUTIVE dispatch
+  # attempts fail with the *same* (normalized) reason, the orchestrator stops
+  # retrying the issue and routes it to a holding state (the first declared
+  # `role: holding` state) for a human to inspect, instead of looping forever
+  # on a deterministically-failing dispatch (issue 128 — a persistent
+  # `401 invalid_api_key` once looped ~324 attempts over ~13h). The streak
+  # resets the moment an attempt fails with a different reason or exits
+  # cleanly, so transient/varied failures still retry under the normal backoff
+  # (`max_retry_backoff_ms`). The tripped issue's body gets a diagnostic note
+  # explaining the trip so the dashboard shows "stuck on identical failure"
+  # rather than a silent loop. Set to 0 to disable; must otherwise be >= 2
+  # (1 would trip on the first failure, never retrying). Default: 5.
+  circuit_breaker_threshold: 5
+
 # ─────────────────────────────────────────────────────────────────────────────
 # acp — Agent Client Protocol adapter selection.
 # ─────────────────────────────────────────────────────────────────────────────

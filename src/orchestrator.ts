@@ -41,11 +41,13 @@ import {
   buildIssueDetailDto,
   classifyPrIntent,
   computeEligibilityReason,
+  decideCircuitBreaker,
   decideExitRetry,
   decideReconcileForIssue,
   decideRetryAfterIneligible,
   requiredAdapterIds,
   resolveActorString,
+  type CircuitBreakerState,
   type EligibilitySnapshot,
 } from './orchestrator-decisions.js';
 
@@ -157,6 +159,12 @@ export class Orchestrator
   private running = new Map<string, RunningEntry>();
   private claimed = new Set<string>();
   private retryAttempts = new Map<string, RetryEntry>();
+  // Per-issue circuit-breaker streak (issue 128): the last abnormal-exit reason
+  // (normalized) and how many consecutive attempts failed with it. Updated on
+  // every worker exit; cleared on a clean exit, on trip, and on claim release.
+  // In-memory only — a process restart resets the streak, but the *trip itself*
+  // is restart-safe because it physically moves the issue out of the active set.
+  private circuitBreakers = new Map<string, CircuitBreakerState>();
   private completed = new Set<string>();
   // Per-state ledger of the most-recent action-list execution. Surfaced via
   // `snapshot.reconciler.resources` so the dashboard can render "Done.actions:
@@ -342,6 +350,7 @@ export class Orchestrator
     for (const e of this.running.values()) e.cancel();
     this.running.clear();
     this.claimed.clear();
+    this.circuitBreakers.clear();
     // Drain every open run log so the JSONL files are flushed before exit.
     const closures: Promise<void>[] = [];
     for (const [issueId, rl] of this.runLogs) {
@@ -887,9 +896,15 @@ export class Orchestrator
     // a new retry — that would leave a live timer behind even though stop() was called.
     if (this.stopped) {
       this.claimed.delete(issueId);
+      this.circuitBreakers.delete(issueId);
       return;
     }
     if (normal) this.completed.add(issueId);
+    // Circuit breaker (issue 128): a deterministically-failing dispatch (same
+    // reason every attempt) would otherwise retry forever under backoff. Trip
+    // after the configured streak and route the issue to a holding state
+    // instead of scheduling another retry.
+    if (this.updateCircuitBreaker(issueId, normal, reason, entry)) return;
     const plan = decideExitRetry({
       normal,
       reason,
@@ -909,6 +924,119 @@ export class Orchestrator
       });
     }
     this.scheduleRetry(issueId, { identifier: entry.identifier, ...plan });
+  }
+
+  /**
+   * Fold this exit into the per-issue circuit-breaker streak (issue 128) and
+   * return true when the breaker tripped — the caller must then NOT schedule a
+   * retry. A clean exit clears the streak; an abnormal exit either records the
+   * (normalized) failure or, on reaching `agent.circuit_breaker_threshold`
+   * consecutive identical failures, trips and fires the holding-state route.
+   * The pure `decideCircuitBreaker` owns the counting; this shell just persists
+   * the streak and dispatches the side effect.
+   */
+  private updateCircuitBreaker(
+    issueId: string,
+    normal: boolean,
+    reason: string,
+    entry: RunningEntry,
+  ): boolean {
+    const decision = decideCircuitBreaker({
+      normal,
+      reason,
+      prior: this.circuitBreakers.get(issueId) ?? null,
+      threshold: this.cfg.agent.circuit_breaker_threshold,
+    });
+    if (decision.kind === 'continue') {
+      this.circuitBreakers.set(issueId, {
+        normalizedReason: decision.normalizedReason,
+        count: decision.count,
+      });
+      return false;
+    }
+    this.circuitBreakers.delete(issueId);
+    if (decision.kind === 'trip') {
+      void this.tripCircuitBreaker(issueId, entry, reason, decision.count);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Stop retrying a circuit-broken issue and move it into a holding state so a
+   * human sees "stuck on identical failure" on the dashboard rather than a
+   * silent multi-hour loop. The move is restart-safe (the file leaves the
+   * active set on disk, so the loop cannot resume on the next process start).
+   * If routing fails — no `holding` state declared, or the tracker can't write
+   * — we keep the issue's dispatch claim so the tick's `already claimed` gate
+   * still halts the loop for this session, and log loudly.
+   */
+  private async tripCircuitBreaker(
+    issueId: string,
+    entry: RunningEntry,
+    reason: string,
+    count: number,
+  ): Promise<void> {
+    const logger = withIssue({ issue_id: issueId, issue_identifier: entry.identifier });
+    this.runLogs.get(issueId)?.system('circuit_breaker_tripped', {
+      reason,
+      consecutive_failures: count,
+    });
+    logger.error('circuit breaker tripped; halting retries', { reason, consecutive_failures: count });
+    let holdingState: string;
+    try {
+      holdingState = pickHoldingState(this.cfg.states);
+    } catch {
+      logger.error('no holding state declared; retaining claim to halt the retry loop', { reason });
+      return;
+    }
+    const moved = await this.routeToHolding(issueId, entry, holdingState, reason, count);
+    if (moved) {
+      this.claimed.delete(issueId);
+      this.closeRunLog(issueId, { reason: 'circuit_breaker_tripped' });
+    }
+  }
+
+  /**
+   * Move `entry`'s tracker file into `holdingState`, appending a diagnostic
+   * note (rendered into the issue body before the rename) so the operator sees
+   * why it stopped. Returns false when the tracker can't perform the move so
+   * the caller can fall back to retaining the claim. Modelled on the runner's
+   * action-reroute path; the orchestrator owns this move because it is
+   * state-machine behavior, not repo-local glue.
+   */
+  private async routeToHolding(
+    issueId: string,
+    entry: RunningEntry,
+    holdingState: string,
+    reason: string,
+    count: number,
+  ): Promise<boolean> {
+    if (!this.tracker.moveIssueToState) return false;
+    const notes = [
+      `**Circuit breaker tripped** — routed to \`${holdingState}\` for human inspection.`,
+      '',
+      `Symphony stopped retrying after **${count} consecutive attempts failed with the same error**, to avoid an unbounded dispatch loop (issue 128).`,
+      '',
+      `**Last failure reason:** ${reason}`,
+      '',
+      `Resolve the underlying cause, then move the issue back into an active state to resume dispatch.`,
+    ].join('\n');
+    try {
+      await this.tracker.moveIssueToState(issueId, holdingState, {
+        fromRoot: entry.tracker_root_at_dispatch ?? undefined,
+        fromState: entry.issue.state,
+        notes,
+        actor: entry.resolved_actor,
+      });
+      return true;
+    } catch (err) {
+      withIssue({ issue_id: issueId, issue_identifier: entry.identifier }).error(
+        'circuit breaker route to holding failed; retaining claim',
+        { error: (err as Error).message },
+      );
+      return false;
+    }
   }
 
   /**
@@ -1053,6 +1181,7 @@ export class Orchestrator
     ineligibleReason?: string,
   ): void {
     this.claimed.delete(issueId);
+    this.circuitBreakers.delete(issueId);
     log.info(
       ineligibleReason
         ? 'retry releasing claim (ineligible)'
