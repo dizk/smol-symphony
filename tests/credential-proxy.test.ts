@@ -141,6 +141,84 @@ async function teardown(b: BootedProxy): Promise<void> {
   await rm(b.tmp, { recursive: true, force: true });
 }
 
+interface CodexProxy {
+  proxy: CredentialProxy;
+  base: string;
+  upstream: FakeUpstream;
+  tmp: string;
+}
+
+// Boot a proxy whose codex profile reads `auth` from a temp `auth.json`. The
+// refresher is stubbed to a no-op so the throwing `defaultCodexRefresher` never
+// fires (it can't, since codex tokens carry a null expiry, but be explicit).
+async function bootCodexProxy(auth: Record<string, unknown>): Promise<CodexProxy> {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'symphony-credproxy-codex-'));
+  const credentialsPath = path.join(tmp, 'auth.json');
+  await writeFile(credentialsPath, JSON.stringify(auth), 'utf8');
+  const upstream = makeFakeUpstream();
+  const proxy = new CredentialProxy({
+    profileOverrides: { codex: { credentialsPath, refresher: async () => undefined } },
+    lockPath: path.join(tmp, 'refresh.lock'),
+    upstream,
+  });
+  await proxy.start('127.0.0.1', 0);
+  return { proxy, base: `http://127.0.0.1:${proxy.port()}`, upstream, tmp };
+}
+
+describe('CredentialProxy: codex ChatGPT-backend routing', () => {
+  let active: CodexProxy | null = null;
+  afterEach(async () => {
+    if (active) {
+      await active.proxy.stop();
+      await rm(active.tmp, { recursive: true, force: true });
+      active = null;
+    }
+  });
+
+  it('rewrites the /v1/models capability probe (with query string) too', async () => {
+    active = await bootCodexProxy({ tokens: { access_token: 't', account_id: 'acct-9' } });
+    const reg = active.proxy.register({ issueId: 'i', identifier: '1', adapterId: 'codex' });
+    await fetch(`${active.base}/v1/models?client_version=0.135.0`, {
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+    }).then((r) => r.text());
+    const call = active.upstream.calls[0]!;
+    assert.equal(call.host, 'chatgpt.com');
+    assert.equal(call.pathname, '/backend-api/codex/models?client_version=0.135.0');
+  });
+
+  it('routes a ChatGPT-OAuth token with no account_id to the backend, without the header', async () => {
+    // A `tokens.access_token` with no `account_id` is still an OAuth subscription
+    // credential — it must NOT fall through to api.openai.com (which 401s it).
+    active = await bootCodexProxy({ tokens: { access_token: 'oauth-no-acct' } });
+    const reg = active.proxy.register({ issueId: 'i', identifier: '1', adapterId: 'codex' });
+    await fetch(`${active.base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '{}',
+    }).then((r) => r.text());
+    const call = active.upstream.calls[0]!;
+    assert.equal(call.host, 'chatgpt.com');
+    assert.equal(call.pathname, '/backend-api/codex/responses');
+    assert.equal(call.headers['authorization'], 'Bearer oauth-no-acct');
+    assert.ok(!('chatgpt-account-id' in call.headers));
+  });
+
+  it('keeps an API-key credential on the metered platform API with no account header', async () => {
+    active = await bootCodexProxy({ auth_mode: 'apikey', OPENAI_API_KEY: 'sk-real-platform-key' });
+    const reg = active.proxy.register({ issueId: 'i', identifier: '1', adapterId: 'codex' });
+    await fetch(`${active.base}/v1/responses`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reg.sentinel}` },
+      body: '{}',
+    }).then((r) => r.text());
+    const call = active.upstream.calls[0]!;
+    assert.equal(call.host, 'api.openai.com');
+    assert.equal(call.pathname, '/v1/responses');
+    assert.equal(call.headers['authorization'], 'Bearer sk-real-platform-key');
+    assert.ok(!('chatgpt-account-id' in call.headers));
+  });
+});
+
 describe('CredentialProxy register/deregister', () => {
   let active: BootedProxy | null = null;
   afterEach(async () => {
@@ -659,7 +737,7 @@ describe('CredentialProxy: adapter-keyed upstream profiles (codex)', () => {
     base = `http://127.0.0.1:${proxy.port()}`;
   }
 
-  it('routes a codex registration to api.openai.com with the ChatGPT-OAuth access token', async () => {
+  it('routes a ChatGPT-OAuth codex registration to the ChatGPT backend with the account header', async () => {
     await boot({
       codexAuth: {
         OPENAI_API_KEY: null,
@@ -676,7 +754,11 @@ describe('CredentialProxy: adapter-keyed upstream profiles (codex)', () => {
     });
     assert.equal(res.status, 200);
     const call = upstream.calls[0]!;
-    assert.equal(call.host, 'api.openai.com');
+    // A ChatGPT-OAuth subscription token is rejected by api.openai.com/v1 (missing
+    // api.responses.write scope); it is honored only on the ChatGPT backend.
+    assert.equal(call.host, 'chatgpt.com');
+    assert.equal(call.pathname, '/backend-api/codex/responses');
+    assert.equal(call.headers['chatgpt-account-id'], 'acc-1');
     assert.equal(call.headers['authorization'], 'Bearer cx-access-token');
     // The refresh token must NEVER reach upstream — it stays host-side.
     assert.equal(JSON.stringify(call).includes('cx-REFRESH-token'), false);
@@ -763,7 +845,8 @@ describe('CredentialProxy: adapter-keyed upstream profiles (codex)', () => {
     });
     assert.equal(upstream.calls[0]!.host, 'api.anthropic.com');
     assert.equal(upstream.calls[0]!.headers['authorization'], 'Bearer an-access');
-    assert.equal(upstream.calls[1]!.host, 'api.openai.com');
+    // codex's ChatGPT-OAuth token routes to the ChatGPT backend, not the platform API.
+    assert.equal(upstream.calls[1]!.host, 'chatgpt.com');
     assert.equal(upstream.calls[1]!.headers['authorization'], 'Bearer oa-access');
   });
 

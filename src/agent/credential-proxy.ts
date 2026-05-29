@@ -124,6 +124,37 @@ export interface UpstreamResponse {
 export interface TokenInfo {
   accessToken: string;
   expiresAtMs: number | null;
+  /**
+   * codex only: true when `accessToken` is a ChatGPT-OAuth subscription token
+   * (auth.json `tokens.access_token`). Such tokens are honored ONLY on the
+   * ChatGPT backend (chatgpt.com/backend-api/codex), never the metered platform
+   * API (api.openai.com/v1, which 401s for the missing `api.responses.write`
+   * scope). The codex profile's `upstreamRoute` keys on this; an API-key
+   * credential leaves it false/undefined and keeps the default platform route.
+   */
+  chatgptOAuth?: boolean;
+  /**
+   * codex ChatGPT-OAuth mode: the `chatgpt_account_id` for the
+   * `chatgpt-account-id` header, when present in auth.json. Routing does NOT
+   * depend on it — a ChatGPT-OAuth token with no account id still routes to the
+   * backend (just without the header); `chatgptOAuth` is the routing signal.
+   */
+  chatgptAccountId?: string | null;
+}
+
+/**
+ * Optional per-request upstream route derived from the live credential. Lets a
+ * profile dial a different host/path with extra headers than its default
+ * `upstreamHost` — used by codex to reach OpenAI's ChatGPT backend with a
+ * subscription token instead of the metered platform API.
+ */
+export interface UpstreamRoute {
+  /** Upstream host to dial instead of the profile's `upstreamHost`. */
+  host: string;
+  /** Rewrite the inbound pathname (e.g. `/v1/responses` → `/backend-api/codex/responses`). */
+  rewritePath(pathname: string): string;
+  /** Extra headers to attach at egress (e.g. `chatgpt-account-id`). */
+  extraHeaders: Record<string, string>;
 }
 
 /**
@@ -149,6 +180,13 @@ export interface UpstreamProfile {
   refresher: () => Promise<void>;
   /** Response header names carrying the subscription billing tell, logged per response. */
   billingTellHeaders: readonly string[];
+  /**
+   * Optional per-request upstream route derived from the live token. codex
+   * returns the ChatGPT-backend route when the credential is a ChatGPT-OAuth
+   * subscription token (see {@link TokenInfo.chatgptAccountId}); null ⇒ forward
+   * to `upstreamHost` with the path unchanged (API-key mode).
+   */
+  upstreamRoute?(token: TokenInfo): UpstreamRoute | null;
 }
 
 /** Per-adapter override hook for tests / non-default deployments. */
@@ -520,11 +558,11 @@ export class CredentialProxy {
     return profile.extractToken(parsed);
   }
 
-  private async ensureFreshToken(profile: UpstreamProfile): Promise<string | null> {
+  private async ensureFreshToken(profile: UpstreamProfile): Promise<TokenInfo | null> {
     const cached = await this.readCachedToken(profile);
     if (cached === null) return null;
     if (cached.expiresAtMs === null || cached.expiresAtMs - this.now() > this.refreshMarginMs) {
-      return cached.accessToken;
+      return cached;
     }
     try {
       await this.refreshNow(profile.adapterId);
@@ -538,10 +576,10 @@ export class CredentialProxy {
       // pick up whatever the peer wrote during our wait; fall back to the
       // stale token if not yet rotated (upstream then surfaces 401 normally).
       const postFail = await this.readCachedToken(profile);
-      return postFail?.accessToken ?? cached.accessToken;
+      return postFail ?? cached;
     }
     const refreshed = await this.readCachedToken(profile);
-    return refreshed?.accessToken ?? cached.accessToken;
+    return refreshed ?? cached;
   }
 
   /**
@@ -562,8 +600,8 @@ export class CredentialProxy {
       return;
     }
     const profile = this.profileFor(matched.adapterId);
-    const access = await this.ensureFreshToken(profile);
-    if (!access) {
+    const token = await this.ensureFreshToken(profile);
+    if (!token) {
       writeProxyError(res, 503, 'credential proxy: no cached access token');
       return;
     }
@@ -574,7 +612,7 @@ export class CredentialProxy {
       headers: collectHeaders(req),
       body,
     });
-    await this.forwardToUpstream(matched, profile, req, res, rewritten, access);
+    await this.forwardToUpstream(matched, profile, req, res, rewritten, token);
   }
 
   private async forwardToUpstream(
@@ -583,16 +621,10 @@ export class CredentialProxy {
     req: IncomingMessage,
     res: ServerResponse,
     rewritten: HeaderOverrideOutput,
-    access: string,
+    token: TokenInfo,
   ): Promise<void> {
     try {
-      const upstream = await this.upstream.send({
-        host: profile.upstreamHost,
-        method: req.method ?? 'GET',
-        pathname: req.url ?? '/',
-        headers: { ...rewritten.headers, authorization: `Bearer ${access}` },
-        body: rewritten.body,
-      });
+      const upstream = await this.upstream.send(buildUpstreamRequest(profile, req, rewritten, token));
       forwardResponse(matched, profile, upstream, res);
     } catch (err) {
       log.warn('credential proxy: upstream error', {
@@ -669,6 +701,7 @@ function buildUpstreamProfiles(opts: CredentialProxyOptions): Map<AcpAdapterId, 
     envFallback: codexEnvFallback,
     refresher: codexOv.refresher ?? defaultCodexRefresher(),
     billingTellHeaders: CODEX_BILLING_TELL_HEADERS,
+    upstreamRoute: codexUpstreamRoute,
   });
   return profiles;
 }
@@ -804,6 +837,28 @@ function collectHeaders(req: IncomingMessage): Record<string, string> {
   return out;
 }
 
+/**
+ * Build the upstream request: apply the profile's credential-derived route
+ * (codex ChatGPT backend → host swap + path rewrite + account header) over the
+ * default host/path, and substitute the real bearer for the inbound sentinel.
+ */
+function buildUpstreamRequest(
+  profile: UpstreamProfile,
+  req: IncomingMessage,
+  rewritten: HeaderOverrideOutput,
+  token: TokenInfo,
+): UpstreamRequestInput {
+  const route = profile.upstreamRoute?.(token) ?? null;
+  const inboundPath = req.url ?? '/';
+  return {
+    host: route?.host ?? profile.upstreamHost,
+    method: req.method ?? 'GET',
+    pathname: route ? route.rewritePath(inboundPath) : inboundPath,
+    headers: { ...rewritten.headers, ...route?.extraHeaders, authorization: `Bearer ${token.accessToken}` },
+    body: rewritten.body,
+  };
+}
+
 /** Buffer the request body into a single Buffer. Bounded by client framing. */
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -899,15 +954,61 @@ function extractClaudeToken(parsed: unknown): TokenInfo | null {
 function extractCodexToken(parsed: unknown): TokenInfo | null {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
   const root = parsed as Record<string, unknown>;
-  const access = codexAccessToken(root) ?? nonEmptyString(root['OPENAI_API_KEY']);
-  return access === null ? null : { accessToken: access, expiresAtMs: null };
+  const tokens = codexTokensObject(root);
+  if (tokens !== null) {
+    const oauth = nonEmptyString(tokens['access_token']);
+    if (oauth !== null) {
+      // ChatGPT-OAuth subscription credential → ChatGPT-backend route. The
+      // account id (when present) becomes the `chatgpt-account-id` header, but
+      // routing keys on `chatgptOAuth`: this token is ALWAYS rejected by the
+      // platform API, with or without the account id.
+      return {
+        accessToken: oauth,
+        expiresAtMs: null,
+        chatgptOAuth: true,
+        chatgptAccountId: nonEmptyString(tokens['account_id']),
+      };
+    }
+  }
+  // API-key credential: forward to the platform API (api.openai.com/v1) unchanged.
+  const apiKey = nonEmptyString(root['OPENAI_API_KEY']);
+  return apiKey === null ? null : { accessToken: apiKey, expiresAtMs: null };
 }
 
-/** Pull `tokens.access_token` (the ChatGPT-OAuth access token) out of auth.json. */
-function codexAccessToken(root: Record<string, unknown>): string | null {
+/** The ChatGPT-OAuth `tokens` bundle from auth.json, or null when absent/malformed. */
+function codexTokensObject(root: Record<string, unknown>): Record<string, unknown> | null {
   const tokens = root['tokens'];
   if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens)) return null;
-  return nonEmptyString((tokens as Record<string, unknown>)['access_token']);
+  return tokens as Record<string, unknown>;
+}
+
+const CHATGPT_BACKEND_HOST = 'chatgpt.com';
+
+/**
+ * codex ChatGPT-OAuth subscription tokens are accepted only by OpenAI's ChatGPT
+ * backend (chatgpt.com/backend-api/codex), NOT the metered platform API
+ * (api.openai.com/v1) — verified live: the platform API 401s with
+ * "Missing scopes: api.responses.write" (the subscription token carries only
+ * openid/profile/email/offline_access). Native codex POSTs to
+ * `/backend-api/codex/responses` with a `chatgpt-account-id` header; the proxy
+ * replays that at egress so the per-dispatch sentinel→token swap reaches a host
+ * that honors the subscription. API-key credentials (no account id) keep the
+ * default api.openai.com/v1 route.
+ */
+function codexUpstreamRoute(token: TokenInfo): UpstreamRoute | null {
+  if (!token.chatgptOAuth) return null;
+  // The account id is the routing context OpenAI's backend expects, but it is
+  // not the routing trigger: an OAuth token without one still must avoid the
+  // platform API. Send the header only when we have it.
+  const extraHeaders: Record<string, string> = token.chatgptAccountId
+    ? { 'chatgpt-account-id': token.chatgptAccountId }
+    : {};
+  return { host: CHATGPT_BACKEND_HOST, rewritePath: rewriteCodexBackendPath, extraHeaders };
+}
+
+/** `/v1/<rest>` → `/backend-api/codex/<rest>`; non-`/v1` paths pass through unchanged. */
+function rewriteCodexBackendPath(pathname: string): string {
+  return pathname.replace(/^\/v1(?=\/|$|\?)/, '/backend-api/codex');
 }
 
 function nonEmptyString(v: unknown): string | null {
