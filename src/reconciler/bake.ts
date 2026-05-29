@@ -15,9 +15,11 @@ import type { SmolvmConfig } from '../types.js';
 import { log } from '../logging.js';
 import {
   computeBakeHash,
+  parseBakeVolumeHostPaths,
   selectGcVictims,
   type CachedArtifact,
 } from './bake-plan.js';
+import { createHash, type Hash } from 'node:crypto';
 import { actionCacheDir, ensureCacheDir, tryAcquireLock, type FileLock } from './cache.js';
 import { ResourceActionLedger } from './ledger.js';
 import type { ResourceSnapshot } from './types.js';
@@ -277,8 +279,19 @@ export class BakeResource {
   // a successful prior bake), and return null so the caller short-circuits.
   private async readDesiredHash(): Promise<string | null> {
     try {
-      const buf = await readFile(this.opts.smolvm.smolfile!);
-      return computeBakeHash(buf);
+      const smolfilePath = this.opts.smolvm.smolfile!;
+      const buf = await readFile(smolfilePath);
+      const baseDir = path.dirname(smolfilePath);
+      // Host dirs the Smolfile bakes into the image (e.g. scripts/) must
+      // content-address into the hash, else editing a baked file silently reuses
+      // a stale artifact.
+      const bakedInputs = await Promise.all(
+        parseBakeVolumeHostPaths(buf.toString('utf8')).map(async (p) => ({
+          path: p,
+          digest: await hashPathContent(path.resolve(baseDir, p)),
+        })),
+      );
+      return computeBakeHash(buf, bakedInputs);
     } catch (err) {
       const msg = `read Smolfile failed: ${(err as Error).message}`;
       this.state.lastError = msg;
@@ -463,6 +476,39 @@ export class BakeResource {
       }
     }
     return out;
+  }
+}
+
+/**
+ * Deterministic content digest of a host path baked into the image. A file
+ * hashes its bytes; a directory is walked in sorted order, folding each entry's
+ * relative path + bytes into one sha256. A missing path folds a stable "absent"
+ * marker (the bake itself surfaces the real error). Used by the bake hash so
+ * editing a baked file (e.g. `scripts/vm-agent.mjs`) forces a re-bake.
+ */
+async function hashPathContent(absPath: string): Promise<string> {
+  const h = createHash('sha256');
+  await foldPathInto(h, absPath, '');
+  return h.digest('hex');
+}
+
+async function foldPathInto(h: Hash, absPath: string, rel: string): Promise<void> {
+  let st;
+  try {
+    st = await stat(absPath);
+  } catch {
+    h.update(`\0absent\0${rel}`);
+    return;
+  }
+  if (st.isDirectory()) {
+    for (const name of (await readdir(absPath)).sort()) {
+      await foldPathInto(h, path.join(absPath, name), rel ? `${rel}/${name}` : name);
+    }
+    return;
+  }
+  if (st.isFile()) {
+    h.update(`\0file\0${rel}\0`);
+    h.update(await readFile(absPath));
   }
 }
 
