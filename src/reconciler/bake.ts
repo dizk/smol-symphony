@@ -65,6 +65,15 @@ export class SmolvmBakeExecutor implements BakeExecutor {
     const stubBase = input.output_path.endsWith('.smolmachine')
       ? input.output_path.slice(0, -'.smolmachine'.length)
       : input.output_path;
+    // Resolve the Smolfile to an absolute path and run `machine create` with cwd
+    // set to its directory, so smolvm resolves `[dev].volumes` relative entries
+    // (e.g. `./scripts`, `../scripts`) against the Smolfile's location — the same
+    // anchor the bake hash uses (readDesiredHash resolves them against
+    // dirname(smolfile)). Without this, a process cwd != Smolfile dir would let
+    // smolvm copy a different scripts/ tree than the one the cache key hashed,
+    // baking a stale/wrong /opt/symphony with no runtime mount to correct it.
+    const smolfileAbs = path.resolve(input.smolfile_path);
+    const smolfileDir = path.dirname(smolfileAbs);
     try {
       await execFileAsync(
         'smolvm',
@@ -73,14 +82,14 @@ export class SmolvmBakeExecutor implements BakeExecutor {
           'create',
           vmName,
           '--smolfile',
-          input.smolfile_path,
+          smolfileAbs,
           '--cpus',
           String(input.cpus),
           '--mem',
           String(input.mem_mib),
           '--net',
         ],
-        { timeout: BAKE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
+        { cwd: smolfileDir, timeout: BAKE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
       );
       await execFileAsync('smolvm', ['machine', 'start', '--name', vmName], {
         timeout: BAKE_TIMEOUT_MS,
@@ -281,7 +290,9 @@ export class BakeResource {
     try {
       const smolfilePath = this.opts.smolvm.smolfile!;
       const buf = await readFile(smolfilePath);
-      const baseDir = path.dirname(smolfilePath);
+      // Absolute so the host-dir resolution below matches the bake, which runs
+      // `machine create` with cwd = dirname(resolved Smolfile) (see bake()).
+      const baseDir = path.dirname(path.resolve(smolfilePath));
       // Host dirs the Smolfile bakes into the image (e.g. scripts/) must
       // content-address into the hash, else editing a baked file silently reuses
       // a stale artifact.
