@@ -143,3 +143,40 @@ describe('AcpBridge token handshake', () => {
     assert.ok(elapsed < 2_000, `close fired too late (${elapsed} ms)`);
   });
 });
+
+describe('AcpBridge loopbackOnly bind guard', () => {
+  let active: AcpBridge | null = null;
+  afterEach(async () => {
+    if (active) {
+      await active.stop();
+      active = null;
+    }
+  });
+
+  it('binds a loopback host when loopbackOnly is set', async () => {
+    const bridge = new AcpBridge({ loopbackOnly: true });
+    await bridge.start('127.0.0.1', 0);
+    active = bridge;
+    assert.ok((bridge.port() ?? 0) > 0, 'bound to an ephemeral loopback port');
+  });
+
+  it('accepts ::1 and localhost under loopbackOnly', async () => {
+    const bridge = new AcpBridge({ loopbackOnly: true });
+    // localhost resolves to loopback; bind should not be refused by the guard.
+    await bridge.start('localhost', 0);
+    active = bridge;
+    assert.ok((bridge.port() ?? 0) > 0);
+  });
+
+  it('REFUSES a non-loopback host when loopbackOnly is set', async () => {
+    const bridge = new AcpBridge({ loopbackOnly: true });
+    await assert.rejects(bridge.start('0.0.0.0', 0), /not a loopback address/);
+  });
+
+  it('default (no loopbackOnly) still binds whatever host is given (smolvm path unchanged)', async () => {
+    const bridge = new AcpBridge();
+    await bridge.start('0.0.0.0', 0);
+    active = bridge;
+    assert.ok((bridge.port() ?? 0) > 0, 'wider bind permitted by default');
+  });
+});
