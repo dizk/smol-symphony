@@ -185,6 +185,59 @@ describe('Orchestrator startup credential check', () => {
     }
   });
 
+  it('fails startup when the opencode GitHub Copilot credential is missing', async () => {
+    // Empty fake $HOME (no ~/.local/share/opencode/auth.json), no XDG_DATA_HOME,
+    // and no COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN env: a workflow that pins
+    // opencode must surface the missing GitHub Copilot credential at startup.
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-opencode-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-startup-opencode-tracker-'));
+    const prevHome = process.env.HOME;
+    const prevXdg = process.env.XDG_DATA_HOME;
+    const prevTokens = {
+      COPILOT_GITHUB_TOKEN: process.env.COPILOT_GITHUB_TOKEN,
+      GH_TOKEN: process.env.GH_TOKEN,
+      GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    };
+    process.env.HOME = fakeHome;
+    delete process.env.XDG_DATA_HOME;
+    delete process.env.COPILOT_GITHUB_TOKEN;
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    try {
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'opencode' },
+          states: {
+            Todo: { role: 'active', adapter: 'opencode' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+      const { workflowSrc, tracker, workspaces, runner } = makeStubs();
+      const orch = new Orchestrator(cfg, def, workflowSrc, tracker, workspaces, runner);
+      await assert.rejects(
+        () => orch.start(),
+        (err: unknown) =>
+          err instanceof Error &&
+          /opencode/.test(err.message) &&
+          /credential/.test(err.message),
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdg;
+      for (const [k, v] of Object.entries(prevTokens)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  });
+
   it('starts cleanly when both adapter credentials are present (codex via auth.json)', async () => {
     // Both adapters referenced; both credentials present. codex is satisfied by
     // a `~/.codex/auth.json` token (no OPENAI_API_KEY env needed).

@@ -148,6 +148,14 @@ export interface AdapterProfile {
   proxyProviderArgs?(input: { baseUrl: string; tokenVar: string }): string[];
 }
 
+// VM-facing env var names the opencode custom provider reads (via `{env:VAR}`)
+// for the proxy base URL + sentinel. Defined as constants so the profile's
+// `proxyEnv` and the staged opencode.json reference the exact same names — a
+// drift between them would silently break the in-VM provider resolution.
+// Declared before ADAPTERS because the object literal reads them at module init.
+const OPENCODE_PROXY_BASE_URL_VAR = 'OPENCODE_PROXY_BASE_URL';
+const OPENCODE_PROXY_TOKEN_VAR = 'OPENCODE_PROXY_TOKEN';
+
 export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   claude: {
     id: 'claude',
@@ -207,7 +215,118 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // HTTPS to the path-transparent proxy.
     proxyProviderArgs: ({ baseUrl, tokenVar }) => codexProxyProviderArgs(baseUrl, tokenVar),
   },
+  opencode: {
+    id: 'opencode',
+    binary: ['opencode', 'acp'],
+    // opencode reaches GitHub Copilot through the host credential proxy. The VM
+    // receives OPENCODE_PROXY_BASE_URL=<proxy> + OPENCODE_PROXY_TOKEN=<sentinel>;
+    // a staged opencode.json declares a custom `@ai-sdk/openai-compatible`
+    // provider whose baseURL/apiKey read those env vars (opencode interpolates
+    // `{env:VAR}`). The proxy validates the sentinel, swaps in a short-lived
+    // GitHub Copilot token (exchanged host-side from the operator's `opencode
+    // auth login` GitHub OAuth token at api.github.com/copilot_internal/v2/token),
+    // injects the Copilot editor headers, and forwards to api.githubcopilot.com.
+    // The durable GitHub OAuth token never enters the VM. See
+    // docs/research/opencode-copilot-accept-matrix.md.
+    credentialStrategy: 'proxy',
+    proxyEnv: { baseUrlVar: OPENCODE_PROXY_BASE_URL_VAR, tokenVar: OPENCODE_PROXY_TOKEN_VAR },
+    // opencode picks its model from the staged opencode.json `model` key
+    // ("<providerID>/<modelID>"); the ACP `session/new` carries no model. The
+    // provider block must exist even when no model is pinned, so the whole
+    // config (provider + model) is staged together via stageOpencodeConfig
+    // (see runner.stageAdapterExtras), not through this env/argv channel.
+    // Returning an empty injection keeps this path inert.
+    modelInjection: () => ({}),
+  },
 };
+
+/** Provider id of the opencode → credential-proxy custom provider. */
+export const OPENCODE_PROXY_PROVIDER_ID = 'symphony-copilot';
+
+/**
+ * Default GitHub Copilot model opencode uses when the workflow pins no
+ * `acp.model`. DOC-DERIVED: `gpt-4o` is broadly available across Copilot
+ * subscription tiers. Operators override per-state via `acp.model` (any id
+ * their Copilot subscription exposes — GPT-5, Claude Sonnet, Gemini, …).
+ */
+export const OPENCODE_DEFAULT_COPILOT_MODEL = 'gpt-4o';
+
+// A small pinned set of Copilot-backed model ids the custom provider advertises
+// so opencode does not need to hit `<baseURL>/models` for discovery (the proxy
+// forwards /models too, but pinning avoids the round-trip and a discovery
+// dependency). DOC-DERIVED — the exact id set a given Copilot subscription
+// exposes is operator/tier-dependent; an operator's `acp.model` is always
+// merged in (see buildOpencodeConfig) so a pinned model that isn't in this list
+// still resolves.
+const OPENCODE_PINNED_COPILOT_MODELS: readonly string[] = [
+  'gpt-4o',
+  'gpt-4.1',
+  'o4-mini',
+  'claude-sonnet-4.5',
+  'claude-sonnet-4',
+  'gemini-2.5-pro',
+];
+
+/**
+ * Build the opencode.json staged into the VM (pure; exported for tests). It
+ * declares the `symphony-copilot` custom provider pointed at the credential
+ * proxy via `{env:…}` interpolation, advertises a pinned Copilot model set
+ * (plus the operator's selected model), and pins the default model to
+ * `<providerID>/<model>`. Two-space-indented so it reads cleanly if an operator
+ * inspects the staged file.
+ *
+ * The `{env:VAR}` names match the profile's `proxyEnv` exactly (shared
+ * constants), so the in-VM opencode resolves the proxy base URL + sentinel the
+ * runner stages.
+ */
+export function buildOpencodeConfig(model: string | null): string {
+  const selected = model && model.length > 0 ? model : OPENCODE_DEFAULT_COPILOT_MODEL;
+  const ids = new Set<string>([...OPENCODE_PINNED_COPILOT_MODELS, selected]);
+  const models: Record<string, Record<string, never>> = {};
+  for (const id of ids) models[id] = {};
+  return JSON.stringify(
+    {
+      $schema: 'https://opencode.ai/config.json',
+      provider: {
+        [OPENCODE_PROXY_PROVIDER_ID]: {
+          npm: '@ai-sdk/openai-compatible',
+          name: 'Symphony Copilot proxy',
+          options: {
+            baseURL: `{env:${OPENCODE_PROXY_BASE_URL_VAR}}`,
+            apiKey: `{env:${OPENCODE_PROXY_TOKEN_VAR}}`,
+          },
+          models,
+        },
+      },
+      model: `${OPENCODE_PROXY_PROVIDER_ID}/${selected}`,
+    },
+    null,
+    2,
+  );
+}
+
+/**
+ * Absolute guest path the staged opencode.json is copied to inside the VM.
+ * opencode reads its global config from `$XDG_CONFIG_HOME/opencode/opencode.json`
+ * (defaulting to `~/.config/opencode/opencode.json`); the VM runs as root, so
+ * `/root/.config/opencode/opencode.json`. DOC-DERIVED: that `opencode acp`
+ * honours the global config + custom provider + `{env:VAR}` interpolation is
+ * recorded in docs/research/opencode-copilot-accept-matrix.md.
+ */
+export const OPENCODE_CONFIG_GUEST_PATH = '/root/.config/opencode/opencode.json';
+
+/**
+ * Stage the opencode.json (custom-provider + model) into the workspace runtime
+ * tree. Mirrors stageCodexPlaceholderAuth: synthetic content (no secret — the
+ * sentinel arrives via env, never a real token), so it never fails on a missing
+ * host file.
+ */
+export async function stageOpencodeConfig(
+  workspacePath: string,
+  model: string | null,
+): Promise<StagedRuntimePaths> {
+  return stageRuntimeFile(workspacePath, 'opencode.json', buildOpencodeConfig(model));
+}
 
 /** Provider id for the codex → credential-proxy `model_providers` override. */
 const CODEX_PROXY_PROVIDER_ID = 'symphony-proxy';

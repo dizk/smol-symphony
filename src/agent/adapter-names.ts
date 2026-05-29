@@ -10,9 +10,9 @@
 import path from 'node:path';
 import os from 'node:os';
 
-export type AcpAdapterId = 'claude' | 'codex';
+export type AcpAdapterId = 'claude' | 'codex' | 'opencode';
 
-export const KNOWN_ADAPTER_IDS: readonly AcpAdapterId[] = ['claude', 'codex'];
+export const KNOWN_ADAPTER_IDS: readonly AcpAdapterId[] = ['claude', 'codex', 'opencode'];
 
 export function isKnownAdapter(id: string): id is AcpAdapterId {
   return (KNOWN_ADAPTER_IDS as readonly string[]).includes(id);
@@ -38,6 +38,91 @@ export function hostClaudeCredentialPath(): string {
  */
 export function hostCodexCredentialPath(): string {
   return path.join(os.homedir(), '.codex', 'auth.json');
+}
+
+/**
+ * Absolute path to the host's opencode credential file. opencode stores its
+ * `opencode auth login` credentials at `$XDG_DATA_HOME/opencode/auth.json`
+ * (defaulting to `~/.local/share/opencode/auth.json`). The credential proxy
+ * reads the host's GitHub Copilot OAuth token out of this file on every
+ * upstream request (to mint a short-lived Copilot token), and the startup
+ * probe reads it once so a missing/empty opencode credential fails fast
+ * instead of surfacing mid-dispatch.
+ */
+export function hostOpencodeCredentialPath(): string {
+  const xdg = process.env['XDG_DATA_HOME'];
+  const base = nonEmptyString(xdg) ? xdg! : path.join(os.homedir(), '.local', 'share');
+  return path.join(base, 'opencode', 'auth.json');
+}
+
+/**
+ * Pure: pull the durable GitHub OAuth token out of opencode's parsed
+ * `auth.json`. opencode keys credentials by provider id; the GitHub Copilot
+ * entry is stored under `"github-copilot"` as an OAuth record. The DURABLE
+ * GitHub OAuth token (the secret the proxy must keep host-side and exchange
+ * for a short-lived Copilot token) lives under `refresh`; opencode caches the
+ * exchanged short-lived Copilot token under `access`/`expires` in the same
+ * record. We deliberately read `refresh` first — that is the long-lived token
+ * the exchange needs — and tolerate alternate field names for forward
+ * compatibility. Returns null when no github-copilot OAuth token is present.
+ *
+ * The exact shape is DOC-DERIVED (see docs/research/opencode-copilot-accept-matrix.md):
+ * `{ "github-copilot": { "type": "oauth", "refresh": "gho_…", "access": "tok…", "expires": <ms> } }`.
+ */
+export function opencodeGithubTokenFromAuth(parsed: unknown): string | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const entry = (parsed as Record<string, unknown>)['github-copilot'];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const rec = entry as Record<string, unknown>;
+  // Prefer `refresh` (the durable GitHub OAuth token); fall back across plausible
+  // field names so a minor opencode storage-schema change doesn't silently break us.
+  for (const key of ['refresh', 'token', 'access', 'oauth']) {
+    if (nonEmptyString(rec[key])) return rec[key] as string;
+  }
+  return null;
+}
+
+/**
+ * Pure: read the GitHub OAuth token opencode would use for the Copilot
+ * exchange from the host environment, following opencode's documented
+ * precedence `COPILOT_GITHUB_TOKEN` > `GH_TOKEN` > `GITHUB_TOKEN`. Returns the
+ * first non-empty value, or null. The proxy uses this as the fallback when
+ * `auth.json` yields no token; the startup probe uses it to accept a dispatch
+ * the proxy could serve from the environment alone.
+ */
+export function opencodeGithubTokenFromEnv(env: NodeJS.ProcessEnv): string | null {
+  for (const key of ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN']) {
+    if (nonEmptyString(env[key])) return env[key]!;
+  }
+  return null;
+}
+
+/**
+ * Pure: does opencode have a resolvable GitHub Copilot credential from either
+ * source the proxy reads — a `github-copilot` token in `auth.json`, or one of
+ * the `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` env vars? The shell
+ * reads the file (passing `null` when absent/unreadable) and its env in; this
+ * mirrors the proxy's read path so the startup probe accepts exactly when a
+ * dispatch would.
+ */
+export function opencodeCredentialAvailable(
+  authFileText: string | null,
+  env: NodeJS.ProcessEnv,
+): boolean {
+  if (opencodeGithubTokenFromEnv(env) !== null) return true;
+  if (authFileText === null) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(authFileText);
+  } catch {
+    return false;
+  }
+  return opencodeGithubTokenFromAuth(parsed) !== null;
+}
+
+/** Human-readable explanation of which opencode credential sources were checked. */
+export function opencodeMissingCredentialMessage(): string {
+  return `adapter "opencode" requires a host GitHub Copilot credential, but none is available: neither a "github-copilot" token in ${hostOpencodeCredentialPath()} (run \`opencode auth login\` → GitHub Copilot on the host) nor a COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN environment variable is present`;
 }
 
 /**

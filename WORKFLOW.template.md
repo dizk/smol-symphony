@@ -47,12 +47,16 @@ tracker:
 #                and the landing directory for `symphony.propose_issue`.
 #   adapter   (string, optional): override the workflow-level `acp.adapter` for
 #             agents dispatched in this state. Must be a known profile (claude,
-#             codex). Both route through the host credential proxy and are
-#             startup-probed so a missing credential fails fast. claude has a
+#             codex, opencode). All route through the host credential proxy and
+#             are startup-probed so a missing credential fails fast. claude has a
 #             single host credential file (~/.claude/.credentials.json) that is
 #             probed for readability; codex passes when either ~/.codex/auth.json
 #             holds a token (ChatGPT-OAuth tokens.access_token or a top-level
-#             OPENAI_API_KEY) or the host OPENAI_API_KEY env var is set.
+#             OPENAI_API_KEY) or the host OPENAI_API_KEY env var is set; opencode
+#             passes when either ~/.local/share/opencode/auth.json holds a
+#             github-copilot token (run `opencode auth login` -> GitHub Copilot
+#             on the host) or a COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN env
+#             var is set.
 #   model     (string, optional): override `acp.model` for this state.
 #             Blank or whitespace-only values normalize to "use the adapter
 #             default" (same as the workflow-level acp.model semantics).
@@ -552,6 +556,12 @@ acp:
   #   codex    — codex-acp. Also routes through the host credential proxy
   #              (issue 116); no credential file — and no real OPENAI_API_KEY —
   #              enters the VM.
+  #   opencode — opencode acp, backed by GitHub Copilot (issue 130). Routes
+  #              through the host credential proxy; the proxy exchanges the
+  #              host's `opencode auth login` GitHub OAuth token for a
+  #              short-lived Copilot token host-side — the GitHub token never
+  #              enters the VM. One Copilot credential unlocks many models
+  #              (GPT-4o/4.1, Claude Sonnet, Gemini, o-series, …).
   adapter: claude
 
   # Credentials never enter the VM (issue 113; codex generalized in 116). On
@@ -576,6 +586,19 @@ acp:
   # env so it cannot land in the VM's PID-1 environment; codex-acp runs in
   # API-key mode against the proxy and never performs the OAuth handshake
   # in-VM (that, and refresh, stay host-side).
+  #
+  # For opencode: VM gets OPENCODE_PROXY_BASE_URL=<proxy> +
+  # OPENCODE_PROXY_TOKEN=<sentinel>, and a staged opencode.json (at
+  # /root/.config/opencode/opencode.json) declares a custom
+  # @ai-sdk/openai-compatible provider whose baseURL/apiKey read those env vars.
+  # The proxy reads the durable GitHub OAuth token from
+  # ~/.local/share/opencode/auth.json (COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN
+  # env fallback), exchanges it host-side at
+  # api.github.com/copilot_internal/v2/token for a short-lived Copilot token
+  # (cached + TTL-refreshed before expiry), injects the Copilot editor headers,
+  # and forwards to api.githubcopilot.com. The durable GitHub token never enters
+  # the VM — so do NOT also list it in `smolvm.forward_env`. See
+  # docs/research/opencode-copilot-accept-matrix.md.
 
   # model (string | null): optional model selector forwarded to the chosen adapter.
   # Each adapter profile knows how to surface it natively:
@@ -583,6 +606,10 @@ acp:
   #             claude-agent-acp would (aliases like "opus", "sonnet", or full IDs
   #             like "claude-opus-4-7").
   #   codex   — passed as `-c model="<value>"` argv to codex-acp (parsed as TOML).
+  #   opencode— baked into the staged opencode.json as model="symphony-copilot/<value>".
+  #             Use a Copilot chat-completions model id (e.g. gpt-4o, gpt-4.1,
+  #             claude-sonnet-4.5, gemini-2.5-pro); codex-class models served only
+  #             on Copilot's /responses path are NOT reachable. Default: gpt-4o.
   # Leave unset / null to use the adapter's own default model. Default: null.
   # model: claude-opus-4-7
 

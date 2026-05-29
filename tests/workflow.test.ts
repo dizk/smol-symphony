@@ -591,7 +591,7 @@ describe('workflow states validation', () => {
         {
           tracker: { kind: 'local', root },
           states: {
-            Todo: { role: 'active', adapter: 'opencode' },
+            Todo: { role: 'active', adapter: 'gemini' },
             Done: { role: 'terminal' },
             Triage: { role: 'holding' },
           },
@@ -599,7 +599,7 @@ describe('workflow states validation', () => {
         '/tmp/WORKFLOW.md',
       );
       const err = validateDispatch(cfg);
-      assert.match(err ?? '', /adapter "opencode" is not a known profile/);
+      assert.match(err ?? '', /adapter "gemini" is not a known profile/);
     });
   });
 

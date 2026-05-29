@@ -25,7 +25,9 @@ import {
   isKnownAdapter,
   stageClaudeIdentity,
   stageCodexPlaceholderAuth,
+  stageOpencodeConfig,
   stageRuntimeFile,
+  OPENCODE_CONFIG_GUEST_PATH,
   type AcpAdapterId,
   type ExtraGuestFile,
   type ModelInjection,
@@ -922,7 +924,7 @@ export class AgentRunner {
     }
     const injectedRes = await this.applyRuntimeInjectionsOrFail(workspacePath, profile, resolved, logger);
     if (!injectedRes.ok) return injectedRes;
-    const extraFilesRes = await this.stageAdapterExtras(workspacePath, profile, injectedRes.value, logger);
+    const extraFilesRes = await this.stageAdapterExtras(workspacePath, profile, resolved, injectedRes.value, logger);
     if (!extraFilesRes.ok) return extraFilesRes;
     // Sentinel registration is deferred to `bringUpVmAndExec` — we don't want
     // a sentinel sitting in the registry if VM start fails. The runtime env
@@ -956,10 +958,19 @@ export class AgentRunner {
    * staged to `/root/.codex/auth.json` purely to satisfy that check; codex then
    * uses the env `OPENAI_API_KEY` sentinel as its bearer and the proxy
    * substitutes the real credential at egress.
+   *
+   * opencode stages an `opencode.json` (custom `symphony-copilot` provider +
+   * the selected model) to `/root/.config/opencode/opencode.json`. The provider
+   * block must exist regardless of whether a model is pinned, so the whole
+   * config — including the model — is built here from `resolved.model` rather
+   * than through the model-injection channel (opencode's `modelInjection` is
+   * inert). The file carries no secret: the proxy base URL + sentinel arrive via
+   * the `{env:…}`-interpolated `OPENCODE_PROXY_*` env vars the runner stages.
    */
   private async stageAdapterExtras(
     workspacePath: string,
     profile: AdapterProfile,
+    resolved: ResolvedDispatchConfig,
     injected: { runtimeExtraFiles: ExtraGuestFile[] },
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<ExtraGuestFile[]>> {
@@ -989,6 +1000,17 @@ export class AgentRunner {
       } catch (err) {
         logger.error('codex placeholder auth staging failed', { error: (err as Error).message });
         return failPhase('codex placeholder auth staging error');
+      }
+    } else if (profile.id === 'opencode') {
+      // Stage the custom-provider opencode.json (provider pinned at the proxy
+      // via {env:…}, plus the resolved model). Synthetic content (no secret),
+      // so this never fails on a missing host file.
+      try {
+        const config = await stageOpencodeConfig(workspacePath, resolved.model);
+        out.push({ stagedRelPath: config.relPath, guestPath: OPENCODE_CONFIG_GUEST_PATH });
+      } catch (err) {
+        logger.error('opencode config staging failed', { error: (err as Error).message });
+        return failPhase('opencode config staging error');
       }
     }
     return { ok: true, value: out };
