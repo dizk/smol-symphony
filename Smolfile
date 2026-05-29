@@ -27,8 +27,14 @@ volumes = ["./scripts:/opt/symphony:ro"]
 # registry knows how to launch (claude-agent-acp, codex-acp, opencode). The
 # `--no-install-recommends` keeps the apt layer slim; `--no-audit --no-fund`
 # strips npm output the orchestrator would otherwise log per dispatch.
+#
+# codex (@openai/codex + @zed-industries/codex-acp) is PINNED: an unpinned
+# global install means a rebake can silently change codex's Responses-API
+# transport behavior, which is exactly what broke codex review against the
+# credential proxy in issue #127 (the WebSocket Responses transport bypassed the
+# proxy and leaked the per-dispatch sentinel to OpenAI). Bump these deliberately.
 init = [
     "apt-get update -q",
     "apt-get install -y --no-install-recommends git ripgrep ca-certificates curl",
-    "npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp opencode-ai",
+    "npm install -g --no-audit --no-fund @openai/codex@0.135.0 @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp@0.15.0 opencode-ai",
 ]

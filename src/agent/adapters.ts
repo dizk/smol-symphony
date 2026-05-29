@@ -127,6 +127,25 @@ export interface AdapterProfile {
    * on models with `supportsEffort`); the adapter rejects invalid values at startup.
    */
   effortInjection?(effort: string): EffortInjection;
+  /**
+   * For a `'proxy'`-strategy adapter whose native transport would otherwise
+   * BYPASS the base-URL env var, the per-dispatch `-c key=value` config
+   * overrides that pin it onto an explicit HTTPS provider routed through the
+   * host credential proxy. Returns extra adapter argv, appended after the model
+   * `-c` override. Applied at exec time (not at model-injection time) because
+   * the args carry the proxy's ephemeral port, known only once the sentinel is
+   * registered against the running proxy.
+   *
+   * Only codex declares it: codex's Responses API defaults to a
+   * `wss://api.openai.com/v1/responses` WebSocket transport that ignores
+   * `OPENAI_BASE_URL` and dials OpenAI directly, sending the per-dispatch
+   * sentinel raw → 401 (issue #127). Forcing `supports_websockets=false` + an
+   * explicit `base_url` routes `/v1/responses` over HTTPS to the proxy, which
+   * is path-transparent. claude omits it (its only transport honors the
+   * base-URL env var). Receives the proxy `baseUrl` (`http://host:port`, NO
+   * `/v1`) and the token env var name (`OPENAI_API_KEY`).
+   */
+  proxyProviderArgs?(input: { baseUrl: string; tokenVar: string }): string[];
 }
 
 export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
@@ -179,8 +198,53 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // (raw-string fallback on parse failure). We always emit a quoted TOML string so
     // model names containing dots or hyphens don't surprise the TOML parser.
     modelInjection: (model) => ({ extraArgs: ['-c', `model=${JSON.stringify(model)}`] }),
+    // Pin codex onto an explicit HTTPS provider routed through the credential
+    // proxy. Without this, codex's Responses API defaults to a
+    // `wss://api.openai.com/v1/responses` WebSocket transport that bypasses the
+    // proxy (ignores OPENAI_BASE_URL), dialing OpenAI directly with the raw
+    // per-dispatch sentinel → 401 (issue #127). `supports_websockets=false`
+    // kills the wss attempt; the explicit `base_url` sends `/v1/responses` over
+    // HTTPS to the path-transparent proxy.
+    proxyProviderArgs: ({ baseUrl, tokenVar }) => codexProxyProviderArgs(baseUrl, tokenVar),
   },
 };
+
+/** Provider id for the codex → credential-proxy `model_providers` override. */
+const CODEX_PROXY_PROVIDER_ID = 'symphony-proxy';
+
+/**
+ * Build the per-dispatch codex `-c` overrides that pin codex onto an explicit
+ * HTTPS provider routed through the host credential proxy (issue #127). See the
+ * codex profile's `proxyProviderArgs` for why this is required.
+ *
+ *   - `model_provider=<id>` selects the provider below over codex's built-in
+ *     `openai` provider, whose Responses transport defaults to a
+ *     `wss://api.openai.com` WebSocket that bypasses the proxy entirely.
+ *   - `base_url=<proxy>/v1` sends `/v1/responses` to the proxy — the proxy
+ *     returns its base as `http://host:port` WITHOUT `/v1`, so we append it
+ *     (tolerating a stray trailing slash defensively).
+ *   - `env_key=<tokenVar>` keeps the per-dispatch sentinel (already staged into
+ *     `OPENAI_API_KEY`) as the bearer the proxy validates and swaps.
+ *   - `wire_api="responses"` matches codex's gpt-5-codex transport.
+ *   - `supports_websockets=false` forces the HTTPS Responses fallback.
+ *
+ * String values are emitted as JSON-quoted TOML strings (TOML basic strings use
+ * the same double-quote syntax) so values with dots/hyphens can't surprise the
+ * TOML parser; `supports_websockets=false` is a raw TOML boolean, not a string.
+ */
+function codexProxyProviderArgs(baseUrl: string, tokenVar: string): string[] {
+  const id = CODEX_PROXY_PROVIDER_ID;
+  const field = (name: string): string => `model_providers.${id}.${name}`;
+  const v1BaseUrl = `${baseUrl.replace(/\/+$/, '')}/v1`;
+  return [
+    '-c', `model_provider=${JSON.stringify(id)}`,
+    '-c', `${field('name')}=${JSON.stringify('Symphony credential proxy')}`,
+    '-c', `${field('base_url')}=${JSON.stringify(v1BaseUrl)}`,
+    '-c', `${field('env_key')}=${JSON.stringify(tokenVar)}`,
+    '-c', `${field('wire_api')}=${JSON.stringify('responses')}`,
+    '-c', `${field('supports_websockets')}=false`,
+  ];
+}
 
 export function profileFor(id: AcpAdapterId): AdapterProfile {
   return ADAPTERS[id];

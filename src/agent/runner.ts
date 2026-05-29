@@ -1147,21 +1147,32 @@ export class AgentRunner {
   }
 
   /**
-   * Fold the credential-proxy env vars onto the adapter runtime env. The var
-   * names come from the adapter's `proxyEnv` (claude → ANTHROPIC_*, codex →
-   * OPENAI_*) so the in-VM client dials the proxy with the sentinel as its
-   * bearer. A `'proxy'`-strategy adapter without `proxyEnv` is a profile bug.
+   * Fold the credential-proxy wiring onto the adapter runtime: the base-URL +
+   * sentinel env vars (claude → ANTHROPIC_*, codex → OPENAI_*) so the in-VM
+   * client dials the proxy with the sentinel as its bearer, plus — for adapters
+   * that declare `proxyProviderArgs` (codex) — the per-dispatch `-c` overrides
+   * that pin the transport onto an explicit HTTPS provider routed through the
+   * proxy (issue #127: codex's default Responses WebSocket transport bypasses
+   * the base-URL env var and leaks the sentinel straight to OpenAI). Those args
+   * carry the proxy's ephemeral port, so they're applied here at exec time
+   * rather than at model-injection time. A `'proxy'`-strategy adapter without
+   * `proxyEnv` is a profile bug (surfaced by `proxyCredentialEnv`).
    */
   private applyCredentialEnv(
     adapter: AdapterRuntime,
     reg: { sentinel: string; baseUrl: string } | null,
   ): AdapterRuntime {
     if (!reg) return adapter;
+    const proxyEnv = adapter.profile.proxyEnv;
+    const providerArgs = adapter.profile.proxyProviderArgs
+      ? adapter.profile.proxyProviderArgs({ baseUrl: reg.baseUrl, tokenVar: proxyEnv?.tokenVar ?? '' })
+      : [];
     return {
       ...adapter,
+      effectiveAdapterArgs: [...adapter.effectiveAdapterArgs, ...providerArgs],
       runtimeEnv: {
         ...adapter.runtimeEnv,
-        ...proxyCredentialEnv(adapter.profile.proxyEnv, adapter.profile.id, reg),
+        ...proxyCredentialEnv(proxyEnv, adapter.profile.id, reg),
       },
     };
   }
