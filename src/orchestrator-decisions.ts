@@ -185,6 +185,87 @@ export function decideRetryAfterIneligible(input: {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Circuit breaker (issue 128). The retry path retries an abnormally-exited
+// dispatch with exponential backoff and NO upper bound on identical failures:
+// a deterministically-failing dispatch (e.g. a persistent `401
+// invalid_api_key`) loops indefinitely, booting + reaping a VM every backoff
+// interval. These pure helpers let the orchestrator bound that loop — count
+// consecutive same-reason failures and decide when to stop retrying — without
+// the streak bookkeeping leaking into the shell.
+
+/**
+ * Normalize a failure `reason` so two attempts that failed *the same way*
+ * compare equal even when the message embeds volatile tokens (request ids,
+ * status codes, timestamps, hashes, per-dispatch sentinels). Without this, a
+ * reason carrying a varying id would never repeat verbatim and the breaker
+ * would never trip.
+ *
+ * Rule: lowercase, then collapse every whitespace-delimited token that
+ * contains a digit into `<id>` — volatile identifiers almost always carry a
+ * digit (a request id, an HTTP status, a timestamp fragment, a counter, a hex
+ * hash), whereas the human-readable words that carry a failure's *identity*
+ * (`agent turn refusal`, `smolvm bring-up error`, `invalid_api_key`) do not.
+ *
+ * The collapse is deliberately one-way and aggressive (a `401` and a `403`
+ * both become `<id>`): for a breaker keyed on "same failure every attempt",
+ * merging near-identical persistent errors is the safe direction — the
+ * alternative (never tripping because an embedded id varies) is the regression
+ * this closes. Genuinely different failure *classes* keep distinct words and
+ * so reset the streak rather than accumulating toward a trip.
+ */
+export function normalizeFailureReason(reason: string): string {
+  return reason
+    .toLowerCase()
+    .replace(/\S*\d\S*/g, '<id>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Per-issue circuit-breaker streak: the last failure's normalized reason and
+ * how many consecutive attempts have failed with it. Held in orchestrator
+ * memory across the dispatch→exit→retry cycle.
+ */
+export interface CircuitBreakerState {
+  normalizedReason: string;
+  count: number;
+}
+
+export type CircuitBreakerDecision =
+  // Clean exit (or breaker irrelevant): clear any streak; keep the normal path.
+  | { kind: 'reset' }
+  // Abnormal exit recorded; under threshold — keep retrying. Caller persists
+  // the returned state.
+  | { kind: 'continue'; normalizedReason: string; count: number }
+  // Threshold reached on identical consecutive failures — stop retrying and
+  // route the issue to a holding state.
+  | { kind: 'trip'; normalizedReason: string; count: number };
+
+/**
+ * Fold one worker exit into the circuit-breaker streak. A clean exit (`normal`)
+ * resets it — the issue made progress. An abnormal exit increments the streak
+ * when its normalized reason matches the prior one, otherwise restarts the
+ * count at 1. When `threshold > 0` and the streak reaches it, the breaker
+ * trips. `threshold <= 0` disables tripping entirely (the streak is still
+ * tracked but never trips), so an operator can turn the breaker off.
+ */
+export function decideCircuitBreaker(input: {
+  normal: boolean;
+  reason: string;
+  prior: CircuitBreakerState | null;
+  threshold: number;
+}): CircuitBreakerDecision {
+  if (input.normal) return { kind: 'reset' };
+  const normalizedReason = normalizeFailureReason(input.reason);
+  const count =
+    input.prior && input.prior.normalizedReason === normalizedReason ? input.prior.count + 1 : 1;
+  if (input.threshold > 0 && count >= input.threshold) {
+    return { kind: 'trip', normalizedReason, count };
+  }
+  return { kind: 'continue', normalizedReason, count };
+}
+
 /**
  * Classify a tracker issue into a PR autopilot intent or `null` (state
  * matches neither the configured merge nor close state). The shell supplies

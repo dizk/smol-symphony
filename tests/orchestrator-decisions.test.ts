@@ -4,10 +4,12 @@ import {
   buildIssueDetailDto,
   classifyPrIntent,
   computeEligibilityReason,
+  decideCircuitBreaker,
   decideExitRetry,
   decideReconcileForIssue,
   decideRetryAfterIneligible,
   hasNonTerminalBlocker,
+  normalizeFailureReason,
   requiredAdapterIds,
   resolveActorString,
   type EligibilitySnapshot,
@@ -151,6 +153,103 @@ describe('decideExitRetry', () => {
     assert.equal(r2.delayMs, 20_000);
     const rCap = decideExitRetry({ ...base, normal: false, reason: 'x', priorAttempt: 10 });
     assert.equal(rCap.delayMs, 60_000);
+  });
+});
+
+describe('normalizeFailureReason', () => {
+  it('collapses volatile tokens so identical-class failures compare equal', () => {
+    const a = normalizeFailureReason('agent turn refusal: 401 invalid_api_key (req_4f8a2b1c9d3e5f00)');
+    const b = normalizeFailureReason('agent turn refusal: 401 invalid_api_key (req_aa11bb22cc33dd44)');
+    assert.equal(a, b);
+  });
+  it('collapses UUIDs, ISO timestamps, status codes, and digit runs to <id>', () => {
+    const r = normalizeFailureReason(
+      'state action failed at 2026-05-29T13:04:05Z for 550e8400-e29b-41d4-a716-446655440000 exit 137',
+    );
+    assert.equal(r, 'state action failed at <id> for <id> exit <id>');
+  });
+  it('lowercases and squeezes whitespace', () => {
+    assert.equal(normalizeFailureReason('  Smolvm   BRING-up   error  '), 'smolvm bring-up error');
+  });
+  it('keeps genuinely different failure classes distinct', () => {
+    assert.notEqual(
+      normalizeFailureReason('smolvm bring-up error'),
+      normalizeFailureReason('before_run hook error'),
+    );
+  });
+});
+
+describe('decideCircuitBreaker', () => {
+  it('clean exit resets the streak', () => {
+    const r = decideCircuitBreaker({
+      normal: true,
+      reason: 'whatever',
+      prior: { normalizedReason: 'x', count: 4 },
+      threshold: 5,
+    });
+    assert.deepEqual(r, { kind: 'reset' });
+  });
+  it('first failure starts the count at 1', () => {
+    const r = decideCircuitBreaker({ normal: false, reason: 'boom 1', prior: null, threshold: 5 });
+    assert.equal(r.kind, 'continue');
+    if (r.kind === 'continue') assert.equal(r.count, 1);
+  });
+  it('identical consecutive failures increment until the threshold trips', () => {
+    let prior = null as { normalizedReason: string; count: number } | null;
+    const counts: number[] = [];
+    let tripped = false;
+    for (let i = 0; i < 5; i++) {
+      // The embedded request id varies every attempt, but normalization collapses it.
+      const reason = `agent turn refusal: 401 invalid_api_key (req_${i}aaaaaaaaaaaaaaaa)`;
+      const r = decideCircuitBreaker({ normal: false, reason, prior, threshold: 5 });
+      if (r.kind === 'trip') {
+        tripped = true;
+        counts.push(r.count);
+        break;
+      }
+      assert.equal(r.kind, 'continue');
+      if (r.kind === 'continue') {
+        counts.push(r.count);
+        prior = { normalizedReason: r.normalizedReason, count: r.count };
+      }
+    }
+    assert.ok(tripped, 'breaker should trip on the 5th identical failure');
+    assert.deepEqual(counts, [1, 2, 3, 4, 5]);
+  });
+  it('a different failure reason resets the streak instead of tripping', () => {
+    const r = decideCircuitBreaker({
+      normal: false,
+      reason: 'before_run hook error',
+      prior: { normalizedReason: normalizeFailureReason('smolvm bring-up error'), count: 4 },
+      threshold: 5,
+    });
+    assert.equal(r.kind, 'continue');
+    if (r.kind === 'continue') assert.equal(r.count, 1);
+  });
+  it('threshold 0 disables tripping (streak still tracked)', () => {
+    const prior = { normalizedReason: normalizeFailureReason('boom'), count: 99 };
+    const r = decideCircuitBreaker({ normal: false, reason: 'boom', prior, threshold: 0 });
+    assert.equal(r.kind, 'continue');
+    if (r.kind === 'continue') assert.equal(r.count, 100);
+  });
+  it('trips exactly when the count reaches the threshold, not before', () => {
+    const reason = 'persistent failure';
+    const norm = normalizeFailureReason(reason);
+    const justUnder = decideCircuitBreaker({
+      normal: false,
+      reason,
+      prior: { normalizedReason: norm, count: 1 },
+      threshold: 3,
+    });
+    assert.equal(justUnder.kind, 'continue');
+    const atThreshold = decideCircuitBreaker({
+      normal: false,
+      reason,
+      prior: { normalizedReason: norm, count: 2 },
+      threshold: 3,
+    });
+    assert.equal(atThreshold.kind, 'trip');
+    if (atThreshold.kind === 'trip') assert.equal(atThreshold.count, 3);
   });
 });
 

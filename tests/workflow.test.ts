@@ -111,6 +111,44 @@ describe('workflow', () => {
     assert.equal(cfg.acp.shell, 'bash');
     // acp.model defaults to null: the adapter falls back to its own default model.
     assert.equal(cfg.acp.model, null);
+    // Circuit breaker (issue 128) defaults to 5 consecutive identical failures.
+    assert.equal(cfg.agent.circuit_breaker_threshold, 5);
+  });
+
+  it('parses agent.circuit_breaker_threshold and rejects the degenerate value 1 (issue 128)', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        agent: { circuit_breaker_threshold: 0 },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.agent.circuit_breaker_threshold, 0); // 0 = disabled
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          {
+            tracker: { kind: 'local', root: '/tmp/issues' },
+            states: minimalStates,
+            agent: { circuit_breaker_threshold: 1 },
+          },
+          '/tmp/WORKFLOW.md',
+        ),
+      /circuit_breaker_threshold must be 0 \(disabled\) or an integer >= 2/,
+    );
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          {
+            tracker: { kind: 'local', root: '/tmp/issues' },
+            states: minimalStates,
+            agent: { circuit_breaker_threshold: -3 },
+          },
+          '/tmp/WORKFLOW.md',
+        ),
+      /circuit_breaker_threshold must be 0 \(disabled\) or an integer >= 2/,
+    );
   });
 
   it('parses acp.model and trims whitespace', () => {
