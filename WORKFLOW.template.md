@@ -789,9 +789,11 @@ smolvm:
   # `--smolfile <path>` to `smolvm machine create`; the Smolfile's `image`, resources,
   # and `[dev].init` / `[dev].volumes` carry the per-VM setup. The repo ships a
   # canonical `Smolfile` at the root that installs node tooling + every ACP-capable
-  # coding agent and bind-mounts scripts/ → /opt/symphony so the in-VM proxy at
-  # /opt/symphony/vm-agent.mjs is the same file the host pins. Mutually exclusive
-  # with `image` and `from`. Default: null.
+  # coding agent and BAKES scripts/ into the image at /opt/symphony (the in-VM
+  # proxy /opt/symphony/vm-agent.mjs) via an `[dev].init` cp — so dispatch needs no
+  # runtime /opt/symphony mount (see `volumes` below). The reconciler's bake hash
+  # folds in the content of the host dirs in `[dev].volumes`, so editing a baked
+  # file forces a re-bake. Mutually exclusive with `image` and `from`. Default: null.
   smolfile: ./Smolfile
 
   # from (path | null): path to a packed .smolmachine.smolmachine artifact
@@ -816,10 +818,15 @@ smolvm:
   # tokens, models, or dependencies at run time.
   net: true
 
-  # volumes (list): additional host:guest bind mounts. smolvm has a small
-  # per-VM mount cap (the workspace itself already consumes one slot), so keep
-  # this list small. Each entry: { host: path, guest: path, readonly?: bool }.
-  # Default: [].
+  # volumes (list): additional host:guest bind mounts. smolvm/libkrun caps a VM
+  # at 3 virtio-fs mounts (a 4th makes `krun_start_enter` return -22), and the
+  # workspace already consumes one slot. If ANY state sets `eval_mode: true`,
+  # leave this list EMPTY: eval_mode adds two read-only mounts (/symphony/issues
+  # + /symphony/logs), so workspace (1) + those (2) = 3 already fills the cap and
+  # a single entry here would be the 4th mount that trips krun -22. Otherwise you
+  # have at most one free slot. Prefer baking static tooling into the image (as
+  # the canonical Smolfile does for scripts/) over a runtime mount. Each entry:
+  # { host: path, guest: path, readonly?: bool }. Default: [].
   volumes:
     - host: ~/.cache/npm
       guest: /root/.npm

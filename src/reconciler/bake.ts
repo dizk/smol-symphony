@@ -7,7 +7,7 @@
 // via `smolvm machine create --from <cache_path>` instead of `--smolfile <path>`,
 // skipping the per-start init pay.
 
-import { readFile, stat, readdir, unlink } from 'node:fs/promises';
+import { readFile, stat, lstat, readlink, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -15,9 +15,11 @@ import type { SmolvmConfig } from '../types.js';
 import { log } from '../logging.js';
 import {
   computeBakeHash,
+  parseBakeVolumeHostPaths,
   selectGcVictims,
   type CachedArtifact,
 } from './bake-plan.js';
+import { createHash, type Hash } from 'node:crypto';
 import { actionCacheDir, ensureCacheDir, tryAcquireLock, type FileLock } from './cache.js';
 import { ResourceActionLedger } from './ledger.js';
 import type { ResourceSnapshot } from './types.js';
@@ -63,6 +65,15 @@ export class SmolvmBakeExecutor implements BakeExecutor {
     const stubBase = input.output_path.endsWith('.smolmachine')
       ? input.output_path.slice(0, -'.smolmachine'.length)
       : input.output_path;
+    // Resolve the Smolfile to an absolute path and run `machine create` with cwd
+    // set to its directory, so smolvm resolves `[dev].volumes` relative entries
+    // (e.g. `./scripts`, `../scripts`) against the Smolfile's location — the same
+    // anchor the bake hash uses (readDesiredHash resolves them against
+    // dirname(smolfile)). Without this, a process cwd != Smolfile dir would let
+    // smolvm copy a different scripts/ tree than the one the cache key hashed,
+    // baking a stale/wrong /opt/symphony with no runtime mount to correct it.
+    const smolfileAbs = path.resolve(input.smolfile_path);
+    const smolfileDir = path.dirname(smolfileAbs);
     try {
       await execFileAsync(
         'smolvm',
@@ -71,14 +82,14 @@ export class SmolvmBakeExecutor implements BakeExecutor {
           'create',
           vmName,
           '--smolfile',
-          input.smolfile_path,
+          smolfileAbs,
           '--cpus',
           String(input.cpus),
           '--mem',
           String(input.mem_mib),
           '--net',
         ],
-        { timeout: BAKE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
+        { cwd: smolfileDir, timeout: BAKE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
       );
       await execFileAsync('smolvm', ['machine', 'start', '--name', vmName], {
         timeout: BAKE_TIMEOUT_MS,
@@ -277,8 +288,21 @@ export class BakeResource {
   // a successful prior bake), and return null so the caller short-circuits.
   private async readDesiredHash(): Promise<string | null> {
     try {
-      const buf = await readFile(this.opts.smolvm.smolfile!);
-      return computeBakeHash(buf);
+      const smolfilePath = this.opts.smolvm.smolfile!;
+      const buf = await readFile(smolfilePath);
+      // Absolute so the host-dir resolution below matches the bake, which runs
+      // `machine create` with cwd = dirname(resolved Smolfile) (see bake()).
+      const baseDir = path.dirname(path.resolve(smolfilePath));
+      // Host dirs the Smolfile bakes into the image (e.g. scripts/) must
+      // content-address into the hash, else editing a baked file silently reuses
+      // a stale artifact.
+      const bakedInputs = await Promise.all(
+        parseBakeVolumeHostPaths(buf.toString('utf8')).map(async (p) => ({
+          path: p,
+          digest: await hashPathContent(path.resolve(baseDir, p)),
+        })),
+      );
+      return computeBakeHash(buf, bakedInputs);
     } catch (err) {
       const msg = `read Smolfile failed: ${(err as Error).message}`;
       this.state.lastError = msg;
@@ -463,6 +487,76 @@ export class BakeResource {
       }
     }
     return out;
+  }
+}
+
+/**
+ * Deterministic content digest of a host path baked into the image. A file
+ * hashes its bytes; a directory is walked in sorted order, folding each entry's
+ * relative path + bytes into one sha256. A missing path folds a stable "absent"
+ * marker (the bake itself surfaces the real error). Used by the bake hash so
+ * editing a baked file (e.g. `scripts/vm-agent.mjs`) forces a re-bake. Folds in
+ * file/dir modes and directory structure (not just file bytes) so metadata-only
+ * changes `cp -a` preserves — `chmod +x`, an added empty dir — also invalidate
+ * the cache. Exported for tests.
+ *
+ * The ROOT path is followed if it is a symlink (`stat`): smolvm resolves a
+ * symlinked `[dev].volumes` host path when it mounts it, and `cp -a <root>/.`
+ * copies the resolved target's contents — so the digest must reflect the target,
+ * not the link text. NESTED entries are walked with `lstat` (see foldPathInto)
+ * so an interior symlink is preserved as a link, exactly as `cp -a` preserves it.
+ */
+export async function hashPathContent(absPath: string): Promise<string> {
+  const h = createHash('sha256');
+  let st;
+  try {
+    st = await stat(absPath); // follow a symlinked root
+  } catch {
+    h.update('\0absent\0');
+    return h.digest('hex');
+  }
+  if (st.isDirectory()) {
+    h.update(`\0root-dir\0${st.mode.toString(8)}\0`);
+    for (const name of (await readdir(absPath)).sort()) {
+      await foldPathInto(h, path.join(absPath, name), name);
+    }
+  } else if (st.isFile()) {
+    h.update(`\0root-file\0${st.mode.toString(8)}\0`);
+    h.update(await readFile(absPath));
+  }
+  return h.digest('hex');
+}
+
+async function foldPathInto(h: Hash, absPath: string, rel: string): Promise<void> {
+  let st;
+  try {
+    // lstat (not stat) so we do NOT follow symlinks — matching `cp -a`, which
+    // preserves the link rather than its target. Following would let the cache
+    // key depend on un-baked files and let a symlink cycle recurse forever.
+    st = await lstat(absPath);
+  } catch {
+    h.update(`\0absent\0${rel}`);
+    return;
+  }
+  if (st.isSymbolicLink()) {
+    h.update(`\0symlink\0${rel}\0`);
+    h.update(await readlink(absPath));
+    return;
+  }
+  if (st.isDirectory()) {
+    // Mark the dir itself (with its mode) so adding/removing an even-empty
+    // directory, or a chmod on one, changes the digest — `cp -a` preserves both.
+    h.update(`\0dir\0${rel}\0${st.mode.toString(8)}\0`);
+    for (const name of (await readdir(absPath)).sort()) {
+      await foldPathInto(h, path.join(absPath, name), rel ? `${rel}/${name}` : name);
+    }
+    return;
+  }
+  if (st.isFile()) {
+    // Include the mode: `cp -a` preserves it, so a metadata-only change like
+    // `chmod +x` alters the baked image even when the bytes are identical.
+    h.update(`\0file\0${rel}\0${st.mode.toString(8)}\0`);
+    h.update(await readFile(absPath));
   }
 }
 

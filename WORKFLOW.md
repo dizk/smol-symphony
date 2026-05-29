@@ -317,16 +317,16 @@ smolvm:
   cpus: 2
   mem_mib: 4096
   net: true
-  # Bind-mount scripts/ at /opt/symphony on every dispatch so the in-VM
-  # stdio proxy at /opt/symphony/vm-agent.mjs is reachable. The Smolfile's
-  # [dev].volumes carries the same mount for direct `smolvm machine create
-  # --smolfile` dev runs, but that directive does NOT persist into a packed
-  # artifact — bind-mounts are runtime-only and the reconciler dispatches
-  # via `--from <pack>`, so the mount has to be re-applied here. Workspace
-  # is auto-mounted by the runner; credentials are staged into the workspace
-  # by symphony; the tracker is reached only through the symphony MCP server.
-  volumes:
-    - { host: ./scripts, guest: /opt/symphony, readonly: true }
+  # No runtime bind-mounts. scripts/ (the in-VM stdio proxy
+  # /opt/symphony/vm-agent.mjs) is now BAKED INTO the image by the Smolfile's
+  # `[dev].init` cp step, so it no longer needs a per-dispatch /opt/symphony
+  # mount. Dropping it keeps a dispatch at 2 mounts (workspace + whatever a
+  # state adds) so an eval_mode state can add its two read-only mounts
+  # (/symphony/issues + /symphony/logs) without exceeding smolvm/libkrun's
+  # 3-mount-per-VM cap (a 4th mount → `krun_start_enter -22`). Workspace is
+  # auto-mounted by the runner; credentials go through the credential proxy;
+  # the tracker is reached via the symphony MCP server (or the eval_mode mount).
+  volumes: []
   # forward_env is a generic passthrough, but for a proxy adapter (claude, codex)
   # the runner strips that adapter's credential var from the forwarded boot env
   # per dispatch and substitutes the per-VM sentinel via the credential proxy —
