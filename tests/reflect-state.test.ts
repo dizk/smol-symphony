@@ -58,6 +58,25 @@ describe('shipped WORKFLOW.md sleep-cycle states', () => {
     assert.deepEqual(reflect!.allowed_transitions, ['Dormant']);
   });
 
+  it('wires the sleep_cycle auto-arm at the Reflect/Dormant states (issue 125)', () => {
+    const { config } = loadShippedWorkflow();
+    const sc = config.sleep_cycle;
+    assert.equal(sc.enabled, true, 'sleep_cycle should be enabled in the shipped workflow');
+    assert.equal(sc.issue_id, 'sleep-cycle');
+    // The auto-arm targets must match the declared Reflect/Dormant states.
+    assert.equal(sc.dormant_state, 'Dormant');
+    assert.equal(sc.reflect_state, 'Reflect');
+    assert.equal(config.states[sc.dormant_state]!.role, 'holding');
+    assert.equal(config.states[sc.reflect_state]!.role, 'active');
+    // At least one trigger must be live for the block to do anything.
+    assert.ok(
+      sc.arm_on_idle || sc.arm_after_done > 0,
+      'expected at least one of arm_on_idle / arm_after_done to be active',
+    );
+    // The enabled block must pass cross-reference validation.
+    assert.equal(validateDispatch(config), null);
+  });
+
   it('declares Dormant as a holding state after Triage', () => {
     const { config } = loadShippedWorkflow();
     const dormant = config.states.Dormant;

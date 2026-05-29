@@ -20,6 +20,7 @@ import type {
   ServerConfig,
   McpConfig,
   PrAutopilotConfig,
+  SleepCycleConfig,
   CredentialsConfig,
 } from './types.js';
 import { log } from './logging.js';
@@ -446,6 +447,8 @@ export function buildServiceConfig(
     );
   }
 
+  const sleepCycle = parseSleepCycle(raw);
+
   return {
     workflow_path: workflowAbs,
     workflow_dir: workflowDir,
@@ -460,8 +463,41 @@ export function buildServiceConfig(
     server,
     mcp,
     pr_autopilot: prAutopilot,
+    sleep_cycle: sleepCycle,
     credentials,
     states,
+  };
+}
+
+// sleep_cycle (issue 125, follow-up to 122). Optional block; default off. When
+// enabled the orchestrator auto-arms the recurring reflection issue (Dormant →
+// Reflect) on idle or after N terminal-state transitions. State-name fields are
+// normalized here and cross-referenced against the declared states map in
+// `validateDispatch` (only when enabled), so an undeclared/wrong-role name gives
+// a clearer error than a runtime lookup failure. `arm_on_idle` defaults to true;
+// the explicit `false` keyword disables the idle trigger while leaving the
+// done-threshold one available.
+function parseSleepCycle(raw: Record<string, unknown>): SleepCycleConfig {
+  const sleepRaw = getObject(raw, 'sleep_cycle');
+  const issueIdRaw = asString(sleepRaw['issue_id']);
+  const issueId = issueIdRaw && issueIdRaw.trim().length > 0 ? issueIdRaw.trim() : null;
+  const dormantRaw = asString(sleepRaw['dormant_state']);
+  const reflectRaw = asString(sleepRaw['reflect_state']);
+  const armOnIdleRaw = sleepRaw['arm_on_idle'];
+  const armAfterDone = asInt(sleepRaw['arm_after_done'], 0);
+  if (armAfterDone < 0) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      'sleep_cycle.arm_after_done must be a non-negative integer (0 disables the done-count trigger)',
+    );
+  }
+  return {
+    enabled: sleepRaw['enabled'] === true,
+    issue_id: issueId,
+    dormant_state: dormantRaw && dormantRaw.trim().length > 0 ? dormantRaw.trim() : 'Dormant',
+    reflect_state: reflectRaw && reflectRaw.trim().length > 0 ? reflectRaw.trim() : 'Reflect',
+    arm_on_idle: armOnIdleRaw === undefined ? true : armOnIdleRaw !== false,
+    arm_after_done: armAfterDone,
   };
 }
 
@@ -774,6 +810,50 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
     const prError = validatePrAutopilot(cfg.pr_autopilot, cfg.states);
     if (prError) return prError;
   }
+  // sleep_cycle is always populated by buildServiceConfig, but legacy
+  // hand-built ServiceConfigs (older test fixtures) may omit it; treat a
+  // missing block as disabled so those fixtures keep validating.
+  if (cfg.sleep_cycle && cfg.sleep_cycle.enabled) {
+    const scError = validateSleepCycle(cfg.sleep_cycle, cfg.states);
+    if (scError) return scError;
+  }
+  return null;
+}
+
+/**
+ * Cross-reference the sleep_cycle block against the declared states map. Only
+ * fires when `sleep_cycle.enabled` is true so a workflow that hasn't opted in
+ * isn't gated on the reflection issue id or the state names. The dormant state
+ * must be `holding` (the reflection issue rests there, never dispatched) and the
+ * reflect state must be `active` (so the armed issue is picked up on the next
+ * poll). `issue_id` must be set — without it the orchestrator has nothing to arm.
+ */
+function validateSleepCycle(
+  cfg: SleepCycleConfig,
+  states: Record<string, StateConfig>,
+): string | null {
+  if (!cfg.issue_id) {
+    return 'sleep_cycle.issue_id is required when sleep_cycle.enabled is true';
+  }
+  const byLower = new Map<string, string>();
+  for (const name of Object.keys(states)) byLower.set(name.toLowerCase(), name);
+
+  const dormantCanonical = byLower.get(cfg.dormant_state.toLowerCase());
+  if (!dormantCanonical) {
+    return `sleep_cycle.dormant_state references undeclared state "${cfg.dormant_state}"`;
+  }
+  if (states[dormantCanonical]!.role !== 'holding') {
+    return `sleep_cycle.dormant_state "${cfg.dormant_state}" must be a holding state (got role: ${states[dormantCanonical]!.role})`;
+  }
+
+  const reflectCanonical = byLower.get(cfg.reflect_state.toLowerCase());
+  if (!reflectCanonical) {
+    return `sleep_cycle.reflect_state references undeclared state "${cfg.reflect_state}"`;
+  }
+  if (states[reflectCanonical]!.role !== 'active') {
+    return `sleep_cycle.reflect_state "${cfg.reflect_state}" must be an active state (got role: ${states[reflectCanonical]!.role})`;
+  }
+
   return null;
 }
 

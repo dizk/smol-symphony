@@ -8,11 +8,14 @@ import {
   decideExitRetry,
   decideReconcileForIssue,
   decideRetryAfterIneligible,
+  decideSleepCycleArm,
   hasNonTerminalBlocker,
   normalizeFailureReason,
   requiredAdapterIds,
   resolveActorString,
+  sleepCycleArmNotes,
   type EligibilitySnapshot,
+  type SleepCycleArmInput,
 } from '../src/orchestrator-decisions.js';
 import type { Issue, ServiceConfig, StateConfig } from '../src/types.js';
 
@@ -354,5 +357,76 @@ describe('buildIssueDetailDto', () => {
     assert.deepEqual(dto.attempts, { current_retry_attempt: 3 });
     const r = dto.retry as { due_at: string };
     assert.equal(r.due_at, new Date(0).toISOString());
+  });
+});
+
+describe('decideSleepCycleArm', () => {
+  function input(over: Partial<SleepCycleArmInput> = {}): SleepCycleArmInput {
+    return {
+      enabled: true,
+      issueId: 'sleep-cycle',
+      armOnIdle: true,
+      armAfterDone: 0,
+      doneSinceReflect: 0,
+      idle: false,
+      ...over,
+    };
+  }
+
+  it('returns null when the block is disabled', () => {
+    assert.equal(decideSleepCycleArm(input({ enabled: false, idle: true, doneSinceReflect: 5 })), null);
+  });
+
+  it('returns null when no issue id is configured', () => {
+    assert.equal(decideSleepCycleArm(input({ issueId: null, idle: true, doneSinceReflect: 5 })), null);
+  });
+
+  it('arms on done_threshold once the count reaches arm_after_done', () => {
+    assert.equal(decideSleepCycleArm(input({ armAfterDone: 3, doneSinceReflect: 2 })), null);
+    assert.equal(decideSleepCycleArm(input({ armAfterDone: 3, doneSinceReflect: 3 })), 'done_threshold');
+    assert.equal(decideSleepCycleArm(input({ armAfterDone: 3, doneSinceReflect: 9 })), 'done_threshold');
+  });
+
+  it('treats arm_after_done: 0 as the threshold trigger disabled', () => {
+    // Even a large accumulated count must not arm via the threshold path.
+    assert.equal(decideSleepCycleArm(input({ armAfterDone: 0, doneSinceReflect: 100 })), null);
+  });
+
+  it('arms on idle only when work finished since the last run', () => {
+    // Idle with nothing finished must NOT arm — that is the anti-spin gate.
+    assert.equal(decideSleepCycleArm(input({ idle: true, doneSinceReflect: 0 })), null);
+    assert.equal(decideSleepCycleArm(input({ idle: true, doneSinceReflect: 1 })), 'idle');
+  });
+
+  it('does not arm on idle when arm_on_idle is off', () => {
+    assert.equal(decideSleepCycleArm(input({ armOnIdle: false, idle: true, doneSinceReflect: 4 })), null);
+  });
+
+  it('does not arm when not idle and the done threshold is unmet', () => {
+    assert.equal(decideSleepCycleArm(input({ idle: false, armAfterDone: 5, doneSinceReflect: 2 })), null);
+  });
+
+  it('prefers done_threshold over idle when both fire', () => {
+    assert.equal(
+      decideSleepCycleArm(input({ idle: true, armAfterDone: 2, doneSinceReflect: 4 })),
+      'done_threshold',
+    );
+  });
+});
+
+describe('sleepCycleArmNotes', () => {
+  it('describes the done_threshold trigger and the human gate', () => {
+    const notes = sleepCycleArmNotes('done_threshold', 10, 10);
+    assert.match(notes, /Auto-armed by the sleep cycle/);
+    assert.match(notes, /done_threshold/);
+    assert.match(notes, /10/);
+    assert.match(notes, /Triage/);
+    assert.match(notes, /human approve\/discard/);
+  });
+
+  it('describes the idle trigger', () => {
+    const notes = sleepCycleArmNotes('idle', 1, 0);
+    assert.match(notes, /idle/);
+    assert.match(notes, /does not bypass/);
   });
 });

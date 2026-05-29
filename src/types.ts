@@ -314,6 +314,46 @@ export interface PrAutopilotConfig {
 }
 
 /**
+ * Sleep-cycle auto-arm (issue 125, follow-up to 122). When `enabled`, the
+ * orchestrator moves the recurring reflection issue (`issue_id`) from its
+ * `dormant_state` (a holding state it rests in between runs) into the active
+ * `reflect_state` automatically, on the "sleep when not busy" framing, when
+ * either trigger fires:
+ *
+ *   • `arm_on_idle` and the orchestrator is idle (nothing running, claimed, or
+ *     pending retry, and no active-state candidate this poll) AND at least one
+ *     issue has reached a terminal state since the last reflection run —
+ *     otherwise an idle orchestrator would re-arm reflection in a tight loop
+ *     with nothing new to mine; or
+ *   • `arm_after_done > 0` and that many issues have reached a terminal state
+ *     (the work the reflector mines) since the last reflection run.
+ *
+ * The counter resets to 0 the moment the reflection issue is armed, so "since
+ * the last reflection run" is measured from the previous arm. It is held in
+ * orchestrator memory only (a process restart resets it to 0).
+ *
+ * Default off, so a workflow that does not declare the block — or declares it
+ * with `enabled: false` — is unaffected, and the only cadence is the
+ * operator/cron/`mv`-on-disk path from issue 122. Auto-arming ONLY moves the
+ * issue into `reflect_state`; the proposals that reflection produces still land
+ * in Triage and still require human approve/discard. It does not bypass the
+ * human gate.
+ *
+ * `dormant_state` / `reflect_state` are case-insensitive lookups against the
+ * declared states map, checked at validation time (when enabled): the dormant
+ * state must be `holding`, the reflect state must be `active`. `issue_id` is
+ * the reflection issue's tracker id/identifier; it is required when enabled.
+ */
+export interface SleepCycleConfig {
+  enabled: boolean;
+  issue_id: string | null;
+  dormant_state: string;
+  reflect_state: string;
+  arm_on_idle: boolean;
+  arm_after_done: number;
+}
+
+/**
  * Host-side credential lifecycle (issue 113). The bind host/port for the
  * credential proxy plus the ticker interval that proactively spawns
  * `claude -p "ok"` to keep the host's cached access token warm during idle
@@ -347,6 +387,7 @@ export interface ServiceConfig {
   server: ServerConfig;
   mcp: McpConfig;
   pr_autopilot: PrAutopilotConfig;
+  sleep_cycle: SleepCycleConfig;
   credentials: CredentialsConfig;
   // Canonical per-state configuration map. The same map is mirrored onto
   // `tracker.states` so the tracker (which only sees its slice of config)

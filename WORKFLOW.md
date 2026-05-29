@@ -67,9 +67,10 @@ states:
     # Smolfile, acceptance criteria, timeouts), NOT the product code under
     # review. After filing it transitions to Dormant and waits to be re-armed.
     # See the Reflect prompt branch (the `when "Reflect"` case in the body) for
-    # the read → distil → propose loop and the guardrails. Cadence for v1 is
-    # operator/scheduled-triggered — no orchestrator trigger logic; auto-arm-on-
-    # idle is a deliberate follow-up.
+    # the read → distil → propose loop and the guardrails. Cadence: the operator
+    # / an external cron / a `mv` on disk can still arm a cycle, and the
+    # orchestrator now also auto-arms Dormant → Reflect on idle or after N
+    # terminal transitions (issue 125 — see the `sleep_cycle:` block below).
     role: active
     adapter: claude
     # 1M-context Opus: a reflection turn reads many Done/*.md transcripts plus
@@ -125,9 +126,11 @@ states:
     role: holding
   Dormant:
     # Resting place for the recurring "Sleep cycle" issue (issue 122) between
-    # reflection runs. Holding → never dispatched. Re-arm a reflection cycle by
-    # moving the issue from Dormant back into Reflect (an external cron, a
-    # `symphony reflect` verb, or `mv` on disk). NOTE: the dashboard currently
+    # reflection runs. Holding → never dispatched. A reflection cycle re-arms by
+    # moving the issue from Dormant back into Reflect: the orchestrator's
+    # `sleep_cycle:` auto-arm (issue 125, below) does this on idle / after N
+    # terminal transitions, and an external cron, a `symphony reflect` verb, or
+    # `mv` on disk still work too. NOTE: the dashboard currently
     # renders triage approve/discard buttons on every holding row and the
     # tracker resolves a move by issue id regardless of source directory, so
     # clicking those buttons on a Dormant issue would mis-route it — re-arm via
@@ -166,6 +169,36 @@ pr_autopilot:
   conflict_route_to: Todo
   auto_merge_strategy: squash
   poll_interval_ms: 30000
+
+# Sleep-cycle auto-arm (issue 125, the deferred follow-up to issue 122). The
+# orchestrator moves the recurring "Sleep cycle" reflection issue from Dormant
+# (holding) into Reflect (active) automatically — the "sleep when not busy"
+# framing — so the cadence no longer depends solely on the operator / an
+# external cron / a `mv` on disk. Two triggers, evaluated on every poll:
+#
+#   • arm_on_idle: when the orchestrator is idle (nothing running, claimed, or
+#     pending retry, and no active candidate this poll) AND ≥1 issue has reached
+#     a terminal state since the last reflection run. The "≥1 since last run"
+#     gate is load-bearing: without it an idle orchestrator would re-arm
+#     reflection in a tight loop with nothing new to mine.
+#   • arm_after_done: a backstop for busy stretches that never go idle — arm
+#     once this many issues have reached a terminal state (Done/Cancelled — the
+#     work the reflector reads) since the last run.
+#
+# The terminal-transition counter resets to 0 the moment the issue is armed, and
+# is held in orchestrator memory only (a restart resets it). GUARDRAILS (carried
+# over from 122): auto-arming ONLY moves the issue into Reflect — the proposals
+# it files still land in Triage and still require human approve/discard, so this
+# does not bypass the human gate. Default off in the parser; this project opts
+# in. Requires a single `sleep-cycle` issue resting in Dormant (created by the
+# operator); the block is inert until that issue exists.
+sleep_cycle:
+  enabled: true
+  issue_id: sleep-cycle
+  dormant_state: Dormant
+  reflect_state: Reflect
+  arm_on_idle: true
+  arm_after_done: 10
 
 polling:
   interval_ms: 5000

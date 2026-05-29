@@ -974,3 +974,146 @@ describe('pr_autopilot block', () => {
   });
 
 });
+
+describe('sleep_cycle block', () => {
+  // States with both a Reflect (active) and Dormant (holding) declared, so the
+  // enabled cross-reference checks have valid targets to resolve against.
+  const sleepStates = {
+    Todo: { role: 'active' as const },
+    Reflect: { role: 'active' as const },
+    Done: { role: 'terminal' as const },
+    Triage: { role: 'holding' as const },
+    Dormant: { role: 'holding' as const },
+  };
+
+  it('defaults off when the block is absent', () => {
+    const cfg = buildServiceConfig(
+      { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.sleep_cycle.enabled, false);
+    assert.equal(cfg.sleep_cycle.issue_id, null);
+    assert.equal(cfg.sleep_cycle.dormant_state, 'Dormant');
+    assert.equal(cfg.sleep_cycle.reflect_state, 'Reflect');
+    assert.equal(cfg.sleep_cycle.arm_on_idle, true);
+    assert.equal(cfg.sleep_cycle.arm_after_done, 0);
+  });
+
+  it('parses explicit fields', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: sleepStates,
+        sleep_cycle: {
+          enabled: true,
+          issue_id: 'sleep-cycle',
+          dormant_state: 'Dormant',
+          reflect_state: 'Reflect',
+          arm_on_idle: false,
+          arm_after_done: 7,
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.sleep_cycle.enabled, true);
+    assert.equal(cfg.sleep_cycle.issue_id, 'sleep-cycle');
+    assert.equal(cfg.sleep_cycle.arm_on_idle, false);
+    assert.equal(cfg.sleep_cycle.arm_after_done, 7);
+  });
+
+  it('rejects a negative arm_after_done at parse time', () => {
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          {
+            tracker: { kind: 'local', root: '/tmp/issues' },
+            states: sleepStates,
+            sleep_cycle: { enabled: true, issue_id: 'sleep-cycle', arm_after_done: -1 },
+          },
+          '/tmp/WORKFLOW.md',
+        ),
+      /arm_after_done must be a non-negative integer/,
+    );
+  });
+
+  it('validates a well-formed enabled block', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: sleepStates,
+        sleep_cycle: {
+          enabled: true,
+          issue_id: 'sleep-cycle',
+          dormant_state: 'Dormant',
+          reflect_state: 'Reflect',
+          arm_after_done: 5,
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(validateDispatch(cfg), null);
+  });
+
+  it('rejects an enabled block with no issue_id', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: sleepStates,
+        sleep_cycle: { enabled: true, dormant_state: 'Dormant', reflect_state: 'Reflect' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.match(validateDispatch(cfg) ?? '', /sleep_cycle\.issue_id is required/);
+  });
+
+  it('rejects a dormant_state that is not a holding state', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: sleepStates,
+        // Todo is active, not holding.
+        sleep_cycle: { enabled: true, issue_id: 'sleep-cycle', dormant_state: 'Todo' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.match(validateDispatch(cfg) ?? '', /dormant_state "Todo" must be a holding state/);
+  });
+
+  it('rejects a reflect_state that is not an active state', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: sleepStates,
+        // Triage is holding, not active.
+        sleep_cycle: { enabled: true, issue_id: 'sleep-cycle', reflect_state: 'Triage' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.match(validateDispatch(cfg) ?? '', /reflect_state "Triage" must be an active state/);
+  });
+
+  it('rejects a dormant_state referencing an undeclared state', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: sleepStates,
+        sleep_cycle: { enabled: true, issue_id: 'sleep-cycle', dormant_state: 'Nowhere' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.match(validateDispatch(cfg) ?? '', /dormant_state references undeclared state "Nowhere"/);
+  });
+
+  it('disabled bypasses cross-reference validation', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        // enabled:false → the undeclared/missing names must not error.
+        sleep_cycle: { enabled: false, dormant_state: 'Nope', reflect_state: 'AlsoNope' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(validateDispatch(cfg), null);
+  });
+});
