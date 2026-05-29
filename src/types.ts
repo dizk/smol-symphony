@@ -413,6 +413,34 @@ export interface RunningEntry {
   steering_requested: boolean;
   steering_question: string | null;
   steering_context: string | null;
+  // Snapshot of the most recent state transition performed during the active
+  // attempt — set by the MCP `transition` tool (and by the runner's action
+  // reroute). The orchestrator folds it into the per-issue run log as a
+  // `transition` lifecycle event after the attempt unwinds, so the run-summary
+  // reducer (src/runlog.ts) can reconstruct the trajectory (state path,
+  // rejection notes, terminal outcome) without re-parsing the raw frame stream.
+  // Null until the issue transitions.
+  last_transition: TransitionRecord | null;
+}
+
+/**
+ * Snapshot of a single state transition. Stashed on the running entry at the
+ * transition site (MCP tool / action reroute) and emitted by the orchestrator
+ * shell as a `transition` run-log event. Kept deliberately small: the
+ * run-summary reducer reads these to rebuild the state path, count review
+ * rejections, capture each rejection's notes, and label the terminal outcome.
+ */
+export interface TransitionRecord {
+  from_state: string;
+  to_state: string;
+  /** Notes appended to the issue body on this move (reviewer rework notes, PR body, …). */
+  notes: string;
+  /** Resolved "<adapter>/<model>" actor that performed the move, or null when unknown. */
+  actor: string | null;
+  /** True when `to_state` has `role: terminal` (this move ends the run). */
+  terminal: boolean;
+  /** True for conflict/rework reroutes (PR-autopilot merge conflict, action `route_to`). */
+  rerouted?: boolean;
 }
 
 // Discriminates the two retry shapes in the queue. A `continuation` is the

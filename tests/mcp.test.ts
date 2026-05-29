@@ -78,6 +78,7 @@ function makeEntry(
     steering_requested: false,
     steering_question: null,
     steering_context: null,
+    last_transition: null,
   };
 }
 
