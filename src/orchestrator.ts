@@ -9,6 +9,7 @@ import type {
   RuntimeEvent,
   ServiceConfig,
   SessionTotals,
+  SleepCycleConfig,
   WorkflowDefinition,
 } from './types.js';
 import type { IssueTracker } from './trackers/types.js';
@@ -45,10 +46,13 @@ import {
   decideExitRetry,
   decideReconcileForIssue,
   decideRetryAfterIneligible,
+  decideSleepCycleArm,
   requiredAdapterIds,
   resolveActorString,
+  sleepCycleArmNotes,
   type CircuitBreakerState,
   type EligibilitySnapshot,
+  type SleepCycleTrigger,
 } from './orchestrator-decisions.js';
 
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
@@ -137,6 +141,11 @@ interface RetrySchedule {
 const CONTINUATION_DELAY_MS = 1_000;
 const FAILURE_BASE_MS = 10_000;
 
+// Actor stamped into the notes header when the orchestrator (not an agent)
+// auto-arms the reflection issue, so the move is attributable on the dashboard
+// and in the issue body.
+const SLEEP_CYCLE_ACTOR = 'symphony/sleep-cycle';
+
 /**
  * Resolve the base branch the autopilot should rebase against. Mirrors the
  * after_create hook contract — operators export `SYMPHONY_BASE_BRANCH` to
@@ -165,6 +174,14 @@ export class Orchestrator
   // In-memory only — a process restart resets the streak, but the *trip itself*
   // is restart-safe because it physically moves the issue out of the active set.
   private circuitBreakers = new Map<string, CircuitBreakerState>();
+  // Sleep-cycle auto-arm (issue 125). Count of terminal-state transitions
+  // observed since the reflection issue was last armed; the idle and
+  // done-threshold triggers both read it, and it resets to 0 on each arm. The
+  // in-flight guard stops two overlapping ticks from both firing the async
+  // Dormant → Reflect move. In-memory only — a process restart resets the
+  // streak (consistent with `circuitBreakers`).
+  private doneSinceReflect = 0;
+  private armingReflection = false;
   private completed = new Set<string>();
   // Per-state ledger of the most-recent action-list execution. Surfaced via
   // `snapshot.reconciler.resources` so the dashboard can render "Done.actions:
@@ -407,6 +424,7 @@ export class Orchestrator
     if (!fetched) return;
     if (this.gatedOnReconciler(fetched.issues.length)) return;
     this.dispatchSorted(this.sortForDispatch(fetched.issues), fetched.root);
+    this.maybeArmSleepCycle(fetched.issues.length === 0);
     this.scheduleTick(this.cfg.polling.interval_ms);
   }
 
@@ -900,6 +918,7 @@ export class Orchestrator
       return;
     }
     if (normal) this.completed.add(issueId);
+    this.recordSleepCycleProgress(entry);
     // Circuit breaker (issue 128): a deterministically-failing dispatch (same
     // reason every attempt) would otherwise retry forever under backoff. Trip
     // after the configured streak and route the issue to a holding state
@@ -1036,6 +1055,101 @@ export class Orchestrator
         { error: (err as Error).message },
       );
       return false;
+    }
+  }
+
+  /**
+   * Sleep-cycle auto-arm (issue 125): fold a finished attempt into the
+   * terminal-transition counter the triggers read. Only the work the reflector
+   * mines counts — a transition into a `role: terminal` state (Done/Cancelled)
+   * — and the reflection issue's own moves (it can only go to its holding
+   * dormant state) are excluded so a reflection run never counts toward arming
+   * the next one. No-op when the block is disabled.
+   */
+  private recordSleepCycleProgress(entry: RunningEntry): void {
+    const sc = this.cfg.sleep_cycle;
+    if (!sc.enabled || !sc.issue_id) return;
+    if (entry.issue_id === sc.issue_id || entry.identifier === sc.issue_id) return;
+    if (entry.last_transition?.terminal) this.doneSinceReflect += 1;
+  }
+
+  /**
+   * Sleep-cycle auto-arm (issue 125): decide — purely — whether to arm the
+   * reflection cycle this tick, and fire the async Dormant → Reflect move when
+   * a trigger fires. `noActiveCandidates` is true when this poll surfaced no
+   * active-state issues; combined with empty running/claimed/retry sets that is
+   * the orchestrator-idle signal. The in-flight guard prevents two overlapping
+   * ticks from both launching the move.
+   */
+  private maybeArmSleepCycle(noActiveCandidates: boolean): void {
+    const sc = this.cfg.sleep_cycle;
+    if (!sc.enabled || this.armingReflection) return;
+    const idle =
+      noActiveCandidates &&
+      this.running.size === 0 &&
+      this.claimed.size === 0 &&
+      this.retryAttempts.size === 0;
+    const trigger = decideSleepCycleArm({
+      enabled: sc.enabled,
+      issueId: sc.issue_id,
+      armOnIdle: sc.arm_on_idle,
+      armAfterDone: sc.arm_after_done,
+      doneSinceReflect: this.doneSinceReflect,
+      idle,
+    });
+    if (!trigger) return;
+    this.armingReflection = true;
+    void this.armReflection(sc, trigger).finally(() => {
+      this.armingReflection = false;
+    });
+  }
+
+  /**
+   * Move the reflection issue from its dormant (holding) state into the active
+   * reflect state. Guarded so it is a no-op unless the issue currently lives in
+   * `dormant_state` (so we never yank it out of Reflect mid-run or relocate it
+   * from some other state), and the counter only resets on a successful move so
+   * a failed arm doesn't silently discard the accumulated terminal count.
+   */
+  private async armReflection(sc: SleepCycleConfig, trigger: SleepCycleTrigger): Promise<void> {
+    if (!this.tracker.moveIssueToState || !sc.issue_id) return;
+    const current = await this.fetchReflectionIssue(sc.issue_id);
+    if (!current) return;
+    if (current.state.toLowerCase() !== sc.dormant_state.toLowerCase()) return;
+    if (this.running.has(current.id) || this.claimed.has(current.id)) return;
+    const count = this.doneSinceReflect;
+    try {
+      await this.tracker.moveIssueToState(current.id, sc.reflect_state, {
+        fromState: sc.dormant_state,
+        notes: sleepCycleArmNotes(trigger, count, sc.arm_after_done),
+        actor: SLEEP_CYCLE_ACTOR,
+      });
+      this.doneSinceReflect = 0;
+      log.info('sleep cycle armed reflection', {
+        issue_id: current.id,
+        trigger,
+        done_since_reflect: count,
+        reflect_state: sc.reflect_state,
+      });
+    } catch (err) {
+      log.warn('sleep cycle arm failed', {
+        issue_id: current.id,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  /** Look up the reflection issue's current tracker state; undefined on miss/error. */
+  private async fetchReflectionIssue(issueId: string): Promise<Issue | undefined> {
+    try {
+      const found = await this.tracker.fetchIssueStatesByIds([issueId]);
+      return found.find((i) => i.id === issueId || i.identifier === issueId);
+    } catch (err) {
+      log.debug('sleep cycle reflection-issue lookup failed', {
+        issue_id: issueId,
+        error: (err as Error).message,
+      });
+      return undefined;
     }
   }
 

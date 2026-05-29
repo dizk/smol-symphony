@@ -1018,3 +1018,160 @@ describe('Orchestrator circuit breaker (issue 128)', () => {
     }
   });
 });
+
+describe('Orchestrator sleep-cycle auto-arm (issue 125)', () => {
+  it('arms the reflection issue Dormant -> Reflect after N terminal transitions', async () => {
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-sc-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-sc-tracker-'));
+    const logsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-sc-logs-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+
+      const { cfg, def } = await buildCfgAndDef(
+        {
+          acp: { adapter: 'claude' },
+          agent: {
+            max_concurrent_agents: 1,
+            memory_admission_enabled: false,
+            circuit_breaker_threshold: 0,
+            max_retry_backoff_ms: 5,
+          },
+          polling: { interval_ms: 20 },
+          logs: { root: logsRoot },
+          sleep_cycle: {
+            enabled: true,
+            issue_id: 'sleep-cycle',
+            dormant_state: 'Dormant',
+            reflect_state: 'Reflect',
+            arm_on_idle: true,
+            arm_after_done: 2,
+          },
+          states: {
+            Todo: { role: 'active', adapter: 'claude' },
+            Reflect: { role: 'active', adapter: 'claude' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+            Dormant: { role: 'holding' },
+          },
+        },
+        trackerRoot,
+      );
+
+      // In-memory tracker: two Todo issues that finish into Done, plus the
+      // recurring reflection issue resting in Dormant.
+      const byId = new Map<string, Issue>([
+        ['a', mk('a', 'Todo')],
+        ['b', mk('b', 'Todo')],
+        ['sleep-cycle', mk('sleep-cycle', 'Dormant')],
+      ]);
+      function mk(id: string, state: string): Issue {
+        return {
+          id, identifier: id, title: id, description: null, priority: null,
+          state, branch_name: null, url: null, labels: [], blocked_by: [],
+          created_at: null, updated_at: null,
+        };
+      }
+      const active = new Set(['todo', 'reflect']);
+      const moves: Array<{ id: string; toState: string; fromState?: string; notes?: string }> = [];
+      const tracker: IssueTracker = {
+        async fetchCandidateIssues(): Promise<CandidateFetchResult> {
+          const issues = [...byId.values()]
+            .filter((i) => active.has(i.state.toLowerCase()))
+            .map((i) => ({ ...i }));
+          return { issues, root: trackerRoot };
+        },
+        async fetchIssuesByStates(names: string[]): Promise<Issue[]> {
+          const want = new Set(names.map((s) => s.toLowerCase()));
+          return [...byId.values()].filter((i) => want.has(i.state.toLowerCase())).map((i) => ({ ...i }));
+        },
+        async fetchIssueStatesByIds(ids: string[]): Promise<Issue[]> {
+          return ids.map((id) => byId.get(id)).filter((i): i is Issue => !!i).map((i) => ({ ...i }));
+        },
+        currentRoot(): string | null {
+          return trackerRoot;
+        },
+        async moveIssueToState(issueId, toState, opts) {
+          const cur = byId.get(issueId);
+          const fromState = cur?.state;
+          moves.push({ id: issueId, toState, fromState: opts?.fromState, notes: opts?.notes });
+          if (cur) byId.set(issueId, { ...cur, state: toState });
+          return { fromState: fromState ?? '?', toState, newPath: path.join(trackerRoot, toState, `${issueId}.md`) };
+        },
+      };
+
+      // The runner stands in for the in-VM agent + MCP transition tool: it moves
+      // the issue's tracker file and records the transition on the entry. A Todo
+      // issue finishes into Done (terminal); the reflection issue, once armed,
+      // returns to Dormant (holding, non-terminal — must NOT count toward arming).
+      const runner = {
+        vmNameFor: (i: Issue) => `symphony-${i.identifier}`,
+        async runAttempt(issue: Issue, _attempt: unknown, _cancel: unknown, entry: any): Promise<RunAttemptResult> {
+          const to = issue.state.toLowerCase() === 'reflect' ? 'Dormant' : 'Done';
+          await tracker.moveIssueToState!(issue.id, to, { fromState: issue.state });
+          entry.last_transition = {
+            from_state: issue.state, to_state: to, notes: '', actor: null, terminal: to === 'Done',
+          };
+          entry.transitioned = true;
+          return { ok: true, reason: 'transitioned', threadId: null, turnsCompleted: 1 };
+        },
+      } as unknown as AgentRunner;
+
+      const fakeWorkspaces = {
+        workspacePathFor: (identifier: string) => path.join(trackerRoot, 'ws', identifier),
+        async ensureFor() {
+          return { path: path.join(trackerRoot, 'ws'), workspace_key: 'sc', created_now: true };
+        },
+        async remove(): Promise<void> {
+          /* no-op */
+        },
+      } as unknown as WorkspaceManager;
+
+      const orch = new Orchestrator(
+        cfg,
+        def,
+        { onChange: () => () => undefined, current: () => ({} as any), stop: async () => undefined } as unknown as WorkflowSource,
+        tracker,
+        fakeWorkspaces,
+        runner,
+      );
+      await orch.start();
+
+      // Wait for the orchestrator to auto-arm the reflection issue.
+      const deadline = Date.now() + 8_000;
+      const armed = () => moves.find((m) => m.id === 'sleep-cycle' && m.toState === 'Reflect');
+      while (!armed() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const arm = armed();
+      assert.ok(arm, 'reflection issue should be auto-armed into Reflect');
+      assert.equal(arm!.fromState, 'Dormant', 'arm must move it out of Dormant');
+      assert.match(arm!.notes ?? '', /Auto-armed by the sleep cycle/);
+      assert.match(arm!.notes ?? '', /Triage/);
+      // Both Todo issues must have reached Done before the threshold tripped.
+      assert.ok(
+        moves.filter((m) => m.toState === 'Done').length >= 2,
+        'two terminal transitions should precede the arm',
+      );
+
+      // Let the loop settle: the reflection run returns to Dormant and, with the
+      // counter reset to 0, idle must NOT re-arm it (no spin).
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(
+        moves.filter((m) => m.id === 'sleep-cycle' && m.toState === 'Reflect').length,
+        1,
+        'reflection should be armed exactly once (counter reset prevents re-arm)',
+      );
+
+      await orch.stop();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+      await rm(logsRoot, { recursive: true, force: true });
+    }
+  });
+});

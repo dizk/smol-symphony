@@ -337,6 +337,65 @@ pr_autopilot:
   poll_interval_ms: 30000
 
 # ─────────────────────────────────────────────────────────────────────────────
+# sleep_cycle — auto-arm the recurring reflection issue (issue 125, the
+# deferred follow-up to issue 122's sleep-cycle Reflect/Dormant states).
+#
+# Optional. When `enabled: true` the orchestrator moves the reflection issue
+# (`issue_id`) from its `dormant_state` (a holding state it rests in between
+# runs) into the active `reflect_state` automatically — the "sleep when not
+# busy" framing — on either trigger, evaluated on every poll:
+#
+#   • arm_on_idle: the orchestrator is idle (nothing running, claimed, or
+#     pending retry, and no active-state candidate this poll) AND ≥1 issue has
+#     reached a terminal state since the last reflection run. The "≥1 since
+#     last run" gate is required: an idle orchestrator with nothing finished
+#     has nothing new to mine, and arming anyway would spin
+#     (arm → reflect → dormant → idle → arm …) forever.
+#   • arm_after_done: arm once this many issues have reached a terminal state
+#     (the Done/Cancelled work the reflector reads) since the last run — a
+#     backstop for busy stretches that never go idle. 0 disables this trigger.
+#
+# The terminal-transition counter resets to 0 the moment the issue is armed
+# ("since the last reflection run" is measured from the previous arm) and is
+# held in orchestrator memory only — a process restart resets it to 0.
+#
+# GUARDRAILS: auto-arming ONLY moves the issue into `reflect_state`. The
+# proposals reflection files still land in the holding triage state and still
+# require human approve/discard — this does not bypass the human gate. When
+# `enabled: false` (or the block is absent) the only cadence is the
+# operator / cron / `mv`-on-disk path, exactly as before.
+#
+# State-name fields are case-insensitive lookups against the declared `states:`
+# map, validated only when `enabled: true`: `dormant_state` must be `holding`,
+# `reflect_state` must be `active`, and `issue_id` must be set.
+# ─────────────────────────────────────────────────────────────────────────────
+sleep_cycle:
+  # enabled (bool): master switch. Default false.
+  enabled: false
+
+  # issue_id (string): id/identifier of the recurring reflection issue resting
+  # in dormant_state. Required when enabled. The block is inert until an issue
+  # with this id exists in dormant_state.
+  issue_id: sleep-cycle
+
+  # dormant_state (string): the holding state the reflection issue rests in
+  # between runs. Default 'Dormant'.
+  dormant_state: Dormant
+
+  # reflect_state (string): the active state the issue is armed into. Default
+  # 'Reflect'.
+  reflect_state: Reflect
+
+  # arm_on_idle (bool): arm when the orchestrator goes idle (with ≥1 terminal
+  # transition since the last run). Default true. Set false to rely only on
+  # arm_after_done.
+  arm_on_idle: true
+
+  # arm_after_done (int): arm after this many terminal transitions since the
+  # last run. Default 0 (disabled). Must be a non-negative integer.
+  arm_after_done: 0
+
+# ─────────────────────────────────────────────────────────────────────────────
 # polling — how often to poll the tracker.
 # ─────────────────────────────────────────────────────────────────────────────
 polling:

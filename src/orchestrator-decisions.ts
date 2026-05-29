@@ -266,6 +266,80 @@ export function decideCircuitBreaker(input: {
   return { kind: 'continue', normalizedReason, count };
 }
 
+// ---------------------------------------------------------------------------
+// Sleep-cycle auto-arm (issue 125, follow-up to 122). The orchestrator moves
+// the recurring reflection issue from its dormant (holding) state into the
+// active reflect state when work has finished and either trigger fires. These
+// pure helpers own the trigger decision and the arm-note text so the shell
+// stays a thin "fetch the issue, move it, reset the counter" wrapper.
+
+/** Which trigger armed the reflection cycle (or null when none fires). */
+export type SleepCycleTrigger = 'idle' | 'done_threshold';
+
+export interface SleepCycleArmInput {
+  /** Whether the sleep-cycle block is enabled at all. */
+  enabled: boolean;
+  /** The reflection issue's id/identifier; null disables arming. */
+  issueId: string | null;
+  /** Arm when the orchestrator is idle (and work finished since last run). */
+  armOnIdle: boolean;
+  /** Arm after this many terminal transitions since last run (0 = disabled). */
+  armAfterDone: number;
+  /** Terminal-state transitions counted since the reflection issue was last armed. */
+  doneSinceReflect: number;
+  /** True when nothing is running/claimed/pending and no active candidate this poll. */
+  idle: boolean;
+}
+
+/**
+ * Decide whether to arm the reflection cycle this tick, and on which trigger.
+ *
+ * The done-threshold trigger takes precedence over idle when both hold (it's
+ * the stronger, count-based signal — handy for the operator-visible log line).
+ *
+ * The idle trigger is deliberately gated on `doneSinceReflect > 0`: an idle
+ * orchestrator with nothing finished since the last run has nothing new to
+ * reflect on, and arming anyway would spin (arm → reflect → dormant → idle →
+ * arm …) forever. Requiring fresh terminal work breaks that loop while still
+ * honoring the "sleep when not busy" framing — reflection runs during downtime,
+ * but only when there is new material to mine.
+ *
+ * Returns null when the block is disabled, has no issue id, or no trigger fires.
+ */
+export function decideSleepCycleArm(input: SleepCycleArmInput): SleepCycleTrigger | null {
+  if (!input.enabled || !input.issueId) return null;
+  if (input.armAfterDone > 0 && input.doneSinceReflect >= input.armAfterDone) {
+    return 'done_threshold';
+  }
+  if (input.armOnIdle && input.idle && input.doneSinceReflect > 0) return 'idle';
+  return null;
+}
+
+/**
+ * The notes block appended to the reflection issue's body when the orchestrator
+ * auto-arms it. Rendered into `issue.description` for the reflector's next
+ * dispatch, so it doubles as a reminder of the guardrail: auto-arming only moves
+ * the issue into Reflect — the proposals it files still land in Triage behind
+ * the human approve/discard gate.
+ */
+export function sleepCycleArmNotes(
+  trigger: SleepCycleTrigger,
+  doneSinceReflect: number,
+  armAfterDone: number,
+): string {
+  const why =
+    trigger === 'done_threshold'
+      ? `**${doneSinceReflect}** issues reached a terminal state since the last reflection run (threshold: ${armAfterDone}).`
+      : `the orchestrator went idle with **${doneSinceReflect}** issue(s) finished since the last reflection run.`;
+  return [
+    '**Auto-armed by the sleep cycle** (issue 125).',
+    '',
+    `Trigger: ${trigger} — ${why}`,
+    '',
+    'This move only arms reflection. The proposals you file still land in Triage and still require human approve/discard — auto-arming does not bypass that gate.',
+  ].join('\n');
+}
+
 /**
  * Classify a tracker issue into a PR autopilot intent or `null` (state
  * matches neither the configured merge nor close state). The shell supplies
