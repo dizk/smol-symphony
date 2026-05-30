@@ -83,14 +83,20 @@ describe('buildAdapterHooksConfig — per-adapter shape', () => {
     assert.equal(cfg.options.onRequest, undefined, 'claude has no onRequest guard');
   });
 
-  it('codex → chatgpt.com with an sk- placeholder', () => {
+  it('codex → chatgpt.com with a JWT-shaped placeholder (native ChatGPT-OAuth, far-future exp)', () => {
     const specs = stubSpecs();
     const cfg = buildAdapterHooksConfig(specs.codex!);
     assert.equal(cfg.secretName, 'OPENAI_API_KEY');
     assert.deepEqual(cfg.options.allowedHosts, ['chatgpt.com']);
     const secret = cfg.options.secrets!['OPENAI_API_KEY']!;
     const placeholder = typeof secret.placeholder === 'function' ? secret.placeholder() : secret.placeholder;
-    assert.ok(placeholder!.startsWith('sk-'), `placeholder ${placeholder} should be token-shaped`);
+    // codex runs in its native ChatGPT-OAuth mode reading tokens.access_token as
+    // its bearer, so the placeholder must be a JWT (header.payload.signature) with a
+    // far-future `exp` — otherwise codex treats it as expired and tries to refresh.
+    const segs = placeholder!.split('.');
+    assert.equal(segs.length, 3, `placeholder ${placeholder} should be JWT-shaped`);
+    const payload = JSON.parse(Buffer.from(segs[1]!, 'base64url').toString('utf8')) as { exp: number };
+    assert.ok(payload.exp > 4_000_000_000, 'far-future exp ⇒ no refresh');
     assert.equal(cfg.options.onRequest, undefined, 'codex has no onRequest guard');
   });
 

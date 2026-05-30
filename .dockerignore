@@ -1,0 +1,16 @@
+# Keep the docker build context small. images/agents/build-image-oci.sh builds with
+# the repo root as context (so Dockerfile.agents can COPY scripts/vm-agent.mjs); the
+# image itself only needs scripts/ + the agent CLIs installed via npm, so exclude the
+# heavy/irrelevant trees from the context sent to the daemon.
+node_modules
+.git
+dist
+spike
+issues
+docs
+.symphony
+.impeccable
+.vm
+.agents
+images/agents/.tools
+**/*.log

@@ -17,22 +17,22 @@ import type {
 import type { IssueTracker } from '../trackers/types.js';
 import { WorkspaceManager, fetchBaseInWorkspace, sanitizeWorkspaceKey } from '../workspace.js';
 import { renderPrompt } from '../prompt.js';
-import { SmolvmClient, SYMPHONY_VM_PREFIX } from './smolvm.js';
+import { SYMPHONY_VM_PREFIX, type VmClient, type VmExec, type VmHandle } from './vm-port.js';
+import {
+  GondolinDispatcher,
+  type GondolinDispatchOptions,
+  type GondolinVmConfig,
+} from './gondolin-dispatch.js';
+import type { AdapterHooksConfig, CredentialSecretRegistry } from './credential-secrets.js';
+import { stripCredentialEnv } from './vm-guards.js';
 import { AcpClient } from './acp.js';
 import {
   ADAPTERS,
-  deriveAcpCommand,
   isKnownAdapter,
-  stageClaudeIdentity,
-  stageCodexPlaceholderAuth,
-  stageOpencodeConfig,
-  stageRuntimeFile,
-  OPENCODE_CONFIG_GUEST_PATH,
   type AcpAdapterId,
-  type ExtraGuestFile,
   type ModelInjection,
 } from './adapters.js';
-import type { CredentialProxy } from './credential-proxy.js';
+import type { GuestCredFile } from './gondolin-creds-staging.js';
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
@@ -55,7 +55,6 @@ import {
   decideAttemptOutcome,
   decideTurnContinuation,
   deriveActionContext,
-  proxyCredentialEnv,
   selectPromptKind,
 } from './runner-decisions.js';
 import type { McpServer } from '@agentclientprotocol/sdk';
@@ -63,7 +62,6 @@ import type { RunLog } from '../runlog.js';
 import type { HookCapture, HookResult } from '../workspace.js';
 import type { AcpBridge, AcpBridgeRegistration } from '../acp-bridge.js';
 import type { Socket } from 'node:net';
-import type { ExecStream } from './smolvm-port.js';
 import type { AdapterProfile } from './adapters.js';
 
 export interface AgentRunnerEvents {
@@ -310,21 +308,20 @@ export class AgentRunner {
     private workflow: WorkflowDefinition,
     private workspaces: WorkspaceManager,
     private tracker: IssueTracker,
-    private smolvm: SmolvmClient,
+    /**
+     * Gondolin VM-substrate client (replaced the smolvm CLI backend). Each
+     * dispatch creates a per-issue VM through a per-attempt `GondolinDispatcher`
+     * built over this client + the shared credential registry.
+     */
+    private vmClient: VmClient,
     private events: AgentRunnerEvents,
     private mcp: McpRegistry | null = null,
     /**
-     * Host-side TCP bridge the in-VM agent dials back to for ACP traffic. Replaced the
-     * smolvm-exec stdio path; required at runtime — runAttempt fails fast if absent.
+     * Host-side TCP bridge the in-VM agent dials back to for ACP traffic. The
+     * exec channel is now just the process tether + stderr tap; required at
+     * runtime — runAttempt fails fast if absent.
      */
     private acpBridge: AcpBridge | null = null,
-    /**
-     * Reconciler-driven bake artifact provider. When set and returning a path,
-     * the runner uses `from: <path>` instead of `smolfile: <Smolfile>`; the
-     * orchestrator's reconciler gate guarantees this returns non-null before
-     * any dispatch happens when `smolvm.smolfile` is configured.
-     */
-    private bakedArtifacts: BakedArtifactProvider | null = null,
     /**
      * Sink for `propose_followup` actions (issue 36). Wired to the
      * orchestrator's tracker in production; nullable for tests that don't
@@ -339,27 +336,30 @@ export class AgentRunner {
      */
     private actionSnapshotSink: ActionSnapshotSink | null = null,
     /**
-     * Host credential proxy (issue 113). Required for adapters whose
-     * `credentialStrategy` is `'proxy'` (claude and codex): the proxy mints
-     * per-dispatch sentinels that the in-VM client uses as its upstream Bearer
-     * (substituted for the real OAuth access token / API key on every request,
-     * per the adapter's upstream profile). Symphony deregisters on teardown.
-     * Adapters with `credentialStrategy: 'forward-env'` read their credential
-     * env var from `smolvm.forward_env` and never touch the proxy.
+     * Shared host credential registry (Gondolin secret-substitution model,
+     * replaces the credential proxy). Owns every live per-VM `secretManager`;
+     * the dispatcher registers a manager per dispatch, the ticker fans fresh
+     * tokens out to all of them on rotation. Required — runAttempt fails fast
+     * if absent.
      */
-    private credentialProxy: CredentialProxy | null = null,
+    private credentialRegistry: CredentialSecretRegistry | null = null,
+    /**
+     * Per-adapter Gondolin hooks config (allowlist + token-shaped placeholder
+     * secret + request/response hooks). Built once at composition time from
+     * `buildAdapterCredentialSpecs`; the dispatcher passes the selected adapter's
+     * entry straight into `createHttpHooks`. Required — runAttempt fails fast
+     * if the dispatched adapter is missing.
+     */
+    private adapterHooks: Record<AcpAdapterId, AdapterHooksConfig> | null = null,
+    /**
+     * Static Gondolin VM shape (image ref + cpus/mem). Resolved from config at
+     * composition time. Required.
+     */
+    private gondolinVmConfig: GondolinVmConfig | null = null,
   ) {}
 
   setAcpBridge(bridge: AcpBridge | null): void {
     this.acpBridge = bridge;
-  }
-
-  setCredentialProxy(proxy: CredentialProxy | null): void {
-    this.credentialProxy = proxy;
-  }
-
-  setBakedArtifactProvider(provider: BakedArtifactProvider | null): void {
-    this.bakedArtifacts = provider;
   }
 
   updateConfig(cfg: ServiceConfig, workflow: WorkflowDefinition): void {
@@ -400,29 +400,27 @@ export class AgentRunner {
 
   /**
    * Construct a `RunInVmExecutor` bound to a specific per-issue VM. Each
-   * invocation spawns a fresh `smolvm machine exec -i` session against
-   * `vmName`, with stdin closed, stdout/stderr drained into the per-issue
-   * run log, and a timeout that escalates to SIGKILL on overrun. The
-   * workspace is bind-mounted at the same host path inside the VM (the
-   * runner declares that mount at bring-up), so `workdir` is identical
-   * on both sides — no path translation needed.
+   * invocation execs a fresh one-shot process against the dispatch's live
+   * `VmHandle`, with stdin closed, stdout/stderr drained into the per-issue
+   * run log, and a timeout that aborts the exec on overrun. The workspace is
+   * VFS-mounted at the same host path inside the VM (the dispatcher declares
+   * that mount at bring-up), so `workdir` is identical on both sides — no path
+   * translation needed.
    *
-   * Wraps the smolvm.execInteractive contract rather than reaching into
-   * the SmolvmClient from the actions module so the actions package
-   * stays free of `node:child_process`/smolvm imports; the dependency
-   * inversion lets tests pass `hostRunInVm` without touching smolvm.
+   * Wraps the `VmHandle.exec` contract rather than reaching into the VmClient
+   * from the actions module so the actions package stays free of
+   * `node:child_process`/VM imports; the dependency inversion lets tests pass
+   * `hostRunInVm` without touching the VM substrate.
    */
-  private buildVmRunInVm(vmName: string, runLog: RunLog | undefined): RunInVmExecutor {
+  private buildVmRunInVm(vm: VmHandle, runLog: RunLog | undefined): RunInVmExecutor {
     return ({ name, cmd, env, workdir, timeoutMs, onStdout, onStderr }) =>
       new Promise((resolve) => {
-        const stream = this.smolvm.execInteractive(vmName, {
+        const stream = vm.exec({
           command: cmd,
           workdir,
           env,
-          // execInteractive's own timeoutMs is forwarded to smolvm CLI as
-          // `--timeout`. We pass it through so the VM-side process gets
-          // killed at the same deadline as our local timer; the local
-          // timer below is the belt-and-braces fallback.
+          // The local timer below kills the exec at the deadline; passing
+          // timeoutMs to the VM exec lets the substrate enforce the same bound.
           timeoutMs,
         });
         // No stdin: run_in_vm is one-shot exec; the action's `cmd` is the
@@ -460,11 +458,14 @@ export class AgentRunner {
           }
         }, timeoutMs);
         stream.exit
-          .then(({ code, signal }) => {
+          .then(({ code }) => {
             clearTimeout(timer);
             resolve({
+              // Gondolin reports the abort/exit as a numeric signal; the
+              // run-log surface only cares about exit_code + timed_out, so the
+              // numeric signal is folded into `null` rather than mistyped.
               exit_code: code,
-              signal: signal ?? null,
+              signal: null,
               timed_out: timedOut,
               stdout,
               stderr,
@@ -614,8 +615,7 @@ export class AgentRunner {
     cleanupState: string,
     runningEntry: RunningEntry | undefined,
     workspacePath: string,
-    vmReady: boolean,
-    vmName: string,
+    vm: VmHandle | null,
     hookCapture: (hook: string) => HookCapture | undefined,
     runLog: RunLog | undefined,
   ): Promise<string | null> {
@@ -634,10 +634,10 @@ export class AgentRunner {
     }
     try {
       // run_in_vm goes through the per-issue VM's exec channel. The VM is still
-      // alive here — destroy is deferred to the reconciler after runAttempt
-      // returns. The `vmReady` guard mirrors the bring-up gate.
-      const runInVm: RunInVmExecutor | undefined = vmReady
-        ? this.buildVmRunInVm(vmName, runLog)
+      // alive here — teardown of the dispatch happens after the cleanup actions
+      // run. A null handle (the dispatch never came up) skips run_in_vm.
+      const runInVm: RunInVmExecutor | undefined = vm
+        ? this.buildVmRunInVm(vm, runLog)
         : undefined;
       const actionResult = await this.runStateActions(
         cleanupState,
@@ -704,9 +704,7 @@ export class AgentRunner {
     const ws = this.unwrap(
       await this.setupWorkspace(issue, initialHooks, hookCapture, runLog, logger),
     );
-    const adapter = this.unwrap(
-      await this.prepareAdapterRuntime(ws.workspace.path, resolved, logger),
-    );
+    const adapter = this.unwrap(this.prepareAdapterRuntime(resolved, logger));
     const bridge = this.unwrap(this.validateAcpBridge(logger));
     const vm = this.unwrap(
       await this.bringUpVmAndExec({
@@ -714,7 +712,6 @@ export class AgentRunner {
         resolved,
         workspacePath: ws.workspace.path,
         adapter,
-        acpReachUrl: bridge.acpReachUrl,
         runLog,
         logger,
       }),
@@ -723,37 +720,78 @@ export class AgentRunner {
       issue,
       runningEntry,
       workspacePath: ws.workspace.path,
-      vmName: vm.vmName,
-      vmReady: true,
+      vm: vm.vm,
       bridgeReg: vm.bridgeReg,
-      execStream: vm.execStream,
+      exec: vm.exec,
+      teardownDispatch: vm.teardownDispatch,
       acpSocket: null,
       hookCapture,
       runLog,
       logger,
-      credentialSentinel: vm.credentialSentinel,
     };
-    const session = this.unwrap(
-      await this.connectBridgeAndInitSession({
-        ctx,
-        resolved,
-        cancelSignal,
-        acpReachUrl: bridge.acpReachUrl,
-      }),
-    );
-    const activeStates = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-    const loopRes = await this.runTurnLoop({
-      ctx,
-      client: session.client,
+    // Once dispatch() has succeeded the VM + the per-VM secret registration are
+    // live and ONLY this ctx's teardown can release them. `unwrap` throws a
+    // `PhaseFailure` straight up the call stack, so a post-dispatch step that
+    // returns early/throws BEFORE `tearDownSession` runs would strand the VM +
+    // the secret manager. Guard the whole post-dispatch path: on any throw, tear
+    // the dispatch down before propagating (idempotent — the dispatcher's
+    // teardown() guards re-entry, so the normal success path's tearDownSession is
+    // never double-counted).
+    return this.runSessionOrTeardown(ctx, {
       resolved,
       cancelSignal,
       attempt,
-      activeStates,
+      acpReachUrl: bridge.acpReachUrl,
     });
-    clearInterval(session.cancelCheckTimer);
-    const tearReason = loopRes.kind === 'mid_failure' ? loopRes.cleanupReason : loopRes.lastReason;
-    const nonRouted = await this.tearDownSession(ctx, tearReason);
-    return composeAttemptResult({ loopRes, sessionId: session.sessionId, nonRouted });
+  }
+
+  /**
+   * Drive the post-dispatch path (bridge connect → session init → turn loop →
+   * teardown) with a teardown safety net: any throw before the normal
+   * `tearDownSession` runs still releases the Gondolin handle (close VM +
+   * deregister the secret manager) so a post-dispatch failure cannot leak the VM.
+   * The dispatch teardown is idempotent, so re-running it from the catch after an
+   * inner `tearDownSession` already fired is a no-op.
+   */
+  private async runSessionOrTeardown(
+    ctx: SessionContext,
+    args: {
+      resolved: ResolvedDispatchConfig;
+      cancelSignal: { cancelled: boolean };
+      attempt: number | null;
+      acpReachUrl: string;
+    },
+  ): Promise<RunAttemptResult> {
+    try {
+      const session = this.unwrap(
+        await this.connectBridgeAndInitSession({
+          ctx,
+          resolved: args.resolved,
+          cancelSignal: args.cancelSignal,
+          acpReachUrl: args.acpReachUrl,
+        }),
+      );
+      const activeStates = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
+      const loopRes = await this.runTurnLoop({
+        ctx,
+        client: session.client,
+        resolved: args.resolved,
+        cancelSignal: args.cancelSignal,
+        attempt: args.attempt,
+        activeStates,
+      });
+      clearInterval(session.cancelCheckTimer);
+      const tearReason =
+        loopRes.kind === 'mid_failure' ? loopRes.cleanupReason : loopRes.lastReason;
+      const nonRouted = await this.tearDownSession(ctx, tearReason);
+      return composeAttemptResult({ loopRes, sessionId: session.sessionId, nonRouted });
+    } catch (err) {
+      // A post-dispatch step threw without unwinding the dispatch (e.g. an
+      // unexpected throw inside session init that bypassed its own teardown).
+      // Release the VM + secret registration before re-propagating.
+      await this.teardownDispatch(ctx, 'post_dispatch_failure');
+      throw err;
+    }
   }
 
   /** Convert a PhaseResult into either the success value or a thrown PhaseFailure. */
@@ -893,137 +931,48 @@ export class AgentRunner {
   // -------------------------------------------------------------------------
 
   /**
-   * Apply model/effort runtime injections, stage any per-adapter extra files
-   * (claude's identity file), and derive the final ACP launch command.
-   * Pre-handshake failures unwind through the normal phase pipeline.
+   * Apply model/effort runtime injections and seal the adapter runtime the
+   * Gondolin dispatcher launches. Pre-handshake failures unwind through the
+   * normal phase pipeline.
    *
-   * Credentials never enter the VM. Dispatch is keyed on the adapter's
-   * `credentialStrategy`, not its id: a `'proxy'` adapter (claude, codex) gets
-   * its `proxyEnv` base-URL + token-sentinel vars from the host credential proxy
-   * (wired at exec time); claude additionally stages a minimal `~/.claude.json`
-   * identity file for fingerprint stability. A `'forward-env'` adapter reads its
-   * credential env var from the env forwarded by `smolvm.forward_env` and
-   * proceeds without the proxy.
+   * Credentials never enter the VM: the dispatcher stages per-adapter FAKE
+   * native creds (placeholders only) and registers a per-VM `secretManager`
+   * that substitutes the real token at egress (Gondolin secret-substitution).
+   * There is no credential proxy and no base-URL injection — the in-VM client
+   * dials its REAL upstream in native mode with the placeholder bearer. So this
+   * phase produces only the model/effort knobs (env vars, extra argv, and the
+   * non-secret staged files like claude's `settings.json` effortLevel), which
+   * ride through the dispatch options.
    */
-  private async prepareAdapterRuntime(
-    workspacePath: string,
+  private prepareAdapterRuntime(
     resolved: ResolvedDispatchConfig,
     logger: ReturnType<typeof withIssue>,
-  ): Promise<PhaseResult<AdapterRuntime>> {
+  ): PhaseResult<AdapterRuntime> {
     const profile = ADAPTERS[resolved.adapter];
-    if (profile.credentialStrategy === 'proxy' && !this.credentialProxy) {
-      logger.error('credential proxy is not wired but adapter requires it', {
-        adapter: profile.id,
-      });
-      return failPhase('credential proxy unavailable');
-    }
-    if (profile.credentialStrategy === 'forward-env') {
-      logger.info('adapter credentials forwarded via smolvm.forward_env; credential proxy not used', {
-        adapter: profile.id,
-      });
-    }
-    const injectedRes = await this.applyRuntimeInjectionsOrFail(workspacePath, profile, resolved, logger);
+    const injectedRes = this.applyRuntimeInjectionsOrFail(profile, resolved, logger);
     if (!injectedRes.ok) return injectedRes;
-    const extraFilesRes = await this.stageAdapterExtras(workspacePath, profile, resolved, injectedRes.value, logger);
-    if (!extraFilesRes.ok) return extraFilesRes;
-    // Sentinel registration is deferred to `bringUpVmAndExec` — we don't want
-    // a sentinel sitting in the registry if VM start fails. The runtime env
-    // and command are sealed at exec time.
-    const effectiveAcpCommand = deriveAcpCommand(profile, extraFilesRes.value);
     return {
       ok: true,
       value: {
         profile,
         adapterBin: profile.binary[0]!,
-        effectiveAcpCommand,
         effectiveAdapterArgs: [...profile.binary.slice(1), ...injectedRes.value.runtimeArgs],
         runtimeEnv: injectedRes.value.runtimeEnv,
-        credentialSentinel: null,
+        // Model/effort staged files (claude effortLevel settings.json) carry
+        // their content in-memory, so they are passed straight to the dispatcher
+        // as guest writes — no workspace staging + in-VM `cp` preamble.
+        extraGuestFiles: injectedRes.value.runtimeExtraFiles,
       },
     };
   }
 
-  /**
-   * Compose the per-adapter extra guest files: every staged file produced by
-   * runtime injections (model/effort knobs), plus — for claude — the minimal
-   * `~/.claude.json` identity (oauthAccount UUIDs only) copied to
-   * `/root/.claude.json` before exec, so the proxy's host-side fingerprint seam
-   * can compose a well-formed `metadata.user_id` if Anthropic re-activates its
-   * server-side check. claude identity staging is best-effort: a missing host
-   * `~/.claude.json` is logged and the dispatch proceeds.
-   *
-   * codex also uses the proxy, but codex-acp's session-init check requires a
-   * `~/.codex/auth.json` FILE to exist (it fails "Authentication required" with
-   * only the env sentinel). So a FAKE placeholder auth.json (no real token) is
-   * staged to `/root/.codex/auth.json` purely to satisfy that check; codex then
-   * uses the env `OPENAI_API_KEY` sentinel as its bearer and the proxy
-   * substitutes the real credential at egress.
-   *
-   * opencode stages an `opencode.json` (custom `symphony-copilot` provider +
-   * the selected model) to `/root/.config/opencode/opencode.json`. The provider
-   * block must exist regardless of whether a model is pinned, so the whole
-   * config — including the model — is built here from `resolved.model` rather
-   * than through the model-injection channel (opencode's `modelInjection` is
-   * inert). The file carries no secret: the proxy base URL + sentinel arrive via
-   * the `{env:…}`-interpolated `OPENCODE_PROXY_*` env vars the runner stages.
-   */
-  private async stageAdapterExtras(
-    workspacePath: string,
-    profile: AdapterProfile,
-    resolved: ResolvedDispatchConfig,
-    injected: { runtimeExtraFiles: ExtraGuestFile[] },
-    logger: ReturnType<typeof withIssue>,
-  ): Promise<PhaseResult<ExtraGuestFile[]>> {
-    const out: ExtraGuestFile[] = [...injected.runtimeExtraFiles];
-    if (profile.id === 'claude') {
-      try {
-        const identity = await stageClaudeIdentity(workspacePath);
-        if (identity) {
-          out.push({ stagedRelPath: identity.relPath, guestPath: '/root/.claude.json' });
-        } else {
-          logger.warn('claude identity missing or malformed at host ~/.claude.json', {});
-        }
-      } catch (err) {
-        logger.error('identity staging failed', { error: (err as Error).message });
-        return failPhase('identity staging error');
-      }
-    } else if (profile.id === 'codex') {
-      // codex-acp's session-init credential check requires a ~/.codex/auth.json
-      // FILE to exist (it fails "Authentication required" with only the env
-      // sentinel). Stage a FAKE placeholder (no real token) so init passes; codex
-      // then uses the env OPENAI_API_KEY (= the proxy sentinel) as its bearer and
-      // the proxy substitutes the real credential. Synthetic content, so this
-      // never fails on a missing host file.
-      try {
-        const placeholder = await stageCodexPlaceholderAuth(workspacePath);
-        out.push({ stagedRelPath: placeholder.relPath, guestPath: '/root/.codex/auth.json' });
-      } catch (err) {
-        logger.error('codex placeholder auth staging failed', { error: (err as Error).message });
-        return failPhase('codex placeholder auth staging error');
-      }
-    } else if (profile.id === 'opencode') {
-      // Stage the custom-provider opencode.json (provider pinned at the proxy
-      // via {env:…}, plus the resolved model). Synthetic content (no secret),
-      // so this never fails on a missing host file.
-      try {
-        const config = await stageOpencodeConfig(workspacePath, resolved.model);
-        out.push({ stagedRelPath: config.relPath, guestPath: OPENCODE_CONFIG_GUEST_PATH });
-      } catch (err) {
-        logger.error('opencode config staging failed', { error: (err as Error).message });
-        return failPhase('opencode config staging error');
-      }
-    }
-    return { ok: true, value: out };
-  }
-
-  private async applyRuntimeInjectionsOrFail(
-    workspacePath: string,
+  private applyRuntimeInjectionsOrFail(
     profile: AdapterProfile,
     resolved: ResolvedDispatchConfig,
     logger: ReturnType<typeof withIssue>,
-  ): Promise<PhaseResult<{ runtimeEnv: Record<string, string>; runtimeArgs: string[]; runtimeExtraFiles: ExtraGuestFile[] }>> {
+  ): PhaseResult<{ runtimeEnv: Record<string, string>; runtimeArgs: string[]; runtimeExtraFiles: GuestCredFile[] }> {
     try {
-      const injected = await this.applyRuntimeInjections(workspacePath, profile, resolved);
+      const injected = this.applyRuntimeInjections(profile, resolved);
       return { ok: true, value: injected };
     } catch (err) {
       logger.error('runtime injection staging failed', { adapter: profile.id, error: (err as Error).message });
@@ -1035,45 +984,44 @@ export class AgentRunner {
    * Compose the model + effort injections through the three orthogonal
    * channels the adapter profile declares: env vars (claude-agent-acp's
    * ANTHROPIC_MODEL), extra argv (codex-acp's `-c model=...`), and staged
-   * files (claude-agent-acp's settings.json for `effortLevel`).
+   * files (claude-agent-acp's settings.json for `effortLevel`). Pure: the
+   * staged-file content is known in-memory and converted directly to guest
+   * writes (no FS staging).
    */
-  private async applyRuntimeInjections(
-    workspacePath: string,
+  private applyRuntimeInjections(
     profile: AdapterProfile,
     resolved: ResolvedDispatchConfig,
-  ): Promise<{
+  ): {
     runtimeEnv: Record<string, string>;
     runtimeArgs: string[];
-    runtimeExtraFiles: ExtraGuestFile[];
-  }> {
-    const acc = { runtimeEnv: {} as Record<string, string>, runtimeArgs: [] as string[], runtimeExtraFiles: [] as ExtraGuestFile[] };
+    runtimeExtraFiles: GuestCredFile[];
+  } {
+    const acc = { runtimeEnv: {} as Record<string, string>, runtimeArgs: [] as string[], runtimeExtraFiles: [] as GuestCredFile[] };
     if (resolved.model) {
-      await this.applyModelInjection(workspacePath, profile.modelInjection(resolved.model), acc);
+      this.applyModelInjection(profile.modelInjection(resolved.model), acc);
     }
     if (resolved.effort && profile.effortInjection) {
-      await this.applyModelInjection(workspacePath, profile.effortInjection(resolved.effort), acc);
+      this.applyModelInjection(profile.effortInjection(resolved.effort), acc);
     }
     return acc;
   }
 
-  /** Fold one injection into the accumulator (env / args / staged files). */
-  private async applyModelInjection(
-    workspacePath: string,
+  /** Fold one injection into the accumulator (env / args / guest files). */
+  private applyModelInjection(
     inj: ModelInjection,
     acc: {
       runtimeEnv: Record<string, string>;
       runtimeArgs: string[];
-      runtimeExtraFiles: ExtraGuestFile[];
+      runtimeExtraFiles: GuestCredFile[];
     },
-  ): Promise<void> {
+  ): void {
     if (inj.env) {
       for (const [k, v] of Object.entries(inj.env)) acc.runtimeEnv[k] = v;
     }
     if (inj.extraArgs) acc.runtimeArgs.push(...inj.extraArgs);
     if (inj.stagedFiles) {
       for (const f of inj.stagedFiles) {
-        const stagedFile = await stageRuntimeFile(workspacePath, f.stagedName, f.content);
-        acc.runtimeExtraFiles.push({ stagedRelPath: stagedFile.relPath, guestPath: f.guestPath });
+        acc.runtimeExtraFiles.push({ guestPath: f.guestPath, content: f.content, mode: 0o600 });
       }
     }
   }
@@ -1117,104 +1065,105 @@ export class AgentRunner {
     resolved: ResolvedDispatchConfig;
     workspacePath: string;
     adapter: AdapterRuntime;
-    acpReachUrl: string;
     runLog: RunLog | undefined;
     logger: ReturnType<typeof withIssue>;
   }): Promise<PhaseResult<VmExecHandle>> {
-    const vmName = this.vmNameFor(args.issue);
-    const startInputs = this.buildVmStartInputs(args.workspacePath, args.resolved);
-    const startRes = await this.startVmOrFail(vmName, startInputs, args.workspacePath, args.logger);
-    if (!startRes.ok) return startRes;
-    const regRes = await this.registerBridgeOrFail(args.issue, args.logger);
+    const dispatcherRes = this.buildDispatcherOrFail(args.resolved, args.logger);
+    if (!dispatcherRes.ok) return dispatcherRes;
+    const bridgePort = this.acpBridge!.port() ?? this.cfg.acp.bridge.bind_port;
+    const bridgeHost = this.cfg.acp.bridge.reach_host;
+    // Register the bridge FIRST so the dispatch launch env carries the bearer.
+    // `register()` attaches its own internal `.catch`, so a cancel before the
+    // caller's `await accepted` cannot escalate to an unhandled rejection.
+    const regRes = this.registerBridgeOrFail(args.issue, args.logger);
     if (!regRes.ok) return regRes;
-    const credentialReg = this.registerCredentialSentinel(args.issue, args.adapter);
-    const execAdapter = this.applyCredentialEnv(args.adapter, credentialReg);
-    const execStream = this.launchExecStream(
-      vmName,
-      args.workspacePath,
-      regRes.value.bridgeReg,
-      args.acpReachUrl,
-      execAdapter,
-    );
-    this.attachStderrTap(execStream, args.issue, args.runLog, args.logger);
+    const bridgeReg = regRes.value.bridgeReg;
+    try {
+      const handle = await dispatcherRes.value.dispatch(
+        this.buildDispatchOptions({ ...args, bridgeHost, bridgePort, bridgeReg }),
+      );
+      return {
+        ok: true,
+        value: { vm: handle.vm, exec: handle.exec, bridgeReg, teardownDispatch: handle.teardown },
+      };
+    } catch (err) {
+      // The dispatch failed mid-bring-up. Cancel the bridge registration (the VM,
+      // if it came up, is torn down by the dispatcher's own error path); the
+      // reconciler GC converges any session that leaked past close().
+      bridgeReg.cancel('gondolin_dispatch_failed');
+      args.logger.error('gondolin dispatch failed', { error: (err as Error).message });
+      return failPhase('gondolin dispatch error');
+    }
+  }
+
+  /**
+   * Build the per-dispatch `GondolinDispatcher` for the resolved adapter. The
+   * VM client, credential registry, and Gondolin VM shape are injected once at
+   * composition time; the per-adapter hooks config (allowlist + placeholder
+   * secret + request/response hooks) selects the credential routing. Fails fast
+   * if any collaborator is unwired (the composition root guarantees them).
+   */
+  private buildDispatcherOrFail(
+    resolved: ResolvedDispatchConfig,
+    logger: ReturnType<typeof withIssue>,
+  ): PhaseResult<GondolinDispatcher> {
+    if (!this.credentialRegistry || !this.adapterHooks || !this.gondolinVmConfig) {
+      logger.error('gondolin dispatch collaborators are not wired', {
+        registry: this.credentialRegistry !== null,
+        hooks: this.adapterHooks !== null,
+        vmConfig: this.gondolinVmConfig !== null,
+      });
+      return failPhase('gondolin dispatch unavailable');
+    }
+    const hooks = this.adapterHooks[resolved.adapter];
+    if (!hooks) {
+      logger.error('no gondolin hooks config for adapter', { adapter: resolved.adapter });
+      return failPhase('gondolin adapter hooks unavailable');
+    }
     return {
       ok: true,
-      value: {
-        vmName,
-        execStream,
-        bridgeReg: regRes.value.bridgeReg,
-        credentialSentinel: credentialReg?.sentinel ?? null,
-      },
+      value: new GondolinDispatcher(
+        this.vmClient,
+        this.credentialRegistry,
+        hooks,
+        this.gondolinVmConfig,
+      ),
     };
   }
 
   /**
-   * Mint a credential-proxy sentinel for `'proxy'`-strategy dispatches (claude
-   * and codex). Sentinel registration happens AFTER VM start + bridge register
-   * so an early failure doesn't leak a registry entry — the proxy's registry is
-   * in-process, but a leaked entry would still be a loose end across the dispatch
-   * lifecycle. The adapter id selects the proxy's upstream profile. `'forward-env'`
-   * adapters get no sentinel.
+   * Assemble the `GondolinDispatchOptions` for a dispatch. Mounts (workspace RW
+   * + configured volumes + eval-mode RO) are validated by the Phase 3 guard
+   * inside the dispatcher; the forwarded boot env is stripped of all credential
+   * vars there too. The adapter bin/args/runtime-env + the non-secret runtime
+   * files (effort settings.json) ride through; the bridge host/port + bearer
+   * become the dispatch's ACP wiring.
    */
-  private registerCredentialSentinel(
-    issue: Issue,
-    adapter: AdapterRuntime,
-  ): { sentinel: string; baseUrl: string } | null {
-    if (adapter.profile.credentialStrategy !== 'proxy' || !this.credentialProxy) return null;
-    return this.credentialProxy.register({
-      issueId: issue.id,
-      identifier: issue.identifier,
-      adapterId: adapter.profile.id,
-    });
-  }
-
-  /**
-   * Fold the credential-proxy wiring onto the adapter runtime: the base-URL +
-   * sentinel env vars (claude → ANTHROPIC_*, codex → OPENAI_*) so the in-VM
-   * client dials the proxy with the sentinel as its bearer, plus — for adapters
-   * that declare `proxyProviderArgs` (codex) — the per-dispatch `-c` overrides
-   * that pin the transport onto an explicit HTTPS provider routed through the
-   * proxy (issue #127: codex's default Responses WebSocket transport bypasses
-   * the base-URL env var and leaks the sentinel straight to OpenAI). Those args
-   * carry the proxy's ephemeral port, so they're applied here at exec time
-   * rather than at model-injection time. A `'proxy'`-strategy adapter without
-   * `proxyEnv` is a profile bug (surfaced by `proxyCredentialEnv`).
-   */
-  private applyCredentialEnv(
-    adapter: AdapterRuntime,
-    reg: { sentinel: string; baseUrl: string } | null,
-  ): AdapterRuntime {
-    if (!reg) return adapter;
-    const proxyEnv = adapter.profile.proxyEnv;
-    const providerArgs = adapter.profile.proxyProviderArgs
-      ? adapter.profile.proxyProviderArgs({ baseUrl: reg.baseUrl, tokenVar: proxyEnv?.tokenVar ?? '' })
-      : [];
+  private buildDispatchOptions(args: {
+    issue: Issue;
+    resolved: ResolvedDispatchConfig;
+    workspacePath: string;
+    adapter: AdapterRuntime;
+    runLog: RunLog | undefined;
+    logger: ReturnType<typeof withIssue>;
+    bridgeHost: string;
+    bridgePort: number;
+    bridgeReg: AcpBridgeRegistration;
+  }): GondolinDispatchOptions {
     return {
-      ...adapter,
-      effectiveAdapterArgs: [...adapter.effectiveAdapterArgs, ...providerArgs],
-      runtimeEnv: {
-        ...adapter.runtimeEnv,
-        ...proxyCredentialEnv(proxyEnv, adapter.profile.id, reg),
-      },
-    };
-  }
-
-  /**
-   * Compose the VM bring-up arguments. Splits assembly into three pure
-   * sub-helpers (mounts, env, source config) so each stays under budget;
-   * `bakedFrom` (issue 32) gates source selection — when a baked artifact
-   * is ready the runner passes `--from <path>` and skips the per-start
-   * `[dev].init` cost.
-   */
-  private buildVmStartInputs(
-    workspacePath: string,
-    resolved: ResolvedDispatchConfig,
-  ): VmStartInputs {
-    const bakedFrom = this.bakedArtifacts?.artifactPath() ?? null;
-    return {
-      mounts: this.buildVmMounts(workspacePath, resolved),
-      env: this.buildForwardedEnv(ADAPTERS[resolved.adapter]),
-      ...this.buildVmSourceConfig(bakedFrom),
+      identifier: sanitizeWorkspaceKey(args.issue.identifier).toLowerCase(),
+      mounts: this.buildVmMounts(args.workspacePath, args.resolved),
+      env: this.buildForwardedEnv(),
+      workdir: args.workspacePath,
+      bridgeHost: args.bridgeHost,
+      bridgePort: args.bridgePort,
+      acpToken: args.bridgeReg.token,
+      adapterBin: args.adapter.adapterBin,
+      adapterArgs: args.adapter.effectiveAdapterArgs,
+      runtimeEnv: args.adapter.runtimeEnv,
+      extraGuestFiles: args.adapter.extraGuestFiles,
+      opencodeModel: args.resolved.model,
+      onStderr: (chunk) => this.onAgentStderr(chunk, args.issue, args.runLog, args.logger),
     };
   }
 
@@ -1235,132 +1184,62 @@ export class AgentRunner {
   }
 
   /**
-   * Forward the configured `smolvm.forward_env` vars into the VM boot env, EXCEPT
-   * the dispatched proxy adapter's credential var. Under proxy mode the VM must
-   * never hold the real credential: the in-VM client receives a per-dispatch
-   * sentinel (via the exec env) instead, and the proxy substitutes the real token
-   * host-side. If the operator still lists e.g. `OPENAI_API_KEY` in `forward_env`
-   * (the default), leaving it in the boot env would plant the real key in the
-   * VM's PID-1 environment — readable via `/proc/1/environ` — defeating the proxy.
-   * So we drop `proxyEnv.tokenVar` for proxy adapters.
+   * Forward the configured `smolvm.forward_env` vars into the VM boot env, then
+   * STRIP every credential-bearing var via `stripCredentialEnv` (defense in depth).
+   * `forward_env` can name a real cred var (e.g. `OPENAI_API_KEY`), so this strip
+   * makes "no real token reaches the guest boot env" obvious AT THE SOURCE rather
+   * than only inside the dispatcher. The dispatcher's `buildCreateVmOptions`
+   * re-applies the SAME `stripCredentialEnv` as the enforcement chokepoint — the
+   * double-strip is idempotent (`stripCredentialEnv` is a pure filter), so the two
+   * layers compose without surprise. The guest holds only the placeholder bearer
+   * Gondolin substitutes at egress (the host-only-refresh invariant). No per-adapter
+   * omit is needed here (the strip is uniform + strictly stronger).
    */
-  private buildForwardedEnv(profile: AdapterProfile): Record<string, string> {
-    const omit =
-      profile.credentialStrategy === 'proxy' ? profile.proxyEnv?.tokenVar : undefined;
-    return computeForwardedEnv(this.cfg.smolvm.forward_env, omit, (k) => process.env[k]);
+  private buildForwardedEnv(): Record<string, string> {
+    return stripCredentialEnv(
+      computeForwardedEnv(this.cfg.smolvm.forward_env, undefined, (k) => process.env[k]),
+    );
   }
 
-  private buildVmSourceConfig(
-    bakedFrom: string | null,
-  ): { vmFrom: string | null; vmSmolfile: string | null; vmImage: string | null } {
-    return {
-      vmFrom: bakedFrom ?? this.cfg.smolvm.from,
-      vmSmolfile: bakedFrom ? null : this.cfg.smolvm.smolfile,
-      vmImage: bakedFrom ? null : this.cfg.smolvm.image,
-    };
-  }
-
-  private async startVmOrFail(
-    vmName: string,
-    inputs: VmStartInputs,
-    workspacePath: string,
-    logger: ReturnType<typeof withIssue>,
-  ): Promise<PhaseResult<void>> {
-    try {
-      await this.smolvm.ensureRunning(vmName, {
-        image: inputs.vmImage,
-        from: inputs.vmFrom,
-        smolfile: inputs.vmSmolfile,
-        cpus: this.cfg.smolvm.cpus,
-        memMib: this.cfg.smolvm.mem_mib,
-        net: this.cfg.smolvm.net,
-        mounts: inputs.mounts,
-        env: inputs.env,
-        workdir: workspacePath,
-        sshAgent: false,
-      });
-      return { ok: true, value: undefined };
-    } catch (err) {
-      logger.error('smolvm bring-up failed', { error: (err as Error).message });
-      // ensureRunning can fail after `machine create` succeeded — teardown is
-      // the reconciler `vm` resource's job (issue 52). Returning here drops
-      // the running entry; the reaper kick in `onWorkerExit` converges the
-      // now-orphan VM.
-      return failPhase('smolvm bring-up error');
-    }
-  }
-
-  private async registerBridgeOrFail(
+  private registerBridgeOrFail(
     issue: Issue,
     logger: ReturnType<typeof withIssue>,
-  ): Promise<PhaseResult<{ bridgeReg: AcpBridgeRegistration }>> {
+  ): PhaseResult<{ bridgeReg: AcpBridgeRegistration }> {
     try {
       const bridgeReg = this.acpBridge!.register(issue.id, issue.identifier);
       return { ok: true, value: { bridgeReg } };
     } catch (err) {
       logger.error('acp bridge register failed', { error: (err as Error).message });
-      // VM is live but the bridge is gone; teardown is the reconciler `vm`
-      // resource's job.
       return failPhase('acp bridge register failed');
     }
   }
 
-  private launchExecStream(
-    vmName: string,
-    workspacePath: string,
-    bridgeReg: AcpBridgeRegistration,
-    acpReachUrl: string,
-    adapter: AdapterRuntime,
-  ): ExecStream {
-    const execStream = this.smolvm.execInteractive(vmName, {
-      command: [this.cfg.acp.shell, '-lc', adapter.effectiveAcpCommand],
-      workdir: workspacePath,
-      // The in-VM proxy (`vm-agent.mjs`) reads these to know where to dial back
-      // and what adapter to spawn. The bearer token is a per-dispatch secret;
-      // visible via `ps` on the host but the host is trusted.
-      env: {
-        SYMPHONY_ACP_URL: acpReachUrl,
-        SYMPHONY_ACP_TOKEN: bridgeReg.token,
-        SYMPHONY_ADAPTER_BIN: adapter.adapterBin,
-        SYMPHONY_ADAPTER_ARGS: JSON.stringify(adapter.effectiveAdapterArgs),
-        ...adapter.runtimeEnv,
-      },
-      timeoutMs: null,
-    });
-    // ACP frames flow over the bridge socket, not the exec stdio. The exec
-    // channel just carries diagnostic stderr and acts as a process tether.
-    execStream.stdin.end();
-    return execStream;
-  }
-
   /**
-   * Attach the stderr tap BEFORE the bridge handshake so any pre-connect
-   * crash (vm-agent missing, malformed env, adapter that exits during
-   * startup) still lands in the per-issue run log and the orchestrator's
-   * event ring.
+   * The diagnostic-stderr sink the dispatcher pipes the in-VM agent's stderr to.
+   * Mirrors the old `attachStderrTap`: records to the run log, surfaces a
+   * truncated `agent_stderr` runtime event, and logs at info. Wired before the
+   * bridge handshake (the dispatcher taps stderr at launch) so a pre-connect
+   * crash still surfaces.
    */
-  private attachStderrTap(
-    execStream: ExecStream,
+  private onAgentStderr(
+    chunk: string,
     issue: Issue,
     runLog: RunLog | undefined,
     logger: ReturnType<typeof withIssue>,
   ): void {
-    execStream.stderr.setEncoding('utf8');
-    execStream.stderr.on('data', (chunk: string) => {
-      runLog?.record({ channel: 'stderr', text: chunk });
-      const text = chunk.trim();
-      if (text.length === 0) return;
-      const truncated =
-        text.length > AgentRunner.STDERR_RING_LIMIT
-          ? text.slice(0, AgentRunner.STDERR_RING_LIMIT) + '…'
-          : text;
-      this.events.onRuntimeEvent(issue.id, {
-        at: new Date().toISOString(),
-        event: 'agent_stderr',
-        message: truncated,
-      });
-      logger.info('agent stderr', { text: text.slice(0, AgentRunner.STDERR_LOG_LIMIT) });
+    runLog?.record({ channel: 'stderr', text: chunk });
+    const text = chunk.trim();
+    if (text.length === 0) return;
+    const truncated =
+      text.length > AgentRunner.STDERR_RING_LIMIT
+        ? text.slice(0, AgentRunner.STDERR_RING_LIMIT) + '…'
+        : text;
+    this.events.onRuntimeEvent(issue.id, {
+      at: new Date().toISOString(),
+      event: 'agent_stderr',
+      message: truncated,
     });
+    logger.info('agent stderr', { text: text.slice(0, AgentRunner.STDERR_LOG_LIMIT) });
   }
 
   // -------------------------------------------------------------------------
@@ -1414,7 +1293,7 @@ export class AgentRunner {
     return new AcpClient({
       stdin: ctx.acpSocket!,
       stdout: ctx.acpSocket!,
-      stderr: ctx.execStream.stderr,
+      stderr: ctx.exec.stderr,
       cwd: ctx.workspacePath,
       readTimeoutMs: this.cfg.acp.read_timeout_ms,
       promptTimeoutMs: this.cfg.acp.prompt_timeout_ms,
@@ -1430,7 +1309,7 @@ export class AgentRunner {
       issueId: ctx.issue.id,
       sessionId,
       threadId: sessionId,
-      pid: ctx.execStream.pid ? String(ctx.execStream.pid) : null,
+      pid: ctx.exec.pid ? String(ctx.exec.pid) : null,
     });
   }
 
@@ -1479,7 +1358,7 @@ export class AgentRunner {
       const c = clientRef.current;
       c?.cancel().catch(() => undefined);
       c?.forceClose('cancel_requested');
-      try { ctx.execStream.kill(); } catch { /* idempotent */ }
+      try { ctx.exec.kill(); } catch { /* idempotent */ }
       if (ctx.acpSocket && !ctx.acpSocket.destroyed) {
         try { ctx.acpSocket.destroy(); } catch { /* idempotent */ }
       }
@@ -1804,30 +1683,31 @@ export class AgentRunner {
 
   /**
    * Unwind a session: cancel the bridge registration, destroy the socket and
-   * kill the exec, deactivate MCP, run the per-state `actions:` block, and
-   * emit the `vm_teardown_deferred` event so the reconciler `vm` resource
-   * (issue 52) can converge the now-orphan VM.
+   * kill the launch exec, deactivate MCP, run the per-state `actions:` block
+   * (which may `run_in_vm` against the still-live VM), THEN tear down the
+   * Gondolin dispatch — close the VM and deregister the per-VM secret manager.
+   * The dispatch owns the VM lifecycle now (Gondolin), so teardown is synchronous
+   * here rather than deferred to the reconciler.
    *
    * Returns the non-routed action failure reason, or null when the cleanup
    * succeeded or routed (so the caller can fold it into `decideAttemptOutcome`).
    */
   private async tearDownSession(ctx: SessionContext, reason: string): Promise<string | null> {
     this.detachSession(ctx, reason);
-    await this.awaitExecExit(ctx.execStream);
+    await this.awaitExecExit(ctx.exec);
     this.deactivateMcpForEntry(ctx.runningEntry);
-    this.deregisterCredentialSentinel(ctx);
     ctx.logger.debug('agent runner cleanup', { reason });
     const nonRouted = await this.runCleanupActions(
       ctx.issue,
       resolveCleanupState(ctx.issue, ctx.runningEntry),
       ctx.runningEntry,
       ctx.workspacePath,
-      ctx.vmReady,
-      ctx.vmName,
+      // run_in_vm cleanup execs into the live dispatch VM before it is closed below.
+      ctx.vm,
       ctx.hookCapture,
       ctx.runLog,
     );
-    this.logVmTeardownDeferred(ctx, reason);
+    await this.teardownDispatch(ctx, reason);
     return nonRouted;
   }
 
@@ -1836,25 +1716,31 @@ export class AgentRunner {
     try {
       if (ctx.acpSocket && !ctx.acpSocket.destroyed) ctx.acpSocket.destroy();
     } catch { /* ignore */ }
-    try { ctx.execStream.kill(); } catch { /* ignore */ }
+    try { ctx.exec.kill(); } catch { /* ignore */ }
   }
 
-  private async awaitExecExit(execStream: ExecStream): Promise<void> {
-    try { await execStream.exit; } catch { /* ignore */ }
+  private async awaitExecExit(exec: VmExec): Promise<void> {
+    try { await exec.exit; } catch { /* ignore */ }
   }
 
   private deactivateMcpForEntry(entry: RunningEntry | undefined): void {
     if (this.mcp && entry) this.mcp.deactivate(entry.identifier);
   }
 
-  private deregisterCredentialSentinel(ctx: SessionContext): void {
-    if (this.credentialProxy && ctx.credentialSentinel) {
-      this.credentialProxy.deregister(ctx.credentialSentinel);
+  /**
+   * Close the dispatch's VM + deregister its secret manager (idempotent — the
+   * dispatcher's `teardown()` guards re-entry). Runs after the cleanup actions
+   * so `run_in_vm` still sees a live VM. A null teardown (the dispatch never
+   * came up) is a no-op.
+   */
+  private async teardownDispatch(ctx: SessionContext, reason: string): Promise<void> {
+    if (!ctx.teardownDispatch) return;
+    ctx.runLog?.system('vm_teardown', { reason });
+    try {
+      await ctx.teardownDispatch();
+    } catch (err) {
+      ctx.logger.warn('gondolin dispatch teardown threw', { error: (err as Error).message });
     }
-  }
-
-  private logVmTeardownDeferred(ctx: SessionContext, reason: string): void {
-    if (ctx.vmReady) ctx.runLog?.system('vm_teardown_deferred', { vm: ctx.vmName, reason });
   }
 }
 
@@ -1880,36 +1766,24 @@ function failPhase(reason: string): { ok: false; result: RunAttemptResult } {
 interface AdapterRuntime {
   profile: AdapterProfile;
   adapterBin: string;
-  effectiveAcpCommand: string;
   effectiveAdapterArgs: string[];
   runtimeEnv: Record<string, string>;
   /**
-   * Credential-proxy sentinel minted at adapter prep. Always null at this
-   * point — sentinel registration is deferred to `bringUpVmAndExec` so an
-   * early dispatch failure can't leak a registry entry. Stashed on the
-   * SessionContext so tearDownSession can deregister it.
+   * Non-secret runtime files (model/effort knobs, e.g. claude's
+   * `~/.claude/settings.json` effortLevel) the dispatcher writes into the guest
+   * before launch. Carries no credential material.
    */
-  credentialSentinel: string | null;
-}
-
-interface VmStartInputs {
-  mounts: Array<{ host: string; guest: string; readonly: boolean }>;
-  env: Record<string, string>;
-  vmFrom: string | null;
-  vmSmolfile: string | null;
-  vmImage: string | null;
+  extraGuestFiles: GuestCredFile[];
 }
 
 interface VmExecHandle {
-  vmName: string;
-  execStream: ExecStream;
+  /** The live dispatch VM handle (run_in_vm cleanup execs into it). */
+  vm: VmHandle;
+  /** The launched `vm-agent.mjs` exec (process tether + stderr tap). */
+  exec: VmExec;
   bridgeReg: AcpBridgeRegistration;
-  /**
-   * Credential-proxy sentinel registered for this `'proxy'`-strategy dispatch
-   * (claude, codex); null for `'forward-env'` dispatches that don't touch the
-   * proxy. Threaded onto the SessionContext so tearDownSession can deregister it.
-   */
-  credentialSentinel: string | null;
+  /** Idempotent dispatch teardown: kill exec, close VM, deregister secret manager. */
+  teardownDispatch: () => Promise<void>;
 }
 
 /**
@@ -1922,21 +1796,16 @@ interface SessionContext {
   issue: Issue;
   runningEntry: RunningEntry | undefined;
   workspacePath: string;
-  vmName: string;
-  vmReady: boolean;
+  /** The dispatch VM handle, or null if the dispatch never came up. */
+  vm: VmHandle | null;
   bridgeReg: AcpBridgeRegistration;
-  execStream: ExecStream;
+  exec: VmExec;
+  /** Idempotent Gondolin dispatch teardown; null when the dispatch never came up. */
+  teardownDispatch: (() => Promise<void>) | null;
   acpSocket: Socket | null;
   hookCapture: (h: string) => HookCapture | undefined;
   runLog: RunLog | undefined;
   logger: ReturnType<typeof withIssue>;
-  /**
-   * Credential-proxy sentinel for this dispatch — minted for `'proxy'`-strategy
-   * adapters (claude and codex), null for `'forward-env'` adapters. Captured at
-   * session construction so `tearDownSession` can deregister it without reaching
-   * back into the AdapterRuntime.
-   */
-  credentialSentinel: string | null;
 }
 
 interface TurnLoopState {

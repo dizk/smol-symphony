@@ -30,6 +30,7 @@
 
 import path from 'node:path';
 import os from 'node:os';
+import { Buffer } from 'node:buffer';
 import {
   createHttpHooks,
   makePlaceholderFunc,
@@ -46,6 +47,7 @@ import {
   opencodeGithubTokenFromAuth,
   opencodeGithubTokenFromEnv,
 } from './adapter-names.js';
+import { validAccountId } from './gondolin-creds-staging.js';
 import {
   extractClaudeToken,
   extractCodexToken,
@@ -95,13 +97,84 @@ const CODEX_UPSTREAM_HOST = 'chatgpt.com';
 function claudePlaceholder(): () => string {
   return makePlaceholderFunc({ prefix: 'sk-ant-', length: 64, alphabet: BASE62_ALPHABET });
 }
-function codexPlaceholder(): () => string {
-  return makePlaceholderFunc({ prefix: 'sk-', length: 48, alphabet: BASE62_ALPHABET });
+/**
+ * codex (ChatGPT-OAuth) runs in its NATIVE mode reading
+ * `~/.codex/auth.json:tokens.access_token` as its bearer, so the placeholder must
+ * be JWT-SHAPED (header.payload.signature) with a far-future `exp` — otherwise
+ * codex treats it as expired and tries to refresh (egress-blocked, doomed). The
+ * placeholder Gondolin substitutes at egress must be byte-identical to that
+ * bearer, so the SAME assembled JWT is both the secret's placeholder here and the
+ * staged `tokens.access_token` (see `gondolin-creds-staging.ts`, which reads this
+ * placeholder out of `createHttpHooks().env` verbatim). The header + payload are
+ * fixed; the signature segment is a high-entropy random string so each VM's
+ * placeholder is unique + exact-matchable. Built once at `createHttpHooks()` time.
+ *
+ * GO-LIVE FINDING: codex-acp's local auth manager reads the
+ * `https://api.openai.com/auth` claim (specifically `chatgpt_account_id`) out of
+ * the bearer JWT *before* any egress. A placeholder with only `{ exp }` (no auth
+ * claim) makes codex-acp consider the token incomplete and attempt a token
+ * REFRESH mid-turn — which is egress-blocked → 403 → the turn is refused. The
+ * spike's C7 placeholder embedded that claim and passed; production had dropped
+ * it. So when the host `account_id` is known we embed it in the placeholder's
+ * auth claim. The id is a NON-SECRET identifier (same one staged into auth.json's
+ * `tokens.account_id`), never a token.
+ */
+function codexPlaceholder(accountId: string | null): () => string {
+  const randomSig = makePlaceholderFunc({ length: 86, alphabet: BASE64URL_ALPHABET });
+  return () => assemblePlaceholderJwt(randomSig(), accountId);
 }
 function opencodePlaceholder(): () => string {
   // The opencode custom provider forwards this as its bearer; a `gho_`-shaped
   // token keeps it indistinguishable in shape from a real Copilot/GitHub token.
   return makePlaceholderFunc({ prefix: 'gho_', length: 36, alphabet: BASE64URL_ALPHABET });
+}
+
+/**
+ * Far-future JWT `exp` (seconds since epoch — 2100-01-01T00:00:00Z) baked into the
+ * codex placeholder so codex's native mode treats it as a long-lived, unexpired
+ * token and never attempts a refresh (which would be egress-blocked). Exported so
+ * the fake-creds staging + tests can assert the same instant.
+ */
+export const PLACEHOLDER_JWT_EXP_SECONDS = 4_102_444_800;
+
+/**
+ * Assemble a structurally-valid (but cryptographically meaningless) JWT-shaped
+ * placeholder: `base64url(header).base64url(payload).<signature>`. codex never
+ * verifies the signature — it reads `exp` (must be far-future, so it never tries
+ * to refresh) and the `https://api.openai.com/auth.chatgpt_account_id` claim
+ * (which it uses to route + to consider the token complete; a missing claim
+ * triggers a refresh, see `codexPlaceholder`). The real token replaces this whole
+ * string at egress. The `signature` segment is the caller's high-entropy random
+ * string, making each VM's placeholder unique + exact-matchable by Gondolin's
+ * header substitution.
+ *
+ * `accountId` is the NON-SECRET `chatgpt_account_id` (when known); embedding it in
+ * the auth claim mirrors the spike's proven C7 placeholder. When null (host has no
+ * account_id) the claim is omitted — the JWT is still well-formed; codex may then
+ * refresh, but there is no id to embed.
+ *
+ * SAFETY-CRITICAL (codex review, HIGH): this JWT becomes the guest's staged BEARER,
+ * so this is the LAST chokepoint before a host `account_id` lands in a bearer slot.
+ * The id is re-validated through the SHARED {@link validAccountId} UUID guard here
+ * (defense-in-depth — independent of the caller's own validation): a non-UUID /
+ * token-shaped value is NOT embedded; the claim is simply OMITTED (the well-formed,
+ * SAFE failure). A real token (JWT / `sk-…` / refresh) never matches a UUID, so it
+ * can never reach the `chatgpt_account_id` claim via this path.
+ */
+export function assemblePlaceholderJwt(signature: string, accountId: string | null = null): string {
+  const safeAccountId = validAccountId(accountId);
+  const header = base64urlJson({ alg: 'RS256', typ: 'JWT' });
+  const payload = base64urlJson({
+    exp: PLACEHOLDER_JWT_EXP_SECONDS,
+    ...(safeAccountId !== null
+      ? { 'https://api.openai.com/auth': { chatgpt_account_id: safeAccountId } }
+      : {}),
+  });
+  return `${header}.${payload}.${signature}`;
+}
+
+function base64urlJson(obj: unknown): string {
+  return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +203,18 @@ export interface AdapterCredentialSpec {
   refresh(): Promise<void>;
   egressHeaders?: Record<string, string>;
   onRequest?: HttpHooks['onRequest'];
+  /**
+   * Whether this adapter's guest egress may open a WebSocket. codex-acp streams
+   * the Responses API over a WS Upgrade, so codex needs `true`; claude/opencode are
+   * plain HTTPS so they stay `false` (default-deny). SAFE under Gondolin: the real
+   * token is substituted on the Upgrade handshake's `Authorization` header (the
+   * handshake is hookable — `createHttpHooks` `onRequest` runs `applySecretsToRequest`),
+   * so the placeholder never egresses; the post-101 frames are an opaque tunnel to
+   * the ALLOWLISTED inference host only (a non-allowlisted refresh host's upgrade is
+   * blocked). The old proxy-era `#127` wss-leak risk does NOT apply (the proxy
+   * couldn't substitute inside the tunnel; Gondolin substitutes before it).
+   */
+  allowWebSockets: boolean;
 }
 
 /** Read+parse a JSON credential file; returns null on any IO/parse failure. */
@@ -213,6 +298,15 @@ export interface BuildSpecsOptions {
   claudeRefresher?: () => Promise<void>;
   /** opencode GitHub→Copilot exchange (default: real https); tests inject a stub. */
   copilotExchange?: CopilotTokenExchange;
+  /**
+   * The host's NON-SECRET codex `chatgpt_account_id`. Embedded in the codex
+   * placeholder JWT's `https://api.openai.com/auth` claim so codex-acp considers
+   * the (placeholder) bearer complete and does NOT attempt a mid-turn refresh
+   * (egress-blocked → 403 → refusal — the go-live finding). Resolve it once at
+   * composition (see `defaultHostIdentityReaders().readCodexAccountId`) and pass
+   * it here. Null/absent ⇒ the claim is omitted (best-effort).
+   */
+  codexAccountId?: string | null;
 }
 
 /**
@@ -246,12 +340,28 @@ export function buildAdapterCredentialSpecs(
       billingHeaders: CLAUDE_BILLING_TELL_HEADERS,
       readToken: async () => extractClaudeToken(await readJsonFile(claudeCredsPath)),
       refresh: claudeRefresher,
+      allowWebSockets: false, // plain HTTPS
     },
     codex: {
       adapterId: 'codex',
       secretName: CODEX_SECRET_NAME,
       allowedHosts: [CODEX_UPSTREAM_HOST],
-      placeholder: codexPlaceholder,
+      // codex-acp streams /backend-api/codex/responses over a WebSocket Upgrade.
+      // It MUST be allowed: the real token is substituted on the hookable Upgrade
+      // handshake (createHttpHooks onRequest → applySecretsToRequest), so the
+      // handshake reaches the ALLOWLISTED inference host with the real bearer and
+      // gets a clean 101; the post-101 frames are an opaque tunnel to that one
+      // host. SAFE — the placeholder never egresses and a non-allowlisted refresh
+      // host's upgrade is blocked. The earlier "post-101 tunnel drop" was a red
+      // herring: it was caused by an INCOMPLETE staged auth.json (codex 0.135
+      // judged the creds incomplete → sent no bearer → 401 → blocked refresh). With
+      // a COMPLETE staged auth.json (auth_mode + last_refresh + the tokens block —
+      // see gondolin-creds-staging.ts buildCodexFiles) the WS turn completes
+      // end-to-end (validated 2026-05-30 through the production dispatch path).
+      allowWebSockets: true,
+      // Bind the host account_id into the placeholder JWT's auth claim so
+      // codex-acp does not refresh the placeholder (go-live finding).
+      placeholder: () => codexPlaceholder(opts.codexAccountId ?? null),
       billingHeaders: CODEX_BILLING_TELL_HEADERS,
       // codex tokens are long-TTL (~8 days): re-read on demand, never drive an
       // OpenAI refresh dance — identical to the proxy's posture.
@@ -315,6 +425,7 @@ function buildOpencodeSpec(args: {
     readToken: async () => cache.token,
     refresh: underLock(args.lockAcquire, args.lockTimeoutMs, mint),
     onRequest: makeGithubExchangePathGuard(),
+    allowWebSockets: false, // openai-compatible HTTP provider
   };
 }
 
@@ -419,6 +530,8 @@ export interface AdapterHooksConfig {
   readToken(): Promise<TokenInfo | null>;
   /** Drive a host-side refresh, then `readToken` again. */
   refresh(): Promise<void>;
+  /** Whether the guest may open a WebSocket (codex-acp Responses stream needs it). */
+  allowWebSockets: boolean;
 }
 
 /** Build the `createHttpHooks` config for a single adapter spec. */
@@ -445,6 +558,7 @@ export function buildAdapterHooksConfig(spec: AdapterCredentialSpec): AdapterHoo
     options,
     readToken: spec.readToken,
     refresh: spec.refresh,
+    allowWebSockets: spec.allowWebSockets,
   };
 }
 

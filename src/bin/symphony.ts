@@ -33,12 +33,22 @@ import type { RunInVmAction, WorkflowAction } from '../actions/index.js';
 import { LocalMarkdownTracker } from '../trackers/local.js';
 import { WorkspaceManager } from '../workspace.js';
 import { SmolvmClient } from '../agent/smolvm.js';
+import { GondolinVmClient } from '../agent/gondolin.js';
+import {
+  CredentialSecretRegistry,
+  buildAdapterCredentialSpecs,
+  buildAdapterHooksConfig,
+  type AdapterCredentialSpec,
+  type AdapterHooksConfig,
+} from '../agent/credential-secrets.js';
+import type { GondolinVmConfig } from '../agent/gondolin-dispatch.js';
+import { defaultHostIdentityReaders } from '../agent/gondolin-creds-staging.js';
+import { KNOWN_ADAPTER_IDS, type AcpAdapterId } from '../agent/adapter-names.js';
 import { AgentRunner } from '../agent/runner.js';
 import { Orchestrator } from '../orchestrator.js';
 import { startHttpServer } from '../http.js';
 import { McpRegistry } from '../mcp.js';
 import { AcpBridge } from '../acp-bridge.js';
-import { CredentialProxy } from '../agent/credential-proxy.js';
 import { CredentialTicker } from '../agent/credential-ticker.js';
 import { GhCliPrApi, Reconciler } from '../reconciler/index.js';
 import { closeLogFile, log, setLogFile, setLogVerbose } from '../logging.js';
@@ -250,20 +260,73 @@ async function loadAndValidateConfig(workflowPath: string): Promise<LoadedConfig
 }
 
 /**
- * Build the host credential proxy + ticker (issue 113). The proxy is the
- * only path the in-VM claude-agent-acp uses to reach Anthropic — every
- * dispatch goes through it.
+ * Build the host credential pipeline for the Gondolin secret-substitution model
+ * (replaces the credential proxy). There is no HTTP proxy server and no base-URL
+ * injection: per-adapter specs carry the extractor/mint/flock-refresh logic, a
+ * single shared `CredentialSecretRegistry` owns every live per-VM secretManager
+ * and seeds it before first egress, and the per-adapter hooks configs (allowlist
+ * + token-shaped placeholder + request/response hooks) thread into each dispatch's
+ * `createHttpHooks`. The ticker fans `refreshAdapter` over every live adapter.
  */
-function buildCredentialPipeline(config: ServiceConfig): {
-  credentialProxy: CredentialProxy;
+async function buildCredentialPipeline(config: ServiceConfig): Promise<{
+  credentialRegistry: CredentialSecretRegistry;
+  adapterHooks: Record<AcpAdapterId, AdapterHooksConfig>;
   credentialTicker: CredentialTicker;
-} {
-  const credentialProxy = new CredentialProxy();
+}> {
+  // Resolve the host's NON-SECRET codex `chatgpt_account_id` once and bind it into
+  // the codex placeholder JWT's auth claim — without it codex-acp attempts a
+  // mid-turn token refresh (egress-blocked → 403 → refusal; the go-live finding).
+  // Best-effort: a missing/malformed auth.json yields null (claim omitted).
+  const codexAccountId = await defaultHostIdentityReaders().readCodexAccountId();
+  const specs = buildAdapterCredentialSpecs({ codexAccountId });
+  const adapterHooks = buildAllAdapterHooks(specs);
+  const credentialRegistry = new CredentialSecretRegistry({
+    readToken: (adapterId) => specs[adapterId].readToken(),
+    refresh: (adapterId) => specs[adapterId].refresh(),
+  });
   const credentialTicker = new CredentialTicker({
     intervalMs: config.credentials.ticker_interval_ms,
-    proxy: credentialProxy,
+    // Fan a host-side refresh over every adapter; each adapter's flock +
+    // single-flight collapses concurrent ticks into one host refresh, and the
+    // registry seeds every live per-VM manager with the fresh value.
+    refreshAll: () => refreshAllAdapters(credentialRegistry),
   });
-  return { credentialProxy, credentialTicker };
+  return { credentialRegistry, adapterHooks, credentialTicker };
+}
+
+/** Build the per-adapter `createHttpHooks` config map from the credential specs. */
+function buildAllAdapterHooks(
+  specs: Record<AcpAdapterId, AdapterCredentialSpec>,
+): Record<AcpAdapterId, AdapterHooksConfig> {
+  const out = {} as Record<AcpAdapterId, AdapterHooksConfig>;
+  for (const id of KNOWN_ADAPTER_IDS) {
+    out[id] = buildAdapterHooksConfig(specs[id]);
+  }
+  return out;
+}
+
+/** Drive a host-side refresh + fan-out for every adapter (the ticker cadence). */
+async function refreshAllAdapters(registry: CredentialSecretRegistry): Promise<void> {
+  for (const id of KNOWN_ADAPTER_IDS) {
+    await registry.refreshAdapter(id);
+  }
+}
+
+/**
+ * Resolve the static Gondolin VM shape from config. The image ref reuses the
+ * smolvm `image`/`from` field for now (a later PR renames these to `gondolin.*`);
+ * fail fast if neither is set so a misconfigured workflow surfaces at boot, not
+ * mid-dispatch after the VM bring-up cost is sunk.
+ */
+function resolveGondolinVmConfig(config: ServiceConfig): GondolinVmConfig {
+  const imagePath = config.smolvm.image ?? config.smolvm.from;
+  if (!imagePath || imagePath.length === 0) {
+    throw new Error(
+      'gondolin: no VM image configured. Set smolvm.image (an OCI image ref/tag/digest ' +
+        'exported by images/agents) or smolvm.from in WORKFLOW.md.',
+    );
+  }
+  return { imagePath, cpus: config.smolvm.cpus, memMib: config.smolvm.mem_mib };
 }
 
 interface OrchestratorGraph {
@@ -272,7 +335,6 @@ interface OrchestratorGraph {
   smolvm: SmolvmClient;
   mcp: McpRegistry;
   acpBridge: AcpBridge;
-  credentialProxy: CredentialProxy;
   credentialTicker: CredentialTicker;
   reconciler: Reconciler;
   runner: AgentRunner;
@@ -293,7 +355,7 @@ interface OrchestratorGraph {
  * The Reconciler is constructed before the Orchestrator (the runner needs the
  * reconciler at its own construction time for the bake-artifact path), so the
  * vm reaper's IntendedVmProvider and workspace providers are plugged in after
- * the orchestrator exists. The vm resource is only built when both `smolvm`
+ * the orchestrator exists. The vm resource is only built when both `vmClient`
  * (passed at Reconciler construction) and an intended provider are wired.
  */
 async function buildOrchestratorGraph(opts: {
@@ -313,7 +375,15 @@ async function buildOrchestratorGraph(opts: {
     await bailStartup(`error: tracker init failed: ${(err as Error).message}\n`, { src });
   }
   const workspaces = new WorkspaceManager(config);
+  // smolvm CLI client. No longer on any live path (dispatch + reaper both run
+  // on Gondolin as of Phase 4); kept constructed only so the graph shape is
+  // unchanged until Phase 6 deletes SmolvmClient + the config migration.
   const smolvm = new SmolvmClient(config.smolvm);
+  // Gondolin VM substrate (replaced the smolvm CLI backend for the dispatch
+  // path). The runner builds a per-dispatch GondolinDispatcher over this client,
+  // and the Reconciler's VM reaper observes its session registry / runs its GC.
+  const vmClient = new GondolinVmClient();
+  const gondolinVmConfig = resolveGondolinVmConfig(config);
   // Always instantiate the registry so a workflow reload that flips mcp.enabled from
   // false to true takes effect without a process restart. The runner and HTTP routes
   // gate behavior on cfg.mcp.enabled at runtime; an inactive registry holds no entries
@@ -323,18 +393,20 @@ async function buildOrchestratorGraph(opts: {
     prAutopilot: config.pr_autopilot,
     now: () => Date.now(),
   });
-  // ACP transport. The bridge listens on a TCP port for the in-VM agent's dial-back,
-  // replacing the smolvm-exec stdio path. Started below alongside the HTTP server so a
-  // bind failure surfaces before we accept any dispatches.
-  const acpBridge = new AcpBridge();
-  const { credentialProxy, credentialTicker } = buildCredentialPipeline(config);
-  // Reconciler (issues 32, 33, 34). Owns the bake artifact lifecycle so the
-  // Smolfile's apt + npm install is paid once per Smolfile-content change
-  // instead of per dispatch (issue 32), reaps stray `symphony-*` VMs +
-  // `_boot-vm` workers that survive process restarts or per-attempt cleanup
-  // failures (issue 33), AND keeps per-issue workspace dirs converged to the
-  // tracker's non-terminal issue set (issue 34).
-  const reconciler = new Reconciler(config, { smolvm });
+  // ACP transport. The bridge listens on a loopback TCP port for the in-VM
+  // agent's dial-back (raw mapped TCP via Gondolin `tcp.hosts`). `loopbackOnly`
+  // hard-refuses a wider bind so the bearer-gated control channel can never be
+  // exposed to the host LAN. Started below alongside the HTTP server so a bind
+  // failure surfaces before we accept any dispatches.
+  const acpBridge = new AcpBridge({ loopbackOnly: true });
+  const { credentialRegistry, adapterHooks, credentialTicker } = await buildCredentialPipeline(config);
+  // Reconciler (issues 32, 33, 34). Owns the VM reaper (now Gondolin-backed:
+  // observes `vmClient.listSessions()` + runs `vmClient.gc()`, reaping
+  // `symphony-`-labelled sessions not in the orchestrator's intended set) + the
+  // per-issue workspace convergence. Bake is bypassed on the Gondolin dispatch
+  // path (the runner uses the prebuilt image directly); the bake resource stays
+  // for now and is deleted in a later PR.
+  const reconciler = new Reconciler(config, { vmClient });
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
@@ -343,7 +415,7 @@ async function buildOrchestratorGraph(opts: {
     definition,
     workspaces,
     tracker,
-    smolvm,
+    vmClient,
     {
       onRuntimeEvent: (id, ev) => orch.reportRuntimeEvent(id, ev),
       onTokenUsage: (id, u) => orch.reportTokenUsage(id, u),
@@ -358,7 +430,6 @@ async function buildOrchestratorGraph(opts: {
     },
     mcp,
     acpBridge,
-    reconciler,
     // propose_followup sink (issue 36): orchestrator owns the tracker write
     // path, mirroring how the MCP `propose_issue` tool routes through the
     // tracker. The runner forwards the parent identifier so provenance is
@@ -368,7 +439,12 @@ async function buildOrchestratorGraph(opts: {
     // /api/v1/snapshot under reconciler.resources so the dashboard sees
     // "Done.actions: …" alongside the bake/vm/workspace resources.
     { recordActionResult: (id, snap) => orch.recordActionResult(id, snap) },
-    credentialProxy,
+    // Gondolin credential layer (replaced the credential proxy): the shared
+    // registry of per-VM secret managers, the per-adapter hooks configs, and the
+    // static VM shape (image + cpus/mem).
+    credentialRegistry,
+    adapterHooks,
+    gondolinVmConfig,
   );
   orch = new Orchestrator(config, definition, src, tracker, workspaces, runner, undefined, reconciler);
   wirePostConstructionProviders({ reconciler, orch });
@@ -392,7 +468,6 @@ async function buildOrchestratorGraph(opts: {
     smolvm,
     mcp,
     acpBridge,
-    credentialProxy,
     credentialTicker,
     reconciler,
     runner,
@@ -506,41 +581,33 @@ async function startTransports(opts: {
   workflowPath: string;
 }): Promise<{ http: { close: () => Promise<void>; port: number } | null }> {
   const { config, graph, cli, src, workflowPath } = opts;
+  // The Gondolin ACP channel is raw mapped TCP: the guest dials a synthetic name
+  // tunnelled to the host loopback via `tcp.hosts`. So the bridge binds loopback
+  // (the `reach_host`, default 127.0.0.1) and `loopbackOnly` hard-refuses a wider
+  // bind — never the config `bind_host` (which defaults to 0.0.0.0 for the old
+  // smolvm slirp gateway).
+  const bridgeHost = config.acp.bridge.reach_host;
   try {
-    await graph.acpBridge.start(config.acp.bridge.bind_host, config.acp.bridge.bind_port);
+    await graph.acpBridge.start(bridgeHost, config.acp.bridge.bind_port);
   } catch (err) {
     await bailStartup(
-      `error: failed to bind ACP bridge on ${config.acp.bridge.bind_host}:${config.acp.bridge.bind_port}: ${(err as Error).message}\n`,
+      `error: failed to bind ACP bridge on ${bridgeHost}:${config.acp.bridge.bind_port}: ${(err as Error).message}\n`,
       { src },
     );
   }
-  await startCredentialProxyOrFail(config, graph, src);
+  startCredentialTicker(graph);
   const http = await bindHttpServer({ config, graph, cli, src, workflowPath });
   await checkMcpPrecondition({ config, graph, src, http });
   return { http };
 }
 
 /**
- * Bind the host credential proxy (issue 113) and start the host ticker.
- * A bind failure here is fatal — without the proxy, in-VM dispatches
- * would fail closed at first upstream request.
+ * Start the host credential ticker (Gondolin secret-substitution model). There
+ * is NO proxy server to bind — the registry seeds each per-VM secret manager at
+ * dispatch and the ticker drives a periodic host-side refresh fan-out. So this
+ * is just the ticker timer; nothing here can fail-to-bind.
  */
-async function startCredentialProxyOrFail(
-  config: ServiceConfig,
-  graph: OrchestratorGraph,
-  src: WorkflowSource,
-): Promise<void> {
-  try {
-    await graph.credentialProxy.start(
-      config.credentials.proxy_bind_host,
-      config.credentials.proxy_bind_port,
-    );
-  } catch (err) {
-    await bailStartup(
-      `error: failed to bind credential proxy on ${config.credentials.proxy_bind_host}:${config.credentials.proxy_bind_port}: ${(err as Error).message}\n`,
-      { src },
-    );
-  }
+function startCredentialTicker(graph: OrchestratorGraph): void {
   graph.credentialTicker.start();
 }
 
@@ -726,7 +793,6 @@ async function main() {
     await graph.orch.stop();
     await graph.acpBridge.stop().catch(() => undefined);
     graph.credentialTicker.stop();
-    await graph.credentialProxy.stop().catch(() => undefined);
     if (http) await http.close().catch(() => undefined);
     await src.stop().catch(() => undefined);
     await closeLogFile().catch(() => undefined);

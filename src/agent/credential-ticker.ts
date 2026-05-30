@@ -1,35 +1,39 @@
-// Host-side OAuth ticker — periodically nudges Claude Code into refreshing
-// the cached access token so the credential proxy's on-demand fallback isn't
-// the only thing keeping `~/.claude/.credentials.json` fresh during long
-// idle windows. Belt to the proxy's braces.
+// Host-side OAuth ticker — periodically drives a credential refresh so the
+// on-demand fallback isn't the only thing keeping the host access token fresh
+// during long idle windows.
 //
-// The work is delegated to the proxy's own `refreshNow()` so both paths
-// share one flock and one in-process single-flight — concurrent ticks +
-// on-demand refresh from a VM request collapse into a single `claude -p`.
+// Under the Gondolin secret-substitution model the work is delegated to the
+// credential registry's `refreshAll()` (which fans `refreshAdapter` over every
+// live adapter); the registry's per-adapter refresh carries the shared flock +
+// single-flight, so concurrent ticks + a per-VM proactive `expiresAt` tick
+// collapse into a single host-side refresh.
 //
 // Lifecycle:
 //   start() — install the interval timer. Idempotent.
 //   stop()  — clear the timer. Idempotent.
 
 import { log } from '../logging.js';
-import type { CredentialProxy } from './credential-proxy.js';
 
 export interface CredentialTickerOptions {
   /** Refresh cadence in milliseconds. 0 disables the ticker. */
   intervalMs: number;
-  /** Proxy whose `refreshNow()` carries the shared flock + single-flight. */
-  proxy: CredentialProxy;
+  /**
+   * Drive a host-side refresh of every live adapter's credential. Wired to the
+   * `CredentialSecretRegistry` fan-out (`refreshAdapter` over each live adapter)
+   * which seeds the per-VM secret managers + carries the flock/single-flight.
+   */
+  refreshAll: () => Promise<void>;
 }
 
 export class CredentialTicker {
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
   private readonly intervalMs: number;
-  private readonly proxy: CredentialProxy;
+  private readonly refreshAll: () => Promise<void>;
 
   constructor(opts: CredentialTickerOptions) {
     this.intervalMs = opts.intervalMs;
-    this.proxy = opts.proxy;
+    this.refreshAll = opts.refreshAll;
   }
 
   start(): void {
@@ -57,7 +61,7 @@ export class CredentialTicker {
   private async tick(): Promise<void> {
     if (this.stopped) return;
     try {
-      await this.proxy.refreshNow();
+      await this.refreshAll();
     } catch (err) {
       log.warn('credential ticker: refresh failed', { error: (err as Error).message });
     }

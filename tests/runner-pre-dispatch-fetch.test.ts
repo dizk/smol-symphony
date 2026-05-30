@@ -11,7 +11,7 @@
 // is guaranteed to exit non-zero), hand it to a minimal AgentRunner via a
 // stub WorkspaceManager, and assert the failure shape + that no downstream
 // orchestration ran. The stub records `runBeforeRun` calls; the other
-// runner ports (tracker, smolvm, events) are wired as never-called values
+// runner ports (tracker, vmClient, events) are wired as never-called values
 // so a regression that lets execution leak past the fetch surfaces as a
 // thrown tripwire rather than a silent pass.
 
@@ -26,7 +26,7 @@ import { buildServiceConfig } from '../src/workflow.js';
 import type { WorkflowDefinition, Issue } from '../src/types.js';
 import type { WorkspaceManager } from '../src/workspace.js';
 import type { IssueTracker } from '../src/trackers/types.js';
-import type { SmolvmClient } from '../src/agent/smolvm.js';
+import type { VmClient } from '../src/agent/vm-port.js';
 
 function run(cmd: string, args: string[], cwd: string): Promise<{ exit: number; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -91,7 +91,13 @@ describe('runAttempt pre-dispatch base fetch (issue 101 precondition)', () => {
       } as unknown as WorkspaceManager;
 
       const tracker = {} as unknown as IssueTracker;
-      const smolvm = {} as unknown as SmolvmClient;
+      // The dispatch never reaches VM bring-up (it aborts at the base fetch), so
+      // a bare VmClient that throws on use is the right tripwire here.
+      const vmClient = {
+        createVm: () => {
+          throw new Error('tripwire: createVm called before pre-dispatch fetch passed');
+        },
+      } as unknown as VmClient;
       const events = {
         onRuntimeEvent: () => {
           throw new Error('tripwire: onRuntimeEvent');
@@ -107,7 +113,7 @@ describe('runAttempt pre-dispatch base fetch (issue 101 precondition)', () => {
         },
       };
 
-      const runner = new AgentRunner(cfg, def, fakeWorkspaces, tracker, smolvm, events);
+      const runner = new AgentRunner(cfg, def, fakeWorkspaces, tracker, vmClient, events);
 
       const issue: Issue = {
         id: '42',
