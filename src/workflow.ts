@@ -16,7 +16,7 @@ import type {
   HooksConfig,
   AgentConfig,
   AcpConfig,
-  SmolvmConfig,
+  GondolinConfig,
   ServerConfig,
   McpConfig,
   PrAutopilotConfig,
@@ -119,9 +119,8 @@ function getObject(parent: Record<string, unknown>, key: string): Record<string,
 }
 
 // Build a fully typed ServiceConfig from a parsed front matter map. `env`
-// supplies the variable map for `$VAR` expansion (and `XDG_RUNTIME_DIR` for
-// the smolvm endpoint default); defaults to {} so pure callers don't need to
-// thread one in.
+// supplies the variable map for `$VAR` expansion; defaults to {} so pure
+// callers don't need to thread one in.
 export function buildServiceConfig(
   raw: Record<string, unknown>,
   workflowPath: string,
@@ -227,8 +226,8 @@ export function buildServiceConfig(
     throw new WorkflowError('workflow_parse_error', 'agent.max_turns must be positive');
   }
   // Memory-aware admission cap (issue 27). Default-on with a 2 GiB host reserve — that's
-  // enough headroom for the orchestrator process, hooks, the smolvm daemon, and the
-  // kernel's working set on a typical workstation. Operators can disable the cap (set
+  // enough headroom for the orchestrator process, hooks, the per-VM Gondolin runners,
+  // and the kernel's working set on a typical workstation. Operators can disable the cap (set
   // `memory_admission_enabled: false`) on hosts that don't expose /proc/meminfo or where
   // the static cap is already the binding constraint.
   const memAdmissionEnabledRaw = agentRaw['memory_admission_enabled'];
@@ -274,7 +273,7 @@ export function buildServiceConfig(
   // `~/.local/share/opencode/auth.json` for opencode).
   //
   // `acp.bridge` configures the host-side TCP listener that the in-VM agent dials back
-  // to for ACP traffic. The bridge replaced the smolvm-exec stdio path; see
+  // to for ACP traffic. The bridge replaced the earlier in-VM-exec stdio path; see
   // src/acp-bridge.ts for rationale.
   const acpRaw = getObject(raw, 'acp');
   const bridgeRaw = getObject(acpRaw, 'bridge');
@@ -309,33 +308,9 @@ export function buildServiceConfig(
     ticker_interval_ms: asInt(credentialsRaw['ticker_interval_ms'], 6 * 60 * 60 * 1000),
   };
 
-  // smolvm extension
-  const smolvmRaw = getObject(raw, 'smolvm');
-  const fromRaw = asString(smolvmRaw['from']);
-  let from: string | null = null;
-  if (fromRaw) {
-    const expanded = expandVar(fromRaw, env);
-    if (expanded === '') {
-      throw new WorkflowError(
-        'workflow_parse_error',
-        `smolvm.from references an unset variable: ${fromRaw}`,
-      );
-    }
-    from = path.isAbsolute(expanded) ? expanded : path.resolve(workflowDir, expanded);
-  }
-  const smolfileRaw = asString(smolvmRaw['smolfile']);
-  let smolfile: string | null = null;
-  if (smolfileRaw) {
-    const expanded = expandVar(smolfileRaw, env);
-    if (expanded === '') {
-      throw new WorkflowError(
-        'workflow_parse_error',
-        `smolvm.smolfile references an unset variable: ${smolfileRaw}`,
-      );
-    }
-    smolfile = path.isAbsolute(expanded) ? expanded : path.resolve(workflowDir, expanded);
-  }
-  const volumesRaw = smolvmRaw['volumes'];
+  // gondolin VM extension
+  const gondolinRaw = getObject(raw, 'gondolin');
+  const volumesRaw = gondolinRaw['volumes'];
   const volumes = Array.isArray(volumesRaw)
     ? volumesRaw.flatMap((v) => {
         if (!v || typeof v !== 'object' || Array.isArray(v)) return [];
@@ -352,27 +327,20 @@ export function buildServiceConfig(
         return [{ host, guest, readonly }];
       })
     : [];
-  const smolvm: SmolvmConfig = {
-    image: asString(smolvmRaw['image']),
-    from,
-    smolfile,
-    cpus: asInt(smolvmRaw['cpus'], 2),
-    mem_mib: asInt(smolvmRaw['mem_mib'], 2048),
-    net: smolvmRaw['net'] !== false,
+  const gondolin: GondolinConfig = {
+    image: asString(gondolinRaw['image']),
+    cpus: asInt(gondolinRaw['cpus'], 2),
+    mem_mib: asInt(gondolinRaw['mem_mib'], 2048),
     volumes,
-    // `forward_env` is forwarded into the VM boot env, but the runner strips the active
-    // proxy adapter's credential var (`proxyEnv.tokenVar` — claude → ANTHROPIC_AUTH_TOKEN,
-    // codex → OPENAI_API_KEY) before boot, since both shipped adapters authenticate via the
-    // host credential proxy + sentinel rather than a forwarded key. So even if an operator
-    // lists `OPENAI_API_KEY` here, a real codex key never reaches a codex dispatch's VM.
-    // The defaults are retained for any future `forward-env`-strategy adapter an operator adds.
-    forward_env: asStringList(smolvmRaw['forward_env'], [
+    // `forward_env` is forwarded into the VM boot env, but the runner strips EVERY
+    // credential-bearing var (`stripCredentialEnv`) before boot — the guest holds
+    // only the token-shaped placeholder Gondolin substitutes at egress, never a real
+    // key. So even if an operator lists `OPENAI_API_KEY` here, it never reaches a VM.
+    // The defaults are retained for any future forward-env-strategy adapter.
+    forward_env: asStringList(gondolinRaw['forward_env'], [
       'OPENAI_API_KEY',
       'ANTHROPIC_API_KEY',
     ]),
-    endpoint:
-      asString(smolvmRaw['endpoint']) ??
-      `unix://${env['XDG_RUNTIME_DIR'] ?? '/run/user/1000'}/smolvm.sock`,
   };
 
   // server extension (§9.5)
@@ -392,8 +360,8 @@ export function buildServiceConfig(
   const mcpEnabled = mcpEnabledRaw === undefined ? true : mcpEnabledRaw !== false;
   const mcp: McpConfig = {
     enabled: mcpEnabled,
-    // 127.0.0.1 works for smolvm because its VM network intercepts loopback
-    // traffic and forwards it to the host's loopback. (Empirically verified;
+    // 127.0.0.1 works because Gondolin maps a synthetic guest host to the host's
+    // loopback (`tcp.hosts`). (Empirically verified;
     // 10.0.2.2 — the QEMU slirp gateway — is NOT reachable here.) Other VMMs
     // can override via the `host` field in the WORKFLOW.md mcp block.
     host: asString(mcpRaw['host']) ?? '127.0.0.1',
@@ -460,7 +428,7 @@ export function buildServiceConfig(
     hooks,
     agent,
     acp,
-    smolvm,
+    gondolin,
     server,
     mcp,
     pr_autopilot: prAutopilot,
@@ -764,9 +732,9 @@ export function warnOnHooksAndActionsConflict(cfg: ServiceConfig): void {
 }
 
 // Dispatch preflight validation (structural, pure). The fs-touching probes —
-// `tracker.root` existence, `smolvm.smolfile` existence, and the proxy-backed
-// adapter credentials — live in the shell loader's `validateDispatchIo`, which
-// the orchestrator calls alongside this function. Both proxy adapters are
+// `tracker.root` existence and the adapter credential files — live in the shell
+// loader's `validateDispatchIo`, which the orchestrator calls alongside this
+// function. Both proxy adapters are
 // startup-probed: claude requires a single readable host file
 // (`~/.claude/.credentials.json`); codex passes when either `~/.codex/auth.json`
 // holds a token (ChatGPT-OAuth `tokens.access_token` or a top-level
@@ -784,25 +752,6 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   if (statesError) return statesError;
   if (!isKnownAdapter(cfg.acp.adapter)) {
     return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex, opencode`;
-  }
-  // smolvm artifact source is one of image / from / smolfile. The smolvm CLI itself
-  // would also reject conflicting flags, but failing here gives the operator a clear
-  // pointer at the workflow key instead of a deep CLI error.
-  const sources = [cfg.smolvm.image, cfg.smolvm.from, cfg.smolvm.smolfile].filter(
-    (v): v is string => v !== null,
-  );
-  if (sources.length > 1) {
-    return 'smolvm: set at most one of image / from / smolfile (mutually exclusive)';
-  }
-  // The bridge transport requires the VM to dial the host. Without networking the proxy
-  // can never reach `SYMPHONY_ACP_URL`, every attempt fails after connect_timeout_ms,
-  // and the operator gets a slow opaque error instead of a fast clear one.
-  if (cfg.smolvm.net === false) {
-    return (
-      'smolvm.net=false is incompatible with the ACP TCP bridge. The in-VM proxy must ' +
-      'reach the host listener; set smolvm.net: true (the default) or override the ' +
-      'reachability of the bridge via acp.bridge.reach_url.'
-    );
   }
   // pr_autopilot is always populated by buildServiceConfig, but test harnesses
   // sometimes hand-build a ServiceConfig from an earlier shape; treat a

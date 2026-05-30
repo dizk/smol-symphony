@@ -1,5 +1,5 @@
 // VM reaper tests (issue 33 / reconciler stage 2; Gondolin migration Phase 4).
-// The reaper observes Gondolin's session registry instead of smolvm
+// The reaper observes Gondolin's session registry instead of the old
 // `machine ls` + `_boot-vm` /proc scraping. Covers the AC scenarios:
 //   (a) `gc()` is invoked every pass (Gondolin's STALE/dead-pid + orphan-socket
 //       collection — the reaper's first action).

@@ -23,7 +23,8 @@ process is logging.
 
 smol-symphony is a small TypeScript orchestrator that takes Markdown issues off a
 local tracker, prepares per-issue workspaces, and runs coding agents
-(Claude Code, Codex, OpenCode) inside isolated smolvm microVMs over ACP. The
+(Claude Code, Codex, OpenCode) inside isolated per-issue Gondolin microVMs over
+ACP. The
 HTTP dashboard exists to do two things well:
 
 1. **Dispatch** — create issues into the tracker without dropping back to the

@@ -1,6 +1,6 @@
 // Agent Runner (SPEC §6.2): workspace + prompt + ACP session, with continuation turns up
 // to agent.max_turns. The ACP adapter (claude-agent-acp / codex-acp / opencode acp) runs
-// inside a per-issue smolvm machine. The host workspace directory is volume-mounted into
+// inside a per-issue Gondolin VM. The host workspace directory is volume-mounted into
 // the VM at the same absolute path so cwd values are consistent.
 
 import { setTimeout as delay } from 'node:timers/promises';
@@ -298,7 +298,7 @@ export class AgentRunner {
     private workspaces: WorkspaceManager,
     private tracker: IssueTracker,
     /**
-     * Gondolin VM-substrate client (replaced the smolvm CLI backend). Each
+     * Gondolin VM-substrate client (the in-process VM backend). Each
      * dispatch creates a per-issue VM through a per-attempt `GondolinDispatcher`
      * built over this client + the shared credential registry.
      */
@@ -1044,7 +1044,7 @@ export class AgentRunner {
 
   /**
    * Bring up the per-issue VM, register with the ACP bridge, and start the
-   * in-VM proxy via smolvm exec. VM start happens BEFORE bridge register so a
+   * in-VM proxy via Gondolin exec. VM start happens BEFORE bridge register so a
    * `register()` synchronous throw cannot leave us with a half-staged
    * registration whose `accepted` promise has no `.catch` attached yet
    * (Node ≥ 15 crashes on unhandled rejections).
@@ -1163,7 +1163,7 @@ export class AgentRunner {
     const mounts: Array<{ host: string; guest: string; readonly: boolean }> = [
       { host: workspacePath, guest: workspacePath, readonly: false },
     ];
-    for (const v of this.cfg.smolvm.volumes) {
+    for (const v of this.cfg.gondolin.volumes) {
       mounts.push({ host: v.host, guest: v.guest, readonly: v.readonly });
     }
     for (const m of buildEvalModeMounts(this.cfg, resolved)) {
@@ -1173,7 +1173,7 @@ export class AgentRunner {
   }
 
   /**
-   * Forward the configured `smolvm.forward_env` vars into the VM boot env, then
+   * Forward the configured `gondolin.forward_env` vars into the VM boot env, then
    * STRIP every credential-bearing var via `stripCredentialEnv` (defense in depth).
    * `forward_env` can name a real cred var (e.g. `OPENAI_API_KEY`), so this strip
    * makes "no real token reaches the guest boot env" obvious AT THE SOURCE rather
@@ -1186,7 +1186,7 @@ export class AgentRunner {
    */
   private buildForwardedEnv(): Record<string, string> {
     return stripCredentialEnv(
-      computeForwardedEnv(this.cfg.smolvm.forward_env, undefined, (k) => process.env[k]),
+      computeForwardedEnv(this.cfg.gondolin.forward_env, undefined, (k) => process.env[k]),
     );
   }
 

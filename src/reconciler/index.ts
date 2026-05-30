@@ -4,8 +4,9 @@
 // Resources: the VM reaper (Gondolin session GC), the workspace janitor, and PR
 // autopilot. The DAG walker, per-action ledger, and dispatch-gating predicate
 // are written generically so additional resources can plug in by registering.
-// (The Smolfile-driven bake resource was removed in the Gondolin migration —
-// the agent image is built once via `images/agents`, not baked per issue.)
+// (The earlier per-issue image-bake resource was removed in the Gondolin
+// migration — the agent image is built once via `images/agents`, not baked per
+// issue.)
 //
 // Triggers (per issue 31 sketch):
 //   • startup            — orchestrator calls reconcile() before the first dispatch.
@@ -52,7 +53,7 @@ export interface ReconcilerOptions {
   // `vmClient` or an intended provider is missing, the vm resource is not
   // constructed and `reapVms()` is a no-op. The reaper observes Gondolin's
   // session registry (`vmClient.listSessions`) + runs Gondolin's GC
-  // (`vmClient.gc`) — no more smolvm `machine ls` / `_boot-vm` /proc scraping.
+  // (`vmClient.gc`) — no more CLI `machine ls` / `_boot-vm` /proc scraping.
   vmClient?: VmClient;
   vmIntendedProvider?: IntendedVmProvider;
   // VmResource test hooks (mirror the same names on VmResourceOptions). Tests

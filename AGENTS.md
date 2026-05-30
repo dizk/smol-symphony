@@ -14,11 +14,10 @@ OpenCode, etc.) working on this repo. Keep it short.
   documents.
 - `src/trackers/local.ts` — local markdown tracker (only kind today).
 - `src/acp-bridge.ts` + `scripts/vm-agent.mjs` — host↔VM ACP transport.
-- `Smolfile` — declarative per-issue VM (image, resources, apt/npm install,
-  scripts/ → /opt/symphony bind mount). Referenced by `WORKFLOW.md`'s
-  `smolvm.smolfile`. Alternative starters live under `templates/`
-  (e.g. `templates/Smolfile.rust` for Rust projects,
-  `templates/Smolfile.kotlin` for Kotlin / Gradle projects).
+- `images/agents/` — the agent rootfs image (Node + the ACP coding-agent CLIs +
+  the in-VM `/opt/symphony/vm-agent.mjs` launcher), built **once** via
+  `npm run build:image`. Selected by `WORKFLOW.md`'s `gondolin.image` (a build
+  id or `name:tag` ref). See `images/agents/README.md`.
 - `src/http.ts` — HTTP dashboard + MCP endpoint listener.
 - `WORKFLOW.md` — canonical workflow this repo dispatches against itself.
 - `WORKFLOW.template.md` — annotated reference for workflow file syntax.
@@ -30,7 +29,7 @@ OpenCode, etc.) working on this repo. Keep it short.
 update `WORKFLOW.template.md` in the same commit.** Concretely:
 
 - Adding a new YAML key under `tracker:`, `polling:`, `workspace:`, `hooks:`,
-  `agent:`, `acp:`, `smolvm:`, `server:`, or `mcp:` → document it in the
+  `agent:`, `acp:`, `gondolin:`, `server:`, or `mcp:` → document it in the
   matching section of the template.
 - Renaming or removing a key → rename or remove it in the template too.
 - Changing a default value in `src/workflow.ts` → update the `Default:`

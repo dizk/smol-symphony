@@ -143,7 +143,7 @@ async function maybeScaffoldMissingWorkflow(workflowPath: string): Promise<boole
     const result = await scaffoldWorkflow({ workflowPath });
     process.stdout.write(`wrote ${result.workflowPath}\n`);
     process.stdout.write(
-      `Edit it to point smolvm at your image / Smolfile / packed artifact, ` +
+      `Edit it to point gondolin.image at your built agent image (npm run build:image), ` +
         `then run \`symphony ${path.relative(process.cwd(), result.workflowPath) || workflowPath}\` again.\n`,
     );
     return true;
@@ -191,7 +191,7 @@ async function handlePreflight(cli: Cli, workflowPath: string): Promise<void> {
     if (cli.subcommand === 'serve') {
       const scaffolded = await maybeScaffoldMissingWorkflow(workflowPath);
       // Stop here on purpose: the operator hasn't finished filling in
-      // smolvm/source-of-truth fields yet, and dispatching immediately
+      // the gondolin.* / source-of-truth fields yet, and dispatching immediately
       // would just fail at the first attempt with a confusing error. The
       // scaffold message already tells them how to relaunch.
       if (scaffolded) process.exit(0);
@@ -312,20 +312,19 @@ async function refreshAllAdapters(registry: CredentialSecretRegistry): Promise<v
 }
 
 /**
- * Resolve the static Gondolin VM shape from config. The image ref reuses the
- * smolvm `image`/`from` field for now (a later PR renames these to `gondolin.*`);
- * fail fast if neither is set so a misconfigured workflow surfaces at boot, not
- * mid-dispatch after the VM bring-up cost is sunk.
+ * Resolve the static Gondolin VM shape from config. Fail fast if no image is set
+ * so a misconfigured workflow surfaces at boot, not mid-dispatch after the VM
+ * bring-up cost is sunk.
  */
 function resolveGondolinVmConfig(config: ServiceConfig): GondolinVmConfig {
-  const imagePath = config.smolvm.image ?? config.smolvm.from;
+  const imagePath = config.gondolin.image;
   if (!imagePath || imagePath.length === 0) {
     throw new Error(
-      'gondolin: no VM image configured. Set smolvm.image (an OCI image ref/tag/digest ' +
-        'exported by images/agents) or smolvm.from in WORKFLOW.md.',
+      'gondolin: no VM image configured. Set gondolin.image (a build id / `name:tag` ref / ' +
+        'asset dir exported by `npm run build:image` — see images/agents) in WORKFLOW.md.',
     );
   }
-  return { imagePath, cpus: config.smolvm.cpus, memMib: config.smolvm.mem_mib };
+  return { imagePath, cpus: config.gondolin.cpus, memMib: config.gondolin.mem_mib };
 }
 
 interface OrchestratorGraph {
@@ -373,7 +372,7 @@ async function buildOrchestratorGraph(opts: {
     await bailStartup(`error: tracker init failed: ${(err as Error).message}\n`, { src });
   }
   const workspaces = new WorkspaceManager(config);
-  // Gondolin VM substrate (replaced the smolvm CLI backend for the dispatch
+  // Gondolin VM substrate (the in-process VM backend for the dispatch
   // path). The runner builds a per-dispatch GondolinDispatcher over this client,
   // and the Reconciler's VM reaper observes its session registry / runs its GC.
   const vmClient = new GondolinVmClient();
@@ -525,8 +524,8 @@ function wirePostConstructionProviders(opts: {
  * the persistent log sink if `logs.root` rotated (unless the env override
  * locked it for the process lifetime), and re-materializes any state
  * directory the new workflow introduced. The orchestrator's own onChange
- * handler already forwards to the reconciler (so a Smolfile-path change kicks
- * off a new bake); we do not re-forward here.
+ * handler already forwards to the reconciler (so a config change rebinds its
+ * managed resources); we do not re-forward here.
  */
 function buildReloadHandler(opts: {
   tracker: LocalMarkdownTracker;
@@ -578,7 +577,7 @@ async function startTransports(opts: {
   // tunnelled to the host loopback via `tcp.hosts`. So the bridge binds loopback
   // (the `reach_host`, default 127.0.0.1) and `loopbackOnly` hard-refuses a wider
   // bind — never the config `bind_host` (which defaults to 0.0.0.0 for the old
-  // smolvm slirp gateway).
+  // slirp gateway).
   const bridgeHost = config.acp.bridge.reach_host;
   try {
     await graph.acpBridge.start(bridgeHost, config.acp.bridge.bind_port);

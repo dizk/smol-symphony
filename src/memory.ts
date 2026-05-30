@@ -5,9 +5,9 @@
 // an operator who raises `agent.max_concurrent_agents` on a memory-constrained host
 // still won't dispatch more VMs than the host can fit. We read MemAvailable from
 // `/proc/meminfo` and the orchestrator clamps the effective slot count to
-// `running + floor((MemAvailable - reserve) / smolvm.mem_mib)`.
+// `running + floor((MemAvailable - reserve) / gondolin.mem_mib)`.
 //
-// `/proc/meminfo` is Linux-only (smolvm itself is Linux-only, but the orchestrator
+// `/proc/meminfo` is Linux-only (Gondolin itself is Linux-only, but the orchestrator
 // codebase is portable enough that running `npm test` on macOS shouldn't trip the
 // probe). On any platform where the file is missing or unreadable, the probe
 // returns null and the orchestrator falls back to the static cap.
@@ -27,7 +27,7 @@ const PROC_MEMINFO = '/proc/meminfo';
 
 /**
  * Parse a `/proc/meminfo` body and pull out `MemAvailable`. The kernel emits the value in
- * KiB (`MemAvailable:    12345678 kB`); we return MiB for symmetry with `smolvm.mem_mib`
+ * KiB (`MemAvailable:    12345678 kB`); we return MiB for symmetry with `gondolin.mem_mib`
  * and `host_memory_reserve_mib`. Returns null if the line is missing or unparseable —
  * the orchestrator treats that the same as the probe being unsupported and falls back
  * to the static cap.

@@ -18,8 +18,8 @@
 //                      no in-progress row exists, pushes a fresh orphan-error
 //                      row with `started_at === finished_at`.
 //   • record(action) — pushes a one-shot already-terminal annotation (used by
-//                      workspace's mark_stale/mark_stuck and bake's
-//                      bake:read-smolfile path).
+//                      workspace's mark_stale/mark_stuck and the vm reaper's
+//                      kill_session path).
 //   • run(action, fn) — convenience wrapper: start → await → done/error.
 //
 // The buffer is capped at `maxHistory * 2` rows; `snapshot()` exposes the
@@ -98,7 +98,7 @@ export class ResourceActionLedger {
   /**
    * One-shot terminal annotation. The action is pushed already-finished;
    * `started_at === finished_at`. Used for state that has no meaningful
-   * in-progress phase (workspace drift annotations, smolfile-read errors).
+   * in-progress phase (workspace drift annotations, vm kill_session errors).
    */
   record(action: string, state: 'done' | 'error', error: string | null = null): void {
     const now = this.iso();

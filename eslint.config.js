@@ -56,7 +56,7 @@ export default [
           { name: 'node:child_process', message: 'no process spawning in core' },
           { name: 'node:net', message: 'no net in core' }, { name: 'node:http', message: 'no http in core' },
           { name: 'node:crypto', message: 'no crypto IO in core' }, { name: 'node:timers/promises', message: 'no timers in core' },
-        ], patterns: [{ group: ['*/util/process*', '*/agent/smolvm*', '*/acp-bridge*', '*/trackers/local*'], message: 'core must not import an adapter; use an injected port' }] }],
+        ], patterns: [{ group: ['*/util/process*', '*/agent/gondolin*', '*/acp-bridge*', '*/trackers/local*'], message: 'core must not import an adapter; use an injected port' }] }],
       'no-restricted-syntax': ['error',
         { selector: "NewExpression[callee.name='Date']", message: 'core must be deterministic; inject a clock (see pr.ts now())' },
         { selector: "MemberExpression[object.name='Date'][property.name='now']", message: 'inject a clock' },

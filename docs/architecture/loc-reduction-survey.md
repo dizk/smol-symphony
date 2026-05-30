@@ -95,8 +95,10 @@ as deprecated and silently ignored with a warning — see
 `findHooksAndActionsConflicts` in `workflow.ts:641`). `setupWorkspaceDir`
 (workspace.ts:187) owns the canonical clone/branch/remote setup that
 `after_create` used to do; the issue body notes that the reconciler's
-workspace/VM resources cover lifecycle; `[dev].init` in the Smolfile covers
-per-VM dep install; `run_in_vm` covers arbitrary in-sandbox commands. The
+workspace/VM resources cover lifecycle; per-VM dep install is baked into the
+agent image (`images/agents/`, built via `npm run build:image`; this was previously the per-issue VM build's init step,
+now baked into the Gondolin image);
+`run_in_vm` covers arbitrary in-sandbox commands. The
 hook surface today is a v1-default that no live workflow exercises and a
 maintenance tax across config parsing, runtime threading, failure-path
 error handling, and four-channel test coverage.
@@ -105,8 +107,10 @@ error handling, and four-channel test coverage.
 add custom workspace setup ("Use `after_create` only for additional setup
 on top of that"). Removing it is a breaking change for any external
 workflow that wired in a custom hook. Mitigations: the recommended
-replacement is a Smolfile `[dev].init` (for build-tooling install) or a
-typed `actions:` entry (for state-machine glue). Both already exist;
+replacement is build tooling baked into the agent image (`images/agents/`,
+built via `npm run build:image`; this was previously the per-issue VM build's init step, at the
+time of writing, now on Gondolin) or a typed `actions:` entry (for
+state-machine glue). Both already exist;
 removing hooks is a documentation-and-migration cost, not a feature loss.
 A subtler risk: `setupWorkspaceDir` is the *current* home for
 clone+branch+remote, but the public contract is "after_create runs after the
@@ -197,7 +201,7 @@ today; that agreement is the maintenance tax that this candidate removes.
 **Estimated LOC removed:** ~250. Direct duplication is smaller than the
 file sizes suggest (the template's comment blocks are unique; the
 workflow's apologia comments are unique), but the structural copy of the
-YAML block shape (states, tracker, hooks, agent, acp, smolvm, server, mcp,
+YAML block shape (states, tracker, hooks, agent, acp, gondolin, server, mcp,
 pr_autopilot) is repeated essentially line-for-line. Generator script is
 ~50 lines, so the net is ~250 LOC.
 
@@ -461,7 +465,7 @@ candidates, but should not be re-proposed:
   `actions/executor.ts`, `reconciler/pr.ts`) plus tests; the port earns its
   keep. Not a single-caller candidate.
 - **`util/process.ts`.** Ten consumers including the workspace,
-  reconciler, smolvm client, actions executor, and predicates. Strong
+  reconciler, Gondolin VM client, actions executor, and predicates. Strong
   multi-consumer port; do not inline.
 - **`hooks.timeout_ms` and the `HOOK_TIMEOUT` paths if `hooks:` survives.**
   Only relevant if #1 is rejected. Don't file as a separate candidate —
@@ -477,7 +481,7 @@ candidates, but should not be re-proposed:
   of truth.
 - **Linear tracker scaffolding.** Already removed (CHANGELOG); only the
   local Markdown tracker exists.
-- **`smolvm.bin_path` workflow mount.** Already removed (CHANGELOG);
+- **The `bin_path` workflow mount.** Already removed (CHANGELOG);
   adapter binaries are baked into the VM image.
 
 ## Notes on accounting

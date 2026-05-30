@@ -1,5 +1,5 @@
 // Unified child_process wrapper (issue 44). Owns spawn lifecycle for every
-// host-side shell-out: hook scripts, git, gh, smolvm. Replaces seven near-
+// host-side shell-out: hook scripts, git, gh. Replaces seven near-
 // identical wrappers that had each independently re-encoded the same spawn
 // quirks (pipe both streams, accumulate with a max-bytes clamp, optional
 // onChunk capture, optional timeout that SIGKILLs on overrun, optional
@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process';
  * Default per-stream byte clamp. Picked to match the dominant value across
  * the wrappers this module replaces (workspace, agent/integration,
  * actions/executor all used 65_536). Callers needing a larger buffer
- * (e.g. smolvm's JSON list of machines) pass `maxBytes` explicitly.
+ * (e.g. a large `git`/`gh` JSON payload) pass `maxBytes` explicitly.
  */
 export const DEFAULT_MAX_BYTES = 65_536;
 

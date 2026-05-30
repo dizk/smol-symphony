@@ -25,7 +25,7 @@ import type { AgentRunner } from '../src/agent/runner.js';
 
 // Issue 27: memory-aware admission cap. The orchestrator reads `/proc/meminfo`
 // each tick and clamps the effective concurrency cap to what fits in
-// `MemAvailable - host_memory_reserve_mib` at `smolvm.mem_mib` per VM. Two
+// `MemAvailable - host_memory_reserve_mib` at `gondolin.mem_mib` per VM. Two
 // layers of coverage:
 //   - the pure `computeMemoryAdmission` math (covering the clamp formula and
 //     the every-knob-off fallback) so the unit doesn't depend on orchestrator
@@ -197,7 +197,7 @@ describe('Orchestrator memory admission integration', () => {
             host_memory_reserve_mib: 2048,
             memory_admission_enabled: true,
           },
-          smolvm: { mem_mib: 4096 },
+          gondolin: { mem_mib: 4096 },
           states: {
             Todo: { role: 'active', adapter: 'claude' },
             Done: { role: 'terminal' },
@@ -250,7 +250,7 @@ describe('Orchestrator memory admission integration', () => {
         {
           acp: { adapter: 'claude' },
           agent: { max_concurrent_agents: 3, memory_admission_enabled: false },
-          smolvm: { mem_mib: 4096 },
+          gondolin: { mem_mib: 4096 },
           states: {
             Todo: { role: 'active', adapter: 'claude' },
             Done: { role: 'terminal' },

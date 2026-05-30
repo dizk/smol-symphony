@@ -1,19 +1,19 @@
-// Gondolin dispatch orchestration — the Gondolin equivalent of the runner's
-// smolvm start + exec-launch + teardown sequence (runner.ts
+// Gondolin dispatch orchestration — the Gondolin VM bring-up +
+// exec-launch + teardown sequence (runner.ts
 // `startVmOrFail`/`launchExecStream`/`attachStderrTap` + teardown), composed over
 // the injected `VmClient` port, the host `CredentialSecretRegistry`, and gondolin's
 // `createHttpHooks`. This is the `application`-role composition seam: it wires the
 // credential adapter + the VM port + the ACP bridge mapping together.
 //
-// DORMANT (Phase 1 + Phase 3): nothing on the live dispatch path (`runner.ts`
-// runAttempt etc.) imports this. smolvm stays the live backend until the later flip
-// PR. The Phase 3 invariant guards (vm-guards.ts) are wired in here so the Gondolin
+// LIVE: the live dispatch path (`runner.ts` runAttempt etc.) imports this.
+// Gondolin is the live VM backend. The invariant guards (vm-guards.ts) are
+// wired in here so the Gondolin
 // path is enforced-by-construction: mounts are validated and env is stripped while
 // the `CreateVmOptions` are built — a credential mount HARD-FAILs and a credential
 // env var can never reach the guest's PID-1 environment.
 //
 // Contract mirrored from the live runner (without modifying it):
-//   - mounts: workspace RW + smolvm.volumes + eval-mode RO (buildVmMounts) — here the
+//   - mounts: workspace RW + gondolin.volumes + eval-mode RO (buildVmMounts) — here the
 //     caller passes the already-built list; we validate it.
 //   - env: forwarded env (buildForwardedEnv) — here generalized via stripCredentialEnv.
 //   - launch: `node /opt/symphony/vm-agent.mjs` (the in-VM ACP launcher), stdin
@@ -85,7 +85,7 @@ export interface GondolinDispatchOptions {
   /**
    * Extra non-credential runtime files to materialize in the guest BEFORE the
    * agent launches (e.g. claude's `~/.claude/settings.json` carrying the
-   * `effortLevel` runtime knob). These replace the smolvm path's
+   * `effortLevel` runtime knob). These replace the earlier dispatch path's
    * `deriveAcpCommand` `cp` preamble: the content is known host-side, so it is
    * written straight into the guest via the same base64-piped exec the fake
    * creds use — no workspace staging + in-VM copy. Holds NO secret (model/effort
@@ -126,7 +126,7 @@ export interface GondolinDispatchHandle {
 }
 
 /**
- * The in-VM ACP launcher command. Mirrors the smolvm path's
+ * The in-VM ACP launcher command. Mirrors the earlier dispatch path's
  * `exec node /opt/symphony/vm-agent.mjs` (deriveAcpCommand). On Gondolin there is no
  * `bash -lc` wrapper and no per-dispatch staged-file `cp` preamble — runtime files
  * land via VFS mounts / the baked image — so the launcher is exec'd directly.

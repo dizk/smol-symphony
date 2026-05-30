@@ -73,11 +73,11 @@ describe('evaluatePredicate (pure)', () => {
   });
 
   it('resolves file_present to an absolute path and routes through the env', async () => {
-    const env = stubEnv({ async pathExists(abs) { return abs === '/ws/Smolfile'; } });
+    const env = stubEnv({ async pathExists(abs) { return abs === '/ws/Dockerfile'; } });
     const ctx = baseCtx('/ws');
-    assert.equal(await evaluatePredicate({ file_present: 'Smolfile' }, ctx, '/ws', env), true);
+    assert.equal(await evaluatePredicate({ file_present: 'Dockerfile' }, ctx, '/ws', env), true);
     assert.equal(await evaluatePredicate({ file_present: '/absolute/missing' }, ctx, '/ws', env), false);
-    assert.deepEqual(env.calls, ['pathExists:/ws/Smolfile', 'pathExists:/absolute/missing']);
+    assert.deepEqual(env.calls, ['pathExists:/ws/Dockerfile', 'pathExists:/absolute/missing']);
   });
 });
 
@@ -137,7 +137,7 @@ describe('action executor: unwired predicateEnv', () => {
     try {
       const ctx = baseCtx(dir);
       const r = await runActions(
-        [{ kind: 'push_branch', remote: 'origin', ref: '$branch', if: { file_present: 'Smolfile' } }],
+        [{ kind: 'push_branch', remote: 'origin', ref: '$branch', if: { file_present: 'Dockerfile' } }],
         { workspacePath: dir, ctx, snapshotId: 'actions:Done' },
       );
       assert.equal(r.ok, false);

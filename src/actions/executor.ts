@@ -87,9 +87,9 @@ export interface ProposeFollowupSink {
 
 /**
  * Backend that executes a `run_in_vm` action's command. Production wires the
- * smolvm exec path (the runner constructs a closure that calls
- * `smolvm.execInteractive(<vmName>, …)` against the per-issue VM so the
- * command lands inside the same sandbox the agent ran in); tests pass
+ * Gondolin exec path (the runner constructs a closure that execs the command
+ * against the per-issue Gondolin VM so the command lands inside the same
+ * sandbox the agent ran in); tests pass
  * `hostRunInVm`, which forks the command on the host. The executor never
  * spawns a `run_in_vm` command directly — failing to wire a `runInVm`
  * closure surfaces as a `run_in_vm: no VM runner wired` failure on the
@@ -129,7 +129,7 @@ export interface ActionExecutorOptions {
   /** Required for `propose_followup`. */
   followupSink?: ProposeFollowupSink;
   /**
-   * Required for `run_in_vm`. Production wires the smolvm exec path; tests
+   * Required for `run_in_vm`. Production wires the Gondolin exec path; tests
    * pass `hostRunInVm`. When absent, `run_in_vm` actions fail immediately
    * with a "no VM runner wired" diagnostic (rather than silently falling
    * back to host spawn, which would defeat the sandbox boundary).
@@ -700,7 +700,7 @@ async function executeRunInVm(
  * Host-spawn implementation of `RunInVmExecutor`. Used by tests so a
  * unit test can exercise the cache/retry plumbing without booting a VM,
  * and as an explicit opt-in for harnesses that want host-mode execution
- * (e.g. running symphony against a workspace with no smolvm available).
+ * (e.g. running symphony against a workspace with no Gondolin VM available).
  * Production wires the VM-side variant in `AgentRunner`; calling this
  * helper from the orchestrator path would defeat the sandbox boundary
  * the typed-action DAG exists to enforce.

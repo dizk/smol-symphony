@@ -205,7 +205,7 @@ export function decideRetryAfterIneligible(input: {
  * contains a digit into `<id>` — volatile identifiers almost always carry a
  * digit (a request id, an HTTP status, a timestamp fragment, a counter, a hex
  * hash), whereas the human-readable words that carry a failure's *identity*
- * (`agent turn refusal`, `smolvm bring-up error`, `invalid_api_key`) do not.
+ * (`agent turn refusal`, `vm bring-up error`, `invalid_api_key`) do not.
  *
  * The collapse is deliberately one-way and aggressive (a `401` and a `403`
  * both become `<id>`): for a breaker keyed on "same failure every attempt",

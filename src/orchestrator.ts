@@ -121,10 +121,10 @@ export interface Snapshot {
     clamp_active: boolean;
   };
   /**
-   * Per-resource reconciler state (issue 32). Stage 1 surfaces a single resource —
-   * the Smolfile-driven `bake` — so the dashboard can render "baking…" / "ready" /
-   * "error: <reason>" instead of an empty queue while dispatch is gated on the
-   * bake. Null when no reconciler is wired (test stubs that don't exercise it).
+   * Per-resource reconciler state (issue 32). Surfaces the managed resources —
+   * the VM reaper, workspace janitor, and PR autopilot — so the dashboard can
+   * render "ready" / "error: <reason>" instead of an empty queue. Null when no
+   * reconciler is wired (test stubs that don't exercise it).
    */
   reconciler: ReconcilerSnapshot | null;
 }
@@ -212,7 +212,7 @@ export class Orchestrator
   private lastValidationError: string | null = null;
 
   // Optional callback used to propagate reloaded config to components that hold their own
-  // tracker/runner/workspace state (so prompt body, hooks, smolvm config, etc., take effect
+  // tracker/runner/workspace state (so prompt body, hooks, gondolin config, etc., take effect
   // on the next dispatch).
   private onConfigReloaded?: (cfg: ServiceConfig, workflow: WorkflowDefinition) => void;
 
@@ -233,11 +233,11 @@ export class Orchestrator
     // mem_available_mib so the clamp behavior is deterministic.
     private memProbe: MemProbe = defaultMemProbe,
     // Reconciler (issue 32, 33) — owns managed external resources: the
-    // Smolfile-driven bake AND the symphony-VM lifecycle reaper. Optional so
-    // tests that don't exercise reconciliation don't have to construct one;
-    // when absent, dispatch is never gated on a bake, `Snapshot.reconciler`
-    // is null, and stray VM reaping is skipped. Production wiring in
-    // bin/symphony.ts always passes one in.
+    // symphony-VM lifecycle reaper, the workspace janitor, and PR autopilot.
+    // Optional so tests that don't exercise reconciliation don't have to
+    // construct one; when absent, `Snapshot.reconciler` is null and stray VM
+    // reaping is skipped. Production wiring in bin/symphony.ts always passes
+    // one in.
     private reconciler: Reconciler | null = null,
   ) {
     workflowSrc.onChange((next) => {
@@ -251,8 +251,8 @@ export class Orchestrator
       this.lastValidationError = null;
       this.onConfigReloaded?.(next.config, next.definition);
       // Issue 32: a config-watcher change is one of the reconciler's declared
-      // triggers. Re-binding the resource set picks up a new `smolvm.smolfile`
-      // path or hash and kicks off a new bake if the contents changed.
+      // triggers. Re-binding the resource set picks up new managed-resource
+      // config (e.g. `gondolin.*` VM settings).
       this.reconciler?.updateConfig(next.config);
       log.info('runtime config reloaded', {
         poll_interval_ms: next.config.polling.interval_ms,
@@ -378,12 +378,12 @@ export class Orchestrator
     await Promise.all(closures);
     // VM teardown lives in the reconciler `vm` resource (issue 52). stop() does NOT
     // wait for in-flight workers to unwind before returning — the bin script then
-    // exits the process, which kills the smolvm CLI children but NOT the libkrun VMs
-    // they launched (those are owned by the smolvm daemon). Without this backstop,
-    // every SIGTERM during an active run leaks one VM per running entry, and over
-    // enough operator restarts the host OOMs (issue 26). `running` is cleared above,
-    // so the reaper's intended set is ∅ and every `symphony-*` VM (registry + any
-    // surviving `_boot-vm` worker) gets torn down.
+    // exits the process, which abruptly ends the per-VM Gondolin runners but can
+    // leave their session sockets behind. Without this backstop, every SIGTERM
+    // during an active run can leak one VM per running entry, and over enough
+    // operator restarts the host OOMs (issue 26). `running` is cleared above,
+    // so the reaper's intended set is ∅ and every `symphony-*` VM (live session +
+    // any orphaned socket) gets torn down.
     if (this.reconciler) {
       await this.reconciler.reapVms();
     }
@@ -644,7 +644,7 @@ export class Orchestrator
   } {
     const staticCap = this.cfg.agent.max_concurrent_agents;
     const reserveMib = this.cfg.agent.host_memory_reserve_mib;
-    const perVmMib = this.cfg.smolvm.mem_mib;
+    const perVmMib = this.cfg.gondolin.mem_mib;
     const enabled = this.cfg.agent.memory_admission_enabled;
     const probe = enabled
       ? this.memProbe()
@@ -714,7 +714,7 @@ export class Orchestrator
     const cancel = { cancelled: false };
     const startedAt = new Date().toISOString();
     const workspacePath = this.workspaces.workspacePathFor(issue.identifier);
-    // Snapshot tracker.root BEFORE workspace setup, before_run, or smolvm
+    // Snapshot tracker.root BEFORE workspace setup, before_run, or Gondolin VM
     // bring-up. A WORKFLOW.md reload during that window (or even between
     // fetchCandidateIssues returning and this iteration of the dispatch loop)
     // can mutate the live tracker config; pinning here closes that window.
@@ -1309,9 +1309,9 @@ export class Orchestrator
    * Implements {@link IntendedVmProvider}. Returns the set of `symphony-*` VM
    * names the orchestrator currently intends to keep alive — one per running
    * dispatch. Used by the reconciler's vm resource to compute the orphan set
-   * to reap. `running.set` happens BEFORE the runner calls
-   * `smolvm.ensureRunning`, so a VM that exists in the daemon registry as
-   * part of an in-flight `machine create` is always already represented
+   * to reap. `running.set` happens BEFORE the runner calls `createVm`, so a VM
+   * that exists in Gondolin's session registry as part of an in-flight create
+   * is always already represented
    * here. The reaper sees it as intended and leaves it alone, closing the
    * "creating-but-not-yet-active" race the issue body calls out.
    */

@@ -1,5 +1,5 @@
 // Per-issue MCP server. Each active dispatch registers an entry here; the agent inside
-// the smolvm connects to /api/v1/issues/<id>/mcp with the per-dispatch bearer token and
+// the Gondolin VM connects to /api/v1/issues/<id>/mcp with the per-dispatch bearer token and
 // sees these tools:
 //
 //   transition(to_state, notes?)    ─ atomic file move into another declared state,
@@ -227,7 +227,7 @@ export class McpRegistry {
     entry.steering_context = null;
     // Carry the dispatch-time tracker-root snapshot through verbatim. Reading
     // this.tracker.currentRoot() here would be wrong: activate runs AFTER
-    // workspace setup, before_run hook, and smolvm bring-up — a window during
+    // workspace setup, before_run hook, and Gondolin VM bring-up — a window during
     // which a WORKFLOW.md reload can mutate tracker.root. The dispatch-time
     // value is the only one that accurately reflects the world the run was
     // started in.

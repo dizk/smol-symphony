@@ -1,4 +1,4 @@
-// Reconciler tests. The Smolfile-driven bake resource was removed in the
+// Reconciler tests. The per-issue image-bake resource was removed in the
 // Gondolin migration (the agent image is built once via images/agents, not
 // baked per issue), so the dispatch-gating prerequisite is gone: dispatch is
 // always ready. The remaining resources (VM reaper, workspace janitor, PR

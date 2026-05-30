@@ -173,7 +173,7 @@ describe('AcpBridge loopbackOnly bind guard', () => {
     await assert.rejects(bridge.start('0.0.0.0', 0), /not a loopback address/);
   });
 
-  it('default (no loopbackOnly) still binds whatever host is given (smolvm path unchanged)', async () => {
+  it('default (no loopbackOnly) still binds whatever host is given (default bind path unchanged)', async () => {
     const bridge = new AcpBridge();
     await bridge.start('0.0.0.0', 0);
     active = bridge;

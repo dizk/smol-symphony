@@ -55,7 +55,7 @@ function makeStubs(): {
 // reaper behavior without touching real Gondolin sessions. Each entry is a
 // `symphony-`-labelled session keyed by label→pid; `destroyed` reports the
 // labels whose backing pid received a SIGTERM (the analogue of the old
-// smolvm-destroy assertion).
+// VM-destroy assertion).
 interface FakeReaper {
   listSessions: () => Promise<ReaperSession[]>;
   gc: () => Promise<number>;
@@ -369,7 +369,7 @@ describe('Orchestrator startup credential check', () => {
 });
 
 // Orphan-VM reaping is the lifecycle counterpart to startup terminal workspace
-// cleanup: each per-issue smolvm VM is owned by the orchestrator process, but the
+// cleanup: each per-issue VM is owned by the orchestrator process, but the
 // libkrun VM itself outlives a SIGKILL or crash of that process because it is
 // daemon-managed. Without the reaping path, every restart leaves the prior
 // instance's VMs behind, and over enough restarts the host OOMs (issue 26).
@@ -637,7 +637,7 @@ describe('Orchestrator VM lifecycle reaping', () => {
 
   it('kicks the reaper after a clean worker exit so the VM is freed within one tick (issue 52)', async () => {
     // Issue 52: VM teardown is owned solely by the reconciler `vm` resource;
-    // the runner no longer calls `smolvm.destroy()` directly. To keep latency
+    // the runner no longer destroys VMs directly. To keep latency
     // close to the prior eager path, `onWorkerExit` must kick `reapVms()` on
     // *every* exit, not just non-clean ones. Pre-issue-52 the kick was guarded
     // by `if (!normal)` so a clean exit waited for the 5-minute backstop tick.
@@ -1011,7 +1011,7 @@ describe('Orchestrator circuit breaker (issue 128)', () => {
           // A DIFFERENT failure class each attempt: the normalized reasons never
           // match two in a row, so the streak resets and the breaker never trips.
           const reasons = [
-            'smolvm bring-up error',
+            'gondolin bring-up error',
             'before_run hook error',
             'acp bridge register failed',
             'workspace error',

@@ -12,12 +12,11 @@ import path from 'node:path';
  * assert against it without re-running the file write, and so future edits to
  * the starter shape stay in one place.
  *
- * The starter intentionally omits `smolvm` source and `volumes` entries — the
- * operator has to pick a Smolfile / image / packed artifact and wire the in-VM
- * proxy mount themselves. Trying to bake an absolute path into the scaffold
- * would couple the generated file to wherever the running symphony was
- * installed at scaffold time, which breaks the moment the operator upgrades or
- * relocates the package. See WORKFLOW.template.md for the worked example.
+ * The starter intentionally omits the `gondolin.image` selector and `volumes`
+ * entries — the operator builds the agent image once (`npm run build:image`)
+ * and pins the resulting build id / tag themselves. Baking a host-specific image
+ * ref into the scaffold would couple the generated file to wherever symphony was
+ * installed at scaffold time. See WORKFLOW.template.md for the worked example.
  */
 export const SCAFFOLD_WORKFLOW_TEMPLATE = `---
 # WORKFLOW.md — scaffolded by smol-symphony.
@@ -51,24 +50,22 @@ agent:
 
 acp:
   # Adapter whose binary symphony launches inside each per-issue VM.
-  # Credentials never enter the VM: both adapters route inference through the
-  # host credential proxy, which reads the real key host-side and presents a
-  # per-VM sentinel (VM sees <PROVIDER>_BASE_URL=<proxy> + a sentinel token).
-  #   claude — proxy reads ~/.claude/.credentials.json
-  #   codex  — proxy reads ~/.codex/auth.json (or host OPENAI_API_KEY)
+  # Credentials never enter the VM: the guest holds only a token-shaped
+  # placeholder, and the host substitutes the real key into the outbound request
+  # at Gondolin egress (TLS-MITM).
+  #   claude — host reads ~/.claude/.credentials.json
+  #   codex  — host reads ~/.codex/auth.json (or host OPENAI_API_KEY)
   adapter: claude
 
-smolvm:
-  # Per-issue microVM. Pick exactly one of \`image\`, \`from\`, or \`smolfile\`.
-  # smol-symphony's in-VM proxy (/opt/symphony/vm-agent.mjs) must be present in
-  # the guest: the canonical Smolfile BAKES scripts/ into the image (an init
-  # \`cp\` from a bake-time scratch mount), so NO runtime \`volumes\` entry is
-  # needed. Leave \`volumes\` empty — especially if any state sets
-  # \`eval_mode: true\`, since its two read-only mounts plus the workspace already
-  # fill smolvm/libkrun's 3-mount cap. See WORKFLOW.template.md and the canonical
-  # Smolfile in the smol-symphony repo for a worked example.
+gondolin:
+  # Per-issue microVM (Gondolin substrate). \`image\` is the agent rootfs the VM
+  # boots: build it once with \`npm run build:image\` (see images/agents/) and pin
+  # the printed build id (a content-addressed digest) or its \`name:tag\` here.
+  # The in-VM launcher (/opt/symphony/vm-agent.mjs) is baked into that image, so
+  # no runtime \`volumes\` entry is needed; leave \`volumes\` empty. See
+  # WORKFLOW.template.md for a worked example.
   #
-  # smolfile: ./Smolfile
+  # image: symphony-agents:latest
   cpus: 2
   mem_mib: 4096
 

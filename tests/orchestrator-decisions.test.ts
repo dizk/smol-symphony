@@ -172,11 +172,11 @@ describe('normalizeFailureReason', () => {
     assert.equal(r, 'state action failed at <id> for <id> exit <id>');
   });
   it('lowercases and squeezes whitespace', () => {
-    assert.equal(normalizeFailureReason('  Smolvm   BRING-up   error  '), 'smolvm bring-up error');
+    assert.equal(normalizeFailureReason('  Gondolin   BRING-up   error  '), 'gondolin bring-up error');
   });
   it('keeps genuinely different failure classes distinct', () => {
     assert.notEqual(
-      normalizeFailureReason('smolvm bring-up error'),
+      normalizeFailureReason('gondolin bring-up error'),
       normalizeFailureReason('before_run hook error'),
     );
   });
@@ -223,7 +223,7 @@ describe('decideCircuitBreaker', () => {
     const r = decideCircuitBreaker({
       normal: false,
       reason: 'before_run hook error',
-      prior: { normalizedReason: normalizeFailureReason('smolvm bring-up error'), count: 4 },
+      prior: { normalizedReason: normalizeFailureReason('gondolin bring-up error'), count: 4 },
       threshold: 5,
     });
     assert.equal(r.kind, 'continue');
@@ -306,7 +306,7 @@ describe('requiredAdapterIds', () => {
     return {
       workflow_path: '', workflow_dir: '', tracker: {} as never, polling: {} as never,
       workspace: {} as never, logs: {} as never, hooks: {} as never, agent: {} as never,
-      acp: { adapter: 'claude' } as never, smolvm: {} as never, server: {} as never,
+      acp: { adapter: 'claude' } as never, gondolin: {} as never, server: {} as never,
       mcp: {} as never, pr_autopilot: {} as never, credentials: {} as never,
       states: {}, ...over,
     };

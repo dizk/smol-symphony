@@ -1,5 +1,5 @@
-// Pins the LIVE Gondolin dispatch seam at the runner layer (the smolvm→Gondolin
-// flip). The runner no longer starts a smolvm machine + dials a credential proxy;
+// Pins the LIVE Gondolin dispatch seam at the runner layer (the VM-backend
+// flip). The runner no longer starts a separate VM-CLI machine + dials a credential proxy;
 // instead it builds a per-dispatch `GondolinDispatcher` over the injected
 // `VmClient` + shared `CredentialSecretRegistry` + per-adapter hooks config, and
 // the dispatch's secret-substitution model (placeholder bearer in the guest, real
