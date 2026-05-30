@@ -71,12 +71,12 @@ export function validateDispatchIo(cfg: ServiceConfig): string | null {
   return null;
 }
 
-// Both proxy-backed adapters have a host credential we can probe at load time.
-// claude: the proxy reads `~/.claude/.credentials.json` on every upstream
-// request to swap the live access token in for a per-VM sentinel. codex: the
-// proxy reads either a `~/.codex/auth.json` token or an `OPENAI_API_KEY` env
-// var. A missing credential fails here at load time instead of as an opaque
-// per-request proxy error mid-dispatch.
+// Both adapters have a host credential we can probe at load time. claude: the
+// host reads `~/.claude/.credentials.json` and substitutes the live access token
+// into the outbound request at Gondolin egress. codex: the host reads either a
+// `~/.codex/auth.json` token or an `OPENAI_API_KEY` env var. A missing credential
+// fails here at load time instead of as an opaque per-request egress failure
+// mid-dispatch.
 function probeStateCredential(stateName: string, adapter: string | undefined): string | null {
   if (adapter === undefined || !isKnownAdapter(adapter)) return null;
   if (adapter === 'claude') return probeClaudeStateCredential(stateName);
