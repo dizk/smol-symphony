@@ -194,23 +194,51 @@ export class GondolinDispatcher {
     const createOpts = this.buildCreateVmOptions(opts, httpHooks, mapping);
 
     const vm = await this.vmClient.createVm(createOpts);
-    // Seed + register the manager BEFORE launching the agent so the placeholder's
-    // real value is present before the first egress (the registry seeds value '' →
-    // real token synchronously-after-await). AWAIT it before exec.
-    const registered = await this.registerSecretManager(secretManager);
+    // Once the VM exists, EVERY subsequent step (register, stage, launch) can
+    // throw — and the handle (the only teardown affordance) has not been returned
+    // yet, so a throw here would strand the VM + the registered manager. Guard the
+    // whole post-createVm bring-up: on any failure close the VM and deregister the
+    // manager (if it got registered), then rethrow. Cleanup reuses the same
+    // idempotent, error-tolerant `teardownDispatch` the handle uses.
+    return this.bringUpOrTeardown(vm, secretManager, fakeCreds, mapping.acpUrl, opts);
+  }
 
-    // Materialize the fake native creds files PLUS any non-credential runtime
-    // files (model/effort knobs) into the guest BEFORE launching the agent — the
-    // placeholder bearer (a fake) and the effort settings.json must be in place
-    // at first read.
-    await this.stageFakeCredsFiles(
-      vm,
-      [...fakeCreds.files, ...(opts.extraGuestFiles ?? [])],
-      opts.workdir,
-    );
-
-    const exec = this.launchAgent(vm, opts, mapping.acpUrl, fakeCreds.env);
-    return this.buildHandle(vm, exec, registered, mapping.acpUrl, fakeCreds);
+  /**
+   * Register the secret manager, stage the fake creds, and launch the agent —
+   * tearing the VM down (and deregistering the manager) on any failure so a
+   * post-createVm throw can never leak the VM handle the caller never received.
+   */
+  private async bringUpOrTeardown(
+    vm: VmHandle,
+    secretManager: SecretManager,
+    fakeCreds: GondolinFakeCreds,
+    acpUrl: string,
+    opts: GondolinDispatchOptions,
+  ): Promise<GondolinDispatchHandle> {
+    let registered: RegisteredVm | null = null;
+    try {
+      // Seed + register the manager BEFORE launching the agent so the placeholder's
+      // real value is present before the first egress (the registry seeds value '' →
+      // real token synchronously-after-await). AWAIT it before exec.
+      registered = await this.registerSecretManager(secretManager);
+      // Materialize the fake native creds files PLUS any non-credential runtime
+      // files (model/effort knobs) into the guest BEFORE launching the agent — the
+      // placeholder bearer (a fake) and the effort settings.json must be in place
+      // at first read.
+      await this.stageFakeCredsFiles(
+        vm,
+        [...fakeCreds.files, ...(opts.extraGuestFiles ?? [])],
+        opts.workdir,
+      );
+      const exec = this.launchAgent(vm, opts, acpUrl, fakeCreds.env);
+      return this.buildHandle(vm, exec, registered, acpUrl, fakeCreds);
+    } catch (err) {
+      // No launch exec yet (or the launch itself threw): close the VM + deregister
+      // the manager (if registration succeeded). teardownDispatch tolerates a null
+      // exec and a null registration, so this is safe at any failure point.
+      await teardownDispatch(vm, null, registered);
+      throw err;
+    }
   }
 
   /**
@@ -382,19 +410,24 @@ export class GondolinDispatcher {
 /**
  * Idempotent, error-tolerant teardown: kill the exec, close the VM, deregister the
  * secret manager. Each step is independently guarded so one failure does not strand
- * the others (mirrors the runner's tearDownSession resilience).
+ * the others (mirrors the runner's tearDownSession resilience). `exec` is `null` when
+ * teardown runs from a bring-up failure that aborted BEFORE the launch exec was
+ * created, and `registered` is `null` when the secret manager never got registered —
+ * both are skipped so the partial-bring-up cleanup is safe at any failure point.
  */
 async function teardownDispatch(
   vm: VmHandle,
-  exec: VmExec,
-  registered: RegisteredVm,
+  exec: VmExec | null,
+  registered: RegisteredVm | null,
 ): Promise<void> {
-  try {
-    exec.kill();
-  } catch (err) {
-    log.warn('gondolin-dispatch: exec.kill threw during teardown', {
-      error: (err as Error).message,
-    });
+  if (exec) {
+    try {
+      exec.kill();
+    } catch (err) {
+      log.warn('gondolin-dispatch: exec.kill threw during teardown', {
+        error: (err as Error).message,
+      });
+    }
   }
   try {
     await vm.close();
@@ -403,11 +436,13 @@ async function teardownDispatch(
       error: (err as Error).message,
     });
   }
-  try {
-    registered.deregister();
-  } catch (err) {
-    log.warn('gondolin-dispatch: deregister threw during teardown', {
-      error: (err as Error).message,
-    });
+  if (registered) {
+    try {
+      registered.deregister();
+    } catch (err) {
+      log.warn('gondolin-dispatch: deregister threw during teardown', {
+        error: (err as Error).message,
+      });
+    }
   }
 }

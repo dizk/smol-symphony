@@ -24,6 +24,7 @@ import {
   type GondolinVmConfig,
 } from './gondolin-dispatch.js';
 import type { AdapterHooksConfig, CredentialSecretRegistry } from './credential-secrets.js';
+import { stripCredentialEnv } from './vm-guards.js';
 import { AcpClient } from './acp.js';
 import {
   ADAPTERS,
@@ -728,27 +729,69 @@ export class AgentRunner {
       runLog,
       logger,
     };
-    const session = this.unwrap(
-      await this.connectBridgeAndInitSession({
-        ctx,
-        resolved,
-        cancelSignal,
-        acpReachUrl: bridge.acpReachUrl,
-      }),
-    );
-    const activeStates = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
-    const loopRes = await this.runTurnLoop({
-      ctx,
-      client: session.client,
+    // Once dispatch() has succeeded the VM + the per-VM secret registration are
+    // live and ONLY this ctx's teardown can release them. `unwrap` throws a
+    // `PhaseFailure` straight up the call stack, so a post-dispatch step that
+    // returns early/throws BEFORE `tearDownSession` runs would strand the VM +
+    // the secret manager. Guard the whole post-dispatch path: on any throw, tear
+    // the dispatch down before propagating (idempotent — the dispatcher's
+    // teardown() guards re-entry, so the normal success path's tearDownSession is
+    // never double-counted).
+    return this.runSessionOrTeardown(ctx, {
       resolved,
       cancelSignal,
       attempt,
-      activeStates,
+      acpReachUrl: bridge.acpReachUrl,
     });
-    clearInterval(session.cancelCheckTimer);
-    const tearReason = loopRes.kind === 'mid_failure' ? loopRes.cleanupReason : loopRes.lastReason;
-    const nonRouted = await this.tearDownSession(ctx, tearReason);
-    return composeAttemptResult({ loopRes, sessionId: session.sessionId, nonRouted });
+  }
+
+  /**
+   * Drive the post-dispatch path (bridge connect → session init → turn loop →
+   * teardown) with a teardown safety net: any throw before the normal
+   * `tearDownSession` runs still releases the Gondolin handle (close VM +
+   * deregister the secret manager) so a post-dispatch failure cannot leak the VM.
+   * The dispatch teardown is idempotent, so re-running it from the catch after an
+   * inner `tearDownSession` already fired is a no-op.
+   */
+  private async runSessionOrTeardown(
+    ctx: SessionContext,
+    args: {
+      resolved: ResolvedDispatchConfig;
+      cancelSignal: { cancelled: boolean };
+      attempt: number | null;
+      acpReachUrl: string;
+    },
+  ): Promise<RunAttemptResult> {
+    try {
+      const session = this.unwrap(
+        await this.connectBridgeAndInitSession({
+          ctx,
+          resolved: args.resolved,
+          cancelSignal: args.cancelSignal,
+          acpReachUrl: args.acpReachUrl,
+        }),
+      );
+      const activeStates = new Set(activeStateNames(this.cfg.states).map((s) => s.toLowerCase()));
+      const loopRes = await this.runTurnLoop({
+        ctx,
+        client: session.client,
+        resolved: args.resolved,
+        cancelSignal: args.cancelSignal,
+        attempt: args.attempt,
+        activeStates,
+      });
+      clearInterval(session.cancelCheckTimer);
+      const tearReason =
+        loopRes.kind === 'mid_failure' ? loopRes.cleanupReason : loopRes.lastReason;
+      const nonRouted = await this.tearDownSession(ctx, tearReason);
+      return composeAttemptResult({ loopRes, sessionId: session.sessionId, nonRouted });
+    } catch (err) {
+      // A post-dispatch step threw without unwinding the dispatch (e.g. an
+      // unexpected throw inside session init that bypassed its own teardown).
+      // Release the VM + secret registration before re-propagating.
+      await this.teardownDispatch(ctx, 'post_dispatch_failure');
+      throw err;
+    }
   }
 
   /** Convert a PhaseResult into either the success value or a thrown PhaseFailure. */
@@ -1141,15 +1184,21 @@ export class AgentRunner {
   }
 
   /**
-   * Forward the configured `smolvm.forward_env` vars into the VM boot env. The
-   * Gondolin dispatcher additionally STRIPS every credential-bearing var via
-   * `stripCredentialEnv` before the env reaches the guest, so the guest never
-   * holds a real token (the host-only-refresh invariant) — the in-VM client's
-   * bearer is the placeholder Gondolin substitutes at egress. No per-adapter
+   * Forward the configured `smolvm.forward_env` vars into the VM boot env, then
+   * STRIP every credential-bearing var via `stripCredentialEnv` (defense in depth).
+   * `forward_env` can name a real cred var (e.g. `OPENAI_API_KEY`), so this strip
+   * makes "no real token reaches the guest boot env" obvious AT THE SOURCE rather
+   * than only inside the dispatcher. The dispatcher's `buildCreateVmOptions`
+   * re-applies the SAME `stripCredentialEnv` as the enforcement chokepoint — the
+   * double-strip is idempotent (`stripCredentialEnv` is a pure filter), so the two
+   * layers compose without surprise. The guest holds only the placeholder bearer
+   * Gondolin substitutes at egress (the host-only-refresh invariant). No per-adapter
    * omit is needed here (the strip is uniform + strictly stronger).
    */
   private buildForwardedEnv(): Record<string, string> {
-    return computeForwardedEnv(this.cfg.smolvm.forward_env, undefined, (k) => process.env[k]);
+    return stripCredentialEnv(
+      computeForwardedEnv(this.cfg.smolvm.forward_env, undefined, (k) => process.env[k]),
+    );
   }
 
   private registerBridgeOrFail(

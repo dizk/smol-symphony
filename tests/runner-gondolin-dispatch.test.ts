@@ -295,6 +295,33 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
     assert.equal(registry.size(), 0, 'secret manager deregistered on teardown');
   });
 
+  it('TEARS DOWN the dispatch (close VM + deregister) when a post-dispatch step throws', async () => {
+    const client = makeFakeVmClient();
+    const registry = new CredentialSecretRegistry({
+      readToken: async () => ({ accessToken: 'real-host-token', expiresAtMs: null }),
+      refresh: async () => {},
+    });
+    const runner = buildRunner(client, registry, 'claude');
+
+    // Simulate a post-dispatch failure that ESCAPES the inner per-step teardown
+    // (e.g. an unexpected throw in session init that bypasses its own `{ok:false}`
+    // + tearDownSession). dispatch() has already created the VM + registered the
+    // secret manager, so only the post-dispatch safety net can release them.
+    const boom = new Error('post-dispatch boom');
+    (runner as unknown as { connectBridgeAndInitSession: () => Promise<never> }).connectBridgeAndInitSession =
+      async () => {
+        throw boom;
+      };
+
+    await assert.rejects(runner.runAttempt(makeIssue(), 0, { cancelled: false }), /post-dispatch boom/);
+
+    // The VM came up (dispatch succeeded) ...
+    assert.equal(client.createCalls.length, 1, 'VM was created by the dispatch');
+    // ... and the post-dispatch failure path still tore it down.
+    assert.equal(client.handle.closed, 1, 'VM closed despite the post-dispatch throw');
+    assert.equal(registry.size(), 0, 'secret manager deregistered despite the post-dispatch throw');
+  });
+
   it('STRIPS credential vars from the boot env even when forward_env lists them', async () => {
     const client = makeFakeVmClient();
     const registry = new CredentialSecretRegistry({

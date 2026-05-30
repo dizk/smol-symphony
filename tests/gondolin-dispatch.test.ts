@@ -412,6 +412,41 @@ describe('GondolinDispatcher.dispatch — teardown', () => {
     await assert.doesNotReject(handle.teardown());
     assert.equal(registry.size(), 0, 'deregistered despite vm.close throwing');
   });
+
+  it('CLOSES the VM and DEREGISTERS the manager when a post-createVm staging exec throws', async () => {
+    const client = makeFakeVmClient();
+    const { registry } = makeRegistry({ accessToken: 'tok', expiresAtMs: null });
+    // The VM is created OK, but the first fake-creds staging write blows up. The
+    // dispatch handle is never returned, so without the bring-up guard the VM +
+    // the registered secret manager would leak.
+    const realExec = client.handle.exec.bind(client.handle);
+    client.handle.exec = (opts) => {
+      if (opts.command[0] === '/bin/sh') throw new Error('staging exec boom');
+      return realExec(opts);
+    };
+    const d = new GondolinDispatcher(client, registry, stubHooksConfig(), VM_CONFIG);
+
+    await assert.rejects(d.dispatch(baseOptions()), /staging exec boom/);
+    assert.equal(client.createCalls.length, 1, 'VM was created (failure is post-createVm)');
+    assert.equal(client.handle.closed, 1, 'VM closed on the bring-up failure path');
+    assert.equal(registry.size(), 0, 'secret manager deregistered on the bring-up failure path');
+  });
+
+  it('CLOSES the VM (and does not register) when registration throws before staging', async () => {
+    const client = makeFakeVmClient();
+    const { registry } = makeRegistry({ accessToken: 'tok', expiresAtMs: null });
+    // register() throws: the manager never lands in the registry, so teardown must
+    // close the VM WITHOUT a deregister (the null-registration branch).
+    registry.register = async () => {
+      throw new Error('register boom');
+    };
+    const d = new GondolinDispatcher(client, registry, stubHooksConfig(), VM_CONFIG);
+
+    await assert.rejects(d.dispatch(baseOptions()), /register boom/);
+    assert.equal(client.createCalls.length, 1, 'VM was created');
+    assert.equal(client.handle.closed, 1, 'VM closed despite register throwing');
+    assert.equal(registry.size(), 0, 'nothing registered (and nothing to deregister)');
+  });
 });
 
 // --- dispatch: fake-creds staging ------------------------------------------
