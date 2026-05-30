@@ -369,17 +369,19 @@ describe('gondolin real dispatch (go-live; SPIKE_GONDOLIN_REAL=1)', () => {
     },
   );
 
-  // KNOWN BLOCKER (diagnosed during go-live validation): codex-acp 0.15 streams
-  // `/backend-api/codex/responses` over a WebSocket that the Gondolin substrate
-  // drops mid-stream (`ResponseStreamDisconnected`), which codex misreads as an
-  // auth failure → an egress-blocked token refresh → 403 → the turn is REFUSED.
-  // The placeholder-JWT account-id fix (credential-secrets.ts) is necessary but
-  // not sufficient, and codex-acp has no user-facing knob to force the HTTP
-  // transport (see the codex profile note in adapters.ts). `codex exec` (HTTP SSE)
-  // works through Gondolin; only codex-acp's WS transport fails. Resolving it needs
-  // a substrate-level or codex-acp-version change. The test body is kept intact and
-  // will pass once that lands — flip `CODEX_BLOCKED` to false to re-enable. claude
-  // is fully green on the identical production path.
+  // BLOCKER (validated 2026-05-30, two layers): codex-acp 0.15 streams
+  // `/backend-api/codex/responses` over a WebSocket. (1) The dispatcher default-denies
+  // WS, so the Upgrade was rejected outright. (2) Allowing WS (codex spec
+  // allowWebSockets:true) lets the Upgrade HANDSHAKE succeed — the real token IS
+  // substituted on the hookable handshake (createHttpHooks onRequest →
+  // applySecretsToRequest), reaching `/responses` with a 101 — BUT the POST-101 opaque
+  // tunnel drops the stream (`ResponseStreamDisconnected { http_status_code: None }`),
+  // and codex-acp then attempts an egress-blocked refresh → 403 → REFUSAL. So WS-allow
+  // is necessary-but-not-sufficient; the real blocker is the post-101 WS tunnel relay
+  // (the layer that is, by Gondolin's design, an opaque passthrough). `codex exec`
+  // (HTTP SSE) works through Gondolin; only codex-acp's WS transport fails. Until the
+  // post-101 issue is resolved OR codex-acp is forced onto HTTP, codex routes via the
+  // proxy fallback. claude is fully green on the identical production path.
   const CODEX_BLOCKED = true;
   it(
     'codex: real turn through the production dispatch path + invariant holds',

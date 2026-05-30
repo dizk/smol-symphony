@@ -315,10 +315,13 @@ export class GondolinDispatcher {
       httpHooks,
       tcp: mapping.tcp,
       dns: mapping.dns,
-      // codex stays on the HTTP Responses transport (its codex-acp WS default is
-      // killed by the profile's `force_http_fallback=true` native arg); WS upgrades
-      // are opaque post-101 so default-deny (design §4.1).
-      allowWebSockets: false,
+      // Per-adapter (credential-secrets spec). Default-deny; codex → true because
+      // codex-acp streams the Responses API over a WS Upgrade. SAFE: Gondolin
+      // substitutes the real token on the (hookable) Upgrade handshake, so the
+      // placeholder never egresses, and the post-101 tunnel reaches only the
+      // allowlisted inference host (a refresh host's upgrade would be blocked). The
+      // proxy-era #127 wss-leak concern does not apply under Gondolin substitution.
+      allowWebSockets: this.hooksConfig.allowWebSockets,
       sessionLabel: `${SYMPHONY_VM_PREFIX}${opts.identifier}`,
       workdir: opts.workdir,
     };

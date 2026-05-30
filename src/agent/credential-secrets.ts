@@ -193,6 +193,18 @@ export interface AdapterCredentialSpec {
   refresh(): Promise<void>;
   egressHeaders?: Record<string, string>;
   onRequest?: HttpHooks['onRequest'];
+  /**
+   * Whether this adapter's guest egress may open a WebSocket. codex-acp streams
+   * the Responses API over a WS Upgrade, so codex needs `true`; claude/opencode are
+   * plain HTTPS so they stay `false` (default-deny). SAFE under Gondolin: the real
+   * token is substituted on the Upgrade handshake's `Authorization` header (the
+   * handshake is hookable — `createHttpHooks` `onRequest` runs `applySecretsToRequest`),
+   * so the placeholder never egresses; the post-101 frames are an opaque tunnel to
+   * the ALLOWLISTED inference host only (a non-allowlisted refresh host's upgrade is
+   * blocked). The old proxy-era `#127` wss-leak risk does NOT apply (the proxy
+   * couldn't substitute inside the tunnel; Gondolin substitutes before it).
+   */
+  allowWebSockets: boolean;
 }
 
 /** Read+parse a JSON credential file; returns null on any IO/parse failure. */
@@ -318,11 +330,20 @@ export function buildAdapterCredentialSpecs(
       billingHeaders: CLAUDE_BILLING_TELL_HEADERS,
       readToken: async () => extractClaudeToken(await readJsonFile(claudeCredsPath)),
       refresh: claudeRefresher,
+      allowWebSockets: false, // plain HTTPS
     },
     codex: {
       adapterId: 'codex',
       secretName: CODEX_SECRET_NAME,
       allowedHosts: [CODEX_UPSTREAM_HOST],
+      // codex-acp streams /backend-api/codex/responses over a WS. Allowing WS lets
+      // the Upgrade handshake succeed (the real token IS substituted on the hookable
+      // handshake → 101), but the POST-101 opaque tunnel drops the Responses stream
+      // (ResponseStreamDisconnected) → codex-acp attempts a blocked refresh → refusal
+      // (validated 2026-05-30). So WS-allow is necessary-but-not-sufficient; codex
+      // stays default-deny + routed via the proxy fallback until the post-101 tunnel
+      // issue is resolved. Flip to true once it is.
+      allowWebSockets: false,
       // Bind the host account_id into the placeholder JWT's auth claim so
       // codex-acp does not refresh the placeholder (go-live finding).
       placeholder: () => codexPlaceholder(opts.codexAccountId ?? null),
@@ -389,6 +410,7 @@ function buildOpencodeSpec(args: {
     readToken: async () => cache.token,
     refresh: underLock(args.lockAcquire, args.lockTimeoutMs, mint),
     onRequest: makeGithubExchangePathGuard(),
+    allowWebSockets: false, // openai-compatible HTTP provider
   };
 }
 
@@ -493,6 +515,8 @@ export interface AdapterHooksConfig {
   readToken(): Promise<TokenInfo | null>;
   /** Drive a host-side refresh, then `readToken` again. */
   refresh(): Promise<void>;
+  /** Whether the guest may open a WebSocket (codex-acp Responses stream needs it). */
+  allowWebSockets: boolean;
 }
 
 /** Build the `createHttpHooks` config for a single adapter spec. */
@@ -519,6 +543,7 @@ export function buildAdapterHooksConfig(spec: AdapterCredentialSpec): AdapterHoo
     options,
     readToken: spec.readToken,
     refresh: spec.refresh,
+    allowWebSockets: spec.allowWebSockets,
   };
 }
 
