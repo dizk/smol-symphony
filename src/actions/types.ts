@@ -7,10 +7,10 @@
 // don't re-execute.
 //
 // Action records are pure data; the executor (src/actions/executor.ts) is the
-// one place that knows how to apply each kind. This mirrors the v1
-// reconciler's `BakeAction`/`DestroyMachineAction`/… pattern (records, not
-// closures) so the snapshot machinery and the dashboard can render per-action
-// state uniformly across both surfaces.
+// one place that knows how to apply each kind. This mirrors the reconciler's
+// `KillSessionAction`/`RemoveWorkspaceAction`/… pattern (records, not closures)
+// so the snapshot machinery and the dashboard can render per-action state
+// uniformly across both surfaces.
 
 import type { ActionStatus, ActionState } from '../reconciler/types.js';
 

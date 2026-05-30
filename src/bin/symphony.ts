@@ -758,10 +758,10 @@ async function main() {
     await bailStartup(`startup failed: ${(err as Error).message}\n`, { http, src });
   }
   if (cli.reconcileForce) {
-    // `--reconcile-force`: drop any cached bake artifact and rebuild before
-    // dispatching. The orchestrator's reconciler gate keeps dispatch off until
-    // the rebuild lands, so callers that pass --force after a dependency change
-    // get a guaranteed fresh artifact on the next dispatch.
+    // `--reconcile-force`: request an immediate reconcile pass (VM/workspace/PR
+    // janitors) instead of waiting on the backstop tick. The bake artifact this
+    // flag used to invalidate is gone (the agent image is built ahead of time),
+    // so it now just triggers an eager pass.
     log.info('reconcile --force requested');
     void graph.orch.triggerReconcile({ force: true }).catch((err) =>
       log.warn('reconcile --force failed', { error: (err as Error).message }),

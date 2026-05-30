@@ -283,17 +283,6 @@ export function buildEvalModeMounts(
 }
 
 /**
- * Source for the currently-ready baked `.smolmachine` artifact produced by the
- * reconciler (issue 32). When set, the runner passes `--from <path>` to smolvm
- * instead of `--smolfile <Smolfile>`, so the per-start `[dev].init` cost is
- * skipped. Null means "no bake ready" — the runner then falls back to whichever
- * of `smolvm.{from,smolfile,image}` is set in config.
- */
-export interface BakedArtifactProvider {
-  artifactPath(): string | null;
-}
-
-/**
  * Sink the runner uses to surface per-attempt action ledgers (issue 36 AC5).
  * Implemented by `Orchestrator.recordActionResult` in production; tests can
  * stub the no-op to skip the snapshot wiring.

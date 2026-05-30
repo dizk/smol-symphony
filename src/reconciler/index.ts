@@ -1,10 +1,11 @@
-// Reconciler stage 1 (issue 32). Owns the resource DAG that converges managed
-// external resources toward their declared desired state.
+// Reconciler (issue 32). Owns the resource DAG that converges managed external
+// resources toward their declared desired state.
 //
-// Stage 1 ships exactly one resource: the Smolfile-driven bake. The DAG walker,
-// per-action ledger, and dispatch-gating predicate are written generically so
-// later stages (VM lifecycle, workspace lifecycle — issues 33–36) can plug in
-// by registering additional resources.
+// Resources: the VM reaper (Gondolin session GC), the workspace janitor, and PR
+// autopilot. The DAG walker, per-action ledger, and dispatch-gating predicate
+// are written generically so additional resources can plug in by registering.
+// (The Smolfile-driven bake resource was removed in the Gondolin migration —
+// the agent image is built once via `images/agents`, not baked per issue.)
 //
 // Triggers (per issue 31 sketch):
 //   • startup            — orchestrator calls reconcile() before the first dispatch.
@@ -14,12 +15,10 @@
 //                          `backstopIntervalMs` so a missed signal can't park the
 //                          reconciler forever.
 //
-// `reconcile --force` (CLI flag) propagates `{ force: true }` through to each
-// resource so the bake can drop its cached artifact and rebuild.
+// `reconcile --force` (CLI flag) propagates `{ force: true }` through, requesting
+// an immediate reconcile pass instead of waiting on the backstop tick.
 
-import { BakeResource, SmolvmBakeExecutor, type BakeExecutor } from './bake.js';
-import { defaultCacheRoot } from './cache.js';
-import type { ReconcilerSnapshot } from './types.js';
+import type { ReconcilerSnapshot, ResourceSnapshot } from './types.js';
 import { VmResource, type IntendedVmProvider, type ReaperSession } from './vm.js';
 import {
   WorkspaceResource,
@@ -40,15 +39,11 @@ import {
   type PrTransitionApi,
 } from './pr.js';
 import { GhCliPrApi } from './pr-adapters.js';
-import type { ServiceConfig, SmolvmConfig } from '../types.js';
+import type { ServiceConfig } from '../types.js';
 import type { VmClient, VmSession } from '../agent/vm-port.js';
 import { log } from '../logging.js';
 
 export interface ReconcilerOptions {
-  // Root for `~/.cache/symphony` (overridable for tests).
-  cacheRoot?: string;
-  // Bake executor (overridable for tests). Defaults to the smolvm-CLI-driven impl.
-  bakeExecutor?: BakeExecutor;
   // Backstop tick interval (ms). Default 5 minutes so a missed config-watcher
   // signal can't park the reconciler forever; tests override to a small value.
   backstopIntervalMs?: number;
@@ -92,10 +87,7 @@ export interface ReconcilerOptions {
 }
 
 export class Reconciler {
-  private readonly cacheRoot: string;
-  private readonly bakeExecutor: BakeExecutor;
   private readonly backstopIntervalMs: number;
-  private bake: BakeResource;
   // VM reaper. Built at construction when a VmClient + intended provider are
   // already wired; otherwise lazily constructed via setIntendedVmProvider
   // (the production path — bin/symphony.ts builds the Reconciler before the
@@ -127,19 +119,12 @@ export class Reconciler {
   private stopped = false;
   // Single-flight: collapse concurrent reconcile() calls into one ongoing pass so
   // an event burst (config reload + backstop + manual trigger landing within ms
-  // of each other) doesn't kick off three overlapping bakes for the same hash.
+  // of each other) doesn't kick off three overlapping reconcile passes.
   private inFlight: Promise<void> | null = null;
   private rerunRequested = false;
 
   constructor(private cfg: ServiceConfig, opts: ReconcilerOptions = {}) {
-    this.cacheRoot = opts.cacheRoot ?? defaultCacheRoot();
-    this.bakeExecutor = opts.bakeExecutor ?? new SmolvmBakeExecutor();
     this.backstopIntervalMs = opts.backstopIntervalMs ?? 5 * 60_000;
-    this.bake = new BakeResource({
-      cacheRoot: this.cacheRoot,
-      smolvm: cfg.smolvm,
-      executor: this.bakeExecutor,
-    });
     this.initVm(opts);
     this.initWorkspace(opts);
     this.initPrProviders(opts);
@@ -343,9 +328,9 @@ export class Reconciler {
    *   • shutdown (`stop()` clears `running` first so desired = ∅).
    *   • non-clean worker exit (the per-attempt destroy may not have fired).
    *
-   * Decoupled from `reconcile()` so VM reaping doesn't have to wait on a
-   * mid-flight bake (and so a bake error doesn't suppress reaping). Returns
-   * immediately when the vm resource isn't wired.
+   * Decoupled from `reconcile()` so VM reaping can run on its own cadence
+   * (startup/shutdown/worker-exit) without waiting on a full reconcile pass.
+   * Returns immediately when the vm resource isn't wired.
    */
   async reapVms(): Promise<void> {
     if (!this.vm) return;
@@ -356,16 +341,9 @@ export class Reconciler {
     }
   }
 
-  // Re-bind the bake resource against the freshly-reloaded smolvm config. The
-  // bake's in-flight task (if any) keeps running against the prior hash; the
-  // next reconcile() pass will pick up the new desired hash.
+  // Re-bind config-dependent resources against the freshly-reloaded config.
   updateConfig(cfg: ServiceConfig): void {
     this.cfg = cfg;
-    this.bake = new BakeResource({
-      cacheRoot: this.cacheRoot,
-      smolvm: cfg.smolvm,
-      executor: this.bakeExecutor,
-    });
     // Workspace janitor reads `workspace.root` at construction; rebind so a
     // workflow reload that moved the workspace root takes effect on the next
     // pass. Preserves the held intended/integration providers — they're
@@ -399,66 +377,50 @@ export class Reconciler {
       clearInterval(this.backstopTimer);
       this.backstopTimer = null;
     }
-    // Don't wait for an in-flight bake — operator-initiated shutdown is expected
-    // to leave any partially-baked artifact behind (the lock file is the signal
-    // for the next run to retry or skip). Surface awaitInFlight() as an explicit
-    // call for tests that need deterministic completion.
+    // Don't block shutdown on an in-flight reconcile pass — the janitors are
+    // idempotent and re-run on the next start. Surface awaitInFlight() as an
+    // explicit call for tests that need deterministic completion.
   }
 
+  // Await the current reconcile pass (if any). Used by tests that trigger a
+  // background reconcile (e.g. via updateConfig) and need it settled before
+  // asserting. Resolves immediately when no pass is in flight.
   async awaitInFlight(): Promise<void> {
-    await this.bake.waitForInFlight();
+    if (this.inFlight) await this.inFlight;
   }
 
   // Trigger a reconcile pass. Idempotent across overlapping callers (single-flight);
   // if a pass is in progress when called, a re-run is scheduled to fire once it
   // completes so the latest config is always observed.
   //
-  // Force semantics: when called with `{ force: true }`, the bake's sticky
-  // `forcePending` flag is set synchronously via `markStale()` BEFORE any await
-  // can yield to the event loop. That closes the dispatch gate immediately
-  // (`bake.ready()` returns false while forcePending is true) and propagates the
-  // "I want a fresh artifact" intent into both the in-flight pass and any
-  // subsequent rerun via the merge inside `BakeResource.reconcile()`. The flag
-  // is cleared only when a successful `runBake()` lands a fresh artifact, so
-  // there is no path where a coalesced force call gets absorbed into a non-force
-  // rerun and silently drops the rebuild.
+  // `force` requests an immediate pass (the CLI `reconcile --force` entry point);
+  // it no longer has resource-specific semantics now that the bake is gone, but
+  // the parameter is threaded so existing callers keep compiling and the rerun
+  // coalescing below still guarantees a fresh pass observes the latest state.
   async reconcile(opts: { force?: boolean } = {}): Promise<void> {
     if (this.stopped) return;
-    if (opts.force === true) {
-      // Synchronous. Must run before the first await of this function so that any
-      // dispatch tick or in-flight pass observing the bake's state from this same
-      // microtask sees the gate closed and forcePending set.
-      this.bake.markStale();
-    }
     if (this.inFlight) {
       this.rerunRequested = true;
       await this.inFlight;
       if (this.rerunRequested) {
         this.rerunRequested = false;
-        // The rerun does not need to re-pass force=true: the in-flight pass
-        // either (a) observed forcePending via the bake's internal merge and
-        // already ran force semantics, or (b) restored readyHash on a cache hit
-        // — in which case forcePending is still set, and this rerun's
-        // `bake.reconcile()` will pick it up and run a force pass itself.
-        await this.runPass({});
+        await this.runPass();
       }
       return;
     }
-    await this.runPass(opts);
+    await this.runPass();
     while (this.rerunRequested && !this.stopped) {
       this.rerunRequested = false;
-      await this.runPass({});
+      await this.runPass();
     }
   }
 
-  private async runPass(opts: { force?: boolean }): Promise<void> {
+  private async runPass(): Promise<void> {
     this.inFlight = (async () => {
       try {
-        // DAG order: bake first (it's the dispatch-gating prereq), then vm
-        // and workspace (independent janitors). Each resource is idempotent /
-        // cheap when there's no work to do — bake short-circuits on cache
-        // hit, vm/workspace passes return immediately when desired == actual.
-        await this.bake.reconcile(opts);
+        // Independent janitors: vm reaper, workspace janitor, PR autopilot. Each
+        // is idempotent / cheap when there's no work to do — the passes return
+        // immediately when desired == actual.
         if (this.vm) {
           try {
             await this.vm.reconcile();
@@ -490,32 +452,15 @@ export class Reconciler {
   }
 
   // Public predicate the orchestrator's dispatch loop calls before claiming an issue.
-  // True iff every resource the dispatch flow depends on is ready. In v1 this is just
-  // the bake.
+  // True iff every resource the dispatch flow depends on is ready. The bake was
+  // the only dispatch-gating prerequisite; with the image built ahead of time
+  // (not per issue) there is nothing left to gate on, so dispatch is always ready.
   dispatchReady(): boolean {
-    return this.bake.ready();
-  }
-
-  // Path the runner passes to `smolvm machine create --from <path>` for the
-  // currently ready bake. Null when no bake is ready (or no Smolfile is configured;
-  // in that case the runner falls back to `smolvm.from`/`smolvm.image` from config).
-  // Implements the runner's `BakedArtifactProvider` interface so the runner can
-  // hold the Reconciler directly without wrapping it.
-  artifactPath(): string | null {
-    return this.bake.artifactPath();
-  }
-
-  bakedArtifactPath(): string | null {
-    return this.bake.artifactPath();
-  }
-
-  // Convenience accessor for tests/CLI.
-  smolvmConfig(): SmolvmConfig {
-    return this.cfg.smolvm;
+    return true;
   }
 
   snapshot(): ReconcilerSnapshot {
-    const resources = [this.bake.snapshot()];
+    const resources: ResourceSnapshot[] = [];
     if (this.vm) resources.push(this.vm.snapshot());
     if (this.workspace) resources.push(this.workspace.snapshot());
     if (this.pr) resources.push(this.pr.snapshot());
@@ -561,7 +506,6 @@ function defaultKillProcess(pid: number, signal: NodeJS.Signals | 0): void {
   process.kill(pid, signal);
 }
 
-export type { BakeExecutor } from './bake.js';
 export type { ReconcilerSnapshot, ResourceSnapshot, ActionStatus } from './types.js';
 export type { IntendedVmProvider, ReaperSession, VmEffect, VmObservedState } from './vm.js';
 export { decideVm } from './vm.js';
