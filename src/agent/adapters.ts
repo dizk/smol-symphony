@@ -2,15 +2,16 @@
 //
 // Each profile encodes the executable inside the VM that speaks ACP, plus the
 // optional model/effort injection channels (env vars, extra argv, staged files)
-// the adapter natively understands. There is no per-adapter credential file
-// plumbing — credentials are no longer staged into the VM. The host credential
-// proxy substitutes a per-VM sentinel for the real upstream token on every
-// request (Anthropic OAuth for claude, an OpenAI API key or ChatGPT-OAuth
-// access token for codex); each proxy adapter declares its VM-facing base-URL
-// and token env var names via `proxyEnv`.
+// the adapter natively understands. Credentials are NOT a per-adapter concern
+// here: the guest holds only a token-shaped placeholder and the host substitutes
+// the real upstream token (Anthropic OAuth for claude, an OpenAI API key or
+// ChatGPT-OAuth access token for codex, a minted GitHub Copilot token for
+// opencode) into the outbound request at Gondolin egress (TLS-MITM — see
+// `src/agent/credential-secrets.ts`). The real refresh/durable token never
+// enters the VM.
 //
-// To add a new adapter (e.g. opencode), populate the profile and add it to
-// ADAPTERS. Unprofiled adapters are not supported at runtime.
+// To add a new adapter, populate the profile and add it to ADAPTERS. Unprofiled
+// adapters are not supported at runtime.
 
 import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -34,7 +35,7 @@ export { isKnownAdapter, type AcpAdapterId };
  * path the in-VM launch command must copy them to. The runner stages each file like
  * the identity file (same staging-root logic, same symlink defenses) and
  * `deriveAcpCommand` emits a `mkdir -p` + `cp` line per file before exec'ing the
- * proxy.
+ * in-VM agent.
  */
 export interface ModelInjection {
   env?: Record<string, string>;
@@ -58,44 +59,6 @@ export interface StagedFileSpec {
   guestPath: string;
 }
 
-/**
- * How symphony supplies upstream credentials to this adapter at dispatch time.
- *
- *  - `'proxy'`: the guest holds only a token-shaped placeholder; the host
- *    substitutes the real upstream token into the outbound request at Gondolin
- *    egress (TLS-MITM). No credential bytes — and crucially no refresh token —
- *    ever enter the VM. Both claude and codex use this (the host-side credential
- *    machinery lives in `src/agent/credential-secrets.ts`, which retired the old
- *    HTTP-proxy + per-dispatch sentinel transport).
- *  - `'forward-env'`: the adapter reads a credential env var forwarded verbatim
- *    into the VM via `gondolin.forward_env`. The proxy is not involved. No shipped
- *    adapter uses this today; it remains for adapters the proxy cannot serve.
- * The runner dispatches on this field (not on `id`) so that proxy-capable
- * adapters route through the proxy and `forward-env` adapters proceed without
- * one — never crash-looping a dispatch for an adapter the proxy can't serve.
- * Both claude and codex are `'proxy'`. codex additionally needs a placeholder
- * `~/.codex/auth.json` staged (see `stageCodexPlaceholderAuth`): a live dispatch
- * showed codex-acp fails its session-init credential check with "Authentication
- * required" when only the env sentinel is set and no auth.json file exists, even
- * though it then uses the env `OPENAI_API_KEY` (= sentinel) as its request
- * bearer. The placeholder is a fake (no real token) — the proxy substitutes the
- * real OpenAI credential at egress. See `docs/research/codex-proxy-accept-matrix.md`.
- */
-export type CredentialStrategy = 'proxy' | 'forward-env';
-
-/**
- * The VM-facing env var names a `'proxy'`-strategy adapter expects for the
- * credential proxy. The runner stages `baseUrlVar=<proxy base URL>` and
- * `tokenVar=<per-dispatch sentinel>` into the in-VM adapter env; the in-VM
- * client then dials the proxy with the sentinel as its bearer. claude reads
- * `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`; codex reads
- * `OPENAI_BASE_URL`/`OPENAI_API_KEY`.
- */
-export interface ProxyEnvVars {
-  baseUrlVar: string;
-  tokenVar: string;
-}
-
 export interface AdapterProfile {
   id: AcpAdapterId;
   /**
@@ -104,14 +67,6 @@ export interface AdapterProfile {
    * commands (e.g. `['opencode', 'acp']`) compose without shell-injection risk.
    */
   binary: readonly string[];
-  /** How symphony supplies upstream credentials to this adapter. See {@link CredentialStrategy}. */
-  credentialStrategy: CredentialStrategy;
-  /**
-   * For `'proxy'`-strategy adapters: the VM-facing env var names the runner uses
-   * to stage the proxy base URL + sentinel. Required when `credentialStrategy`
-   * is `'proxy'`; unused for `'forward-env'`. See {@link ProxyEnvVars}.
-   */
-  proxyEnv?: ProxyEnvVars;
   /**
    * Map an `acp.model` string into the env vars / extra argv this adapter needs to
    * actually select the model. Called only when `acp.model` is non-null; profiles can
@@ -127,32 +82,14 @@ export interface AdapterProfile {
    * on models with `supportsEffort`); the adapter rejects invalid values at startup.
    */
   effortInjection?(effort: string): EffortInjection;
-  /**
-   * For a `'proxy'`-strategy adapter whose native transport would otherwise
-   * BYPASS the base-URL env var, the per-dispatch `-c key=value` config
-   * overrides that pin it onto an explicit HTTPS provider routed through the
-   * host credential proxy. Returns extra adapter argv, appended after the model
-   * `-c` override. Applied at exec time (not at model-injection time) because
-   * the args carry the proxy's ephemeral port, known only once the sentinel is
-   * registered against the running proxy.
-   *
-   * Only codex declares it: codex's Responses API defaults to a
-   * `wss://api.openai.com/v1/responses` WebSocket transport that ignores
-   * `OPENAI_BASE_URL` and dials OpenAI directly, sending the per-dispatch
-   * sentinel raw → 401 (issue #127). Forcing `supports_websockets=false` + an
-   * explicit `base_url` routes `/v1/responses` over HTTPS to the proxy, which
-   * is path-transparent. claude omits it (its only transport honors the
-   * base-URL env var). Receives the proxy `baseUrl` (`http://host:port`, NO
-   * `/v1`) and the token env var name (`OPENAI_API_KEY`).
-   */
-  proxyProviderArgs?(input: { baseUrl: string; tokenVar: string }): string[];
 }
 
 // VM-facing env var names the opencode custom provider reads (via `{env:VAR}`)
-// for the proxy base URL + sentinel. Defined as constants so the profile's
-// `proxyEnv` and the staged opencode.json reference the exact same names — a
-// drift between them would silently break the in-VM provider resolution.
-// Declared before ADAPTERS because the object literal reads them at module init.
+// for its base URL + bearer. The staged opencode.json (`buildOpencodeConfig`)
+// references these exact names; the token var MUST equal `OPENCODE_SECRET_NAME`
+// in `credential-secrets.ts` so the placeholder bearer Gondolin substitutes at
+// egress is keyed under the name the in-VM provider reads — a drift would
+// silently break the in-VM provider resolution.
 const OPENCODE_PROXY_BASE_URL_VAR = 'OPENCODE_PROXY_BASE_URL';
 const OPENCODE_PROXY_TOKEN_VAR = 'OPENCODE_PROXY_TOKEN';
 
@@ -160,10 +97,9 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   claude: {
     id: 'claude',
     binary: ['claude-agent-acp'],
-    // Anthropic subscription OAuth lives only on the host; the proxy substitutes
-    // a per-VM sentinel for the real access token on every upstream request.
-    credentialStrategy: 'proxy',
-    proxyEnv: { baseUrlVar: 'ANTHROPIC_BASE_URL', tokenVar: 'ANTHROPIC_AUTH_TOKEN' },
+    // Anthropic subscription OAuth lives only on the host; the guest holds a
+    // token-shaped placeholder and Gondolin substitutes the real access token at
+    // egress on every upstream request (see `credential-secrets.ts`).
     // claude-agent-acp reads ANTHROPIC_MODEL on startup (see acp-agent.js getAvailableModels:
     // ANTHROPIC_MODEL > settings.model > default). The adapter resolves aliases like
     // "opus" or "claude-sonnet-4-5" against the SDK's model list, so anything the user
@@ -174,7 +110,7 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // etc.) and applies it via `query.applyFlagSettings`. There is no ANTHROPIC_EFFORT env var
     // and the wrapper does not expose a CLI flag, so the only reachable channel from symphony
     // is a settings.json staged next to the identity file and copied to /root/.claude/settings.json
-    // before the proxy execs the adapter. Valid values are `low|medium|high|xhigh|max`, gated
+    // before the in-VM agent execs the adapter. Valid values are `low|medium|high|xhigh|max`, gated
     // per-model by claude-agent-acp's `supportedEffortLevels`; symphony lets the adapter reject
     // invalid choices rather than mirroring the gate.
     effortInjection: (effort) => ({
@@ -190,30 +126,17 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   codex: {
     id: 'codex',
     binary: ['codex-acp'],
-    // The proxy substitutes a per-VM sentinel for the real OpenAI credential on
-    // every request; the VM holds OPENAI_API_KEY=<sentinel> + OPENAI_BASE_URL=
-    // <proxy>, never a real token. BUT codex-acp's session-init credential check
-    // fails ("Authentication required") if no ~/.codex/auth.json FILE exists,
-    // even with the env sentinel present (a live dispatch proved this — #116
-    // staged only the env). So a fake placeholder auth.json is staged
-    // (stageCodexPlaceholderAuth) purely to satisfy that init check; codex then
-    // uses the env OPENAI_API_KEY (= sentinel, precedence over the file) as its
-    // bearer and the proxy swaps in the real credential. No real token, and no
-    // refresh token, ever enters the VM. See docs/research/codex-proxy-accept-matrix.md.
-    credentialStrategy: 'proxy',
-    proxyEnv: { baseUrlVar: 'OPENAI_BASE_URL', tokenVar: 'OPENAI_API_KEY' },
+    // codex (ChatGPT-OAuth) runs in its NATIVE mode: the guest holds a JWT-shaped
+    // placeholder as `~/.codex/auth.json:tokens.access_token` and Gondolin
+    // substitutes the real ChatGPT/OpenAI token at egress. The host stages a
+    // COMPLETE fake auth.json (placeholder tokens + the non-secret
+    // `account_id`/`auth_mode`/`last_refresh` codex 0.135's completeness check
+    // needs — see `gondolin-creds-staging.ts` `buildCodexFiles`); no real token,
+    // and no refresh token, ever enters the VM.
     // codex-acp takes config overrides via `-c key=value` where value is parsed as TOML
     // (raw-string fallback on parse failure). We always emit a quoted TOML string so
     // model names containing dots or hyphens don't surprise the TOML parser.
     modelInjection: (model) => ({ extraArgs: ['-c', `model=${JSON.stringify(model)}`] }),
-    // Pin codex onto an explicit HTTPS provider routed through the credential
-    // proxy. Without this, codex's Responses API defaults to a
-    // `wss://api.openai.com/v1/responses` WebSocket transport that bypasses the
-    // proxy (ignores OPENAI_BASE_URL), dialing OpenAI directly with the raw
-    // per-dispatch sentinel → 401 (issue #127). `supports_websockets=false`
-    // kills the wss attempt; the explicit `base_url` sends `/v1/responses` over
-    // HTTPS to the path-transparent proxy.
-    proxyProviderArgs: ({ baseUrl, tokenVar }) => codexProxyProviderArgs(baseUrl, tokenVar),
     // KNOWN GO-LIVE BLOCKER (codex over Gondolin, native ChatGPT-OAuth): codex-acp
     // 0.15 streams `/backend-api/codex/responses` over a WebSocket. Through the
     // Gondolin substrate that stream disconnects (`ResponseStreamDisconnected`,
@@ -235,18 +158,17 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   opencode: {
     id: 'opencode',
     binary: ['opencode', 'acp'],
-    // opencode reaches GitHub Copilot through the host credential proxy. The VM
-    // receives OPENCODE_PROXY_BASE_URL=<proxy> + OPENCODE_PROXY_TOKEN=<sentinel>;
-    // a staged opencode.json declares a custom `@ai-sdk/openai-compatible`
-    // provider whose baseURL/apiKey read those env vars (opencode interpolates
-    // `{env:VAR}`). The proxy validates the sentinel, swaps in a short-lived
-    // GitHub Copilot token (exchanged host-side from the operator's `opencode
-    // auth login` GitHub OAuth token at api.github.com/copilot_internal/v2/token),
-    // injects the Copilot editor headers, and forwards to api.githubcopilot.com.
-    // The durable GitHub OAuth token never enters the VM. See
+    // opencode reaches GitHub Copilot via a staged opencode.json custom
+    // `@ai-sdk/openai-compatible` provider whose baseURL/apiKey read the
+    // OPENCODE_PROXY_* env vars through opencode's `{env:VAR}` interpolation. The
+    // guest sends only a `gho_`-shaped placeholder bearer; the host mints a
+    // short-lived GitHub Copilot token (exchanged host-side from the operator's
+    // `opencode auth login` GitHub OAuth token at
+    // api.github.com/copilot_internal/v2/token) and Gondolin substitutes it into
+    // the outbound request at egress, injecting the Copilot editor headers,
+    // against api.githubcopilot.com. The durable GitHub OAuth token never enters
+    // the VM. See `credential-secrets.ts` and
     // docs/research/opencode-copilot-accept-matrix.md.
-    credentialStrategy: 'proxy',
-    proxyEnv: { baseUrlVar: OPENCODE_PROXY_BASE_URL_VAR, tokenVar: OPENCODE_PROXY_TOKEN_VAR },
     // opencode picks its model from the staged opencode.json `model` key
     // ("<providerID>/<modelID>"); the ACP `session/new` carries no model. The
     // provider block must exist even when no model is pinned, so the whole
@@ -269,8 +191,8 @@ export const OPENCODE_PROXY_PROVIDER_ID = 'symphony-copilot';
 export const OPENCODE_DEFAULT_COPILOT_MODEL = 'gpt-4o';
 
 // A small pinned set of Copilot-backed model ids the custom provider advertises
-// so opencode does not need to hit `<baseURL>/models` for discovery (the proxy
-// forwards /models too, but pinning avoids the round-trip and a discovery
+// so opencode does not need to hit `<baseURL>/models` for discovery (the
+// upstream serves /models too, but pinning avoids the round-trip and a discovery
 // dependency). DOC-DERIVED — the exact id set a given Copilot subscription
 // exposes is operator/tier-dependent; an operator's `acp.model` is always
 // merged in (see buildOpencodeConfig) so a pinned model that isn't in this list
@@ -286,15 +208,15 @@ const OPENCODE_PINNED_COPILOT_MODELS: readonly string[] = [
 
 /**
  * Build the opencode.json staged into the VM (pure; exported for tests). It
- * declares the `symphony-copilot` custom provider pointed at the credential
- * proxy via `{env:…}` interpolation, advertises a pinned Copilot model set
- * (plus the operator's selected model), and pins the default model to
- * `<providerID>/<model>`. Two-space-indented so it reads cleanly if an operator
- * inspects the staged file.
+ * declares the `symphony-copilot` custom provider whose baseURL/apiKey read the
+ * OPENCODE_PROXY_* env vars via `{env:…}` interpolation, advertises a pinned
+ * Copilot model set (plus the operator's selected model), and pins the default
+ * model to `<providerID>/<model>`. Two-space-indented so it reads cleanly if an
+ * operator inspects the staged file.
  *
- * The `{env:VAR}` names match the profile's `proxyEnv` exactly (shared
- * constants), so the in-VM opencode resolves the proxy base URL + sentinel the
- * runner stages.
+ * The `{env:VAR}` names are the shared OPENCODE_PROXY_* constants, so the in-VM
+ * opencode resolves the same base URL + placeholder bearer the host stages (the
+ * token var matches `OPENCODE_SECRET_NAME` in `credential-secrets.ts`).
  */
 export function buildOpencodeConfig(model: string | null): string {
   const selected = model && model.length > 0 ? model : OPENCODE_DEFAULT_COPILOT_MODEL;
@@ -335,51 +257,14 @@ export const OPENCODE_CONFIG_GUEST_PATH = '/root/.config/opencode/opencode.json'
 /**
  * Stage the opencode.json (custom-provider + model) into the workspace runtime
  * tree. Mirrors stageCodexPlaceholderAuth: synthetic content (no secret — the
- * sentinel arrives via env, never a real token), so it never fails on a missing
- * host file.
+ * placeholder bearer arrives via env, never a real token), so it never fails on
+ * a missing host file.
  */
 export async function stageOpencodeConfig(
   workspacePath: string,
   model: string | null,
 ): Promise<StagedRuntimePaths> {
   return stageRuntimeFile(workspacePath, 'opencode.json', buildOpencodeConfig(model));
-}
-
-/** Provider id for the codex (credential-substituted) `model_providers` override. */
-const CODEX_PROXY_PROVIDER_ID = 'symphony-proxy';
-
-/**
- * Build the per-dispatch codex `-c` overrides that pin codex onto an explicit
- * HTTPS provider routed through the host credential proxy (issue #127). See the
- * codex profile's `proxyProviderArgs` for why this is required.
- *
- *   - `model_provider=<id>` selects the provider below over codex's built-in
- *     `openai` provider, whose Responses transport defaults to a
- *     `wss://api.openai.com` WebSocket that bypasses the proxy entirely.
- *   - `base_url=<proxy>/v1` sends `/v1/responses` to the proxy — the proxy
- *     returns its base as `http://host:port` WITHOUT `/v1`, so we append it
- *     (tolerating a stray trailing slash defensively).
- *   - `env_key=<tokenVar>` keeps the per-dispatch sentinel (already staged into
- *     `OPENAI_API_KEY`) as the bearer the proxy validates and swaps.
- *   - `wire_api="responses"` matches codex's gpt-5-codex transport.
- *   - `supports_websockets=false` forces the HTTPS Responses fallback.
- *
- * String values are emitted as JSON-quoted TOML strings (TOML basic strings use
- * the same double-quote syntax) so values with dots/hyphens can't surprise the
- * TOML parser; `supports_websockets=false` is a raw TOML boolean, not a string.
- */
-function codexProxyProviderArgs(baseUrl: string, tokenVar: string): string[] {
-  const id = CODEX_PROXY_PROVIDER_ID;
-  const field = (name: string): string => `model_providers.${id}.${name}`;
-  const v1BaseUrl = `${baseUrl.replace(/\/+$/, '')}/v1`;
-  return [
-    '-c', `model_provider=${JSON.stringify(id)}`,
-    '-c', `${field('name')}=${JSON.stringify('Symphony credential proxy')}`,
-    '-c', `${field('base_url')}=${JSON.stringify(v1BaseUrl)}`,
-    '-c', `${field('env_key')}=${JSON.stringify(tokenVar)}`,
-    '-c', `${field('wire_api')}=${JSON.stringify('responses')}`,
-    '-c', `${field('supports_websockets')}=false`,
-  ];
 }
 
 export function profileFor(id: AcpAdapterId): AdapterProfile {
@@ -441,8 +326,8 @@ export async function stageRuntimeFile(
  * staged file for `accessToken`/`refreshToken` substrings.
  *
  * When `~/.claude.json` is missing or contains no `oauthAccount` we skip the
- * staging (returning null) rather than fail the dispatch — the proxy seam
- * is defense in depth, not a hard gate on running.
+ * staging (returning null) rather than fail the dispatch — the egress-substitution
+ * seam is defense in depth, not a hard gate on running.
  */
 export async function stageClaudeIdentity(
   workspacePath: string,
@@ -470,17 +355,16 @@ export async function stageClaudeIdentity(
 /**
  * Stage a FAKE placeholder `~/.codex/auth.json` into the workspace for the codex
  * adapter. codex-acp's session-init credential check fails with "Authentication
- * required" when no auth.json file exists, even though the per-dispatch sentinel
- * is supplied via the `OPENAI_API_KEY` env var (a live dispatch proved this —
- * #116 staged only the env). This file exists PURELY to satisfy that init check:
- * it contains NO real credential — `OPENAI_API_KEY` is a sentinel-shaped
- * placeholder and there is no OAuth `tokens` block — so codex falls through to
- * the env `OPENAI_API_KEY` (= the real per-dispatch sentinel, which has
- * precedence over the file) as its request bearer, and the host credential proxy
- * substitutes the real OpenAI token at egress. No real token, and no refresh
- * token, ever enters the VM.
+ * required" when no auth.json file exists, even though the placeholder bearer is
+ * supplied via the `OPENAI_API_KEY` env var (a live dispatch proved this — #116
+ * staged only the env). This file exists PURELY to satisfy that init check: it
+ * contains NO real credential — `OPENAI_API_KEY` is a token-shaped placeholder
+ * and there is no OAuth `tokens` block — so codex falls through to the env
+ * `OPENAI_API_KEY` (= the placeholder, which has precedence over the file) as its
+ * request bearer, and Gondolin substitutes the real OpenAI token at egress
+ * (TLS-MITM). No real token, and no refresh token, ever enters the VM.
  *
- * `auth_mode: 'apikey'` so codex takes the API-key path (the env sentinel),
+ * `auth_mode: 'apikey'` so codex takes the API-key path (the env placeholder),
  * never an OAuth handshake. `last_refresh` is omitted (no OAuth tokens to age).
  */
 export async function stageCodexPlaceholderAuth(
@@ -715,7 +599,7 @@ async function ensureRealDir(p: string): Promise<void> {
 }
 
 /**
- * Additional file to copy into the VM before exec'ing the proxy. Carries
+ * Additional file to copy into the VM before exec'ing the in-VM agent. Carries
  * runtime knobs that surface through files: claude's identity (~/.claude.json)
  * and the settings.json that holds `effortLevel`. `stagedRelPath` is the POSIX
  * path within the workspace mount (relative to the in-VM cwd) and `guestPath`
@@ -733,24 +617,26 @@ export interface ExtraGuestFile {
 /**
  * Build the bash command symphony will exec inside the VM. For each staged
  * extra file: `mkdir -p` the destination directory, `cp` the file into place,
- * `chmod 600`. Then exec the in-VM proxy at `/opt/symphony/vm-agent.mjs`. The
- * proxy reads its config — SYMPHONY_ACP_URL, SYMPHONY_ACP_TOKEN,
+ * `chmod 600`. Then exec the in-VM agent at `/opt/symphony/vm-agent.mjs`. It
+ * reads its config — SYMPHONY_ACP_URL, SYMPHONY_ACP_TOKEN,
  * SYMPHONY_ADAPTER_BIN, SYMPHONY_ADAPTER_ARGS — from the environment that
  * symphony sets on the in-VM exec invocation, dials the host's TCP ACP
  * bridge, and spawns the adapter with kernel pipes.
  *
- * Why TCP through a proxy: the in-VM exec stdin pump does not reliably wake the
- * in-VM reader for kernel events unless host stdin keeps writing. Piping ACP
- * frames through the in-VM exec stdio caused the adapter to hang after the first
- * session/update. The TCP bridge (see src/acp-bridge.ts) bypasses that pump
+ * Why TCP through the in-VM agent: the in-VM exec stdin pump does not reliably
+ * wake the in-VM reader for kernel events unless host stdin keeps writing. Piping
+ * ACP frames through the in-VM exec stdio caused the adapter to hang after the
+ * first session/update. The TCP bridge (see src/acp-bridge.ts) bypasses that pump
  * entirely and decouples symphony from any specific sandbox tech — any sandbox
  * that can launch a process with env vars and reach the host loopback can run
  * this stack unchanged.
  *
- * Credentials are NOT staged into the VM. The host credential proxy substitutes
- * a per-VM sentinel for the real upstream token (Anthropic OAuth for claude,
- * an OpenAI API key or ChatGPT-OAuth access token for codex) on every request;
- * the VM only ever holds the sentinel + the adapter's base-URL env var.
+ * No real credential enters the VM: the guest holds only a token-shaped
+ * placeholder (staged as fake native creds + env), and Gondolin substitutes the
+ * real upstream token (Anthropic OAuth for claude, an OpenAI API key or
+ * ChatGPT-OAuth access token for codex, a minted GitHub Copilot token for
+ * opencode) into the outbound request at egress (TLS-MITM). See
+ * `credential-secrets.ts` / `gondolin-creds-staging.ts`.
  */
 export function deriveAcpCommand(
   profile: AdapterProfile,

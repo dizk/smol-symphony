@@ -7,7 +7,6 @@
 
 import type { Issue } from '../types.js';
 import type { ActionContext } from '../actions/index.js';
-import type { ProxyEnvVars } from './adapters.js';
 
 export interface AttemptOutcome {
   ok: boolean;
@@ -166,29 +165,12 @@ export interface DeriveActionContextInput {
  * stay under the imperative-shell budget.
  */
 /**
- * Build the VM-facing credential-proxy env vars for a `'proxy'`-strategy
- * dispatch: `baseUrlVar=<proxy base URL>` and `tokenVar=<per-dispatch sentinel>`.
- * The in-VM client dials the proxy with the sentinel as its bearer; the proxy
- * substitutes the real upstream token host-side. A proxy adapter that declares
- * no `proxyEnv` is a profile bug, surfaced loudly here.
- */
-export function proxyCredentialEnv(
-  proxyEnv: ProxyEnvVars | undefined,
-  adapterId: string,
-  reg: { sentinel: string; baseUrl: string },
-): Record<string, string> {
-  if (!proxyEnv) {
-    throw new Error(`adapter "${adapterId}" uses the credential proxy but declares no proxyEnv`);
-  }
-  return { [proxyEnv.baseUrlVar]: reg.baseUrl, [proxyEnv.tokenVar]: reg.sentinel };
-}
-
-/**
  * Compute the VM boot env from the `forward_env` list, dropping `omitVar` when
- * set. The runner passes the proxy adapter's credential var as `omitVar` so the
- * real token is never planted in the VM's PID-1 environment (it would otherwise
- * be readable via `/proc/1/environ`, defeating the proxy). `readEnv` is injected
- * so this stays deterministic and unit-testable.
+ * set. `omitVar` lets a caller exclude a single var from the forwarded set; the
+ * runner now strips every credential-bearing var uniformly via
+ * `stripCredentialEnv` (the guest holds only a placeholder Gondolin substitutes
+ * at egress), so it passes `undefined` here. `readEnv` is injected so this stays
+ * deterministic and unit-testable.
  */
 export function computeForwardedEnv(
   forwardList: readonly string[],

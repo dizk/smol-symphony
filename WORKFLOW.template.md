@@ -47,8 +47,9 @@ tracker:
 #                and the landing directory for `symphony.propose_issue`.
 #   adapter   (string, optional): override the workflow-level `acp.adapter` for
 #             agents dispatched in this state. Must be a known profile (claude,
-#             codex, opencode). All route through the host credential proxy and
-#             are startup-probed so a missing credential fails fast. claude has a
+#             codex, opencode). All use host-side credential substitution at
+#             Gondolin egress and are startup-probed so a missing credential
+#             fails fast. claude has a
 #             single host credential file (~/.claude/.credentials.json) that is
 #             probed for readability; codex passes when either ~/.codex/auth.json
 #             holds a token (ChatGPT-OAuth tokens.access_token or a top-level
@@ -623,54 +624,52 @@ agent:
 # ─────────────────────────────────────────────────────────────────────────────
 acp:
   # adapter (string): one of symphony's known profiles. Default: 'claude'.
-  #   claude   — claude-agent-acp. Routes through the host credential proxy;
-  #              no credential file enters the VM.
-  #   codex    — codex-acp. Also routes through the host credential proxy
-  #              (issue 116); no credential file — and no real OPENAI_API_KEY —
-  #              enters the VM.
-  #   opencode — opencode acp, backed by GitHub Copilot (issue 130). Routes
-  #              through the host credential proxy; the proxy exchanges the
-  #              host's `opencode auth login` GitHub OAuth token for a
-  #              short-lived Copilot token host-side — the GitHub token never
-  #              enters the VM. One Copilot credential unlocks many models
-  #              (GPT-4o/4.1, Claude Sonnet, Gemini, o-series, …).
+  #   claude   — claude-agent-acp. The guest holds a placeholder bearer; the host
+  #              substitutes the real Anthropic OAuth token at Gondolin egress.
+  #              No real credential enters the VM.
+  #   codex    — codex-acp (issue 116). Same model: the guest holds a placeholder
+  #              bearer (in a fake ~/.codex/auth.json); the host substitutes the
+  #              real OpenAI/ChatGPT token at egress. No real credential — and no
+  #              real OPENAI_API_KEY — enters the VM.
+  #   opencode — opencode acp, backed by GitHub Copilot (issue 130). The host
+  #              exchanges the operator's `opencode auth login` GitHub OAuth token
+  #              for a short-lived Copilot token host-side and substitutes it at
+  #              egress — the GitHub token never enters the VM. One Copilot
+  #              credential unlocks many models (GPT-4o/4.1, Claude Sonnet,
+  #              Gemini, o-series, …).
   adapter: claude
 
-  # Credentials never enter the VM (issue 113; codex generalized in 116). On
-  # each dispatch the host credential proxy (`credentials.proxy_*`, default
-  # 127.0.0.1 + ephemeral port) mints a per-VM sentinel; the VM is launched
-  # with the adapter's base-URL env var pointed at the proxy and its
-  # token env var set to the sentinel. The proxy validates each inbound
-  # sentinel, swaps in the live upstream credential host-side, and forwards
-  # to the adapter's upstream.
+  # Credentials never enter the VM (issue 113; codex generalized in 116). The
+  # guest holds only a token-shaped placeholder; on every outbound request the
+  # host substitutes the real upstream credential at Gondolin egress (TLS-MITM,
+  # see src/agent/credential-secrets.ts). The real refresh/durable token always
+  # stays host-side.
   #
-  # For claude: VM gets ANTHROPIC_BASE_URL=<proxy> + ANTHROPIC_AUTH_TOKEN=<sentinel>;
-  # the proxy reads the live access token from ~/.claude/.credentials.json
-  # (refreshing host-side via `claude -p "ok"` under flock when the cache is
-  # stale) and forwards to api.anthropic.com. A minimal ~/.claude.json is
-  # staged for identity only — NO refreshToken, NO accessToken on the VM.
+  # For claude: the host reads the live access token from
+  # ~/.claude/.credentials.json (refreshing host-side via `claude -p "ok"` under
+  # flock when the cache is stale) and injects it at egress to api.anthropic.com.
+  # A minimal ~/.claude.json is staged for identity only — NO refreshToken, NO
+  # accessToken on the VM.
   #
-  # For codex: VM gets OPENAI_BASE_URL=<proxy> + OPENAI_API_KEY=<sentinel>;
-  # the proxy reads the live credential (`tokens.access_token` or
-  # `OPENAI_API_KEY` from ~/.codex/auth.json, with an OPENAI_API_KEY env
-  # fallback — NEVER the refresh token) and forwards to api.openai.com. The
-  # real OPENAI_API_KEY is intentionally stripped from the forwarded VM boot
-  # env so it cannot land in the VM's PID-1 environment; codex-acp runs in
-  # API-key mode against the proxy and never performs the OAuth handshake
-  # in-VM (that, and refresh, stay host-side).
+  # For codex: the host reads the live credential (`tokens.access_token` from
+  # ~/.codex/auth.json, with an OPENAI_API_KEY env fallback — NEVER the refresh
+  # token) and injects it at egress to chatgpt.com / api.openai.com. A COMPLETE
+  # fake ~/.codex/auth.json is staged (JWT-shaped placeholder tokens + the
+  # non-secret account_id/auth_mode/last_refresh codex's completeness check needs),
+  # so codex-acp runs in its native mode without an in-VM OAuth handshake or
+  # refresh (both stay host-side). Every credential-bearing var is stripped from
+  # the forwarded VM boot env.
   #
-  # For opencode: VM gets OPENCODE_PROXY_BASE_URL=<proxy> +
-  # OPENCODE_PROXY_TOKEN=<sentinel>, and a staged opencode.json (at
-  # /root/.config/opencode/opencode.json) declares a custom
-  # @ai-sdk/openai-compatible provider whose baseURL/apiKey read those env vars.
-  # The proxy reads the durable GitHub OAuth token from
-  # ~/.local/share/opencode/auth.json (COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN
-  # env fallback), exchanges it host-side at
-  # api.github.com/copilot_internal/v2/token for a short-lived Copilot token
-  # (cached + TTL-refreshed before expiry), injects the Copilot editor headers,
-  # and forwards to api.githubcopilot.com. The durable GitHub token never enters
-  # the VM — so do NOT also list it in `gondolin.forward_env`. See
-  # docs/research/opencode-copilot-accept-matrix.md.
+  # For opencode: a staged opencode.json (at /root/.config/opencode/opencode.json)
+  # declares a custom @ai-sdk/openai-compatible provider whose baseURL/apiKey read
+  # the OPENCODE_PROXY_* env vars (a `gho_`-shaped placeholder bearer). The host
+  # reads the durable GitHub OAuth token from ~/.local/share/opencode/auth.json
+  # (COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN env fallback), exchanges it
+  # host-side at api.github.com/copilot_internal/v2/token for a short-lived Copilot
+  # token (cached + TTL-refreshed before expiry), injects the Copilot editor
+  # headers, and substitutes it at egress to api.githubcopilot.com. The durable
+  # GitHub token never enters the VM — so do NOT also list it in
+  # `gondolin.forward_env`. See docs/research/opencode-copilot-accept-matrix.md.
 
   # model (string | null): optional model selector forwarded to the chosen adapter.
   # Each adapter profile knows how to surface it natively:
@@ -699,9 +698,9 @@ acp:
   # Leave unset / null for the adapter's own default. Default: null.
   # effort: xhigh
 
-  # NOTE: the launch shape is fixed (an in-VM proxy dials back over the bridge
-  # and spawns the chosen adapter). Customizing what the proxy spawns requires
-  # forking that proxy and rebuilding the VM image with the fork in place.
+  # NOTE: the launch shape is fixed (an in-VM agent dials back over the bridge
+  # and spawns the chosen adapter). Customizing what the agent spawns requires
+  # forking that agent and rebuilding the VM image with the fork in place.
 
   # shell (string): shell used to run the ACP launch command. Default: 'bash'.
   shell: bash
@@ -719,10 +718,10 @@ acp:
   # the turn is killed and retried. Default: 300000
   stall_timeout_ms: 300000
 
-  # bridge — host-side TCP listener the in-VM proxy dials back to for ACP traffic.
+  # bridge — host-side TCP listener the in-VM agent dials back to for ACP traffic.
   #
   # This replaced the earlier in-VM-exec stdio path. Symphony writes ACP JSON-RPC frames
-  # onto an authenticated TCP socket; the in-VM proxy (`/opt/symphony/vm-agent.mjs`)
+  # onto an authenticated TCP socket; the in-VM agent (`/opt/symphony/vm-agent.mjs`)
   # spawns the adapter via `child_process.spawn` with kernel pipes and bridges the
   # socket to the adapter's stdio. This decouples symphony from any particular
   # sandbox's stdio quirks — any sandbox that can launch a process with env vars and
@@ -742,41 +741,30 @@ acp:
     # may need a different alias. Default: 127.0.0.1
     reach_host: 127.0.0.1
 
-    # reach_url (string|null): full URL override for the in-VM proxy's dial
+    # reach_url (string|null): full URL override for the in-VM agent's dial
     # destination, e.g. through a reverse proxy or different scheme. When null,
     # symphony constructs `tcp://<reach_host>:<bind_port>`. Default: null
     # reach_url: null
 
-    # connect_timeout_ms (int): how long to wait for the in-VM proxy to connect after
+    # connect_timeout_ms (int): how long to wait for the in-VM agent to connect after
     # the sandbox is launched, before failing the attempt. Default: 30000
     connect_timeout_ms: 30000
 
 # ─────────────────────────────────────────────────────────────────────────────
-# credentials — host credential lifecycle (issue 113). The proxy listens on
-# host loopback and substitutes the real OAuth access token for a per-VM
-# sentinel on every request. The ticker keeps the host's cached access token
-# warm by periodically running `claude -p "ok"` — Claude Code's own OAuth
-# path detects the stale token, refreshes against Anthropic, and atomically
-# writes the rotated tuple back to `~/.claude/.credentials.json`. Symphony
-# never implements OAuth; Anthropic's own client does.
+# credentials — host credential lifecycle (issue 113). The host substitutes the
+# real OAuth access token into each VM's outbound request at Gondolin egress; the
+# ticker keeps the host's cached access token warm by periodically running
+# `claude -p "ok"` — Claude Code's own OAuth path detects the stale token,
+# refreshes against Anthropic, and atomically writes the rotated tuple back to
+# `~/.claude/.credentials.json`. Symphony never implements OAuth; Anthropic's own
+# client does.
 # ─────────────────────────────────────────────────────────────────────────────
 credentials:
-  # proxy_bind_host (string): host the credential proxy binds on. Defaults to
-  # loopback so the proxy is unreachable from outside the host. Gondolin maps the
-  # in-VM 127.0.0.1 to the host's 127.0.0.1 transparently, same as the ACP bridge
-  # case. Default: 127.0.0.1
-  proxy_bind_host: 127.0.0.1
-
-  # proxy_bind_port (int): port the credential proxy binds on. 0 picks an
-  # ephemeral port at startup. Default: 0
-  proxy_bind_port: 0
-
   # ticker_interval_ms (int): how often the host ticker spawns `claude -p "ok"`
-  # to refresh the OAuth cache. The proxy also refreshes on demand when a VM
-  # request lands with an expired cached token, so the ticker is belt-to-the-
-  # braces for idle periods. Set to 0 to disable the in-symphony ticker
-  # entirely (operator runs their own systemd timer instead). Default: 21600000
-  # (6 hours).
+  # to refresh the OAuth cache. Each live VM also refreshes proactively before its
+  # cached token expires, so the ticker is belt-to-the-braces for idle periods.
+  # Set to 0 to disable the in-symphony ticker entirely (operator runs their own
+  # systemd timer instead). Default: 21600000 (6 hours).
   ticker_interval_ms: 21600000
 
 # ─────────────────────────────────────────────────────────────────────────────

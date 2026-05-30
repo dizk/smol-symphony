@@ -7,10 +7,8 @@ import {
   decideAttemptOutcome,
   decideTurnContinuation,
   deriveActionContext,
-  proxyCredentialEnv,
   selectPromptKind,
 } from '../src/agent/runner-decisions.js';
-import { ADAPTERS } from '../src/agent/adapters.js';
 
 function makeIssue(state: string): Issue {
   return {
@@ -218,28 +216,6 @@ describe('deriveActionContext', () => {
   });
 });
 
-describe('proxyCredentialEnv', () => {
-  const reg = { sentinel: 'sk-symphony-xyz', baseUrl: 'http://127.0.0.1:5000' };
-
-  it('stages the sentinel + base URL under the claude env var names', () => {
-    assert.deepEqual(proxyCredentialEnv(ADAPTERS.claude.proxyEnv, 'claude', reg), {
-      ANTHROPIC_BASE_URL: 'http://127.0.0.1:5000',
-      ANTHROPIC_AUTH_TOKEN: 'sk-symphony-xyz',
-    });
-  });
-
-  it('stages the sentinel + base URL under the codex env var names', () => {
-    assert.deepEqual(proxyCredentialEnv(ADAPTERS.codex.proxyEnv, 'codex', reg), {
-      OPENAI_BASE_URL: 'http://127.0.0.1:5000',
-      OPENAI_API_KEY: 'sk-symphony-xyz',
-    });
-  });
-
-  it('throws when a proxy adapter declares no proxyEnv (profile bug)', () => {
-    assert.throws(() => proxyCredentialEnv(undefined, 'opencode', reg), /declares no proxyEnv/);
-  });
-});
-
 describe('computeForwardedEnv', () => {
   const readEnv = (k: string): string | undefined =>
     ({ OPENAI_API_KEY: 'sk-real-openai', ANTHROPIC_API_KEY: 'sk-real-anthropic', EMPTY: '' })[k];
@@ -250,9 +226,9 @@ describe('computeForwardedEnv', () => {
     });
   });
 
-  it('omits the proxy credential var so the real key never reaches the VM boot env', () => {
-    // The whole point of proxy mode: with OPENAI_API_KEY omitted, the real key
-    // is absent from the forwarded env even though it is in the forward_env list.
+  it('omits the var named by omitVar from the forwarded env', () => {
+    // With OPENAI_API_KEY passed as omitVar, it is absent from the forwarded env
+    // even though it is in the forward_env list.
     const env = computeForwardedEnv(
       ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY'],
       'OPENAI_API_KEY',

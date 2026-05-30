@@ -122,6 +122,16 @@ hand work off between them via a single MCP call.
 - Linear tracker scaffolding. No implementation ever shipped behind
   the `linear` endpoint, so the option has been dropped; the local
   Markdown tracker is the only `tracker.endpoint` value.
+- Dead credential-proxy CLIENT scaffolding left behind by the Gondolin
+  cutover (PR #128/#129): the `AdapterProfile.proxyEnv` /
+  `credentialStrategy` fields (and the `ProxyEnvVars` / `CredentialStrategy`
+  types), the codex `proxyProviderArgs` provider-override builder,
+  `runner-decisions.ts`'s `proxyCredentialEnv`, and the
+  `credentials.proxy_bind_host` / `proxy_bind_port` workflow keys. Nothing read
+  them at runtime once the proxy transport was deleted; the live model is
+  egress-time token substitution (the guest holds a placeholder, the host swaps
+  the real token in at Gondolin egress). The credential prose in
+  `WORKFLOW.template.md` was reconciled to that model to match `WORKFLOW.md`.
 
 ## [0.1.1] — 2026-05-19
 

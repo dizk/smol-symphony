@@ -96,41 +96,13 @@ describe('adapters registry', () => {
     assert.deepEqual(ADAPTERS.codex.binary, ['codex-acp']);
   });
 
-  it('exposes the opencode profile (binary, proxy strategy, proxyEnv)', () => {
+  it('exposes the opencode profile (binary + inert model/effort channels)', () => {
     assert.ok(ADAPTERS.opencode);
     assert.deepEqual(ADAPTERS.opencode.binary, ['opencode', 'acp']);
-    assert.equal(ADAPTERS.opencode.credentialStrategy, 'proxy');
-    assert.deepEqual(ADAPTERS.opencode.proxyEnv, {
-      baseUrlVar: 'OPENCODE_PROXY_BASE_URL',
-      tokenVar: 'OPENCODE_PROXY_TOKEN',
-    });
     // opencode picks the model from the staged opencode.json, not via an env/argv
-    // channel, so modelInjection is inert and there is no transport override.
+    // channel, so modelInjection is inert.
     assert.deepEqual(ADAPTERS.opencode.modelInjection('gpt-4o'), {});
     assert.equal(ADAPTERS.opencode.effortInjection, undefined);
-    assert.equal(ADAPTERS.opencode.proxyProviderArgs, undefined);
-  });
-
-  it('declares the per-adapter credential strategy the runner dispatches on', () => {
-    // The runner keys credential handling on `credentialStrategy`, not on `id`
-    // (issue #115/#116). Both claude and codex now route through the host
-    // credential proxy. A 'forward-env' adapter must NOT crash-loop when the
-    // proxy is unwired — it just proceeds; none ship today.
-    assert.equal(ADAPTERS.claude.credentialStrategy, 'proxy');
-    assert.equal(ADAPTERS.codex.credentialStrategy, 'proxy');
-  });
-
-  it('proxy adapters declare the VM-facing base-URL + token env var names', () => {
-    // applyCredentialEnv stages reg.baseUrl/sentinel under these names so the
-    // in-VM client dials the proxy with the sentinel as its bearer (issue #116).
-    assert.deepEqual(ADAPTERS.claude.proxyEnv, {
-      baseUrlVar: 'ANTHROPIC_BASE_URL',
-      tokenVar: 'ANTHROPIC_AUTH_TOKEN',
-    });
-    assert.deepEqual(ADAPTERS.codex.proxyEnv, {
-      baseUrlVar: 'OPENAI_BASE_URL',
-      tokenVar: 'OPENAI_API_KEY',
-    });
   });
 
   it('isKnownAdapter narrows on supported ids only', () => {
@@ -142,7 +114,7 @@ describe('adapters registry', () => {
     assert.equal(isKnownAdapter(''), false);
   });
 
-  it('deriveAcpCommand with no extra files just execs the in-VM proxy', () => {
+  it('deriveAcpCommand with no extra files just execs the in-VM agent', () => {
     // Credentials no longer cross the boundary: the in-VM agent reads its config
     // (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from the environment
     // symphony sets on the VM exec invocation, and the host substitutes the real
@@ -154,9 +126,9 @@ describe('adapters registry', () => {
     assert.doesNotMatch(cmd, /\.credentials\.json/);
   });
 
-  it('deriveAcpCommand for codex also just execs the proxy (no credential staging)', () => {
-    // codex routes through the host credential proxy (sentinel + OPENAI_BASE_URL);
-    // it stages no identity file, so nothing crosses the boundary either.
+  it('deriveAcpCommand for codex also just execs the in-VM agent (no credential staging)', () => {
+    // codex's real token is substituted at Gondolin egress, not staged into the
+    // VM; it stages no identity file, so nothing crosses the boundary either.
     const cmd = deriveAcpCommand(ADAPTERS.codex);
     assert.equal(cmd, 'exec node /opt/symphony/vm-agent.mjs');
   });
@@ -166,7 +138,6 @@ describe('adapters registry', () => {
       id: 'claude' as const,
       // Imagine a future profile with multi-token launch + a metacharacter slipping in.
       binary: ['opencode', 'acp', '; rm -rf /'] as const,
-      credentialStrategy: 'proxy' as const,
       modelInjection: () => ({}),
     };
     const cmd = deriveAcpCommand(evil);
@@ -185,7 +156,6 @@ describe('adapters registry', () => {
         deriveAcpCommand({
           id: 'claude',
           binary: [],
-          credentialStrategy: 'proxy',
           modelInjection: () => ({}),
         }),
       /empty binary launch vector/,
@@ -194,8 +164,8 @@ describe('adapters registry', () => {
 
   it('deriveAcpCommand copies the claude identity file before exec', () => {
     // The minimal ~/.claude.json identity (oauthAccount UUIDs only) is staged
-    // by stageClaudeIdentity and copied to /root/.claude.json before the proxy
-    // execs the adapter. The order matters: the staged file must land before
+    // by stageClaudeIdentity and copied to /root/.claude.json before the in-VM
+    // agent execs the adapter. The order matters: the staged file must land before
     // `exec` replaces the shell.
     const cmd = deriveAcpCommand(ADAPTERS.claude, [
       {
@@ -292,74 +262,6 @@ describe('adapters registry', () => {
     // operator who sets acp.effort under a codex-backed state still dispatches
     // cleanly — symphony just doesn't inject anything.
     assert.equal(ADAPTERS.codex.effortInjection, undefined);
-  });
-});
-
-describe('codex proxyProviderArgs (issue 127: force HTTPS provider through the proxy)', () => {
-  const reg = { baseUrl: 'http://127.0.0.1:5000', tokenVar: 'OPENAI_API_KEY' };
-
-  it('claude declares no proxyProviderArgs (its only transport honors the base-URL env var)', () => {
-    // claude-agent-acp talks HTTPS to ANTHROPIC_BASE_URL, so the proxy is in the
-    // path without any provider override. Only codex needs to be forced off its
-    // WebSocket Responses transport.
-    assert.equal(ADAPTERS.claude.proxyProviderArgs, undefined);
-  });
-
-  it('pins an explicit HTTPS provider routed through the proxy base_url + /v1', () => {
-    const args = ADAPTERS.codex.proxyProviderArgs!(reg);
-    assert.deepEqual(args, [
-      '-c', 'model_provider="symphony-proxy"',
-      '-c', 'model_providers.symphony-proxy.name="Symphony credential proxy"',
-      '-c', 'model_providers.symphony-proxy.base_url="http://127.0.0.1:5000/v1"',
-      '-c', 'model_providers.symphony-proxy.env_key="OPENAI_API_KEY"',
-      '-c', 'model_providers.symphony-proxy.wire_api="responses"',
-      '-c', 'model_providers.symphony-proxy.supports_websockets=false',
-    ]);
-  });
-
-  it('disables the WebSocket transport as a raw TOML bool, not a quoted string', () => {
-    // The whole bug (#127): codex's Responses API defaults to a
-    // wss://api.openai.com/v1/responses WebSocket that bypasses the proxy and
-    // leaks the sentinel raw. supports_websockets=false (a TOML boolean, NOT the
-    // string "false") kills that attempt.
-    const args = ADAPTERS.codex.proxyProviderArgs!(reg);
-    assert.ok(args.includes('model_providers.symphony-proxy.supports_websockets=false'));
-    assert.ok(
-      !args.some((a) => a.includes('supports_websockets="false"')),
-      'supports_websockets must be a TOML bool, not a string',
-    );
-  });
-
-  it('appends /v1 to the proxy base URL (the proxy returns host:port WITHOUT /v1)', () => {
-    // credential-proxy.ts returns http://host:port with no /v1 suffix; the
-    // provider base_url must carry it so codex POSTs /v1/responses to the proxy.
-    const args = ADAPTERS.codex.proxyProviderArgs!(reg);
-    const idx = args.findIndex((a) => a.startsWith('model_providers.symphony-proxy.base_url='));
-    assert.equal(
-      args[idx],
-      'model_providers.symphony-proxy.base_url="http://127.0.0.1:5000/v1"',
-    );
-  });
-
-  it('tolerates a trailing slash on the proxy base URL without doubling', () => {
-    const args = ADAPTERS.codex.proxyProviderArgs!({ ...reg, baseUrl: 'http://127.0.0.1:5000/' });
-    const idx = args.findIndex((a) => a.startsWith('model_providers.symphony-proxy.base_url='));
-    assert.equal(
-      args[idx],
-      'model_providers.symphony-proxy.base_url="http://127.0.0.1:5000/v1"',
-    );
-  });
-
-  it('uses the supplied token env var for env_key so the sentinel stays the bearer', () => {
-    // env_key tells codex which env var holds the API key; OPENAI_API_KEY is
-    // already staged to the per-dispatch sentinel, which the proxy validates and
-    // swaps for the real OpenAI credential. Derived from the profile's proxyEnv,
-    // not hard-coded.
-    const args = ADAPTERS.codex.proxyProviderArgs!({
-      ...reg,
-      tokenVar: ADAPTERS.codex.proxyEnv!.tokenVar,
-    });
-    assert.ok(args.includes('model_providers.symphony-proxy.env_key="OPENAI_API_KEY"'));
   });
 });
 
@@ -481,24 +383,27 @@ describe('opencode credential helpers (issue 130)', () => {
   });
 });
 
-describe('buildOpencodeConfig (issue 130: custom Copilot provider via the proxy)', () => {
-  it('declares the symphony-copilot provider pointed at the proxy via {env:…}', () => {
+describe('buildOpencodeConfig (issue 130: custom Copilot provider, egress-substituted)', () => {
+  it('declares the symphony-copilot provider reading the OPENCODE_PROXY_* env vars via {env:…}', () => {
     const cfg = JSON.parse(buildOpencodeConfig(null)) as Record<string, any>;
     const provider = cfg.provider?.[OPENCODE_PROXY_PROVIDER_ID];
     assert.ok(provider, 'expected the symphony-copilot provider');
     assert.equal(provider.npm, '@ai-sdk/openai-compatible');
-    // The base URL + apiKey read the proxy env vars opencode interpolates.
+    // The base URL + apiKey read the env vars opencode interpolates; the host
+    // stages the placeholder bearer under OPENCODE_PROXY_TOKEN.
     assert.equal(provider.options.baseURL, '{env:OPENCODE_PROXY_BASE_URL}');
     assert.equal(provider.options.apiKey, '{env:OPENCODE_PROXY_TOKEN}');
   });
 
-  it('the {env:…} var names match the opencode profile proxyEnv exactly (no drift)', () => {
-    // If these diverge, the in-VM opencode reads empty base URL / apiKey and the
-    // provider silently fails. Lock them together.
+  it('the {env:…} var names lock to the OPENCODE_PROXY_* env vars (no drift)', () => {
+    // If these diverge from the env var names the host stages the placeholder
+    // under (OPENCODE_SECRET_NAME in credential-secrets.ts = OPENCODE_PROXY_TOKEN),
+    // the in-VM opencode reads an empty base URL / apiKey and the provider
+    // silently fails. Lock the literal names here.
     const cfg = JSON.parse(buildOpencodeConfig(null)) as Record<string, any>;
     const opts = cfg.provider[OPENCODE_PROXY_PROVIDER_ID].options;
-    assert.equal(opts.baseURL, `{env:${ADAPTERS.opencode.proxyEnv!.baseUrlVar}}`);
-    assert.equal(opts.apiKey, `{env:${ADAPTERS.opencode.proxyEnv!.tokenVar}}`);
+    assert.equal(opts.baseURL, '{env:OPENCODE_PROXY_BASE_URL}');
+    assert.equal(opts.apiKey, '{env:OPENCODE_PROXY_TOKEN}');
   });
 
   it('pins the default Copilot model when no model is configured', () => {

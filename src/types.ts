@@ -359,21 +359,17 @@ export interface SleepCycleConfig {
 }
 
 /**
- * Host-side credential lifecycle (issue 113). The bind host/port for the
- * credential proxy plus the ticker interval that proactively spawns
- * `claude -p "ok"` to keep the host's cached access token warm during idle
- * periods.
+ * Host-side credential lifecycle (issue 113). The ticker interval that
+ * proactively spawns `claude -p "ok"` to keep the host's cached access token
+ * warm during idle periods, so a long-lived dispatch's egress substitution
+ * always has a fresh upstream token to inject.
  */
 export interface CredentialsConfig {
-  /** Host the credential proxy binds on. Default: 127.0.0.1 (host-only). */
-  proxy_bind_host: string;
-  /** Port the credential proxy binds on. 0 picks an ephemeral port. */
-  proxy_bind_port: number;
   /**
    * How often the host ticker spawns `claude -p "ok"` to keep the OAuth
-   * cache warm. Belt-and-braces to the proxy's on-demand fallback. Default:
+   * cache warm. Belt-and-braces to the per-VM proactive refresh. Default:
    * 6h. Set to 0 to disable the ticker entirely (operator runs their own
-   * systemd timer instead, or simply leans on the proxy's on-demand path).
+   * systemd timer instead).
    */
   ticker_interval_ms: number;
 }
