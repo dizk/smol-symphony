@@ -336,14 +336,19 @@ export function buildAdapterCredentialSpecs(
       adapterId: 'codex',
       secretName: CODEX_SECRET_NAME,
       allowedHosts: [CODEX_UPSTREAM_HOST],
-      // codex-acp streams /backend-api/codex/responses over a WS. Allowing WS lets
-      // the Upgrade handshake succeed (the real token IS substituted on the hookable
-      // handshake → 101), but the POST-101 opaque tunnel drops the Responses stream
-      // (ResponseStreamDisconnected) → codex-acp attempts a blocked refresh → refusal
-      // (validated 2026-05-30). So WS-allow is necessary-but-not-sufficient; codex
-      // stays default-deny + routed via the proxy fallback until the post-101 tunnel
-      // issue is resolved. Flip to true once it is.
-      allowWebSockets: false,
+      // codex-acp streams /backend-api/codex/responses over a WebSocket Upgrade.
+      // It MUST be allowed: the real token is substituted on the hookable Upgrade
+      // handshake (createHttpHooks onRequest → applySecretsToRequest), so the
+      // handshake reaches the ALLOWLISTED inference host with the real bearer and
+      // gets a clean 101; the post-101 frames are an opaque tunnel to that one
+      // host. SAFE — the placeholder never egresses and a non-allowlisted refresh
+      // host's upgrade is blocked. The earlier "post-101 tunnel drop" was a red
+      // herring: it was caused by an INCOMPLETE staged auth.json (codex 0.135
+      // judged the creds incomplete → sent no bearer → 401 → blocked refresh). With
+      // a COMPLETE staged auth.json (auth_mode + last_refresh + the tokens block —
+      // see gondolin-creds-staging.ts buildCodexFiles) the WS turn completes
+      // end-to-end (validated 2026-05-30 through the production dispatch path).
+      allowWebSockets: true,
       // Bind the host account_id into the placeholder JWT's auth claim so
       // codex-acp does not refresh the placeholder (go-live finding).
       placeholder: () => codexPlaceholder(opts.codexAccountId ?? null),

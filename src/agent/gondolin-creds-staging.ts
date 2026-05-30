@@ -33,10 +33,12 @@
 // real tokens, so the default reader parses a file whose bytes include them (the
 // host process already holds these tokens — `credential-secrets.ts` reads the same
 // file for the access token, so this is no new host-side exposure). What this
-// module guarantees is that it **extracts and EMITS only the non-secret identity**
-// (`account_id`, oauthAccount UUIDs) — a real access/refresh token is never
-// returned to the caller, never written into a staged file, and never put in the
-// guest env. The guest-facing invariant (no real token in the VM) holds.
+// module guarantees is that it **extracts and EMITS only non-secret identity +
+// metadata** (codex `account_id` / `auth_mode` / `last_refresh`, claude
+// oauthAccount UUIDs — all read by an allowlist of known non-secret keys) — a real
+// access/refresh token (or a real `OPENAI_API_KEY`) is never returned to the
+// caller, never written into a staged file, and never put in the guest env. The
+// guest-facing invariant (no real token in the VM) holds.
 //
 // DORMANT (Phase 5): only `gondolin-dispatch.ts` (itself off the live runner
 // path) consumes this. The smolvm path keeps `adapters.ts`' `stage*` helpers.
@@ -110,18 +112,43 @@ export interface ClaudeIdentity {
 }
 
 /**
+ * Non-secret codex completeness/identity metadata copied (by an explicit
+ * allowlist) into the fake `~/.codex/auth.json`. EVERY field here is non-secret:
+ * `accountId` is the `chatgpt_account_id` routing identifier; `authMode` /
+ * `lastRefresh` are completeness markers codex 0.135 requires before it will send
+ * the bearer (see `buildCodexFiles`). The real access/id/refresh tokens and any
+ * real `OPENAI_API_KEY` are NEVER part of this struct — the reader reads them by
+ * an allowlist and discards everything else.
+ */
+export interface CodexIdentity {
+  /** `tokens.account_id` — the non-secret `chatgpt_account_id` routing identifier. */
+  accountId: string | null;
+  /** Top-level `auth_mode` (e.g. `"chatgpt"`) — a non-secret completeness marker. */
+  authMode: string | null;
+  /** Top-level `last_refresh` ISO timestamp — a non-secret completeness marker. */
+  lastRefresh: string | null;
+}
+
+/**
  * Injectable host-side reads for the non-secret identity fields. NEITHER reader
  * RETURNS a token: the claude reader returns only the oauthAccount UUIDs, the
- * codex reader returns only the `account_id` — even though the default codex
- * reader parses an auth.json whose bytes also contain real tokens (it discards
- * them; see the module header invariant). Both default to a real file read (lazy
- * fs import) and tolerate a missing/malformed file by returning null.
+ * codex reader returns only an allowlisted set of non-secret metadata fields
+ * (account_id / auth_mode / last_refresh) — even though the default codex reader
+ * parses an auth.json whose bytes also contain real tokens (it discards them; see
+ * the module header invariant). All default to a real file read (lazy fs import)
+ * and tolerate a missing/malformed file by returning null.
  */
 export interface HostIdentityReaders {
   /** Resolve the non-secret claude oauthAccount identity, or null. */
   readClaudeIdentity(): Promise<ClaudeIdentity | null>;
   /** Resolve the non-secret codex `account_id`, or null. */
   readCodexAccountId(): Promise<string | null>;
+  /**
+   * Resolve the non-secret codex completeness metadata (account_id / auth_mode /
+   * last_refresh), or null when the file is missing/malformed. Reads by an
+   * ALLOWLIST — never returns the access/id/refresh token or a real OPENAI_API_KEY.
+   */
+  readCodexMetadata(): Promise<CodexIdentity | null>;
 }
 
 /** Inputs the per-adapter builders need beyond the placeholder. */
@@ -200,31 +227,54 @@ async function buildClaudeFiles(
 }
 
 /**
- * codex fake `~/.codex/auth.json` with a `tokens` block: the JWT-shaped
- * placeholder (used VERBATIM as both `access_token` and `id_token` — codex's
- * native mode reads `access_token` as its bearer and Gondolin substitutes it at
- * egress) + the REAL, non-secret `account_id` read from the host auth.json (for
- * the `chatgpt-account-id` routing header) + a junk refresh_token. The
- * placeholder's far-future `exp` (baked in by `credential-secrets.ts`) keeps
- * codex from refreshing. `OPENAI_API_KEY` is omitted (the OAuth `tokens` block is
- * the live credential).
+ * codex fake `~/.codex/auth.json`, shaped to be COMPLETE for codex 0.135.
+ *
+ * GO-LIVE FINDING (2026-05-30, the real root cause; the earlier "post-101 WS
+ * drop" was a red herring): codex 0.135's local auth manager runs a COMPLETENESS
+ * check on auth.json BEFORE it will send the `Authorization` bearer. A too-minimal
+ * `{ tokens: { access_token, id_token, refresh_token, account_id } }` is judged
+ * "credentials incomplete" — so codex sends NO bearer at all → unauthenticated →
+ * 401 → a blocked refresh → turn refusal. With a COMPLETE auth.json the WS Upgrade
+ * gets a clean 101 through Gondolin and the turn completes. The proven-working
+ * shape (spike C7, VERIFIED) carries the non-secret top-level completeness fields
+ * `auth_mode` + `last_refresh` (and `OPENAI_API_KEY: null`) alongside the tokens
+ * block.
+ *
+ * SAFETY-FIRST: we do NOT spread the host auth.json into the staged file (that
+ * would leak a real token if any secret field were missed). Instead we read ONLY
+ * an ALLOWLIST of non-secret metadata via the injected reader and BUILD a fresh
+ * object from scratch:
+ *   - top level: `OPENAI_API_KEY: null` (the OAuth tokens block is the live cred,
+ *     never an apikey) + the non-secret `auth_mode` + `last_refresh` when known;
+ *   - `tokens`: the JWT-shaped `placeholder` as both `access_token` (codex's
+ *     bearer; Gondolin substitutes the real token at egress) and `id_token`, a
+ *     JUNK `refresh_token` (the guest has nothing real to rotate), and the
+ *     non-secret `account_id` (the `chatgpt-account-id` routing identifier).
+ * The placeholder's far-future JWT `exp` (baked in by `credential-secrets.ts`)
+ * keeps codex from proactively refreshing. The real access/id/refresh token never
+ * enters this object.
  */
 async function buildCodexFiles(
   placeholder: string,
   readers: HostIdentityReaders,
 ): Promise<GuestCredFile[]> {
-  const accountId = await safeReadCodexAccountId(readers);
+  const meta = await safeReadCodexMetadata(readers);
   const tokens: Record<string, unknown> = {
     access_token: placeholder,
     id_token: placeholder,
     refresh_token: JUNK_REFRESH,
-    ...(accountId !== null ? { account_id: accountId } : {}),
+    ...(meta?.accountId != null ? { account_id: meta.accountId } : {}),
   };
-  // `last_refresh` is omitted on purpose: codex's "is the token expired?" decision
-  // keys off the JWT `exp` (far-future, baked into the placeholder), not the file's
-  // last_refresh timestamp. Omitting it (matching the apikey-mode fake in
-  // adapters.ts) avoids any "time since last refresh" heuristic confusion.
-  const auth = { tokens };
+  // Top-level non-secret completeness fields. `OPENAI_API_KEY: null` mirrors the
+  // host (codex stores the OAuth tokens block, NOT an api key); `auth_mode` /
+  // `last_refresh` are the markers codex 0.135's completeness check requires (see
+  // the doc comment). All are non-secret; absent ⇒ omitted (best-effort).
+  const auth: Record<string, unknown> = {
+    OPENAI_API_KEY: null,
+    ...(meta?.authMode != null ? { auth_mode: meta.authMode } : {}),
+    tokens,
+    ...(meta?.lastRefresh != null ? { last_refresh: meta.lastRefresh } : {}),
+  };
   return [credFile(CODEX_AUTH_GUEST_PATH, JSON.stringify(auth))];
 }
 
@@ -257,11 +307,11 @@ async function safeReadClaudeIdentity(readers: HostIdentityReaders): Promise<Cla
   }
 }
 
-async function safeReadCodexAccountId(readers: HostIdentityReaders): Promise<string | null> {
+async function safeReadCodexMetadata(readers: HostIdentityReaders): Promise<CodexIdentity | null> {
   try {
-    return await readers.readCodexAccountId();
+    return await readers.readCodexMetadata();
   } catch (err) {
-    log.warn('gondolin-creds-staging: codex account_id read failed (non-fatal)', {
+    log.warn('gondolin-creds-staging: codex metadata read failed (non-fatal)', {
       error: (err as Error).message,
     });
     return null;
@@ -274,17 +324,19 @@ async function safeReadCodexAccountId(readers: HostIdentityReaders): Promise<str
 
 /**
  * Default readers backed by the host filesystem. Each parses the host file and
- * returns ONLY the non-secret identity field — the claude oauthAccount UUIDs and
- * the codex `account_id`. The codex auth.json's bytes also contain real tokens;
- * they are parsed-then-discarded and never returned/emitted (module header
- * invariant). A missing/malformed file yields null.
+ * returns ONLY the non-secret identity/metadata — the claude oauthAccount UUIDs,
+ * the codex `account_id`, and the codex completeness metadata (account_id /
+ * auth_mode / last_refresh, allowlisted). The codex auth.json's bytes also contain
+ * real tokens; they are parsed-then-discarded and never returned/emitted (module
+ * header invariant). A missing/malformed file yields null.
  */
 export function defaultHostIdentityReaders(): HostIdentityReaders {
+  const readCodexAuth = () => readHostJson(path.join(os.homedir(), '.codex', 'auth.json'));
   return {
     readClaudeIdentity: async () =>
       extractClaudeIdentity(await readHostJson(path.join(os.homedir(), '.claude.json'))),
-    readCodexAccountId: async () =>
-      extractCodexAccountId(await readHostJson(path.join(os.homedir(), '.codex', 'auth.json'))),
+    readCodexAccountId: async () => extractCodexAccountId(await readCodexAuth()),
+    readCodexMetadata: async () => extractCodexMetadata(await readCodexAuth()),
   };
 }
 
@@ -327,6 +379,28 @@ export function extractCodexAccountId(parsed: unknown): string | null {
   const tokens = pickObject(parsed, 'tokens');
   if (tokens === null) return null;
   return pickString(tokens, 'account_id');
+}
+
+/**
+ * Pure: pull ONLY the allowlisted NON-SECRET codex completeness metadata out of a
+ * parsed `~/.codex/auth.json`. SAFETY-CRITICAL: this reads three explicit
+ * non-secret keys by name (`tokens.account_id`, top-level `auth_mode`,
+ * `last_refresh`) and NEVER touches `tokens.access_token` / `tokens.id_token` /
+ * `tokens.refresh_token` / a real `OPENAI_API_KEY` — even though the parsed object
+ * holds them. Returns null only when the file is entirely missing/unparseable
+ * (parsed === null); a present-but-sparse auth.json yields a struct with null
+ * fields (each omitted downstream). The non-null fields are pure identity /
+ * metadata that codex 0.135 needs to consider the staged creds complete.
+ */
+export function extractCodexMetadata(parsed: unknown): CodexIdentity | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const top = parsed as Record<string, unknown>;
+  const tokens = pickObject(parsed, 'tokens');
+  return {
+    accountId: tokens !== null ? pickString(tokens, 'account_id') : null,
+    authMode: pickString(top, 'auth_mode'),
+    lastRefresh: pickString(top, 'last_refresh'),
+  };
 }
 
 function pickObject(value: unknown, key: string): Record<string, unknown> | null {

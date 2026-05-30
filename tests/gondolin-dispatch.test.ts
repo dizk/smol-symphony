@@ -216,6 +216,11 @@ const FAKE_HOST_READERS = {
     organizationUuid: '66666666-7777-8888-9999-000000000000',
   }),
   readCodexAccountId: async () => FAKE_ACCOUNT_ID,
+  readCodexMetadata: async () => ({
+    accountId: FAKE_ACCOUNT_ID,
+    authMode: 'chatgpt',
+    lastRefresh: '2026-05-22T08:59:06.309350255Z',
+  }),
 };
 
 function baseOptions(overrides: Partial<GondolinDispatchOptions> = {}): GondolinDispatchOptions {
@@ -492,7 +497,12 @@ describe('GondolinDispatcher.dispatch — fake native creds staging', () => {
     const writes = stagedWrites(client.handle);
     const auth = writes.find((w) => w.guestPath === '/root/.codex/auth.json');
     assert.ok(auth, 'codex auth.json staged');
-    const parsed = JSON.parse(auth!.content) as { tokens: Record<string, unknown> };
+    const parsed = JSON.parse(auth!.content) as {
+      OPENAI_API_KEY: unknown;
+      auth_mode: unknown;
+      last_refresh: unknown;
+      tokens: Record<string, unknown>;
+    };
     const placeholder = handle.fakeCreds.env.OPENAI_API_KEY!;
     assert.equal(parsed.tokens.access_token, placeholder, 'access_token IS the placeholder bearer');
     // JWT-shaped: 3 base64url segments; payload carries a far-future exp.
@@ -503,6 +513,11 @@ describe('GondolinDispatcher.dispatch — fake native creds staging', () => {
     // The REAL, non-secret account_id was copied from the injected host reader.
     assert.equal(parsed.tokens.account_id, FAKE_ACCOUNT_ID, 'real non-secret account_id copied');
     assert.equal(parsed.tokens.refresh_token, 'JUNK-PLACEHOLDER-REFRESH-not-a-real-token');
+    // codex-0.135 completeness fields: non-secret top-level markers from the host
+    // reader, plus OPENAI_API_KEY: null (OAuth tokens block is the live cred).
+    assert.equal(parsed.OPENAI_API_KEY, null, 'OPENAI_API_KEY is null (not an apikey)');
+    assert.equal(parsed.auth_mode, 'chatgpt', 'non-secret auth_mode copied');
+    assert.equal(parsed.last_refresh, '2026-05-22T08:59:06.309350255Z', 'non-secret last_refresh copied');
   });
 
   it('stages opencode config (custom provider, no inline token; placeholder via env)', async () => {

@@ -369,20 +369,16 @@ describe('gondolin real dispatch (go-live; SPIKE_GONDOLIN_REAL=1)', () => {
     },
   );
 
-  // BLOCKER (validated 2026-05-30, two layers): codex-acp 0.15 streams
-  // `/backend-api/codex/responses` over a WebSocket. (1) The dispatcher default-denies
-  // WS, so the Upgrade was rejected outright. (2) Allowing WS (codex spec
-  // allowWebSockets:true) lets the Upgrade HANDSHAKE succeed — the real token IS
-  // substituted on the hookable handshake (createHttpHooks onRequest →
-  // applySecretsToRequest), reaching `/responses` with a 101 — BUT the POST-101 opaque
-  // tunnel drops the stream (`ResponseStreamDisconnected { http_status_code: None }`),
-  // and codex-acp then attempts an egress-blocked refresh → 403 → REFUSAL. So WS-allow
-  // is necessary-but-not-sufficient; the real blocker is the post-101 WS tunnel relay
-  // (the layer that is, by Gondolin's design, an opaque passthrough). `codex exec`
-  // (HTTP SSE) works through Gondolin; only codex-acp's WS transport fails. Until the
-  // post-101 issue is resolved OR codex-acp is forced onto HTTP, codex routes via the
-  // proxy fallback. claude is fully green on the identical production path.
-  const CODEX_BLOCKED = true;
+  // RESOLVED (2026-05-30): the earlier "post-101 WS tunnel drop" was a RED HERRING.
+  // The true root cause was an INCOMPLETE staged `~/.codex/auth.json`: codex 0.135
+  // runs a completeness check before sending the bearer, and a too-minimal
+  // `{ tokens: {...} }` (missing the non-secret `auth_mode` / `last_refresh` markers)
+  // is judged "credentials incomplete" → codex sends NO bearer → 401 → blocked
+  // refresh → turn refusal (which surfaced as a stream drop). With a COMPLETE staged
+  // auth.json (gondolin-creds-staging.ts buildCodexFiles: auth_mode + last_refresh +
+  // OPENAI_API_KEY:null + the tokens block) AND codex allowWebSockets:true, codex-acp's
+  // WS Upgrade gets a clean 101 through Gondolin and the turn completes end-to-end.
+  const CODEX_BLOCKED = false;
   it(
     'codex: real turn through the production dispatch path + invariant holds',
     { skip: !ENABLED || CODEX_BLOCKED, timeout: TURN_TIMEOUT_MS + 60_000 },
