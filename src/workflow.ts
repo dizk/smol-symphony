@@ -17,6 +17,7 @@ import type {
   AgentConfig,
   AcpConfig,
   GondolinConfig,
+  EgressConfig,
   ServerConfig,
   McpConfig,
   PrAutopilotConfig,
@@ -343,6 +344,16 @@ export function buildServiceConfig(
     ]),
   };
 
+  // egress firewall: the general dev-tooling allowlist the in-VM agent may reach
+  // (npm/git/CDNs) for gates. DISTINCT from the credential layer's per-adapter
+  // substitution hosts — nothing listed here ever gets a real token substituted
+  // (see credential-secrets.ts buildAdapterHooksConfig). Empty default: the agent
+  // can reach only each adapter's inference host until the operator opts hosts in.
+  const egressRaw = getObject(raw, 'egress');
+  const egress: EgressConfig = {
+    allowed_hosts: asStringList(egressRaw['allowed_hosts'], []),
+  };
+
   // server extension (§9.5)
   const serverRaw = getObject(raw, 'server');
   const server: ServerConfig = {
@@ -429,6 +440,7 @@ export function buildServiceConfig(
     agent,
     acp,
     gondolin,
+    egress,
     server,
     mcp,
     pr_autopilot: prAutopilot,

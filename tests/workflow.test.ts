@@ -218,6 +218,24 @@ describe('workflow', () => {
     assert.deepEqual(cfg.gondolin.volumes, []);
   });
 
+  it('parses egress.allowed_hosts (the dev-tooling firewall) and defaults to []', () => {
+    const withEgress = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: minimalStates,
+        egress: { allowed_hosts: ['registry.npmjs.org', 'github.com'] },
+      },
+      '/tmp/symphony/WORKFLOW.md',
+    );
+    assert.deepEqual(withEgress.egress.allowed_hosts, ['registry.npmjs.org', 'github.com']);
+
+    const noEgress = buildServiceConfig(
+      { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
+      '/tmp/symphony/WORKFLOW.md',
+    );
+    assert.deepEqual(noEgress.egress.allowed_hosts, [], 'absent egress block ⇒ empty allowlist');
+  });
+
   it('rejects a workflow YAML with no states block', () => {
     assert.throws(
       () =>

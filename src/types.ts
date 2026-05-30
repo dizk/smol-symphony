@@ -246,6 +246,20 @@ export interface GondolinConfig {
   forward_env: string[];
 }
 
+// General egress firewall for the in-VM agent (WORKFLOW.md `egress:`). Gondolin
+// denies guest→non-allowlisted egress by default; these are the dev-tooling hosts
+// the agent may reach for gates (npm registry, git hosts, release CDNs).
+// SECURITY: this is the firewall ONLY — no credential is ever substituted for
+// these hosts. The real token substitutes solely on each adapter's
+// `substitutionHosts` (see credential-secrets.ts); the effective per-adapter
+// allowlist handed to `createHttpHooks` is THIS list UNION that adapter's
+// substitution host(s). So listing a host here grants plain network egress, never
+// a token. Entries are bare hostnames (no scheme/port/path), matched against the
+// request host; a malformed entry fails safe (the host stays blocked, never opened).
+export interface EgressConfig {
+  allowed_hosts: string[];
+}
+
 export interface ServerConfig {
   port: number | null;
   host: string;
@@ -375,6 +389,7 @@ export interface ServiceConfig {
   agent: AgentConfig;
   acp: AcpConfig;
   gondolin: GondolinConfig;
+  egress: EgressConfig;
   server: ServerConfig;
   mcp: McpConfig;
   pr_autopilot: PrAutopilotConfig;

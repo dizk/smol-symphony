@@ -329,6 +329,20 @@ gondolin:
     - OPENAI_API_KEY
     - ANTHROPIC_API_KEY
 
+egress:
+  # General dev-tooling firewall for the in-VM agent. Gondolin denies guest egress
+  # by default; the agent can always reach its own inference host (handled by the
+  # credential layer), and these hosts are additionally opened so gates can run
+  # (`npm install`, git-based deps, release binaries). SECURITY: nothing here ever
+  # gets a real token substituted — listing a host grants plain network egress
+  # only. The real upstream token is substituted solely on each adapter's inference
+  # host (see src/agent/credential-secrets.ts).
+  allowed_hosts:
+    - registry.npmjs.org             # npm install
+    - github.com                     # git-based deps / release pages
+    - codeload.github.com            # GitHub tarball fetch
+    - objects.githubusercontent.com  # release-binary downloads
+
 server:
   port: 8787
   # Bound to all interfaces because access is gated by tailscale, not by the

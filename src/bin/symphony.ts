@@ -278,7 +278,7 @@ async function buildCredentialPipeline(config: ServiceConfig): Promise<{
   // Best-effort: a missing/malformed auth.json yields null (claim omitted).
   const codexAccountId = await defaultHostIdentityReaders().readCodexAccountId();
   const specs = buildAdapterCredentialSpecs({ codexAccountId });
-  const adapterHooks = buildAllAdapterHooks(specs);
+  const adapterHooks = buildAllAdapterHooks(specs, config.egress.allowed_hosts);
   const credentialRegistry = new CredentialSecretRegistry({
     readToken: (adapterId) => specs[adapterId].readToken(),
     refresh: (adapterId) => specs[adapterId].refresh(),
@@ -293,13 +293,18 @@ async function buildCredentialPipeline(config: ServiceConfig): Promise<{
   return { credentialRegistry, adapterHooks, credentialTicker };
 }
 
-/** Build the per-adapter `createHttpHooks` config map from the credential specs. */
+/**
+ * Build the per-adapter `createHttpHooks` config map from the credential specs.
+ * `egressAllowlist` is the general workspace dev-tooling firewall (npm/git/CDNs)
+ * unioned into every adapter's `allowedHosts` (never into its substitution scope).
+ */
 function buildAllAdapterHooks(
   specs: Record<AcpAdapterId, AdapterCredentialSpec>,
+  egressAllowlist: readonly string[],
 ): Record<AcpAdapterId, AdapterHooksConfig> {
   const out = {} as Record<AcpAdapterId, AdapterHooksConfig>;
   for (const id of KNOWN_ADAPTER_IDS) {
-    out[id] = buildAdapterHooksConfig(specs[id]);
+    out[id] = buildAdapterHooksConfig(specs[id], egressAllowlist);
   }
   return out;
 }

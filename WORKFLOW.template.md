@@ -822,6 +822,35 @@ gondolin:
     - ANTHROPIC_API_KEY
 
 # ─────────────────────────────────────────────────────────────────────────────
+# egress — general dev-tooling firewall for the in-VM agent.
+#
+# Gondolin denies guest egress to non-allowlisted hosts by default. The agent can
+# always reach its own inference host (that is handled by the credential layer,
+# which substitutes the real upstream token at egress). This block additionally
+# opens the dev-tooling hosts the agent needs so gates can run inside the VM —
+# `npm install`, git-based dependencies, release-binary downloads.
+#
+# SECURITY: this is the firewall ONLY. No credential is ever substituted for a host
+# listed here — the real token substitutes solely on each adapter's inference host
+# (see src/agent/credential-secrets.ts `substitutionHosts`). The effective
+# per-adapter allowlist handed to Gondolin is THIS list UNION that adapter's
+# substitution host(s). Listing a host therefore grants plain network egress, never
+# a token. Keep the list tight — every entry widens the network surface of
+# semi-trusted in-VM code.
+# ─────────────────────────────────────────────────────────────────────────────
+egress:
+  # allowed_hosts (string[]): hostnames the in-VM agent may reach for dev tooling.
+  # Default: [] (no extra hosts — the agent can reach only its inference host).
+  # Bare hostnames ONLY — no scheme, port, or path (`github.com`, not
+  # `https://github.com/...`). A malformed entry fails safe (the host simply stays
+  # blocked, never opened). Each entry is matched against the request host exactly.
+  allowed_hosts:
+    - registry.npmjs.org             # npm install
+    - github.com                     # git-based deps / release pages
+    - codeload.github.com            # GitHub tarball fetch
+    - objects.githubusercontent.com  # release-binary downloads
+
+# ─────────────────────────────────────────────────────────────────────────────
 # server — HTTP dashboard + MCP endpoint listener.
 # ─────────────────────────────────────────────────────────────────────────────
 server:
