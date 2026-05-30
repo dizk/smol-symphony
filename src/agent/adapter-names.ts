@@ -19,22 +19,22 @@ export function isKnownAdapter(id: string): id is AcpAdapterId {
 }
 
 /**
- * Absolute path to the host's claude OAuth credential file. The host
- * credential proxy reads this on every upstream request to substitute the
- * live access token for a per-VM sentinel; the workflow loader probes its
- * existence at startup so a missing file fails fast with a clear message
- * instead of opaque per-request errors.
+ * Absolute path to the host's claude OAuth credential file. The host reads this
+ * to substitute the live access token into the outbound request at Gondolin
+ * egress (the guest only ever holds a token-shaped placeholder); the workflow
+ * loader probes its existence at startup so a missing file fails fast with a
+ * clear message instead of opaque per-request errors.
  */
 export function hostClaudeCredentialPath(): string {
   return path.join(os.homedir(), '.claude', '.credentials.json');
 }
 
 /**
- * Absolute path to the host's codex credential file. The credential proxy
- * re-reads this on every upstream request (a ChatGPT-OAuth `tokens.access_token`
- * or a top-level `OPENAI_API_KEY`); the startup probe reads it once so a
- * completely missing codex credential fails fast instead of surfacing as a
- * mid-dispatch `503 no cached access token`.
+ * Absolute path to the host's codex credential file. The host re-reads this to
+ * substitute the live token into the outbound request at Gondolin egress (a
+ * ChatGPT-OAuth `tokens.access_token` or a top-level `OPENAI_API_KEY`); the
+ * startup probe reads it once so a completely missing codex credential fails
+ * fast instead of surfacing as a mid-dispatch `503 no cached access token`.
  */
 export function hostCodexCredentialPath(): string {
   return path.join(os.homedir(), '.codex', 'auth.json');
@@ -43,10 +43,10 @@ export function hostCodexCredentialPath(): string {
 /**
  * Absolute path to the host's opencode credential file. opencode stores its
  * `opencode auth login` credentials at `$XDG_DATA_HOME/opencode/auth.json`
- * (defaulting to `~/.local/share/opencode/auth.json`). The credential proxy
- * reads the host's GitHub Copilot OAuth token out of this file on every
- * upstream request (to mint a short-lived Copilot token), and the startup
- * probe reads it once so a missing/empty opencode credential fails fast
+ * (defaulting to `~/.local/share/opencode/auth.json`). The host reads the
+ * GitHub Copilot OAuth token out of this file to mint a short-lived Copilot
+ * token and substitute it into the outbound request at Gondolin egress, and the
+ * startup probe reads it once so a missing/empty opencode credential fails fast
  * instead of surfacing mid-dispatch.
  */
 export function hostOpencodeCredentialPath(): string {
@@ -59,8 +59,8 @@ export function hostOpencodeCredentialPath(): string {
  * Pure: pull the durable GitHub OAuth token out of opencode's parsed
  * `auth.json`. opencode keys credentials by provider id; the GitHub Copilot
  * entry is stored under `"github-copilot"` as an OAuth record. The DURABLE
- * GitHub OAuth token (the secret the proxy must keep host-side and exchange
- * for a short-lived Copilot token) lives under `refresh`; opencode caches the
+ * GitHub OAuth token (the secret the host keeps and exchanges for a short-lived
+ * Copilot token) lives under `refresh`; opencode caches the
  * exchanged short-lived Copilot token under `access`/`expires` in the same
  * record. We deliberately read `refresh` first — that is the long-lived token
  * the exchange needs — and tolerate alternate field names for forward
@@ -86,9 +86,9 @@ export function opencodeGithubTokenFromAuth(parsed: unknown): string | null {
  * Pure: read the GitHub OAuth token opencode would use for the Copilot
  * exchange from the host environment, following opencode's documented
  * precedence `COPILOT_GITHUB_TOKEN` > `GH_TOKEN` > `GITHUB_TOKEN`. Returns the
- * first non-empty value, or null. The proxy uses this as the fallback when
+ * first non-empty value, or null. The host uses this as the fallback when
  * `auth.json` yields no token; the startup probe uses it to accept a dispatch
- * the proxy could serve from the environment alone.
+ * the host could serve from the environment alone.
  */
 export function opencodeGithubTokenFromEnv(env: NodeJS.ProcessEnv): string | null {
   for (const key of ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN']) {
@@ -99,11 +99,11 @@ export function opencodeGithubTokenFromEnv(env: NodeJS.ProcessEnv): string | nul
 
 /**
  * Pure: does opencode have a resolvable GitHub Copilot credential from either
- * source the proxy reads — a `github-copilot` token in `auth.json`, or one of
+ * source the host reads — a `github-copilot` token in `auth.json`, or one of
  * the `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` env vars? The shell
  * reads the file (passing `null` when absent/unreadable) and its env in; this
- * mirrors the proxy's read path so the startup probe accepts exactly when a
- * dispatch would.
+ * mirrors the host's egress read path so the startup probe accepts exactly when
+ * a dispatch would.
  */
 export function opencodeCredentialAvailable(
   authFileText: string | null,
@@ -127,10 +127,10 @@ export function opencodeMissingCredentialMessage(): string {
 
 /**
  * Pure: does codex have a resolvable credential from either valid source? The
- * credential proxy reads two — the `~/.codex/auth.json` token (a ChatGPT-OAuth
+ * host reads two — the `~/.codex/auth.json` token (a ChatGPT-OAuth
  * `tokens.access_token` or a top-level `OPENAI_API_KEY`) or an `OPENAI_API_KEY`
  * env var. The shell reads the file (passing `null` when absent/unreadable) and
- * its env in; this mirrors the proxy's `extractCodexToken` + env fallback so the
+ * its env in; this mirrors the host's `extractCodexToken` + env fallback so the
  * startup probe accepts exactly when a dispatch would.
  */
 export function codexCredentialAvailable(

@@ -266,12 +266,12 @@ export function buildServiceConfig(
   // acp (Symphony extension; see §4.3.6). `adapter` selects
   // one of symphony's known profiles (claude, codex, opencode); symphony auto-derives the
   // launch command from the adapter profile. Credentials are NOT staged into the workspace:
-  // every shipped adapter routes inference through the host credential proxy, so the VM
-  // only ever sees `<provider>_BASE_URL=<proxy>` + a per-dispatch sentinel token. The
-  // proxy swaps the sentinel for the real host credential request-side
+  // the guest only ever holds a token-shaped placeholder, and the host substitutes the real
+  // upstream token into the outbound request at Gondolin egress (TLS-MITM via
+  // `createHttpHooks` in src/agent/credential-secrets.ts). The real host credential
   // (`~/.claude/.credentials.json` for claude; `~/.codex/auth.json` access token or
   // `OPENAI_API_KEY` for codex; the GitHub Copilot token exchanged from
-  // `~/.local/share/opencode/auth.json` for opencode).
+  // `~/.local/share/opencode/auth.json` for opencode) never enters the VM.
   //
   // `acp.bridge` configures the host-side TCP listener that the in-VM agent dials back
   // to for ACP traffic. The bridge replaced the earlier in-VM-exec stdio path; see
@@ -743,11 +743,10 @@ export function warnOnHooksAndActionsConflict(cfg: ServiceConfig): void {
 // Dispatch preflight validation (structural, pure). The fs-touching probes —
 // `tracker.root` existence and the adapter credential files — live in the shell
 // loader's `validateDispatchIo`, which the orchestrator calls alongside this
-// function. Both proxy adapters are
-// startup-probed: claude requires a single readable host file
-// (`~/.claude/.credentials.json`); codex passes when either `~/.codex/auth.json`
-// holds a token (ChatGPT-OAuth `tokens.access_token` or a top-level
-// `OPENAI_API_KEY`) or the host `OPENAI_API_KEY` env var is set. Keeping this
+// function. Both adapters are startup-probed: claude requires a single readable
+// host file (`~/.claude/.credentials.json`); codex passes when either
+// `~/.codex/auth.json` holds a token (ChatGPT-OAuth `tokens.access_token` or a
+// top-level `OPENAI_API_KEY`) or the host `OPENAI_API_KEY` env var is set. Keeping this
 // structural half pure means tests and the reload tick can re-run it cheaply on
 // every reconcile without re-hitting the disk.
 export function validateDispatch(cfg: ServiceConfig): string | null {

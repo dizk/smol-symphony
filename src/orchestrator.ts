@@ -283,14 +283,15 @@ export class Orchestrator
 
   /**
    * Fail fast when symphony will dispatch to an adapter whose host credential
-   * (consumed by the credential proxy) is missing. Per-state overrides can
-   * change the adapter, so the set is the union of `cfg.acp.adapter` and every
-   * distinct `states.<name>.adapter`. claude needs `~/.claude/.credentials.json`;
-   * codex needs either a `~/.codex/auth.json` token or an `OPENAI_API_KEY` env
-   * var; opencode needs either a `github-copilot` token in
-   * `~/.local/share/opencode/auth.json` or a COPILOT_GITHUB_TOKEN/GH_TOKEN/
-   * GITHUB_TOKEN env var. A missing credential surfaces here as a clear startup
-   * error rather than an opaque per-request proxy failure mid-dispatch.
+   * (substituted into the outbound request at Gondolin egress) is missing.
+   * Per-state overrides can change the adapter, so the set is the union of
+   * `cfg.acp.adapter` and every distinct `states.<name>.adapter`. claude needs
+   * `~/.claude/.credentials.json`; codex needs either a `~/.codex/auth.json`
+   * token or an `OPENAI_API_KEY` env var; opencode needs either a
+   * `github-copilot` token in `~/.local/share/opencode/auth.json` or a
+   * COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN env var. A missing credential
+   * surfaces here as a clear startup error rather than an opaque per-request
+   * egress failure mid-dispatch.
    */
   private async assertAdapterCredentials(): Promise<void> {
     const ids = requiredAdapterIds(this.cfg, isKnownAdapter);

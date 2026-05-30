@@ -165,12 +165,12 @@ export interface AgentConfig {
 
 // ACP adapter configuration. `adapter` selects one of symphony's known adapter profiles
 // (currently `claude` and `codex`); the profile encodes the binary symphony launches
-// inside the VM. Credentials never enter the VM: both adapters route through the host
-// credential proxy, which substitutes a per-VM sentinel for the real key on every
-// upstream request — the Anthropic OAuth access token for claude, the
-// `~/.codex/auth.json` access token (or host `OPENAI_API_KEY`) for codex. The VM only
-// ever sees `<PROVIDER>_BASE_URL=<proxy>` plus the sentinel. Operators who need a
-// custom launch shape fork scripts/vm-agent.mjs.
+// inside the VM. Credentials never enter the VM: the guest only ever holds a token-shaped
+// placeholder, and the host substitutes the real key into the outbound request at Gondolin
+// egress (TLS-MITM via `createHttpHooks` in src/agent/credential-secrets.ts) — the
+// Anthropic OAuth access token for claude, the `~/.codex/auth.json` access token (or host
+// `OPENAI_API_KEY`) for codex. Operators who need a custom launch shape fork
+// scripts/vm-agent.mjs.
 export interface AcpConfig {
   adapter: string;
   /**
