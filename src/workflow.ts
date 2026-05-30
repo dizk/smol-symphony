@@ -300,12 +300,9 @@ export function buildServiceConfig(
   };
 
   // credentials extension (issue 113). Defaults work out of the box for the
-  // common case: bind on 127.0.0.1 with an ephemeral port, run the host
-  // ticker every 6 hours.
+  // common case: run the host ticker every 6 hours.
   const credentialsRaw = getObject(raw, 'credentials');
   const credentials: CredentialsConfig = {
-    proxy_bind_host: asString(credentialsRaw['proxy_bind_host']) ?? '127.0.0.1',
-    proxy_bind_port: asInt(credentialsRaw['proxy_bind_port'], 0),
     ticker_interval_ms: asInt(credentialsRaw['ticker_interval_ms'], 6 * 60 * 60 * 1000),
   };
 

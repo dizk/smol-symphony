@@ -163,28 +163,22 @@ describe('workflow', () => {
     assert.equal(cfg.acp.model, 'claude-opus-4-7');
   });
 
-  it('parses the credentials block (proxy bind host/port + ticker interval) (issue 113)', () => {
+  it('parses the credentials block (ticker interval) (issue 113)', () => {
     const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
         states: minimalStates,
         credentials: {
-          proxy_bind_host: '0.0.0.0',
-          proxy_bind_port: 9999,
           ticker_interval_ms: 600_000,
         },
       },
       '/tmp/WORKFLOW.md',
     );
-    assert.equal(cfg.credentials.proxy_bind_host, '0.0.0.0');
-    assert.equal(cfg.credentials.proxy_bind_port, 9999);
     assert.equal(cfg.credentials.ticker_interval_ms, 600_000);
     const defaults = buildServiceConfig(
       { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
       '/tmp/WORKFLOW.md',
     );
-    assert.equal(defaults.credentials.proxy_bind_host, '127.0.0.1');
-    assert.equal(defaults.credentials.proxy_bind_port, 0);
     assert.equal(defaults.credentials.ticker_interval_ms, 6 * 60 * 60 * 1000);
   });
 
