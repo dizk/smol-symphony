@@ -2,7 +2,7 @@
 // Gondolin migration). No VM, no /dev/kvm, no network — fakes only.
 //
 // Coverage:
-//   - per-adapter hooks-config shape (allowedHosts, token-shaped placeholder,
+//   - per-adapter hooks-config shape (substitutionHosts → allowedHosts, token-shaped placeholder,
 //     secret name, billing-tell onResponse, opencode onRequest present)
 //   - the registry push-to-all fan-out incl. a torn-down manager (no throw; the
 //     survivor still gets updated) and seed-on-register from the cache
@@ -113,6 +113,25 @@ describe('buildAdapterHooksConfig — per-adapter shape', () => {
     const placeholder = typeof secret.placeholder === 'function' ? secret.placeholder() : secret.placeholder;
     assert.ok(placeholder!.startsWith('gho_'), `placeholder ${placeholder} should be token-shaped`);
     assert.equal(typeof cfg.options.onRequest, 'function', 'opencode has the path-allowlist guard');
+  });
+
+  it('egress allowlist is UNIONED into allowedHosts but NEVER into the secret substitution scope', () => {
+    const specs = stubSpecs();
+    // Includes a host that overlaps claude's own substitution host, to prove dedup.
+    const egress = ['registry.npmjs.org', 'github.com', 'api.anthropic.com'];
+    const cfg = buildAdapterHooksConfig(specs.claude!, egress);
+    // Firewall = egress ∪ substitutionHosts, de-duplicated (api.anthropic.com once).
+    assert.deepEqual(
+      [...cfg.options.allowedHosts!].sort(),
+      ['api.anthropic.com', 'github.com', 'registry.npmjs.org'],
+      'allowedHosts = egress ∪ substitutionHosts, deduped',
+    );
+    // SECURITY: the secret substitutes ONLY on the substitution host — a general
+    // egress host (npm/github) is reachable but never receives the real token.
+    const secret = cfg.options.secrets!['ANTHROPIC_AUTH_TOKEN']!;
+    assert.deepEqual(secret.hosts, ['api.anthropic.com'], 'substitution scope excludes egress hosts');
+    assert.ok(!secret.hosts!.includes('registry.npmjs.org'));
+    assert.ok(!secret.hosts!.includes('github.com'));
   });
 });
 

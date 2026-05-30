@@ -184,7 +184,12 @@ function base64urlJson(obj: unknown): string {
  * Per-adapter credential lifecycle, reusing the proxy's extractor/mint/refresh
  * logic verbatim — only the *delivery* (push into a Gondolin secret) is new.
  *   - `secretName`     the Gondolin secret / env var name the placeholder is keyed under
- *   - `allowedHosts`   the egress allowlist for this adapter's `createHttpHooks`
+ *   - `substitutionHosts` the hosts the real token may be substituted onto at egress
+ *                      (the credential's validity scope). NOT the general firewall:
+ *                      `buildAdapterHooksConfig` unions these with the workspace
+ *                      `egress.allowed_hosts` to form `createHttpHooks.allowedHosts`,
+ *                      but only `substitutionHosts` are wired into `secrets[].hosts`,
+ *                      so a general egress host never receives a real token.
  *   - `placeholder`    the token-shaped placeholder generator (§4.3)
  *   - `billingHeaders` the billing-tell response header set (`onResponse` logging)
  *   - `readToken()`    resolve the current host-side access token (or null)
@@ -195,7 +200,9 @@ function base64urlJson(obj: unknown): string {
 export interface AdapterCredentialSpec {
   adapterId: AcpAdapterId;
   secretName: string;
-  allowedHosts: readonly string[];
+  /** Hosts the real token may be substituted onto (credential validity scope),
+   *  NOT the general egress firewall — see the interface doc above. */
+  substitutionHosts: readonly string[];
   placeholder(): () => string;
   billingHeaders: readonly string[];
   readToken(): Promise<TokenInfo | null>;
@@ -334,7 +341,7 @@ export function buildAdapterCredentialSpecs(
     claude: {
       adapterId: 'claude',
       secretName: CLAUDE_SECRET_NAME,
-      allowedHosts: [CLAUDE_UPSTREAM_HOST],
+      substitutionHosts: [CLAUDE_UPSTREAM_HOST],
       placeholder: claudePlaceholder,
       billingHeaders: CLAUDE_BILLING_TELL_HEADERS,
       readToken: async () => extractClaudeToken(await readJsonFile(claudeCredsPath)),
@@ -344,7 +351,7 @@ export function buildAdapterCredentialSpecs(
     codex: {
       adapterId: 'codex',
       secretName: CODEX_SECRET_NAME,
-      allowedHosts: [CODEX_UPSTREAM_HOST],
+      substitutionHosts: [CODEX_UPSTREAM_HOST],
       // codex-acp streams /backend-api/codex/responses over a WebSocket Upgrade.
       // It MUST be allowed: the real token is substituted on the hookable Upgrade
       // handshake (createHttpHooks onRequest → applySecretsToRequest), so the
@@ -414,8 +421,10 @@ function buildOpencodeSpec(args: {
     secretName: OPENCODE_SECRET_NAME,
     // Inference host + the host-mint exchange host. The exchange host is gated by
     // `onRequest` (only GET /copilot_internal/v2/token) — the durable-token
-    // oracle guard (§4.4).
-    allowedHosts: [COPILOT_INFERENCE_HOST, COPILOT_EXCHANGE_HOST],
+    // oracle guard (§4.4). Both are substitution hosts: the minted Copilot token
+    // is valid on inference, and the exchange handshake is hookable on the
+    // exchange host (the placeholder never egresses).
+    substitutionHosts: [COPILOT_INFERENCE_HOST, COPILOT_EXCHANGE_HOST],
     placeholder: opencodePlaceholder,
     billingHeaders: COPILOT_BILLING_TELL_HEADERS,
     egressHeaders: COPILOT_EGRESS_HEADERS,
@@ -533,15 +542,28 @@ export interface AdapterHooksConfig {
   allowWebSockets: boolean;
 }
 
-/** Build the `createHttpHooks` config for a single adapter spec. */
-export function buildAdapterHooksConfig(spec: AdapterCredentialSpec): AdapterHooksConfig {
+/**
+ * Build the `createHttpHooks` config for a single adapter spec.
+ *
+ * The egress firewall (`options.allowedHosts`) = the general workspace dev-tooling
+ * allowlist (`egress.allowed_hosts` from WORKFLOW.md — npm/git/CDNs) UNION this
+ * adapter's `substitutionHosts` (you must be able to reach the host whose token you
+ * substitute on). SECURITY: only `substitutionHosts` are wired into
+ * `secrets[].hosts`, so the real token is NEVER substituted for a general egress
+ * host — those receive plain network egress only. The firewall is the union; the
+ * substitution scope is not.
+ */
+export function buildAdapterHooksConfig(
+  spec: AdapterCredentialSpec,
+  egressAllowlist: readonly string[] = [],
+): AdapterHooksConfig {
   const onRequest = spec.onRequest;
   const onResponse = makeBillingTellResponseHook(spec.adapterId, spec.billingHeaders);
   const options: CreateHttpHooksOptions = {
-    allowedHosts: [...spec.allowedHosts],
+    allowedHosts: [...new Set([...egressAllowlist, ...spec.substitutionHosts])],
     secrets: {
       [spec.secretName]: {
-        hosts: [...spec.allowedHosts],
+        hosts: [...spec.substitutionHosts],
         // Seeded later via `updateSecret`; the empty initial value is never
         // forwarded on the happy path (the registry seeds before first exec).
         value: '',
