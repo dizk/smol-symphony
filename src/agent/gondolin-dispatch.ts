@@ -82,6 +82,17 @@ export interface GondolinDispatchOptions {
   runtimeEnv: Record<string, string>;
   /** Diagnostic stderr sink (run log + event ring on the runner side). */
   onStderr: StderrSink;
+  /**
+   * Extra non-credential runtime files to materialize in the guest BEFORE the
+   * agent launches (e.g. claude's `~/.claude/settings.json` carrying the
+   * `effortLevel` runtime knob). These replace the smolvm path's
+   * `deriveAcpCommand` `cp` preamble: the content is known host-side, so it is
+   * written straight into the guest via the same base64-piped exec the fake
+   * creds use — no workspace staging + in-VM copy. Holds NO secret (model/effort
+   * config only); credential material is delivered solely via the secretManager
+   * placeholder + the fake-creds files.
+   */
+  extraGuestFiles?: readonly GuestCredFile[];
   /** Override the credential-mount denylist (tests). */
   mountGuard?: CredentialMountGuardOptions;
   /**
@@ -188,9 +199,15 @@ export class GondolinDispatcher {
     // real token synchronously-after-await). AWAIT it before exec.
     const registered = await this.registerSecretManager(secretManager);
 
-    // Materialize the fake native creds files into the guest BEFORE launching the
-    // agent — the placeholder bearer (a fake) must be in place at first read.
-    await this.stageFakeCredsFiles(vm, fakeCreds.files, opts.workdir);
+    // Materialize the fake native creds files PLUS any non-credential runtime
+    // files (model/effort knobs) into the guest BEFORE launching the agent — the
+    // placeholder bearer (a fake) and the effort settings.json must be in place
+    // at first read.
+    await this.stageFakeCredsFiles(
+      vm,
+      [...fakeCreds.files, ...(opts.extraGuestFiles ?? [])],
+      opts.workdir,
+    );
 
     const exec = this.launchAgent(vm, opts, mapping.acpUrl, fakeCreds.env);
     return this.buildHandle(vm, exec, registered, mapping.acpUrl, fakeCreds);
