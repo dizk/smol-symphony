@@ -1,21 +1,21 @@
 // ACP TCP bridge — host-side transport for the in-VM ACP adapter.
 //
-// Before this module, symphony spoke ACP to the in-VM adapter over the smolvm-exec
-// stdio channel directly. Two problems with that:
+// Before this module, symphony spoke ACP to the in-VM adapter over the earlier
+// in-VM-exec stdio channel directly. Two problems with that:
 //
-//   1. smolvm-exec's stdin pump does not reliably wake the in-VM reader for new
+//   1. The in-VM-exec stdin pump does not reliably wake the in-VM reader for new
 //      event-loop iterations unless host-side stdin keeps writing — so once symphony
 //      stopped writing (after `session/prompt`), the adapter would freeze waiting for
 //      events that the kernel had already delivered. The previous workaround was a
-//      1.5 s `\n` keepalive on the smolvm-exec stdin.
+//      1.5 s `\n` keepalive on the in-VM-exec stdin.
 //
-//   2. The smolvm-exec stdio path tightly couples symphony to smolvm. If we ever swap
-//      smolvm out for another sandbox (firecracker, gvisor, Kubernetes job, …) we'd
-//      have to relearn the same per-sandbox-stdio quirks.
+//   2. The in-VM-exec stdio path tightly coupled symphony to the exec channel. If we
+//      ever swap the sandbox out for another (firecracker, gvisor, Kubernetes job, …)
+//      we'd have to relearn the same per-sandbox-stdio quirks.
 //
 // This bridge replaces that path: symphony binds a TCP listener; the in-VM `vm-agent`
 // dials back, authenticates with a per-dispatch bearer token, and from then on ACP
-// JSON-RPC frames flow over a regular TCP socket. smolvm-exec is reduced to a process
+// JSON-RPC frames flow over a regular TCP socket. The in-VM exec is reduced to a process
 // launcher — its stdio is used only for diagnostic stderr from the in-VM agent. Any
 // sandbox that can (a) exec a process with env vars and (b) reach the host loopback
 // can now run our agent stack.
@@ -32,7 +32,7 @@
 //      `accepted` promise with the now-authenticated socket.
 //   4. Caller hands the socket to AcpClient as its stdin/stdout.
 //   5. On attempt teardown the caller closes the socket; vm-agent reacts by killing
-//      the adapter and exiting; smolvm-exec sees the in-VM agent exit; the orchestrator
+//      the adapter and exiting; the in-VM exec sees the in-VM agent exit; the orchestrator
 //      destroys the VM (per current lifecycle).
 
 import { createServer, type Server, type Socket } from 'node:net';
@@ -68,7 +68,7 @@ export interface AcpBridgeOptions {
    * passes this: its ACP channel is raw mapped TCP (the guest dials a synthetic name
    * tunnelled to `127.0.0.1:<port>` via `tcp.hosts`), so a wider bind (e.g.
    * `0.0.0.0`) would expose the bearer-gated control channel to the host LAN with no
-   * benefit. Default false keeps the existing smolvm dispatch behavior unchanged
+   * benefit. Default false keeps the legacy dispatch behavior unchanged
    * (it binds whatever host config supplies, typically the QEMU slirp gateway).
    */
   loopbackOnly?: boolean;

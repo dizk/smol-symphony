@@ -219,9 +219,8 @@ describe('resolveDispatchConfig', () => {
 describe('buildEvalModeMounts', () => {
   it('returns no mounts when the state did not opt in', () => {
     // Defensive: even with both roots configured, a state that didn't set
-    // eval_mode: true should contribute zero extra mounts. Smolvm's per-VM
-    // mount cap is small so this is a load-bearing assertion — flipping it
-    // by accident would consume mount slots on every dispatch.
+    // eval_mode: true should contribute zero extra mounts — flipping it by
+    // accident would add VFS mounts to every dispatch that didn't ask for them.
     const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
@@ -265,7 +264,7 @@ describe('buildEvalModeMounts', () => {
     // Defense in depth: the local-tracker loader always pins tracker.root,
     // but a hand-built ServiceConfig (or a future non-local tracker) might
     // leave it null. The eval-mode mounts then degrade to whichever roots
-    // are available rather than passing a null host path to smolvm.
+    // are available rather than passing a null host path to the VM mount.
     const cfg = buildServiceConfig(
       {
         // Non-local tracker — parser does not auto-default tracker.root.

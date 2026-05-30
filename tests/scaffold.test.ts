@@ -77,12 +77,10 @@ describe('scaffold', () => {
       // Prompt body must include the issue identifier Liquid hook so the
       // dispatched agent sees which issue it is working on.
       assert.match(def.prompt_template, /\{\{\s*issue\.identifier\s*\}\}/);
-      // Scaffold deliberately leaves smolvm source unset; sources.length=0
-      // is allowed by the parser (the operator picks image/from/smolfile
-      // themselves before the first dispatch).
-      assert.equal(cfg.smolvm.smolfile, null);
-      assert.equal(cfg.smolvm.image, null);
-      assert.equal(cfg.smolvm.from, null);
+      // Scaffold deliberately leaves the gondolin image unset; the parser allows
+      // it (the operator pins gondolin.image to a built image before the first
+      // dispatch — the runner fails fast at boot if it's still unset).
+      assert.equal(cfg.gondolin.image, null);
     });
   });
 });

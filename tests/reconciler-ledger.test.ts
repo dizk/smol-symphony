@@ -1,5 +1,5 @@
 // Unit tests for ResourceActionLedger (issue 43). The four resources
-// (bake/vm/workspace/pr) used to verify these semantics indirectly through
+// (vm/workspace/pr) used to verify these semantics indirectly through
 // each resource's snapshot; centralizing the plumbing means the contract is
 // pinned in one place.
 
@@ -18,12 +18,12 @@ function pinnedClock(seed: number): () => number {
 
 describe('ResourceActionLedger', () => {
   it('start unshifts an in_progress row carrying the resource id', () => {
-    const ledger = new ResourceActionLedger('bake', { now: () => 1_700_000_000_000 });
-    ledger.start('bake:abc');
+    const ledger = new ResourceActionLedger('vm', { now: () => 1_700_000_000_000 });
+    ledger.start('kill_session:abc');
     const rows = ledger.snapshot();
     assert.equal(rows.length, 1);
-    assert.equal(rows[0]!.resource, 'bake');
-    assert.equal(rows[0]!.action, 'bake:abc');
+    assert.equal(rows[0]!.resource, 'vm');
+    assert.equal(rows[0]!.action, 'kill_session:abc');
     assert.equal(rows[0]!.state, 'in_progress');
     assert.equal(rows[0]!.finished_at, null);
     assert.equal(rows[0]!.error, null);
@@ -64,12 +64,12 @@ describe('ResourceActionLedger', () => {
   });
 
   it('error promotes to an orphan row when no in_progress row exists', () => {
-    const ledger = new ResourceActionLedger('bake', { now: () => 1_700_000_000_000 });
-    ledger.error('bake:read-smolfile', 'ENOENT');
+    const ledger = new ResourceActionLedger('vm', { now: () => 1_700_000_000_000 });
+    ledger.error('gc:read', 'ENOENT');
     const rows = ledger.snapshot();
     assert.equal(rows.length, 1);
     assert.equal(rows[0]!.state, 'error');
-    assert.equal(rows[0]!.action, 'bake:read-smolfile');
+    assert.equal(rows[0]!.action, 'gc:read');
     assert.equal(rows[0]!.error, 'ENOENT');
     assert.equal(rows[0]!.started_at, rows[0]!.finished_at);
   });
@@ -98,19 +98,19 @@ describe('ResourceActionLedger', () => {
   });
 
   it('snapshot defaults to maxHistory when no maxItems is passed', () => {
-    const ledger = new ResourceActionLedger('bake', { maxHistory: 4 });
+    const ledger = new ResourceActionLedger('vm', { maxHistory: 4 });
     for (let i = 0; i < 6; i++) {
-      ledger.start(`bake:${i}`);
-      ledger.done(`bake:${i}`);
+      ledger.start(`kill_session:${i}`);
+      ledger.done(`kill_session:${i}`);
     }
     assert.equal(ledger.snapshot().length, 4);
   });
 
   it('internal buffer is capped at maxHistory * 2 (clamp keeps a small lookback)', () => {
-    const ledger = new ResourceActionLedger('bake', { maxHistory: 3 });
+    const ledger = new ResourceActionLedger('vm', { maxHistory: 3 });
     for (let i = 0; i < 100; i++) {
-      ledger.start(`bake:${i}`);
-      ledger.done(`bake:${i}`);
+      ledger.start(`kill_session:${i}`);
+      ledger.done(`kill_session:${i}`);
     }
     // Snapshot at the clamp ceiling proves no growth beyond maxHistory * 2.
     assert.equal(ledger.snapshot(1000).length, 6);
@@ -149,12 +149,12 @@ describe('ResourceActionLedger', () => {
     assert.equal(rows[1]!.state, 'done');
   });
 
-  it('opaque action keys support hash-based shapes (bake)', () => {
-    const ledger = new ResourceActionLedger('bake');
-    ledger.start('bake:deadbeef');
-    ledger.done('bake:deadbeef');
+  it('opaque action keys support hash-based shapes (vm)', () => {
+    const ledger = new ResourceActionLedger('vm');
+    ledger.start('kill_session:deadbeef');
+    ledger.done('kill_session:deadbeef');
     const rows = ledger.snapshot();
-    assert.equal(rows[0]!.action, 'bake:deadbeef');
+    assert.equal(rows[0]!.action, 'kill_session:deadbeef');
     assert.equal(rows[0]!.state, 'done');
   });
 });

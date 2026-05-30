@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, stat, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -8,6 +8,7 @@ import {
   isKnownAdapter,
   deriveAcpCommand,
   stageRuntimeFile,
+  stageClaudeIdentity,
   stageCodexPlaceholderAuth,
   stageOpencodeConfig,
   buildOpencodeConfig,
@@ -74,18 +75,12 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
       },
       ...over,
     },
-    smolvm: {
+    gondolin: {
       image: null,
-      from: null,
-      smolfile: null,
       cpus: 1,
       mem_mib: 256,
-      // The TCP bridge needs the VM to reach the host listener; validateDispatch refuses
-      // `net: false` under the bridge transport.
-      net: true,
       volumes: [],
       forward_env: [],
-      endpoint: 'unix:///tmp/sock',
     },
     server: { port: null, host: '127.0.0.1' },
     mcp: { enabled: true, host: '10.0.2.2', explicit_host_url: null },
@@ -148,11 +143,11 @@ describe('adapters registry', () => {
   });
 
   it('deriveAcpCommand with no extra files just execs the in-VM proxy', () => {
-    // Credentials no longer cross the boundary: the in-VM proxy reads its config
+    // Credentials no longer cross the boundary: the in-VM agent reads its config
     // (SYMPHONY_ACP_URL/TOKEN/ADAPTER_BIN/ADAPTER_ARGS) from the environment
-    // symphony sets on the `smolvm exec` invocation and the credential proxy
-    // mints a per-VM sentinel for the bearer. So with no extra files staged the
-    // command is literally just `exec node /opt/symphony/vm-agent.mjs`.
+    // symphony sets on the VM exec invocation, and the host substitutes the real
+    // token at egress. So with no extra files staged the command is literally
+    // just `exec node /opt/symphony/vm-agent.mjs`.
     const cmd = deriveAcpCommand(ADAPTERS.claude);
     assert.equal(cmd, 'exec node /opt/symphony/vm-agent.mjs');
     assert.doesNotMatch(cmd, /SYMPHONY_/);
@@ -176,9 +171,9 @@ describe('adapters registry', () => {
     };
     const cmd = deriveAcpCommand(evil);
     // The adapter binary + args don't appear in the bash command at all under the TCP
-    // architecture — they're passed via env on the smolvm-exec call, where the values
-    // are argv to `smolvm` rather than substituted into a shell. The command must end
-    // exactly at the proxy exec; nothing the profile contributes lands in the shell.
+    // architecture — they're passed via env on the VM exec call, where the values
+    // are argv to the VM runner rather than substituted into a shell. The command must
+    // end exactly at the agent exec; nothing the profile contributes lands in the shell.
     assert.match(cmd, /exec node \/opt\/symphony\/vm-agent\.mjs$/);
     assert.doesNotMatch(cmd, /opencode/);
     assert.doesNotMatch(cmd, /rm -rf \//);
@@ -572,65 +567,92 @@ describe('validateDispatch', () => {
     }
   });
 
-  it('rejects smolvm.net=false (in-VM proxy must reach the bridge)', async () => {
+  it('accepts a bare valid config (no VM image required for structural validation)', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
     try {
       const cfg = bareCfg({ adapter: 'claude' });
       cfg.tracker.root = root;
-      cfg.smolvm.net = false;
-      const err = validateDispatch(cfg);
-      assert.ok(err, 'expected validation error');
-      assert.match(err!, /smolvm\.net=false is incompatible/);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('rejects setting both smolvm.image and smolvm.smolfile (mutually exclusive)', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
-    try {
-      const cfg = bareCfg({ adapter: 'claude' });
-      cfg.tracker.root = root;
-      cfg.smolvm.image = 'node:24-bookworm-slim';
-      cfg.smolvm.smolfile = '/nonexistent/Smolfile';
-      const err = validateDispatch(cfg);
-      assert.ok(err, 'expected validation error');
-      assert.match(err!, /set at most one of image \/ from \/ smolfile/);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('rejects smolvm.smolfile pointing at a missing file', async () => {
-    // smolfile existence is an fs probe; structural validateDispatch returns
-    // null and the loader-side validateDispatchIo surfaces the missing-file
-    // error.
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
-    try {
-      const cfg = bareCfg({ adapter: 'claude' });
-      cfg.tracker.root = root;
-      cfg.smolvm.smolfile = path.join(root, 'no-such-Smolfile');
-      assert.equal(validateDispatch(cfg), null);
-      const err = validateDispatchIo(cfg);
-      assert.ok(err, 'expected validation error');
-      assert.match(err!, /smolvm\.smolfile not found/);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('accepts smolvm.smolfile when the file exists', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vd-'));
-    try {
-      const cfg = bareCfg({ adapter: 'claude' });
-      cfg.tracker.root = root;
-      const smolfilePath = path.join(root, 'Smolfile');
-      await writeFile(smolfilePath, 'image = "node:24-bookworm-slim"\n');
-      cfg.smolvm.smolfile = smolfilePath;
       assert.equal(validateDispatch(cfg), null);
       assert.equal(validateDispatchIo(cfg), null);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('stageClaudeIdentity', () => {
+  let prevHome: string | undefined;
+  let tmpHome: string;
+  let tmpWs: string;
+
+  beforeEach(async () => {
+    prevHome = process.env.HOME;
+    tmpHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-identity-home-'));
+    tmpWs = await mkdtemp(path.join(os.tmpdir(), 'symphony-identity-ws-'));
+    process.env.HOME = tmpHome;
+  });
+
+  afterEach(async () => {
+    process.env.HOME = prevHome;
+    await rm(tmpHome, { recursive: true, force: true });
+    await rm(tmpWs, { recursive: true, force: true });
+  });
+
+  it('writes a minimal identity file with only oauthAccount.{accountUuid,organizationUuid}', async () => {
+    // Host ~/.claude.json may carry a lot of operator-local state: prompt history pointers,
+    // session_id, device_id, theme. None of that should reach the VM.
+    await writeFile(
+      path.join(tmpHome, '.claude.json'),
+      JSON.stringify({
+        oauthAccount: {
+          accountUuid: 'ACCT-uuid-abc',
+          organizationUuid: 'ORG-uuid-xyz',
+          emailAddress: 'operator@example.com',
+        },
+        device_id: 'device-leak-me',
+        session_id: 'session-leak-me',
+        recent_paths: ['/operator/private/dir'],
+        access_token_should_never_be_here: 'sk-ant-oat-fake-token',
+        refreshToken: 'sk-ant-oar-fake-refresh',
+      }),
+      'utf8',
+    );
+    const staged = await stageClaudeIdentity(tmpWs);
+    assert.ok(staged, 'staging should succeed when oauthAccount is present');
+    const onDisk = await readFile(staged!.absPath, 'utf8');
+    const parsed = JSON.parse(onDisk) as Record<string, unknown>;
+    assert.deepEqual(parsed, {
+      oauthAccount: {
+        accountUuid: 'ACCT-uuid-abc',
+        organizationUuid: 'ORG-uuid-xyz',
+      },
+    });
+    // Defensive scan against the literal token + leakable identifier substrings.
+    assert.equal(onDisk.includes('accessToken'), false);
+    assert.equal(onDisk.includes('refreshToken'), false);
+    assert.equal(onDisk.includes('device-leak-me'), false);
+    assert.equal(onDisk.includes('session-leak-me'), false);
+    assert.equal(onDisk.includes('sk-ant'), false);
+    assert.equal(onDisk.includes('operator@example.com'), false);
+    // Path matches the documented layout.
+    assert.match(staged!.relPath, /symphony-runtime\/identity\/claude\.json$/);
+    // Mode is restrictive (0600).
+    const st = await stat(staged!.absPath);
+    assert.equal(st.mode & 0o777, 0o600);
+  });
+
+  it('returns null when ~/.claude.json is missing', async () => {
+    const result = await stageClaudeIdentity(tmpWs);
+    assert.equal(result, null);
+  });
+
+  it('returns null when oauthAccount is malformed or missing UUIDs', async () => {
+    await writeFile(
+      path.join(tmpHome, '.claude.json'),
+      JSON.stringify({ oauthAccount: { accountUuid: 'present-but-no-org' } }),
+      'utf8',
+    );
+    const result = await stageClaudeIdentity(tmpWs);
+    assert.equal(result, null);
   });
 });

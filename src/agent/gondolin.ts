@@ -3,7 +3,7 @@
 // Implements the `vm-port.ts` contract. Thin by design: `createVm` → `VM.create`
 // (host mounts become `RealFSProvider`/`ReadonlyProvider` VFS entries), the
 // handle's `exec` → `vm.exec` (piped stdio + an `AbortController` standing in
-// for the smolvm port's `kill()`), `close` → `vm.close`, and `listSessions`/`gc`
+// for the VM port's `kill()`), `close` → `vm.close`, and `listSessions`/`gc`
 // → Gondolin's session registry. No domain imports (hexagonal `adapters↛inward`).
 //
 // Phase 0: added but not yet wired into the runner/reconciler — that is Phase 1+.

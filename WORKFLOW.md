@@ -64,7 +64,7 @@ states:
     # lessons, and file improvement proposals via propose_issue (which land in
     # Triage — the human gate). It reflects on *how symphony runs work*
     # (WORKFLOW.md prompt branches, per-state model/max_turns/effort, hooks,
-    # Smolfile, acceptance criteria, timeouts), NOT the product code under
+    # the gondolin image config, acceptance criteria, timeouts), NOT the product code under
     # review. After filing it transitions to Dormant and waits to be re-armed.
     # See the Reflect prompt branch (the `when "Reflect"` case in the body) for
     # the read → distil → propose loop and the guardrails. Cadence: the operator
@@ -264,20 +264,18 @@ agent:
 
 acp:
   # Selecting "claude" is enough: symphony probes ~/.claude/.credentials.json
-  # on the host at startup (the credential proxy reads it on every upstream
-  # request to substitute the live access token for a per-VM sentinel) and
-  # auto-generates a launch command for the in-VM proxy. There is no `command`
-  # escape hatch under the TCP bridge transport — the launch shape is fixed;
-  # fork scripts/vm-agent.mjs if you need to customize what the proxy spawns.
+  # on the host at startup and auto-generates a launch command for the in-VM
+  # agent. There is no `command` escape hatch under the TCP bridge transport —
+  # the launch shape is fixed; fork scripts/vm-agent.mjs if you need to customize
+  # what the agent spawns.
   adapter: claude
   # Credentials never enter the VM (issue 113; codex generalized in 116). The
-  # host credential proxy substitutes a per-VM sentinel for the real upstream
-  # credential on every request: for claude, the Anthropic OAuth access token;
-  # for codex (the Review state's adapter), the OpenAI credential read from
-  # ~/.codex/auth.json (access token or OPENAI_API_KEY, never the refresh
-  # token). The codex VM is launched with OPENAI_BASE_URL=<proxy> +
-  # OPENAI_API_KEY=<sentinel>; the real OPENAI_API_KEY is stripped from the
-  # forwarded VM boot env, so no real OpenAI credential lands in the VM.
+  # guest holds only a token-shaped placeholder; the host substitutes the real
+  # upstream credential into the outbound request at Gondolin egress (TLS-MITM):
+  # for claude, the Anthropic OAuth access token; for codex (the Review state's
+  # adapter), the OpenAI credential read from ~/.codex/auth.json (access token or
+  # OPENAI_API_KEY, never the refresh token). Every credential-bearing var is
+  # stripped from the forwarded VM boot env, so no real credential lands in the VM.
   # Reasoning effort forwarded to claude-agent-acp via a staged settings.json
   # (`{"effortLevel": "xhigh"}`) copied into /root/.claude/settings.json before the
   # adapter starts. xhigh is the second-highest tier under Opus 4.7 (max is the top
@@ -294,9 +292,9 @@ acp:
   prompt_timeout_ms: 3600000
   read_timeout_ms: 30000
   # ACP TCP bridge. Symphony binds a listener on `bridge.bind_host:bind_port`; the in-VM
-  # proxy (`/opt/symphony/vm-agent.mjs`) dials `bridge.reach_host:bind_port` on startup
-  # and authenticates with a per-dispatch bearer token. This replaced the smolvm-exec
-  # stdio path so symphony is not coupled to any particular sandbox's stdio quirks.
+  # agent (`/opt/symphony/vm-agent.mjs`) dials `bridge.reach_host:bind_port` on startup
+  # and authenticates with a per-dispatch bearer token. This replaced the earlier
+  # in-VM-exec stdio path so symphony is not coupled to any particular sandbox's quirks.
   bridge:
     bind_host: 0.0.0.0
     bind_port: 8788
@@ -307,30 +305,26 @@ acp:
   # die at this longer threshold; if the agent is just thinking, we let it finish.
   stall_timeout_ms: 1800000
 
-smolvm:
-  # Declarative VM setup via Smolfile. The reconciler (issue 32) hashes the Smolfile
-  # on startup and on change, builds a .smolmachine artifact under
-  # ~/.cache/symphony/actions/bake/<sha256>.smolmachine, and gates dispatch on
-  # bake-ready. Dispatch then uses `smolvm machine create --from <cache>` so the
-  # Smolfile's apt + npm install are paid once at bake time, not per dispatch.
-  smolfile: ./Smolfile
+gondolin:
+  # Per-issue microVM (Gondolin substrate). `image` is the agent rootfs the VM
+  # boots, built ONCE with `npm run build:image` (see images/agents/) — not baked
+  # per issue. The value is a Gondolin image selector: the content-addressed build
+  # id printed by the build (pinned below for reproducibility), a `name:tag` ref
+  # like `symphony-agents:latest`, or a path to an exported asset directory.
+  image: cb875342-03ef-56e0-9306-dde8628aa17d
   cpus: 2
   mem_mib: 4096
-  net: true
-  # No runtime bind-mounts. scripts/ (the in-VM stdio proxy
-  # /opt/symphony/vm-agent.mjs) is now BAKED INTO the image by the Smolfile's
-  # `[dev].init` cp step, so it no longer needs a per-dispatch /opt/symphony
-  # mount. Dropping it keeps a dispatch at 2 mounts (workspace + whatever a
-  # state adds) so an eval_mode state can add its two read-only mounts
-  # (/symphony/issues + /symphony/logs) without exceeding smolvm/libkrun's
-  # 3-mount-per-VM cap (a 4th mount → `krun_start_enter -22`). Workspace is
-  # auto-mounted by the runner; credentials go through the credential proxy;
-  # the tracker is reached via the symphony MCP server (or the eval_mode mount).
+  # No runtime bind-mounts. The in-VM launcher (/opt/symphony/vm-agent.mjs) is
+  # baked into the image, so it needs no per-dispatch mount. Keeping `volumes`
+  # empty leaves room for an eval_mode state's two read-only mounts (/symphony/issues
+  # + /symphony/logs) on top of the auto-mounted workspace. Credentials never
+  # mount: the host substitutes the real token at Gondolin egress; the tracker is
+  # reached via the symphony MCP server (or the eval_mode mount).
   volumes: []
-  # forward_env is a generic passthrough, but for a proxy adapter (claude, codex)
-  # the runner strips that adapter's credential var from the forwarded boot env
-  # per dispatch and substitutes the per-VM sentinel via the credential proxy —
-  # so listing OPENAI_API_KEY here does NOT plant the real key in a codex VM.
+  # forward_env is a generic passthrough into the VM boot env, but the runner
+  # strips EVERY credential-bearing var before boot (the guest holds only a
+  # placeholder Gondolin substitutes at egress) — so listing OPENAI_API_KEY here
+  # does NOT plant the real key in a VM.
   forward_env:
     - OPENAI_API_KEY
     - ANTHROPIC_API_KEY
@@ -343,13 +337,13 @@ server:
   host: 0.0.0.0
 
 mcp:
-  # The VM's loopback transparently reaches the host's loopback in smolvm, so
+  # Gondolin maps a synthetic guest host to the host's loopback (`tcp.hosts`), so
   # 127.0.0.1 from inside the VM hits the host's listener. Override only if
   # your VMM has a different host alias.
   host: 127.0.0.1
 ---
 You are working on **smol-symphony**, a TypeScript orchestrator that dispatches
-coding agents into per-issue smolvm microVMs and talks to them over the Agent
+coding agents into per-issue Gondolin microVMs and talks to them over the Agent
 Client Protocol (ACP). Your workspace is a fresh clone of this repo.
 
 Issue: **{{ issue.identifier }} — {{ issue.title }}**
@@ -566,7 +560,7 @@ load-bearing — follow them exactly.
   This is where stalls, turn-budget exhaustion, retries, and timeouts show up
   in detail.
 - Your workspace is a clone of the symphony repo, so you can read `WORKFLOW.md`,
-  `WORKFLOW.template.md`, `src/`, the `Smolfile`, etc. to ground each proposal
+  `WORKFLOW.template.md`, `src/`, `images/agents/`, etc. to ground each proposal
   in the concrete knob it would change.
 
 If structured per-issue run summaries exist (companion issue #123), start from
@@ -591,8 +585,8 @@ per-item). Each proposal must:
 
 - name a single concrete change to the **harness / operating config**: a
   `WORKFLOW.md` prompt branch, a per-state `model` / `max_turns` /
-  `allowed_transitions` / `effort`, a hook, the `Smolfile`, an acceptance
-  criterion, or a timeout;
+  `allowed_transitions` / `effort`, a hook, the `gondolin` image config, an
+  acceptance criterion, or a timeout;
 - include a **before → after** (what the config/prompt says now, what you'd
   change it to);
 - cite the **evidence** — the issue ids (and, where useful, the log lines or
@@ -602,8 +596,8 @@ per-item). Each proposal must:
 **Hard guardrails — a proposal that violates any of these must NOT be filed:**
 
 - Propose changes to the **harness only** — `WORKFLOW.md` /
-  `WORKFLOW.template.md`, per-state config, hooks, `Smolfile`, acceptance
-  criteria, timeouts. Do **not** propose edits to product/source code under
+  `WORKFLOW.template.md`, per-state config, hooks, the `gondolin` image config,
+  acceptance criteria, timeouts. Do **not** propose edits to product/source code under
   `src/` as a "fix" for a trajectory; if a genuine product bug is the root
   cause, that is an ordinary `propose_issue` for an implementer, not a harness
   change, and you should frame it that way.

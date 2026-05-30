@@ -1,19 +1,18 @@
-// Host credential-secrets module — re-homes the credential *lifecycle* (extract,
-// mint, refresh) onto Gondolin's secret-injection model. This is the
-// "transport-free" half of the old `credential-proxy.ts`: instead of running an
-// HTTP server that mints per-dispatch sentinels and forwards upstream, we hand
-// Gondolin a `createHttpHooks(...)` config per VM (host allowlist + a
-// token-shaped placeholder secret + request/response hooks) and let Gondolin
-// substitute the real access token into the outbound request at egress
-// (TLS-MITM). The host stays the sole owner of the durable refresh token; the
-// guest only ever sees a placeholder. See `docs/research/gondolin-sandbox-migration.md`
-// §3 (the host-only-refresh invariant), §4.3 (the per-VM fan-out design), §4.4
-// (per-adapter routing).
+// Host credential-secrets module — homes the credential *lifecycle* (extract,
+// mint, refresh) onto Gondolin's secret-injection model. Instead of an HTTP
+// proxy that mints per-dispatch sentinels and forwards upstream (the retired
+// credential-proxy transport), we hand Gondolin a `createHttpHooks(...)` config
+// per VM (host allowlist + a token-shaped placeholder secret + request/response
+// hooks) and let Gondolin substitute the real access token into the outbound
+// request at egress (TLS-MITM). The host stays the sole owner of the durable
+// refresh token; the guest only ever sees a placeholder. See
+// `docs/research/gondolin-sandbox-migration.md` §3 (the host-only-refresh
+// invariant), §4.3 (the per-VM fan-out design), §4.4 (per-adapter routing).
 //
-// DORMANT (Phase 2): nothing on the dispatch path imports this module yet. It
-// reuses the extractor/mint/flock-refresh logic from `credential-proxy.ts` +
-// `adapter-names.ts` rather than duplicating it — only the *shape* of the output
-// (a Gondolin hooks config + an `updateSecret` push) is new.
+// The host-side credential primitives (token extractors, the GitHub→Copilot
+// mint, the flock-serialized refresh) live in `credential-extractors.ts`; this
+// module reuses them + `adapter-names.ts` rather than duplicating — only the
+// *shape* of the output (a Gondolin hooks config + an `updateSecret` push) is new.
 //
 // The §4.3 fan-out, restated as the contract this module owns:
 //   - Each VM gets its own `createHttpHooks` instance, so each has its own
@@ -65,7 +64,7 @@ import {
   type TokenInfo,
   type CopilotTokenExchange,
   type LockAcquire,
-} from './credential-proxy.js';
+} from './credential-extractors.js';
 
 // ---------------------------------------------------------------------------
 // Per-adapter static config (placeholder shape, secret env var name, hosts).

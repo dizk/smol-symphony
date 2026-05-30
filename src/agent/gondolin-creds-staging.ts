@@ -1,6 +1,6 @@
 // Per-adapter Gondolin fake-native-credential staging (design §3.3).
 //
-// This is the credential-MODEL half of the smolvm→Gondolin flip — NOT the proxy
+// This is the credential-MODEL half of the Gondolin backend — NOT the old proxy
 // model. There is no proxy server and no base-URL injection: the in-VM client
 // dials its REAL upstream (claude→api.anthropic.com, codex→chatgpt.com backend,
 // opencode→api.githubcopilot.com) in its NATIVE mode, with a token-shaped
@@ -40,8 +40,9 @@
 // caller, never written into a staged file, and never put in the guest env. The
 // guest-facing invariant (no real token in the VM) holds.
 //
-// DORMANT (Phase 5): only `gondolin-dispatch.ts` (itself off the live runner
-// path) consumes this. The smolvm path keeps `adapters.ts`' `stage*` helpers.
+// LIVE: the runner (`runner.ts`) and `gondolin-dispatch.ts` consume this on the
+// dispatch path. The runtime (non-credential) files still flow through
+// `adapters.ts`' `stage*` helpers.
 //
 // The fake-creds shapes are the ones the spike VERIFIED end-to-end (B5 claude,
 // C7 codex) — see `spike/gondolin/tests/{b5-claude-real,c7-codex-real}.mjs` and
@@ -83,7 +84,7 @@ export interface GondolinFakeCreds {
 // ---------------------------------------------------------------------------
 
 // Guest paths the fake native creds land at (the VM runs as root). These mirror
-// the smolvm `stageAdapterExtras` guest paths (runner.ts) so a client finds its
+// the runner's `stageAdapterExtras` guest paths (runner.ts) so a client finds its
 // creds in exactly the place its native mode looks.
 const CLAUDE_CREDENTIALS_GUEST_PATH = '/root/.claude/.credentials.json';
 const CLAUDE_CONFIG_GUEST_PATH = '/root/.claude.json';

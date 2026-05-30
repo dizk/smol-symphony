@@ -3,21 +3,21 @@
 // to a TCP socket dialed back to the host orchestrator.
 //
 // Why TCP and not stdio: the previous version of this proxy bridged the in-VM adapter's
-// stdio to the smolvm-exec stdio channel directly. That channel has a stdin-pump bug
+// stdio to the VM-exec stdio channel directly. That channel has a stdin-pump bug
 // that wedges the adapter after the SDK's first `available_commands_update` notification
 // (the in-guest reader never wakes for subsequent kernel events unless host stdin keeps
 // writing). We worked around it for a while with a 1.5 s `\n` keepalive on the host
-// side, but the proper fix is to stop piping ACP through smolvm-exec at all. This proxy
+// side, but the proper fix is to stop piping ACP through the VM-exec stdio at all. This proxy
 // dials back to a TCP listener on the host (`SYMPHONY_ACP_URL`), authenticates with a
 // per-dispatch bearer token (`SYMPHONY_ACP_TOKEN`), and from then on talks ACP over a
-// plain socket the host owns. smolvm-exec is reduced to a launcher: its stdio just
+// plain socket the host owns. the VM exec is reduced to a launcher: its stdio just
 // carries this proxy's own diagnostic stderr and the adapter's stderr (`inherit`'d).
 //
 // The same proxy works under any sandbox tech that can launch a process with env vars
 // and reach the host loopback — that's the portability win.
 //
 // Configuration (all required unless noted):
-//   SYMPHONY_ACP_URL          — `tcp://host:port` to dial. `127.0.0.1:8788` under smolvm
+//   SYMPHONY_ACP_URL          — `tcp://host:port` to dial. `127.0.0.1:8788` under the Gondolin bridge mapping
 //                               since the guest loopback is rewritten to the host
 //                               loopback.
 //   SYMPHONY_ACP_TOKEN        — opaque per-dispatch bearer; sent as `Bearer <token>\n`
@@ -114,7 +114,7 @@ function startBridge() {
   log(`spawn ${adapterBin} ${JSON.stringify(adapterArgs)}`);
   const child = spawn(adapterBin, adapterArgs, {
     // Adapter stdio: kernel pipes we fully own. Adapter stderr is inherited so any
-    // crashes / warnings show up on this proxy's stderr → smolvm-exec stderr → host
+    // crashes / warnings show up on this proxy's stderr → VM-exec stderr → host
     // orchestrator stderr capture. ACP frames flow ONLY over the TCP socket.
     stdio: ['pipe', 'pipe', 'inherit'],
   });

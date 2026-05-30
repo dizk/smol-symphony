@@ -6,8 +6,8 @@
 
 A small TypeScript orchestrator that reads issues off a local Markdown tracker,
 prepares per-issue workspaces, and runs coding agents (Claude Code, Codex,
-OpenCode) inside isolated [smolvm](https://smolmachines.com/) microVMs over the
-[Agent Client Protocol](https://agentclientprotocol.com).
+OpenCode) inside isolated per-issue [Gondolin](https://github.com/earendil-works/gondolin)
+microVMs over the [Agent Client Protocol](https://agentclientprotocol.com).
 
 The agent signals progress through an injected MCP server (`transition`,
 `request_human_steering`, `propose_issue`); the orchestrator handles state,
@@ -25,7 +25,7 @@ workspace for review.
 │                                                          │               │
 │                                                          ▼  ACP/RPC      │
 │                                       ┌───────────────────────────────┐  │
-│                                       │ smolvm  (per-issue VM)        │  │
+│                                       │ Gondolin  (per-issue VM)      │  │
 │                                       │   adapter (claude / codex)    │  │
 │                                       │   workspace mount             │  │
 │                                       │   mcp client  ────────────────┼─┐│
@@ -48,32 +48,22 @@ original architectural narrative, see
 Prerequisites:
 
 - Node.js ≥ 20.
-- A `smolvm` binary on `$PATH` with the server reachable on the configured
-  endpoint (e.g. `smolvm serve start --listen unix:///run/user/$UID/smolvm.sock`).
-- A `Smolfile` describing the per-issue VM. The repo ships one at the root that
-  starts from `node:24-bookworm-slim`, installs base CLI tooling, npm-installs
+- The agent rootfs image. Gondolin is the in-process microVM substrate
+  (`@earendil-works/gondolin`), so there is no separate VM daemon to run. The
+  agent image is built **once** from `images/agents/` via `npm run build:image`:
+  it starts from `node:24-bookworm-slim`, installs base CLI tooling, npm-installs
   every ACP-capable coding agent (`claude-agent-acp`, `codex-acp`, `opencode`),
-  and bakes `scripts/` into the image at `/opt/symphony` (a bake-time `cp` from a
-  scratch mount) so the in-VM stdio proxy at `/opt/symphony/vm-agent.mjs` ships in
-  the artifact with no runtime mount — keeping a dispatch within smolvm/libkrun's
-  3-mount cap so an `eval_mode` state can add its two read-only mounts. `WORKFLOW.md`'s
-  `smolvm.smolfile` points at it; symphony's reconciler bakes the Smolfile into
-  a cached `.smolmachine` artifact under `~/.cache/symphony/actions/bake/<sha256>`
-  on first run, then hands `--from <cache>` to `smolvm machine create` on every
-  subsequent dispatch — the per-start `[dev].init` (apt + npm install) only runs
-  once per Smolfile-content change. Run `symphony reconcile --force` (or pass
-  the legacy `--reconcile-force` flag) to drop the cached artifact and rebake.
-  A Rust starter Smolfile lives at `templates/Smolfile.rust` (rustup + cargo
-  + stable toolchain layered with NodeSource so the in-VM proxy still has a
-  Node runtime); a Kotlin / Gradle starter lives at `templates/Smolfile.kotlin`
-  (Temurin 21 JDK + system Gradle layered with NodeSource for the same
-  reason). Point `smolvm.smolfile` at the one you want, or copy it to the
-  project root and adjust the `volumes` path noted in its header.
+  and bakes the in-VM stdio launcher at `/opt/symphony/vm-agent.mjs` into the
+  image. The build prints a content-addressed build id; pin it (or a
+  `name:tag` ref like `symphony-agents:latest`) in `WORKFLOW.md`'s
+  `gondolin.image`. See [images/agents/README.md](./images/agents/README.md)
+  for the build steps and requirements.
 - For the default `acp.adapter: claude`: a credentials file at
   `~/.claude/.credentials.json` on the host. Symphony reads it only on the
-  host side: a loopback proxy substitutes the real OAuth access token for a
-  per-VM sentinel on every request. The credential file itself is never
-  staged into the VM.
+  host side: the guest holds only a token-shaped placeholder, and the host
+  substitutes the real OAuth access token into the outbound request at
+  Gondolin egress (TLS-MITM). The credential file itself is never staged into
+  the VM.
 
 Run, against an existing workflow file in the current directory:
 
@@ -172,7 +162,7 @@ prompt body can branch on the current state with Liquid
 `Todo → Review → Done` flow (Claude implements, Codex reviews).
 
 Symphony watches the file and re-applies poll interval, concurrency, hooks,
-prompt body, smolvm settings, etc. on change without restart. In-flight runs
+prompt body, gondolin settings, etc. on change without restart. In-flight runs
 keep the settings they started with.
 
 ## Dashboard
@@ -228,7 +218,7 @@ bearer token. Three tools:
   the proposal's front-matter as `proposed_by` / `proposed_at` so provenance
   is visible.
 
-In smolvm, the VM's `127.0.0.1` transparently reaches the host's
+In Gondolin, the VM's `127.0.0.1` transparently reaches the host's
 `127.0.0.1` (verified empirically), so the agent reaches the orchestrator
 without any mount or special host alias.
 
@@ -240,8 +230,8 @@ the adapter reaches for inside the VM:
 
 | Adapter   | Binary             | Credential surface                |
 | --------- | ------------------ | --------------------------------- |
-| `claude`  | `claude-agent-acp` | host loopback proxy + sentinel    |
-| `codex`   | `codex-acp`        | host loopback proxy + sentinel    |
+| `claude`  | `claude-agent-acp` | placeholder + host egress swap    |
+| `codex`   | `codex-acp`        | placeholder + host egress swap    |
 
 `WORKFLOW.md`:
 
@@ -257,21 +247,22 @@ acp:
 Selecting an adapter is enough — symphony auto-derives the launch command.
 For `claude`, a per-VM identity file (organization + account UUIDs only,
 no tokens) is staged into the workspace runtime dir and copied to
-`~/.claude.json` inside the VM; requests reach Anthropic via the host
-loopback proxy that substitutes the real access token for the VM's
-sentinel. For `codex`, no identity file is staged (OpenAI ships no
-third-party fingerprint check); the VM is launched with
-`OPENAI_BASE_URL=<proxy>` + `OPENAI_API_KEY=<sentinel>`, and the proxy
-substitutes the real OpenAI credential host-side. Set `command:` only to
-override (testing a forked adapter, a non-standard binary path).
+`~/.claude.json` inside the VM; the guest holds only a token-shaped
+placeholder, and the host substitutes the real access token into the
+outbound request at Gondolin egress. For `codex`, no identity file is
+staged (OpenAI ships no third-party fingerprint check); the VM is launched
+with `OPENAI_API_KEY=<placeholder>`, and the host substitutes the real
+OpenAI credential at egress. Set `command:` only to override (testing a
+forked adapter, a non-standard binary path).
 
 Credentials **never enter the VM** for either adapter. For `claude`, the
-host's `~/.claude/.credentials.json` is read only by the proxy on the host
-side; the VM sees `~/.claude.json` (identity-only) plus the sentinel value
-in its `Authorization` header. For `codex`, the host's `~/.codex/auth.json`
-(access token / `OPENAI_API_KEY`, **never** the refresh token) is read only
-by the proxy host-side; the real `OPENAI_API_KEY` is stripped from the
-forwarded VM boot env, so the VM holds only the sentinel.
+host's `~/.claude/.credentials.json` is read only on the host side; the VM
+sees `~/.claude.json` (identity-only) plus the placeholder value in its
+`Authorization` header, which the host swaps for the real token at egress.
+For `codex`, the host's `~/.codex/auth.json` (access token /
+`OPENAI_API_KEY`, **never** the refresh token) is read only host-side; the
+real `OPENAI_API_KEY` is stripped from the forwarded VM boot env, so the VM
+holds only the placeholder.
 
 ## After-run handoff: pull request
 
@@ -295,13 +286,14 @@ commands.
 
 ## Trust posture
 
-Sandbox isolation comes from running each agent inside a smolvm microVM.
+Sandbox isolation comes from running each agent inside a Gondolin microVM.
 The VM has no OAuth refresh tokens or long-lived access tokens: for both
-`claude` and `codex`, the host loopback proxy holds the real credential
-and swaps in the per-VM sentinel on every outbound request, so no real
-Anthropic or OpenAI credential is present in the VM. The VM has no
-tracker filesystem access (the tracker is reached only through the MCP
-server) and stripped git remotes (set by `after_create`).
+`claude` and `codex`, the guest holds only a token-shaped placeholder and
+the host substitutes the real credential into the outbound request at
+Gondolin egress, so no real Anthropic or OpenAI credential is present in
+the VM. The VM has no tracker filesystem access (the tracker is reached
+only through the MCP server) and stripped git remotes (set by
+`after_create`).
 
 Within the ACP session, the orchestrator follows SPEC §6.1's "high-trust"
 posture:
@@ -321,7 +313,7 @@ npm test             # 170 tests across workflow, tracker, prompt, workspace,
 npm run build        # tsc emit to dist/
 ```
 
-An end-to-end smoke run needs a real smolvm + VM image.
+An end-to-end smoke run needs the built agent image (see `images/agents/`).
 
 See [CHANGELOG.md](./CHANGELOG.md) for operator-visible changes between
 releases.

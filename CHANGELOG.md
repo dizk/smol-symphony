@@ -20,22 +20,6 @@ hand work off between them via a single MCP call.
   alongside the per-issue JSONL run logs already in the same directory. Set
   `SYMPHONY_LOG_FILE` to override the path; set it to the empty string to
   disable the file sink (stderr remains).
-- `templates/Smolfile.rust`. A starter Smolfile for projects whose per-issue
-  VM should ship a Rust toolchain instead of the canonical Node one: bases on
-  `rust:1-bookworm` (rustup + cargo + stable, with clippy + rustfmt), layers
-  NodeSource so the in-VM proxy still has a Node runtime, and installs the
-  same ACP adapter set the root Smolfile does. Point `smolvm.smolfile` in
-  WORKFLOW.md at it, or copy it to the project root as `Smolfile` and adjust
-  the `volumes` path noted in the file header.
-- `templates/Smolfile.kotlin`. A starter Smolfile for Kotlin / Gradle (or
-  any JVM-on-Gradle) projects: bases on `eclipse-temurin:21-jdk-noble` so
-  `java` and `JAVA_HOME` are wired up for a project-checked-in `gradlew`
-  wrapper, layers NodeSource so the in-VM proxy still has a Node runtime,
-  installs a recent stable Gradle on `$PATH` for wrapper-less projects, and
-  warms the Gradle / JVM caches via `gradle --version` so the bake step
-  amortises that cost. The file header documents the optional
-  `~/.gradle:/root/.gradle` host volume for persisting dependency jars
-  across per-issue VMs.
 - `pr_autopilot` workflow block (default off). When `enabled: true` the
   reconciler grows a `pr` resource that, on every tick, keeps each
   terminal-state issue's GitHub PR rebased on `origin/<base>`, arms
@@ -51,13 +35,14 @@ hand work off between them via a single MCP call.
   without one). When enabled, transitions into `merge_state` skip the
   standard terminal workspace cleanup — the autopilot owns the workspace
   until the PR merges or closes.
-- `smolvm.smolfile` workflow key. Point it at a TOML
-  [Smolfile](https://github.com/smol-machines/smolvm) and symphony hands it
-  to `smolvm machine create --smolfile` for every per-issue VM. The repo
-  ships a canonical `Smolfile` at the root that boots `node:24-bookworm-slim`,
-  installs base CLI tooling + every ACP-capable coding agent, and
-  bind-mounts `scripts/` as `/opt/symphony` so the in-VM stdio proxy at
-  `/opt/symphony/vm-agent.mjs` is the same file the host pins.
+- [Gondolin](https://github.com/earendil-works/gondolin) is the per-issue
+  microVM substrate. The agent rootfs (Node runtime + every ACP-capable coding
+  agent + the in-VM launcher at `/opt/symphony/vm-agent.mjs`) is built ONCE with
+  `npm run build:image` (see `images/agents/`); pin the printed content-addressed
+  build id (or a `name:tag` ref) in the `gondolin.image` workflow key. The
+  guest never holds a real credential — it carries a token-shaped placeholder
+  and the host substitutes the live upstream token into the outbound request at
+  Gondolin egress (TLS-MITM), keeping the durable refresh token host-side.
 - Workflows now declare states under a top-level `states:` block. Each
   state has a `role` (`active`, `terminal`, or `holding`) and optional
   per-state `adapter`, `model`, `max_turns`, and `allowed_transitions`
@@ -110,11 +95,16 @@ hand work off between them via a single MCP call.
 
 ### Removed
 
-- `scripts/build-vm.sh`. The Smolfile (with `smolvm.smolfile` in
-  `WORKFLOW.md`) drives the per-issue VM declaratively; the imperative
-  pre-pack script is no longer needed. To keep the old packed flow,
-  run `smolvm pack create -s ./Smolfile -o ./.vm/symphony.smolmachine`
-  once and set `smolvm.from` in `WORKFLOW.md` instead.
+- The smolvm microVM backend, the root `Smolfile` + `smolvm.smolfile`/`from`
+  config and the `templates/Smolfile.*` starters, the per-issue bake/pack
+  pipeline (the reconciler `bake` resource + its action cache), and the HTTP
+  credential-proxy transport (per-dispatch sentinels + base-URL injection).
+  All replaced by the Gondolin substrate: a once-built agent image selected by
+  `gondolin.image`, and egress-time token substitution. The `smolvm.*` workflow
+  keys are renamed to `gondolin.*` (`gondolin.image` / `cpus` / `mem_mib` /
+  `volumes` / `forward_env`); `net`/`endpoint`/`from`/`smolfile` are gone.
+- `scripts/build-vm.sh`. Superseded by `npm run build:image` (`images/agents/`),
+  which builds the agent rootfs once for the Gondolin substrate.
 - `mark_done` MCP tool. Use `transition({ to_state: "<terminal>",
   notes })` instead. The `notes` block becomes the PR description,
   the same way the old `mark_done({ title, summary })` payload did.
@@ -127,7 +117,7 @@ hand work off between them via a single MCP call.
   `WORKFLOW.template.md`.
 - `acp.command` workflow key. The TCP bridge cannot honor a raw
   adapter command; all adapters connect through the bridge.
-- `smolvm.bin_path` workflow mount. Adapter binaries are baked into
+- `gondolin.bin_path` workflow mount. Adapter binaries are baked into
   the VM image now, so there is no host directory to bind-mount.
 - Linear tracker scaffolding. No implementation ever shipped behind
   the `linear` endpoint, so the option has been dropped; the local

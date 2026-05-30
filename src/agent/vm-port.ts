@@ -1,11 +1,10 @@
 // Generalized VM-substrate port (Gondolin object model).
 //
-// Successor to `smolvm-port.ts`. Where the smolvm port mirrored the CLI's
-// name-keyed verbs (`create`/`start`/`stop`/`destroy`/`exec`), this port
-// mirrors Gondolin's object model: `createVm(opts)` hands back a `VmHandle`
-// that owns `exec()` / `close()`, and session discovery/GC is global —
-// Gondolin owns the lifecycle registry, replacing the smolvm machine registry
-// + the `_boot-vm` reaper.
+// Where the earlier CLI-backed port mirrored that CLI's name-keyed verbs
+// (`create`/`start`/`stop`/`destroy`/`exec`), this port mirrors Gondolin's
+// object model: `createVm(opts)` hands back a `VmHandle` that owns `exec()` /
+// `close()`, and session discovery/GC is global — Gondolin owns the lifecycle
+// registry, replacing the earlier machine registry + the `_boot-vm` reaper.
 //
 // Domain code imports only this module (the hexagonal `domain↛adapters`
 // direction holds); the concrete adapter lives in `./gondolin.ts`. The handful
@@ -15,7 +14,7 @@
 // the single-adapter seam, so leaking those infra types here is deliberate and
 // cheap (the reaper-facing half — `listSessions`/`gc` — stays Gondolin-free).
 //
-// Phase 0 adds this alongside the still-live smolvm port; nothing wires it yet.
+// This is the live VM-substrate port; the runner and reconciler wire it.
 
 import type { Readable } from 'node:stream';
 import type { DnsOptions, HttpHooks, TcpOptions } from '@earendil-works/gondolin';
@@ -34,7 +33,8 @@ export interface VmMount {
 export interface CreateVmOptions {
   /**
    * Gondolin image ref (tag or digest) exported by `images/agents` — maps to
-   * `VMOptions.sandbox.imagePath`. Replaces the smolvm image/from/smolfile trio.
+   * `VMOptions.sandbox.imagePath`. The single image ref (`gondolin.image`)
+   * replaces the earlier image/from/source-of-truth trio.
    */
   imagePath: string;
   cpus: number;
@@ -43,7 +43,7 @@ export interface CreateVmOptions {
    * Host→guest mounts. The adapter wraps each host path in a `RealFSProvider`
    * (read-write) or a `ReadonlyProvider`-wrapped one (read-only) under
    * `VMOptions.vfs.mounts`. No fixed mount cap (programmable VFS), so the
-   * smolvm "bake scripts/ into the image" workaround is no longer needed.
+   * earlier "bake scripts/ into the image" workaround is no longer needed.
    */
   mounts: VmMount[];
   /**
@@ -86,7 +86,7 @@ export interface VmExec {
   stdin: { write(chunk: string | Buffer): void; end(): void };
   stdout: Readable;
   stderr: Readable;
-  /** Host pid of the VM runner, when known (logging parity with the smolvm port). */
+  /** Host pid of the VM runner, when known (logging parity with the earlier VM port). */
   pid: number | undefined;
   exit: Promise<{ code: number | null; signal: number | null }>;
   /** Send the abort signal; idempotent. */

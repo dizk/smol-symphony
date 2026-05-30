@@ -1,13 +1,13 @@
 {
   "name": "smol-symphony",
   "version": "0.1.1",
-  "description": "TypeScript orchestrator that runs coding agents (Claude, Codex, OpenCode) in per-issue smolvm microVMs over ACP.",
+  "description": "TypeScript orchestrator that runs coding agents (Claude, Codex, OpenCode) in per-issue Gondolin microVMs over ACP.",
   "keywords": [
     "orchestrator",
     "agent",
     "acp",
     "mcp",
-    "smolvm",
+    "gondolin",
     "claude",
     "codex",
     "opencode",
@@ -35,8 +35,6 @@
     "SPEC.md",
     "PRODUCT.md",
     "DESIGN.md",
-    "Smolfile",
-    "templates/",
     "scripts/vm-agent.mjs",
     "README.md",
     "LICENSE"

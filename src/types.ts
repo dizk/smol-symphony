@@ -91,8 +91,8 @@ export interface StateConfig {
    *   • `logs.root`    → `/symphony/logs`   (per-issue JSONL run-log
    *     transcripts captured by RunLog)
    *
-   * Either mount is skipped if the corresponding root is unset. Smolvm has a
-   * small per-VM mount cap so the flag is opt-in per state rather than a
+   * Either mount is skipped if the corresponding root is unset. Each VFS mount
+   * has a cost so the flag is opt-in per state rather than a
    * workflow-wide default — flip it on for a dedicated eval state, not for
    * routine implement/review flow.
    */
@@ -139,14 +139,14 @@ export interface AgentConfig {
   /**
    * When true, the orchestrator reads `/proc/meminfo` on every tick and clamps the
    * effective concurrency cap to what currently fits in
-   * `MemAvailable - host_memory_reserve_mib` at `smolvm.mem_mib` per VM. Issue 27.
+   * `MemAvailable - host_memory_reserve_mib` at `gondolin.mem_mib` per VM. Issue 27.
    * When false (or on hosts without /proc/meminfo) the static `max_concurrent_agents`
    * is used unchanged.
    */
   memory_admission_enabled: boolean;
   /**
    * Headroom (MiB) the memory admission cap keeps for the orchestrator process itself,
-   * hooks, the smolvm daemon, and the kernel's own working set. Only consulted when
+   * hooks, the per-VM Gondolin runners, and the kernel's own working set. Only consulted when
    * `memory_admission_enabled` is true.
    */
   host_memory_reserve_mib: number;
@@ -195,7 +195,7 @@ export interface AcpConfig {
   stall_timeout_ms: number;
   /**
    * Host-side TCP bridge that the in-VM agent dials back to for ACP traffic. The bridge
-   * replaces the previous smolvm-exec stdio path (which had a stdin-pump bug) and decouples
+   * replaced the earlier in-VM-exec stdio path (which had a stdin-pump bug) and decouples
    * symphony from any specific sandbox tech.
    */
   bridge: AcpBridgeConfig;
@@ -207,9 +207,9 @@ export interface AcpBridgeConfig {
   /** Port symphony binds. 0 picks an ephemeral port (recorded after start). */
   bind_port: number;
   /**
-   * Host the in-VM agent uses to reach the bridge. Defaults to 127.0.0.1 because smolvm
-   * remaps guest loopback to host loopback. Other sandboxes that need a different host
-   * alias (or a reverse proxy) can override.
+   * Host the in-VM agent uses to reach the bridge. Defaults to 127.0.0.1; Gondolin
+   * maps a synthetic guest host to the host loopback (`tcp.hosts`). Other sandboxes
+   * that need a different host alias (or a reverse proxy) can override.
    */
   reach_host: string;
   /** Optional override for the full URL (e.g. through a reverse proxy). */
@@ -222,37 +222,28 @@ export interface AcpBridgeConfig {
   connect_timeout_ms: number;
 }
 
-export interface SmolvmVolume {
+export interface GondolinVolume {
   host: string;
   guest: string;
   readonly: boolean;
 }
 
-export interface SmolvmConfig {
-  // Container image to pull. Mutually exclusive with `from` and `smolfile`.
+export interface GondolinConfig {
+  // Gondolin image selector: a build id (digest, e.g. the content-addressed id
+  // printed by `npm run build:image`), a `name:tag` ref, or a path to an asset
+  // directory exported by images/agents. Passed straight through to
+  // `VM.create({ sandbox: { imagePath } })`. Required for dispatch (the runner
+  // fails fast at boot when unset).
   image: string | null;
-  // Path to a packed .smolmachine artifact (smolvm pack create --from-vm). When set, takes
-  // precedence over `image`; the agent runner passes it to `smolvm machine create --from`.
-  from: string | null;
-  // Path to a TOML Smolfile (https://github.com/smol-machines/smolvm) describing the
-  // per-issue VM declaratively. When set, the runner passes `--smolfile <path>` to
-  // `smolvm machine create`; the Smolfile's `image`, `cpus`, `memory`, `net`, and
-  // `[dev].init` / `[dev].volumes` provide the source-of-truth setup, replacing the
-  // old hand-built .smolmachine pre-pack flow. CLI flags symphony still emits (cpus,
-  // memory, net, --volume for the workspace mount, --env for forwarded credentials)
-  // override or merge with the Smolfile per smolvm's precedence rules. When both
-  // `smolfile` and one of `image`/`from` are set the workflow parser rejects the
-  // config (mutually exclusive).
-  smolfile: string | null;
   cpus: number;
   mem_mib: number;
-  net: boolean;
-  // Additional host:guest volume mounts (credentials, repo caches, ssh keys, …).
-  volumes: SmolvmVolume[];
-  // Extra env vars forwarded into the VM exec (e.g. OPENAI_API_KEY).
+  // Additional host:guest VFS mounts beyond the per-issue workspace (repo
+  // caches, eval-mode fixtures, …).
+  volumes: GondolinVolume[];
+  // Extra env vars forwarded into the VM exec. Credential-bearing vars are
+  // stripped before boot regardless (see runner.buildForwardedEnv) so the guest
+  // never receives a real token in its PID-1 environment.
   forward_env: string[];
-  // Base URL or unix socket for the smolvm server. Format: "unix:///path/to/sock" or "http://host:port".
-  endpoint: string;
 }
 
 export interface ServerConfig {
@@ -266,7 +257,7 @@ export interface ServerConfig {
 // and request_human_steering.
 export interface McpConfig {
   enabled: boolean;
-  // Hostname or IP the agent uses to reach the orchestrator from inside the smolvm.
+  // Hostname or IP the agent uses to reach the orchestrator from inside the VM.
   // Defaults to the QEMU slirp host address. The port is resolved at runtime from the
   // actually-bound HTTP server (NOT server.port at parse time), so `--port` and a workflow
   // that omits server.port can never desync.
@@ -383,7 +374,7 @@ export interface ServiceConfig {
   hooks: HooksConfig;
   agent: AgentConfig;
   acp: AcpConfig;
-  smolvm: SmolvmConfig;
+  gondolin: GondolinConfig;
   server: ServerConfig;
   mcp: McpConfig;
   pr_autopilot: PrAutopilotConfig;
@@ -444,7 +435,7 @@ export interface RunningEntry {
   // Snapshot of `tracker.root` captured at dispatch time so a WORKFLOW.md reload
   // mid-flight cannot redirect an in-flight `transition` (or `propose_issue`) to
   // a different filesystem location. The orchestrator pins this in dispatchIssue
-  // BEFORE workspace setup, before_run hooks, or smolvm bring-up — anything that
+  // BEFORE workspace setup, before_run hooks, or VM bring-up — anything that
   // happens during that window (including a workflow reload that mutates
   // tracker.root) must not affect where the move lands. McpRegistry.activate
   // copies the value into the ActiveEntry as-is.

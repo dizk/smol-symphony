@@ -1,7 +1,7 @@
 # Agent image (`symphony-agents`)
 
 The rootfs Gondolin boots for every dispatch. Built **once** (here), not per-issue —
-this replaces the old smolvm `Smolfile` + reconciler bake/pack pipeline.
+this replaces the old per-issue VM-image bake/pack pipeline.
 
 ## Build
 
@@ -24,14 +24,18 @@ default `0.12.0`); override with `GONDOLIN_BIN`.
 ## What's inside (verified booted, 2026-05-29)
 
 `claude` (2.1.156), `claude-agent-acp`, `codex` (0.135.0), `codex-acp`,
-`opencode` (1.15.12) — all on PATH (Debian 12 / glibc). Agent CLI pins match the
-prod Smolfile set; bump `Dockerfile.agents` deliberately (codex/codex-acp/opencode
-transport behavior is load-bearing — see the pin comment).
+`opencode` (1.15.12) — all on PATH (Debian 12 / glibc). Agent CLI pins carry over
+the set the former per-issue VM image pinned in production; bump
+`Dockerfile.agents` deliberately (codex/codex-acp/opencode transport behavior is
+load-bearing — see the pin comment).
 
 ## Notes
-- **`scripts/vm-agent.mjs` is NOT baked in.** Gondolin's VFS is programmable, so the
-  runner mounts `scripts/` at runtime — the smolvm 3-mount-cap workaround (baking
-  scripts into the image, commit `ba1b520`) is gone.
+- **`scripts/vm-agent.mjs` IS baked in** at `/opt/symphony/vm-agent.mjs` (the `COPY`
+  in `Dockerfile.agents`). The Gondolin dispatcher launches
+  `node /opt/symphony/vm-agent.mjs` with NO runtime `/opt/symphony` mount, so the
+  launcher must live in the image (a go-live finding: it was previously neither
+  baked nor mounted). The old 3-mount-cap workaround (commit `ba1b520`) is gone —
+  Gondolin's VFS is programmable, but the launcher is baked rather than mounted.
 - **No CA setup needed.** Gondolin injects its MITM CA into the guest at boot
   (spike-verified: trusted out-of-the-box).
 - Pin a **digest** (not `:latest`) in the runner's gondolin config for reproducible

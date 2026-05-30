@@ -5,7 +5,7 @@
 // (`opencode acp`). The protocol is JSON-RPC over stdio.
 //
 // This wrapper:
-//   * spawns the adapter command inside a smolvm machine (the child process stdio is the
+//   * spawns the adapter command inside a Gondolin VM (the child process stdio is the
 //     transport; nothing local is mutated outside the VM)
 //   * bridges Node child process stdio to the SDK's WHATWG streams via Readable.toWeb / etc.
 //   * implements the small Client surface ACP requires — session update streaming,
@@ -265,7 +265,7 @@ export class AcpClient {
   }
 
   // The Client interface implementation that the adapter calls back into. Every method is
-  // implemented because we run the agent inside a smolvm; ACP requires the client to handle
+  // implemented because we run the agent inside a Gondolin VM; ACP requires the client to handle
   // requests it advertises, and the SDK's Client interface lists them all.
   private makeClient(): Client {
     const self = this;

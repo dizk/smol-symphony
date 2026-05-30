@@ -1,5 +1,5 @@
 // Pure decisions extracted from `runAttempt` / its cleanup closure (issues 62, 103).
-// The runner remains the imperative shell that drives ports (smolvm, bridge,
+// The runner remains the imperative shell that drives ports (the Gondolin VM, bridge,
 // tracker, hooks); each helper here takes a snapshot of shell state and
 // returns the next decision so branches can be unit tested without spinning
 // up a VM or a workspace. Everything in this module is deterministic and

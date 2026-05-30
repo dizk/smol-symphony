@@ -7,9 +7,9 @@
 // Default workflow path is ./WORKFLOW.md.
 //
 // The `reconcile` subcommand boots symphony exactly the same way as the bare
-// form; `--force` additionally invalidates any cached bake artifact for the
-// current Smolfile hash before dispatch so the next bake is guaranteed to
-// rebuild. `--reconcile-force` is kept as a top-level alias for ergonomics.
+// form; `--force` additionally requests an immediate reconcile pass (VM /
+// workspace / PR janitors) instead of waiting on the backstop tick.
+// `--reconcile-force` is kept as a top-level alias for ergonomics.
 //
 // The `rerun` subcommand (issue 36) invalidates one `run_in_vm` action's
 // content-hash cache entries so the next dispatch into the state hosting it
@@ -32,7 +32,6 @@ import { invalidateRunInVmByName } from '../actions/index.js';
 import type { RunInVmAction, WorkflowAction } from '../actions/index.js';
 import { LocalMarkdownTracker } from '../trackers/local.js';
 import { WorkspaceManager } from '../workspace.js';
-import { SmolvmClient } from '../agent/smolvm.js';
 import { GondolinVmClient } from '../agent/gondolin.js';
 import {
   CredentialSecretRegistry,
@@ -144,7 +143,7 @@ async function maybeScaffoldMissingWorkflow(workflowPath: string): Promise<boole
     const result = await scaffoldWorkflow({ workflowPath });
     process.stdout.write(`wrote ${result.workflowPath}\n`);
     process.stdout.write(
-      `Edit it to point smolvm at your image / Smolfile / packed artifact, ` +
+      `Edit it to point gondolin.image at your built agent image (npm run build:image), ` +
         `then run \`symphony ${path.relative(process.cwd(), result.workflowPath) || workflowPath}\` again.\n`,
     );
     return true;
@@ -192,7 +191,7 @@ async function handlePreflight(cli: Cli, workflowPath: string): Promise<void> {
     if (cli.subcommand === 'serve') {
       const scaffolded = await maybeScaffoldMissingWorkflow(workflowPath);
       // Stop here on purpose: the operator hasn't finished filling in
-      // smolvm/source-of-truth fields yet, and dispatching immediately
+      // the gondolin.* / source-of-truth fields yet, and dispatching immediately
       // would just fail at the first attempt with a confusing error. The
       // scaffold message already tells them how to relaunch.
       if (scaffolded) process.exit(0);
@@ -313,26 +312,24 @@ async function refreshAllAdapters(registry: CredentialSecretRegistry): Promise<v
 }
 
 /**
- * Resolve the static Gondolin VM shape from config. The image ref reuses the
- * smolvm `image`/`from` field for now (a later PR renames these to `gondolin.*`);
- * fail fast if neither is set so a misconfigured workflow surfaces at boot, not
- * mid-dispatch after the VM bring-up cost is sunk.
+ * Resolve the static Gondolin VM shape from config. Fail fast if no image is set
+ * so a misconfigured workflow surfaces at boot, not mid-dispatch after the VM
+ * bring-up cost is sunk.
  */
 function resolveGondolinVmConfig(config: ServiceConfig): GondolinVmConfig {
-  const imagePath = config.smolvm.image ?? config.smolvm.from;
+  const imagePath = config.gondolin.image;
   if (!imagePath || imagePath.length === 0) {
     throw new Error(
-      'gondolin: no VM image configured. Set smolvm.image (an OCI image ref/tag/digest ' +
-        'exported by images/agents) or smolvm.from in WORKFLOW.md.',
+      'gondolin: no VM image configured. Set gondolin.image (a build id / `name:tag` ref / ' +
+        'asset dir exported by `npm run build:image` — see images/agents) in WORKFLOW.md.',
     );
   }
-  return { imagePath, cpus: config.smolvm.cpus, memMib: config.smolvm.mem_mib };
+  return { imagePath, cpus: config.gondolin.cpus, memMib: config.gondolin.mem_mib };
 }
 
 interface OrchestratorGraph {
   tracker: LocalMarkdownTracker;
   workspaces: WorkspaceManager;
-  smolvm: SmolvmClient;
   mcp: McpRegistry;
   acpBridge: AcpBridge;
   credentialTicker: CredentialTicker;
@@ -346,16 +343,16 @@ interface OrchestratorGraph {
 }
 
 /**
- * Build the in-process graph: tracker, workspaces, smolvm, mcp, acpBridge,
+ * Build the in-process graph: tracker, workspaces, vmClient, mcp, acpBridge,
  * reconciler, runner, orchestrator. Wires the post-construction provider
  * hooks (`reconciler.setIntendedVmProvider` / `setWorkspaceProviders` /
  * `setPrAutopilotProviders`) and the reload callback that propagates config
  * updates through every component.
  *
  * The Reconciler is constructed before the Orchestrator (the runner needs the
- * reconciler at its own construction time for the bake-artifact path), so the
- * vm reaper's IntendedVmProvider and workspace providers are plugged in after
- * the orchestrator exists. The vm resource is only built when both `vmClient`
+ * reconciler at its own construction time), so the vm reaper's
+ * IntendedVmProvider and workspace providers are plugged in after the
+ * orchestrator exists. The vm resource is only built when both `vmClient`
  * (passed at Reconciler construction) and an intended provider are wired.
  */
 async function buildOrchestratorGraph(opts: {
@@ -375,11 +372,7 @@ async function buildOrchestratorGraph(opts: {
     await bailStartup(`error: tracker init failed: ${(err as Error).message}\n`, { src });
   }
   const workspaces = new WorkspaceManager(config);
-  // smolvm CLI client. No longer on any live path (dispatch + reaper both run
-  // on Gondolin as of Phase 4); kept constructed only so the graph shape is
-  // unchanged until Phase 6 deletes SmolvmClient + the config migration.
-  const smolvm = new SmolvmClient(config.smolvm);
-  // Gondolin VM substrate (replaced the smolvm CLI backend for the dispatch
+  // Gondolin VM substrate (the in-process VM backend for the dispatch
   // path). The runner builds a per-dispatch GondolinDispatcher over this client,
   // and the Reconciler's VM reaper observes its session registry / runs its GC.
   const vmClient = new GondolinVmClient();
@@ -465,7 +458,6 @@ async function buildOrchestratorGraph(opts: {
   return {
     tracker,
     workspaces,
-    smolvm,
     mcp,
     acpBridge,
     credentialTicker,
@@ -532,8 +524,8 @@ function wirePostConstructionProviders(opts: {
  * the persistent log sink if `logs.root` rotated (unless the env override
  * locked it for the process lifetime), and re-materializes any state
  * directory the new workflow introduced. The orchestrator's own onChange
- * handler already forwards to the reconciler (so a Smolfile-path change kicks
- * off a new bake); we do not re-forward here.
+ * handler already forwards to the reconciler (so a config change rebinds its
+ * managed resources); we do not re-forward here.
  */
 function buildReloadHandler(opts: {
   tracker: LocalMarkdownTracker;
@@ -585,7 +577,7 @@ async function startTransports(opts: {
   // tunnelled to the host loopback via `tcp.hosts`. So the bridge binds loopback
   // (the `reach_host`, default 127.0.0.1) and `loopbackOnly` hard-refuses a wider
   // bind — never the config `bind_host` (which defaults to 0.0.0.0 for the old
-  // smolvm slirp gateway).
+  // slirp gateway).
   const bridgeHost = config.acp.bridge.reach_host;
   try {
     await graph.acpBridge.start(bridgeHost, config.acp.bridge.bind_port);
@@ -758,10 +750,10 @@ async function main() {
     await bailStartup(`startup failed: ${(err as Error).message}\n`, { http, src });
   }
   if (cli.reconcileForce) {
-    // `--reconcile-force`: drop any cached bake artifact and rebuild before
-    // dispatching. The orchestrator's reconciler gate keeps dispatch off until
-    // the rebuild lands, so callers that pass --force after a dependency change
-    // get a guaranteed fresh artifact on the next dispatch.
+    // `--reconcile-force`: request an immediate reconcile pass (VM/workspace/PR
+    // janitors) instead of waiting on the backstop tick. The bake artifact this
+    // flag used to invalidate is gone (the agent image is built ahead of time),
+    // so it now just triggers an eager pass.
     log.info('reconcile --force requested');
     void graph.orch.triggerReconcile({ force: true }).catch((err) =>
       log.warn('reconcile --force failed', { error: (err as Error).message }),

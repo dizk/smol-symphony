@@ -2,7 +2,7 @@
 //
 // This module is the imperative shell around the pure `parseWorkflow`
 // (src/workflow.ts): it reads the file off disk, captures `process.env`, and
-// runs the fs probes (`tracker.root` existence, `smolvm.smolfile` presence,
+// runs the fs probes (`tracker.root` existence,
 // per-state credential readability) that the pure validator cannot. The
 // chokidar watcher lives here too — on every reload it re-reads the file and
 // re-invokes the pure parser, then publishes to listeners.
@@ -55,18 +55,14 @@ export async function loadWorkflow(
 
 /**
  * IO-touching dispatch checks. Run alongside the pure `validateDispatch`:
- * tracker.root must be a real directory, smolvm.smolfile (if set) must exist,
- * and any per-state adapter override must have a readable host credential.
- * Returns null when every probe passes.
+ * tracker.root must be a real directory, and any per-state adapter override
+ * must have a readable host credential. Returns null when every probe passes.
  */
 export function validateDispatchIo(cfg: ServiceConfig): string | null {
   if (cfg.tracker.kind === 'local' && cfg.tracker.root) {
     if (!existsSync(cfg.tracker.root) || !statSync(cfg.tracker.root).isDirectory()) {
       return `tracker.root not found or not a directory: ${cfg.tracker.root}`;
     }
-  }
-  if (cfg.smolvm.smolfile && !existsSync(cfg.smolvm.smolfile)) {
-    return `smolvm.smolfile not found: ${cfg.smolvm.smolfile}`;
   }
   for (const [name, sc] of Object.entries(cfg.states)) {
     const credError = probeStateCredential(name, sc.adapter);

@@ -2,7 +2,7 @@
 // Owns the lifecycle of `symphony-*` VMs: anything outside the orchestrator's
 // intended set is an orphan and gets reaped.
 //
-// Observation source = Gondolin's session registry, NOT the smolvm machine
+// Observation source = Gondolin's session registry, NOT the earlier CLI machine
 // registry + `_boot-vm` /proc scraping. Gondolin owns one host runner process
 // per VM and tracks it in a session registry keyed by uuid, carrying the
 // `sessionLabel` the orchestrator minted (`symphony-<identifier>`) and the host
@@ -213,7 +213,7 @@ export class VmResource {
     const desired = this.opts.intended.intendedVmNames();
 
     // Gondolin's own GC first: collect STALE (dead-pid) sessions + orphan
-    // sockets. This subsumes the old smolvm "worker survived the daemon
+    // sockets. This subsumes the earlier "worker survived the daemon
     // destroy" cleanup — Gondolin reconciles its registry against live pids.
     await this.runGc();
 

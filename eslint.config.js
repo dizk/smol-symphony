@@ -9,12 +9,12 @@ const shell = [
   'src/orchestrator.ts', 'src/agent/runner.ts', 'src/reconciler/index.ts',
   'src/actions/executor.ts', // run-side of planActions/runEffects split (issue 68)
   // adapters (IO wrappers — should stay thin too)
-  'src/trackers/local.ts', 'src/agent/smolvm.ts', 'src/agent/adapters.ts', 'src/agent/acp.ts',
-  'src/agent/tool-call-summary.ts', 'src/agent/credential-proxy.ts',
+  'src/trackers/local.ts', 'src/agent/adapters.ts', 'src/agent/acp.ts',
+  'src/agent/tool-call-summary.ts', 'src/agent/credential-extractors.ts',
   'src/agent/credential-secrets.ts', 'src/agent/credential-ticker.ts',
   'src/agent/gondolin-dispatch.ts', 'src/agent/gondolin-creds-staging.ts',
   'src/acp-bridge.ts', 'src/runlog.ts', 'src/memory.ts',
-  'src/reconciler/bake.ts', 'src/reconciler/cache.ts', 'src/reconciler/pr-adapters.ts',
+  'src/reconciler/cache.ts', 'src/reconciler/pr-adapters.ts',
   'src/actions/cache.ts', 'src/workflow-loader.ts', 'src/workspace.ts',
   // entry
   'src/http.ts', 'src/http-disk.ts', 'src/bin/symphony.ts',
@@ -56,7 +56,7 @@ export default [
           { name: 'node:child_process', message: 'no process spawning in core' },
           { name: 'node:net', message: 'no net in core' }, { name: 'node:http', message: 'no http in core' },
           { name: 'node:crypto', message: 'no crypto IO in core' }, { name: 'node:timers/promises', message: 'no timers in core' },
-        ], patterns: [{ group: ['*/util/process*', '*/agent/smolvm*', '*/acp-bridge*', '*/trackers/local*'], message: 'core must not import an adapter; use an injected port' }] }],
+        ], patterns: [{ group: ['*/util/process*', '*/agent/gondolin*', '*/acp-bridge*', '*/trackers/local*'], message: 'core must not import an adapter; use an injected port' }] }],
       'no-restricted-syntax': ['error',
         { selector: "NewExpression[callee.name='Date']", message: 'core must be deterministic; inject a clock (see pr.ts now())' },
         { selector: "MemberExpression[object.name='Date'][property.name='now']", message: 'inject a clock' },

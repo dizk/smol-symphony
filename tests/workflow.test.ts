@@ -203,19 +203,19 @@ describe('workflow', () => {
     assert.equal(cfg.acp.model, null);
   });
 
-  it('parses smolvm.smolfile and resolves it relative to the workflow directory', () => {
+  it('parses gondolin.image (the VM image selector) and defaults the rest', () => {
     const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
         states: minimalStates,
-        smolvm: { smolfile: './Smolfile' },
+        gondolin: { image: 'symphony-agents:latest', cpus: 4, mem_mib: 8192 },
       },
       '/tmp/symphony/WORKFLOW.md',
     );
-    assert.equal(cfg.smolvm.smolfile, '/tmp/symphony/Smolfile');
-    // image/from default to null when smolfile is the chosen source.
-    assert.equal(cfg.smolvm.image, null);
-    assert.equal(cfg.smolvm.from, null);
+    assert.equal(cfg.gondolin.image, 'symphony-agents:latest');
+    assert.equal(cfg.gondolin.cpus, 4);
+    assert.equal(cfg.gondolin.mem_mib, 8192);
+    assert.deepEqual(cfg.gondolin.volumes, []);
   });
 
   it('rejects a workflow YAML with no states block', () => {

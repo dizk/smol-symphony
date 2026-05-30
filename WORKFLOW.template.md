@@ -85,8 +85,7 @@ tracker:
 #                 system events — plus the compact `<key>.summary.json` outcome
 #                 records the reflector reads; see the `logs:` block below)
 #             Either mount is skipped silently if the corresponding root is
-#             unset. Smolvm has a small per-VM mount cap (the workspace itself
-#             already consumes one slot), so this is opt-in per state rather
+#             unset. Each VFS mount has a cost, so this is opt-in per state rather
 #             than a workflow-wide default — flip it on for a dedicated eval
 #             state, not for the routine implement/review flow. Default: false.
 #             The canonical consumer is the "sleep cycle" reflection pattern —
@@ -205,7 +204,7 @@ states:
 # (the read-only mounts `eval_mode` exposes), distils *recurring* friction, and
 # files improvement proposals against the HARNESS (this WORKFLOW.md's prompt
 # branches and per-state model/max_turns/allowed_transitions/effort, hooks, the
-# Smolfile, acceptance criteria, timeouts) — never the product code under
+# the gondolin image config, acceptance criteria, timeouts) — never the product code under
 # review. Proposals land in Triage via `propose_issue`, so a human stays the
 # gate. This is the "self-improving agent" pattern aimed at the harness rather
 # than the product.
@@ -589,7 +588,7 @@ agent:
 
   # memory_admission_enabled (bool): when true, before each dispatch the
   # orchestrator reads `/proc/meminfo` (MemAvailable) and clamps the effective
-  # concurrency cap to what currently fits at `smolvm.mem_mib` per VM after
+  # concurrency cap to what currently fits at `gondolin.mem_mib` per VM after
   # subtracting `host_memory_reserve_mib`. This is a defense-in-depth backstop
   # for hosts where the static `max_concurrent_agents` is set generously: when
   # MemAvailable drops, new dispatches are gated so a misconfigured cap can't
@@ -599,7 +598,7 @@ agent:
   memory_admission_enabled: true
 
   # host_memory_reserve_mib (int): headroom (MiB) the memory admission cap
-  # keeps for the orchestrator process itself, hooks, the smolvm daemon, and
+  # keeps for the orchestrator process itself, hooks, the per-VM Gondolin runners, and
   # the kernel's own working set. Only consulted when
   # `memory_admission_enabled` is true. Raise on hosts with heavy non-symphony
   # workloads; lower on dedicated worker hosts. Default: 2048.
@@ -670,7 +669,7 @@ acp:
   # api.github.com/copilot_internal/v2/token for a short-lived Copilot token
   # (cached + TTL-refreshed before expiry), injects the Copilot editor headers,
   # and forwards to api.githubcopilot.com. The durable GitHub token never enters
-  # the VM — so do NOT also list it in `smolvm.forward_env`. See
+  # the VM — so do NOT also list it in `gondolin.forward_env`. See
   # docs/research/opencode-copilot-accept-matrix.md.
 
   # model (string | null): optional model selector forwarded to the chosen adapter.
@@ -722,7 +721,7 @@ acp:
 
   # bridge — host-side TCP listener the in-VM proxy dials back to for ACP traffic.
   #
-  # This replaced the old smolvm-exec stdio path. Symphony writes ACP JSON-RPC frames
+  # This replaced the earlier in-VM-exec stdio path. Symphony writes ACP JSON-RPC frames
   # onto an authenticated TCP socket; the in-VM proxy (`/opt/symphony/vm-agent.mjs`)
   # spawns the adapter via `child_process.spawn` with kernel pipes and bridges the
   # socket to the adapter's stdio. This decouples symphony from any particular
@@ -730,7 +729,7 @@ acp:
   # reach the host loopback works unchanged.
   bridge:
     # bind_host (string): host symphony binds the listener on. 0.0.0.0 allows any
-    # in-VM interface to reach the host loopback (smolvm remaps guest loopback to
+    # in-VM interface to reach the host loopback (Gondolin maps a synthetic guest host to
     # host loopback transparently). Default: 0.0.0.0
     bind_host: 0.0.0.0
 
@@ -738,7 +737,7 @@ acp:
     # port (used port surfaces via the in-VM SYMPHONY_ACP_URL env var). Default: 8788
     bind_port: 8788
 
-    # reach_host (string): host the in-VM proxy dials back to. For smolvm this is
+    # reach_host (string): host the in-VM agent dials back to. Under Gondolin this is
     # 127.0.0.1 because the guest loopback hits the host loopback. Other sandboxes
     # may need a different alias. Default: 127.0.0.1
     reach_host: 127.0.0.1
@@ -763,9 +762,9 @@ acp:
 # ─────────────────────────────────────────────────────────────────────────────
 credentials:
   # proxy_bind_host (string): host the credential proxy binds on. Defaults to
-  # loopback so the proxy is unreachable from outside the host. The smolvm
-  # guest-loopback shim rewrites the in-VM 127.0.0.1 to the host's 127.0.0.1
-  # transparently, same as the ACP bridge case. Default: 127.0.0.1
+  # loopback so the proxy is unreachable from outside the host. Gondolin maps the
+  # in-VM 127.0.0.1 to the host's 127.0.0.1 transparently, same as the ACP bridge
+  # case. Default: 127.0.0.1
   proxy_bind_host: 127.0.0.1
 
   # proxy_bind_port (int): port the credential proxy binds on. 0 picks an
@@ -781,31 +780,19 @@ credentials:
   ticker_interval_ms: 21600000
 
 # ─────────────────────────────────────────────────────────────────────────────
-# smolvm — microVM execution environment.
+# gondolin — microVM execution environment (Gondolin substrate).
 # ─────────────────────────────────────────────────────────────────────────────
-smolvm:
-  # smolfile (path | null): path to a TOML Smolfile (https://github.com/smol-machines/smolvm)
-  # describing the per-issue VM declaratively. When set, the runner passes
-  # `--smolfile <path>` to `smolvm machine create`; the Smolfile's `image`, resources,
-  # and `[dev].init` / `[dev].volumes` carry the per-VM setup. The repo ships a
-  # canonical `Smolfile` at the root that installs node tooling + every ACP-capable
-  # coding agent and BAKES scripts/ into the image at /opt/symphony (the in-VM
-  # proxy /opt/symphony/vm-agent.mjs) via an `[dev].init` cp — so dispatch needs no
-  # runtime /opt/symphony mount (see `volumes` below). The reconciler's bake hash
-  # folds in the content of the host dirs in `[dev].volumes`, so editing a baked
-  # file forces a re-bake. Mutually exclusive with `image` and `from`. Default: null.
-  smolfile: ./Smolfile
-
-  # from (path | null): path to a packed .smolmachine.smolmachine artifact
-  # built with `smolvm pack create`. Mutually exclusive with `image` and
-  # `smolfile`. The artifact must contain a Node.js runtime, the ACP adapters
-  # you intend to use (claude-agent-acp, codex-acp, etc.), and the symphony
-  # in-VM proxy at /opt/symphony/vm-agent.mjs. Default: null.
-  from: null
-
-  # image (string | null): container image to pull instead of a packed artifact
-  # or Smolfile. Mutually exclusive with `from` and `smolfile`. Default: null.
-  image: null
+gondolin:
+  # image (string | null): the agent rootfs the VM boots, expressed as a Gondolin
+  # image selector. Build it ONCE with `npm run build:image` (see images/agents/) —
+  # the build prints a content-addressed build id (a digest); pin that id here for
+  # an immutable, reproducible reference. A `name:tag` ref (e.g.
+  # `symphony-agents:latest`) or a path to an exported asset directory also work.
+  # The image bakes a Node.js runtime, every ACP-capable coding agent
+  # (claude-agent-acp, codex-acp, opencode), and the in-VM launcher at
+  # /opt/symphony/vm-agent.mjs — so dispatch needs no runtime mounts. REQUIRED:
+  # the runner fails fast at boot when this is unset. Default: null.
+  image: symphony-agents:latest
 
   # cpus (int): vCPU count per VM. Default: 2.
   cpus: 2
@@ -813,19 +800,11 @@ smolvm:
   # mem_mib (int): RAM per VM in MiB. Default: 2048.
   mem_mib: 4096
 
-  # net (bool): whether the VM has outbound networking. Default: true.
-  # Setting false isolates the VM at the cost of breaking adapters that fetch
-  # tokens, models, or dependencies at run time.
-  net: true
-
-  # volumes (list): additional host:guest bind mounts. smolvm/libkrun caps a VM
-  # at 3 virtio-fs mounts (a 4th makes `krun_start_enter` return -22), and the
-  # workspace already consumes one slot. If ANY state sets `eval_mode: true`,
-  # leave this list EMPTY: eval_mode adds two read-only mounts (/symphony/issues
-  # + /symphony/logs), so workspace (1) + those (2) = 3 already fills the cap and
-  # a single entry here would be the 4th mount that trips krun -22. Otherwise you
-  # have at most one free slot. Prefer baking static tooling into the image (as
-  # the canonical Smolfile does for scripts/) over a runtime mount. Each entry:
+  # volumes (list): additional host:guest VFS mounts beyond the auto-mounted
+  # workspace. Gondolin's VFS is programmable (no hard per-VM mount cap), but keep
+  # this lean — if ANY state sets `eval_mode: true` it adds two read-only mounts
+  # (/symphony/issues + /symphony/logs) on top of the workspace. Prefer baking
+  # static tooling into the image over a runtime mount. Each entry:
   # { host: path, guest: path, readonly?: bool }. Default: [].
   volumes:
     - host: ~/.cache/npm
@@ -834,17 +813,13 @@ smolvm:
 
   # forward_env (string[]): host env vars forwarded into the VM exec.
   # Default: [OPENAI_API_KEY, ANTHROPIC_API_KEY]
-  # NOTE: for a proxy adapter (claude, codex) the runner strips that adapter's
-  # credential var (e.g. OPENAI_API_KEY for codex) from the forwarded boot env
-  # per dispatch and substitutes the per-VM sentinel via the credential proxy,
-  # so listing it here does NOT plant the real key in the VM's PID-1 env.
+  # NOTE: the runner strips EVERY credential-bearing var from the forwarded boot
+  # env before launch — the guest holds only a token-shaped placeholder that
+  # Gondolin substitutes with the real token at egress — so listing a credential
+  # var here does NOT plant the real key in the VM's PID-1 env.
   forward_env:
     - OPENAI_API_KEY
     - ANTHROPIC_API_KEY
-
-  # endpoint (string): smolvm server. unix:// or http:// URI.
-  # Default: unix://$XDG_RUNTIME_DIR/smolvm.sock (or /run/user/1000/smolvm.sock)
-  endpoint: unix:///run/user/1000/smolvm.sock
 
 # ─────────────────────────────────────────────────────────────────────────────
 # server — HTTP dashboard + MCP endpoint listener.
@@ -887,8 +862,8 @@ mcp:
   enabled: true
 
   # host (string): hostname or IP the agent uses to reach the orchestrator
-  # from inside the smolvm. The port is resolved at runtime from the
-  # actually-bound HTTP server. Default: '127.0.0.1' (smolvm proxies VM
+  # from inside the VM. The port is resolved at runtime from the
+  # actually-bound HTTP server. Default: '127.0.0.1' (Gondolin maps VM
   # loopback to host loopback; verified empirically).
   host: 127.0.0.1
 
