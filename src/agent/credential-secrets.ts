@@ -30,6 +30,7 @@
 
 import path from 'node:path';
 import os from 'node:os';
+import { Buffer } from 'node:buffer';
 import {
   createHttpHooks,
   makePlaceholderFunc,
@@ -95,13 +96,52 @@ const CODEX_UPSTREAM_HOST = 'chatgpt.com';
 function claudePlaceholder(): () => string {
   return makePlaceholderFunc({ prefix: 'sk-ant-', length: 64, alphabet: BASE62_ALPHABET });
 }
+/**
+ * codex (ChatGPT-OAuth) runs in its NATIVE mode reading
+ * `~/.codex/auth.json:tokens.access_token` as its bearer, so the placeholder must
+ * be JWT-SHAPED (header.payload.signature) with a far-future `exp` — otherwise
+ * codex treats it as expired and tries to refresh (egress-blocked, doomed). The
+ * placeholder Gondolin substitutes at egress must be byte-identical to that
+ * bearer, so the SAME assembled JWT is both the secret's placeholder here and the
+ * staged `tokens.access_token` (see `gondolin-creds-staging.ts`, which reads this
+ * placeholder out of `createHttpHooks().env` verbatim). The header + payload are
+ * fixed; the signature segment is a high-entropy random string so each VM's
+ * placeholder is unique + exact-matchable. Built once at `createHttpHooks()` time.
+ */
 function codexPlaceholder(): () => string {
-  return makePlaceholderFunc({ prefix: 'sk-', length: 48, alphabet: BASE62_ALPHABET });
+  const randomSig = makePlaceholderFunc({ length: 86, alphabet: BASE64URL_ALPHABET });
+  return () => assemblePlaceholderJwt(randomSig());
 }
 function opencodePlaceholder(): () => string {
   // The opencode custom provider forwards this as its bearer; a `gho_`-shaped
   // token keeps it indistinguishable in shape from a real Copilot/GitHub token.
   return makePlaceholderFunc({ prefix: 'gho_', length: 36, alphabet: BASE64URL_ALPHABET });
+}
+
+/**
+ * Far-future JWT `exp` (seconds since epoch — 2100-01-01T00:00:00Z) baked into the
+ * codex placeholder so codex's native mode treats it as a long-lived, unexpired
+ * token and never attempts a refresh (which would be egress-blocked). Exported so
+ * the fake-creds staging + tests can assert the same instant.
+ */
+export const PLACEHOLDER_JWT_EXP_SECONDS = 4_102_444_800;
+
+/**
+ * Assemble a structurally-valid (but cryptographically meaningless) JWT-shaped
+ * placeholder: `base64url(header).base64url(payload).<signature>`. codex never
+ * verifies the signature — it only reads `exp` — and the real token replaces this
+ * whole string at egress. The `signature` segment is the caller's high-entropy
+ * random string, making each VM's placeholder unique + exact-matchable by
+ * Gondolin's header substitution.
+ */
+export function assemblePlaceholderJwt(signature: string): string {
+  const header = base64urlJson({ alg: 'RS256', typ: 'JWT' });
+  const payload = base64urlJson({ exp: PLACEHOLDER_JWT_EXP_SECONDS });
+  return `${header}.${payload}.${signature}`;
+}
+
+function base64urlJson(obj: unknown): string {
+  return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
 }
 
 // ---------------------------------------------------------------------------

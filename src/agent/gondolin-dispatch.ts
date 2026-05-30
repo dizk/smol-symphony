@@ -22,6 +22,7 @@
 //   - teardown: kill the exec, close the VM, deregister the secret manager —
 //     idempotent and error-tolerant.
 
+import { Buffer } from 'node:buffer';
 import { createHttpHooks, type SecretManager } from '@earendil-works/gondolin';
 import { log } from '../logging.js';
 import type { AcpAdapterId } from './adapter-names.js';
@@ -41,6 +42,12 @@ import {
   stripCredentialTokenVars,
   type CredentialMountGuardOptions,
 } from './vm-guards.js';
+import {
+  buildGondolinFakeCreds,
+  type GondolinFakeCreds,
+  type GuestCredFile,
+  type HostIdentityReaders,
+} from './gondolin-creds-staging.js';
 
 /** Static VM-shape config the runner reads from `cfg` (image ref + resources). */
 export interface GondolinVmConfig {
@@ -77,6 +84,17 @@ export interface GondolinDispatchOptions {
   onStderr: StderrSink;
   /** Override the credential-mount denylist (tests). */
   mountGuard?: CredentialMountGuardOptions;
+  /**
+   * Resolved opencode model for the fake custom-provider config (opencode only;
+   * ignored for claude/codex). Null ⇒ the adapter default.
+   */
+  opencodeModel?: string | null;
+  /**
+   * Injectable non-secret host identity reads for fake-creds staging (claude
+   * oauthAccount UUIDs, codex `account_id`). Tests pass fakes; production uses the
+   * default FS-backed readers. NEVER reads a real access/refresh token.
+   */
+  hostReaders?: HostIdentityReaders;
 }
 
 /** A launched Gondolin dispatch: the exec streams plus an idempotent teardown. */
@@ -85,6 +103,13 @@ export interface GondolinDispatchHandle {
   readonly exec: VmExec;
   /** What `SYMPHONY_ACP_URL` was set to (the mapped synthetic name + port). */
   readonly acpUrl: string;
+  /**
+   * The fake native credential files staged into the guest (placeholders only) +
+   * the placeholder env additions. Already materialized into the guest before the
+   * agent launched; exposed for observability/tests (and so a future VFS-mount
+   * variant can re-stage the same content).
+   */
+  readonly fakeCreds: GondolinFakeCreds;
   /** Kill the exec, close the VM, deregister the secret manager. Idempotent. */
   teardown(): Promise<void>;
 }
@@ -96,6 +121,35 @@ export interface GondolinDispatchHandle {
  * land via VFS mounts / the baked image — so the launcher is exec'd directly.
  */
 const VM_AGENT_COMMAND: readonly string[] = ['node', '/opt/symphony/vm-agent.mjs'];
+
+/** Bound on each fake-creds write exec (a tiny mkdir+write; never hangs). */
+const STAGE_TIMEOUT_MS = 15_000;
+
+/**
+ * Build the in-guest write command for a single fake-creds file. The content is
+ * base64-encoded host-side and decoded in-guest, so arbitrary JSON (quotes,
+ * newlines, `$`) can never break out of the shell or be interpreted — there is no
+ * heredoc/`echo` injection surface. `mkdir -p` the parent, decode into place, then
+ * `chmod`. POSIX-portable (`/bin/sh`, `base64 -d`). The guest path is single-quoted
+ * (paths we emit contain no `'`).
+ */
+function writeFileCommand(file: GuestCredFile): string[] {
+  const b64 = Buffer.from(file.content, 'utf8').toString('base64');
+  const dir = posixDirname(file.guestPath);
+  const mode = file.mode.toString(8);
+  const script =
+    `mkdir -p '${dir}' && ` +
+    `printf %s '${b64}' | base64 -d > '${file.guestPath}' && ` +
+    `chmod ${mode} '${file.guestPath}'`;
+  return ['/bin/sh', '-c', script];
+}
+
+/** POSIX dirname for an absolute guest path (always `/`-separated). */
+function posixDirname(p: string): string {
+  const idx = p.lastIndexOf('/');
+  if (idx <= 0) return '/';
+  return p.slice(0, idx);
+}
 
 /**
  * Orchestrates a single Gondolin dispatch. Inject the VM port, the host credential
@@ -112,12 +166,16 @@ export class GondolinDispatcher {
   ) {}
 
   async dispatch(opts: GondolinDispatchOptions): Promise<GondolinDispatchHandle> {
-    // ONE createHttpHooks call yields BOTH the httpHooks (into createVm) and the
-    // secretManager (into the registry) for this VM. Splitting them would give the
-    // VM hooks a different manager than the one we seed/refresh — they must be the
-    // same instance.
-    const { httpHooks, secretManager } = createHttpHooks(this.hooksConfig.options);
+    // ONE createHttpHooks call yields the httpHooks (into createVm), the
+    // secretManager (into the registry), AND the placeholder `env` map (the
+    // token-shaped fake bearer keyed by the secret name) for this VM. They must be
+    // the same instance — and the placeholder `env` (previously dropped) is the
+    // value the guest holds, so its fake creds + launch env are built from it.
+    const { httpHooks, secretManager, env: placeholderEnv } = createHttpHooks(
+      this.hooksConfig.options,
+    );
     const mapping = buildAcpTcpDns(opts.bridgeHost, opts.bridgePort);
+    const fakeCreds = await this.buildFakeCreds(opts, placeholderEnv);
 
     // Phase 3 enforcement, BEFORE createVm: a credential mount throws here, and the
     // env is stripped so no real token reaches the guest's boot environment.
@@ -130,8 +188,56 @@ export class GondolinDispatcher {
     // real token synchronously-after-await). AWAIT it before exec.
     const registered = await this.registerSecretManager(secretManager);
 
-    const exec = this.launchAgent(vm, opts, mapping.acpUrl);
-    return this.buildHandle(vm, exec, registered, mapping.acpUrl);
+    // Materialize the fake native creds files into the guest BEFORE launching the
+    // agent — the placeholder bearer (a fake) must be in place at first read.
+    await this.stageFakeCredsFiles(vm, fakeCreds.files, opts.workdir);
+
+    const exec = this.launchAgent(vm, opts, mapping.acpUrl, fakeCreds.env);
+    return this.buildHandle(vm, exec, registered, mapping.acpUrl, fakeCreds);
+  }
+
+  /**
+   * Build the per-adapter fake native creds + placeholder env from the
+   * placeholder Gondolin minted (`createHttpHooks().env[secretName]`). The
+   * placeholder is used VERBATIM so it byte-matches what Gondolin substitutes at
+   * egress; the real token never appears.
+   */
+  private async buildFakeCreds(
+    opts: GondolinDispatchOptions,
+    placeholderEnv: Record<string, string>,
+  ): Promise<GondolinFakeCreds> {
+    const secretName = this.hooksConfig.secretName;
+    const placeholder = placeholderEnv[secretName] ?? '';
+    return buildGondolinFakeCreds(this.hooksConfig.adapterId as AcpAdapterId, {
+      placeholder,
+      secretName,
+      opencodeModel: opts.opencodeModel ?? null,
+      hostReaders: opts.hostReaders,
+    });
+  }
+
+  /**
+   * Write each fake-creds file into the guest via a pre-launch exec. The content
+   * is base64-piped (no shell-quoting hazard for arbitrary JSON) into a
+   * `mkdir -p`'d destination, then chmod'd. Gondolin's programmable VFS could also
+   * host these as mounts, but a write-exec needs no port extension and keeps the
+   * "placeholder-before-launch" ordering enforced-by-construction here. Each write
+   * is awaited so the file exists before `vm-agent.mjs` (and the adapter) starts.
+   */
+  private async stageFakeCredsFiles(
+    vm: VmHandle,
+    files: readonly GuestCredFile[],
+    workdir: string,
+  ): Promise<void> {
+    for (const f of files) {
+      const exec = vm.exec({
+        command: writeFileCommand(f),
+        workdir,
+        timeoutMs: STAGE_TIMEOUT_MS,
+      });
+      exec.stdin.end();
+      await exec.exit;
+    }
   }
 
   /** Build the enforced `CreateVmOptions`: stripped env, validated mounts, ACP mapping. */
@@ -171,11 +277,16 @@ export class GondolinDispatcher {
    * TCP bridge, not the exec stdio; the exec channel is a process tether + a
    * diagnostic-stderr pipe (mirrors launchExecStream + attachStderrTap).
    */
-  private launchAgent(vm: VmHandle, opts: GondolinDispatchOptions, acpUrl: string): VmExec {
+  private launchAgent(
+    vm: VmHandle,
+    opts: GondolinDispatchOptions,
+    acpUrl: string,
+    placeholderEnv: Record<string, string>,
+  ): VmExec {
     const exec = vm.exec({
       command: [...VM_AGENT_COMMAND],
       workdir: opts.workdir,
-      env: this.buildLaunchEnv(opts, acpUrl),
+      env: this.buildLaunchEnv(opts, acpUrl, placeholderEnv),
       timeoutMs: null,
     });
     exec.stdin.end();
@@ -189,14 +300,26 @@ export class GondolinDispatcher {
    * `stripCredentialTokenVars` so an adapter injection can never smuggle a real token
    * into the guest while preserving the non-secret vendor-prefixed config knobs
    * (`ANTHROPIC_MODEL`, `OPENAI_BASE_URL`, …) the adapter legitimately needs.
+   *
+   * ORDERING (load-bearing): the placeholder bearer (a FAKE value keyed by the
+   * credential var name itself, e.g. `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY`) is
+   * merged AFTER `stripCredentialTokenVars` — the strip would otherwise drop it as
+   * a `*_TOKEN`/`*_API_KEY` name. Spreading it last means the placeholder survives
+   * the strip while a real token smuggled via `runtimeEnv` (stripped first) cannot.
    */
-  private buildLaunchEnv(opts: GondolinDispatchOptions, acpUrl: string): Record<string, string> {
+  private buildLaunchEnv(
+    opts: GondolinDispatchOptions,
+    acpUrl: string,
+    placeholderEnv: Record<string, string>,
+  ): Record<string, string> {
     return {
       SYMPHONY_ACP_URL: acpUrl,
       SYMPHONY_ACP_TOKEN: opts.acpToken,
       SYMPHONY_ADAPTER_BIN: opts.adapterBin,
       SYMPHONY_ADAPTER_ARGS: JSON.stringify(opts.adapterArgs),
       ...stripCredentialTokenVars(opts.runtimeEnv),
+      // The placeholder (a fake) is ADDED after the strip — see the ordering note.
+      ...placeholderEnv,
     };
   }
 
@@ -222,12 +345,14 @@ export class GondolinDispatcher {
     exec: VmExec,
     registered: RegisteredVm,
     acpUrl: string,
+    fakeCreds: GondolinFakeCreds,
   ): GondolinDispatchHandle {
     let torndown = false;
     return {
       vm,
       exec,
       acpUrl,
+      fakeCreds,
       teardown: async () => {
         if (torndown) return;
         torndown = true;
