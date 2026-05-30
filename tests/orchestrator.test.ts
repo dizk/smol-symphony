@@ -11,8 +11,8 @@ import type { WorkflowSource } from '../src/workflow.js';
 import type { IssueTracker, CandidateFetchResult } from '../src/trackers/types.js';
 import type { WorkspaceManager } from '../src/workspace.js';
 import type { AgentRunner } from '../src/agent/runner.js';
-import type { SmolvmClient } from '../src/agent/smolvm.js';
 import { Reconciler } from '../src/reconciler/index.js';
+import type { ReaperSession } from '../src/reconciler/vm.js';
 
 // Startup credential contract under the credential-proxy architecture
 // (#114/#116/#120): every proxy-backed adapter in the union of workflow-level
@@ -49,34 +49,79 @@ function makeStubs(): {
   };
 }
 
-// Recording fake of SmolvmClient — captures `list()` and `destroy()` calls so the
-// orphan-cleanup tests can assert which VMs were enumerated and which were torn down,
-// without touching the real smolvm CLI.
-interface FakeSmolvm {
-  client: SmolvmClient;
+// Recording fake of the Gondolin reaper surface (`listSessions` + `gc` +
+// `killProcess`). Captures which session pids were SIGTERM'd and how often the
+// session set was enumerated / gc'd, so the orphan-cleanup tests can assert
+// reaper behavior without touching real Gondolin sessions. Each entry is a
+// `symphony-`-labelled session keyed by label→pid; `destroyed` reports the
+// labels whose backing pid received a SIGTERM (the analogue of the old
+// smolvm-destroy assertion).
+interface FakeReaper {
+  listSessions: () => Promise<ReaperSession[]>;
+  gc: () => Promise<number>;
+  killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
   destroyed: string[];
   listCalls: number;
+  gcCalls: number;
+  setSessions: (labels: string[]) => void;
 }
 
-function makeFakeSmolvm(initialVms: string[]): FakeSmolvm {
-  const state = { vms: [...initialVms], destroyed: [] as string[], listCalls: 0 };
-  const client: Partial<SmolvmClient> = {
-    list: async () => {
-      state.listCalls++;
-      return [...state.vms];
-    },
-    destroy: async (name: string) => {
-      state.destroyed.push(name);
-      state.vms = state.vms.filter((v) => v !== name);
-    },
+// Deterministic label→pid map so a label like `symphony-1` always maps to the
+// same fake host pid across enumerations within one fake.
+function makeFakeReaper(initialLabels: string[]): FakeReaper {
+  const pidFor = new Map<string, number>();
+  let nextPid = 9001;
+  const pidOf = (label: string): number => {
+    let pid = pidFor.get(label);
+    if (pid === undefined) {
+      pid = nextPid++;
+      pidFor.set(label, pid);
+    }
+    return pid;
   };
+  const state = { labels: [...initialLabels], killedPids: [] as number[], listCalls: 0, gcCalls: 0 };
   return {
-    client: client as SmolvmClient,
+    listSessions: async (): Promise<ReaperSession[]> => {
+      state.listCalls++;
+      return state.labels.map((label) => ({ pid: pidOf(label), label }));
+    },
+    gc: async (): Promise<number> => {
+      state.gcCalls++;
+      return 0;
+    },
+    killProcess: (pid: number, signal: NodeJS.Signals | 0): void => {
+      // The reaper SIGTERMs first, then probes with signal 0 / escalates to
+      // SIGKILL. Our fake processes always exit on SIGTERM: record the kill and
+      // drop the session from the live set so a subsequent pass enumerates
+      // nothing (mirroring the real Gondolin runner exiting), then the probe
+      // ESRCHes.
+      if (signal === 'SIGTERM') {
+        state.killedPids.push(pid);
+        const label = [...pidFor.entries()].find(([, p]) => p === pid)?.[0];
+        if (label !== undefined) state.labels = state.labels.filter((l) => l !== label);
+        return;
+      }
+      // signal 0 (alive probe) after the SIGTERM-exit ⇒ ESRCH.
+      const err: NodeJS.ErrnoException = new Error('kill ESRCH');
+      err.code = 'ESRCH';
+      throw err;
+    },
     get destroyed() {
-      return state.destroyed;
+      // Map killed pids back to labels for a readable assertion.
+      const byPid = new Map<number, string>();
+      for (const label of pidFor.keys()) byPid.set(pidOf(label), label);
+      return state.killedPids.map((pid) => byPid.get(pid) ?? `pid-${pid}`);
     },
     get listCalls() {
       return state.listCalls;
+    },
+    get gcCalls() {
+      return state.gcCalls;
+    },
+    setSessions: (labels: string[]) => {
+      // Pre-seed pids so a label injected after construction is stable.
+      for (const label of labels) pidOf(label);
+      state.labels = [...labels];
     },
   };
 }
@@ -334,18 +379,18 @@ describe('Orchestrator startup credential check', () => {
 // reap at three points: startup (sweep prior-process strays), shutdown
 // (backstop in-flight workers whose cleanup the SIGTERM cancelled), and after
 // any non-clean worker exit. These tests pin those orchestrator-level
-// integration points; the per-action details (SIGTERM→SIGKILL grace,
-// boot-worker enumeration via /proc) are covered in tests/reconciler-vm.test.ts.
+// integration points; the per-action details (SIGTERM→SIGKILL grace, Gondolin
+// session enumeration / gc) are covered in tests/reconciler-vm.test.ts.
 describe('Orchestrator VM lifecycle reaping', () => {
-  // Helper: build a Reconciler with the supplied fake smolvm client and a
-  // hermetic boot-worker stub. The boot-worker default reads host /proc; tests
-  // must stub it so the suite doesn't pick up real `_boot-vm` workers on a
-  // busy developer box.
-  function makeReconcilerWith(cfg: ServiceConfig, fake: FakeSmolvm): Reconciler {
+  // Helper: build a Reconciler wired to the supplied fake Gondolin reaper
+  // surface (listSessions + gc + killProcess). The defaults enumerate no
+  // sessions / kill nothing, so the suite stays hermetic — it never touches
+  // real Gondolin sessions on a busy developer box.
+  function makeReconcilerWith(cfg: ServiceConfig, fake: FakeReaper): Reconciler {
     return new Reconciler(cfg, {
-      smolvm: fake.client,
-      listBootWorkers: async () => [],
-      killProcess: () => undefined,
+      listSessions: fake.listSessions,
+      gc: fake.gc,
+      killProcess: fake.killProcess,
       killGraceMs: 0,
       // Keep the backstop interval long so it never fires inside a test;
       // we drive reapVms() manually via start/stop.
@@ -374,9 +419,9 @@ describe('Orchestrator VM lifecycle reaping', () => {
         trackerRoot,
       );
       const { workflowSrc, tracker, workspaces, runner } = makeStubs();
-      // Mix orphan symphony VMs with an unrelated VM the operator may have running.
-      // Only the symphony-prefixed ones should be reaped.
-      const fake = makeFakeSmolvm([
+      // Mix orphan symphony sessions with an unrelated session the operator may
+      // have running. Only the symphony-prefixed labels should be reaped.
+      const fake = makeFakeReaper([
         'symphony-1',
         'symphony-old-issue',
         'unrelated-vm',
@@ -426,9 +471,10 @@ describe('Orchestrator VM lifecycle reaping', () => {
         trackerRoot,
       );
       const { workflowSrc, tracker, workspaces, runner } = makeStubs();
-      // No orphans at startup; simulate a VM that the runner's per-attempt cleanup
-      // didn't reach in time (e.g. SIGTERM mid-attempt) by injecting it before stop().
-      const fake = makeFakeSmolvm([]);
+      // No orphans at startup; simulate a session that the runner's per-attempt
+      // cleanup didn't reach in time (e.g. SIGTERM mid-attempt) by injecting it
+      // into the session view before stop().
+      const fake = makeFakeReaper([]);
       const reconciler = makeReconcilerWith(cfg, fake);
       const orch = new Orchestrator(
         cfg,
@@ -443,8 +489,9 @@ describe('Orchestrator VM lifecycle reaping', () => {
       reconciler.setIntendedVmProvider(orch);
       await orch.start();
       assert.deepEqual(fake.destroyed, []);
-      // Inject a "leaked" VM into the smolvm view to mimic the SIGTERM-mid-run path.
-      (fake.client.list as () => Promise<string[]>) = async () => ['symphony-leaked-7'];
+      // Inject a "leaked" session into the Gondolin view to mimic the
+      // SIGTERM-mid-run path (a runner child that outlived its dispatch).
+      fake.setSessions(['symphony-leaked-7']);
       await orch.stop();
       assert.deepEqual(fake.destroyed, ['symphony-leaked-7']);
     } finally {
@@ -663,7 +710,7 @@ describe('Orchestrator VM lifecycle reaping', () => {
         },
       } as unknown as AgentRunner;
 
-      const fake = makeFakeSmolvm([]);
+      const fake = makeFakeReaper([]);
       const reconciler = makeReconcilerWith(cfg, fake);
       // Spy on reapVms. The orchestrator calls it at startup (initial sweep)
       // and after every worker exit. We only care about post-exit calls, so

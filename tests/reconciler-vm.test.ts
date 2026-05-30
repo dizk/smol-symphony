@@ -1,197 +1,164 @@
-// VM reaper tests (issue 33 / reconciler stage 2). Covers the AC scenarios:
-//   (a) daemon registry empty + 3 orphan _boot-vm workers → all killed.
-//   (b) stale symphony-* in registry, no current dispatch → destroyed.
-//   (c) active dispatch + matching registry + matching worker → left alone.
-//   (d) SIGTERM-then-SIGKILL grace: a worker that ignores SIGTERM is SIGKILL'd
-//       after the configured grace period.
+// VM reaper tests (issue 33 / reconciler stage 2; Gondolin migration Phase 4).
+// The reaper observes Gondolin's session registry instead of smolvm
+// `machine ls` + `_boot-vm` /proc scraping. Covers the AC scenarios:
+//   (a) `gc()` is invoked every pass (Gondolin's STALE/dead-pid + orphan-socket
+//       collection — the reaper's first action).
+//   (b) a symphony-labelled session NOT in the intended set is a LIVE orphan and
+//       is killed by its host pid (SIGTERM, then SIGKILL after grace if it
+//       ignores SIGTERM).
+//   (c) an intended session is spared.
+//   (d) a non-symphony session (or one with no label) is spared.
 //
-// The tests drive `VmResource` directly with stubbed smolvm + boot-worker
-// enumerators so they stay hermetic and fast — no host /proc reads or smolvm
-// CLI calls.
+// The tests drive `VmResource` directly with a stubbed session enumerator + gc
+// + a recording `killProcess` so they stay hermetic and fast — no real Gondolin
+// sessions, no host signals.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
 import {
   VmResource,
   decideVm,
-  type BootWorker,
   type IntendedVmProvider,
+  type ReaperSession,
   type VmEffect,
 } from '../src/reconciler/vm.js';
-import { resolveBootWorkerVmName } from '../src/reconciler/index.js';
-import type { SmolvmClient } from '../src/agent/smolvm.js';
 
 // --- shared fixtures ---------------------------------------------------------
-
-interface FakeSmolvm {
-  client: SmolvmClient;
-  destroyed: string[];
-  setRegistry: (vms: string[]) => void;
-}
-
-function makeFakeSmolvm(initialVms: string[]): FakeSmolvm {
-  const state = { vms: [...initialVms], destroyed: [] as string[] };
-  const client: Partial<SmolvmClient> = {
-    list: async () => [...state.vms],
-    destroy: async (name: string) => {
-      state.destroyed.push(name);
-      state.vms = state.vms.filter((v) => v !== name);
-    },
-  };
-  return {
-    client: client as SmolvmClient,
-    get destroyed() {
-      return state.destroyed;
-    },
-    setRegistry: (vms: string[]) => {
-      state.vms = [...vms];
-    },
-  };
-}
 
 function provider(names: string[]): IntendedVmProvider {
   return { intendedVmNames: () => new Set(names) };
 }
 
-interface FakeProcess {
+interface FakeSession {
   pid: number;
-  vmName: string;
+  label?: string;
   alive: boolean;
-  // Should this PID exit when receiving SIGTERM? false = ignore SIGTERM (the
-  // grace-test scenario where SIGKILL is required).
+  // Should this pid exit on SIGTERM? false = ignore SIGTERM (the grace-test
+  // scenario where SIGKILL is required).
   exitsOnSigterm: boolean;
 }
 
-interface KillRecorder {
+interface ReaperHarness {
   signals: Array<{ pid: number; signal: NodeJS.Signals | 0 }>;
-  // The current worker list as inferred from the procs[] state; passed to the
-  // VmResource as `listBootWorkers`.
-  list: () => Promise<BootWorker[]>;
-  kill: (pid: number, signal: NodeJS.Signals | 0) => void;
+  gcCalls: number;
+  listSessions: () => Promise<ReaperSession[]>;
+  gc: () => Promise<number>;
+  killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
 }
 
-function makeKillRecorder(procs: FakeProcess[]): KillRecorder {
+// Build the Gondolin-reaper IO surface (listSessions + gc + killProcess) over a
+// mutable set of fake sessions. `listSessions` reflects only live sessions, so
+// a SIGTERM/SIGKILL that flips `alive` is observable on the next enumeration.
+function makeReaperHarness(sessions: FakeSession[]): ReaperHarness {
   const signals: Array<{ pid: number; signal: NodeJS.Signals | 0 }> = [];
-  const list = async (): Promise<BootWorker[]> =>
-    procs.filter((p) => p.alive).map((p) => ({ pid: p.pid, vmName: p.vmName }));
-  const kill = (pid: number, signal: NodeJS.Signals | 0): void => {
+  let gcCalls = 0;
+  const listSessions = async (): Promise<ReaperSession[]> =>
+    sessions.filter((s) => s.alive).map((s) => ({ pid: s.pid, label: s.label }));
+  const gc = async (): Promise<number> => {
+    gcCalls++;
+    return 0;
+  };
+  const killProcess = (pid: number, signal: NodeJS.Signals | 0): void => {
     signals.push({ pid, signal });
-    const p = procs.find((x) => x.pid === pid);
-    if (!p || !p.alive) {
-      const err: NodeJS.ErrnoException = new Error(`kill ESRCH`);
+    const s = sessions.find((x) => x.pid === pid);
+    if (!s || !s.alive) {
+      const err: NodeJS.ErrnoException = new Error('kill ESRCH');
       err.code = 'ESRCH';
       throw err;
     }
     if (signal === 0) return;
-    if (signal === 'SIGTERM' && p.exitsOnSigterm) {
-      p.alive = false;
+    if (signal === 'SIGTERM' && s.exitsOnSigterm) {
+      s.alive = false;
       return;
     }
     if (signal === 'SIGKILL') {
-      p.alive = false;
+      s.alive = false;
     }
   };
-  return { signals, list, kill };
+  return {
+    signals,
+    get gcCalls() {
+      return gcCalls;
+    },
+    listSessions,
+    gc,
+    killProcess,
+  };
 }
 
 // --- tests -------------------------------------------------------------------
 
-describe('VmResource reaper', () => {
-  it('daemon registry empty + 3 orphan _boot-vm workers → reconciler kills all three', async () => {
-    // The 2026-05-22 incident shape: smolvm's machine ls is empty but the host
-    // has surviving `_boot-vm` workers holding their VMs' memory. The reaper
-    // must SIGTERM each one — none survive the pass.
-    const smolvm = makeFakeSmolvm([]);
-    const procs: FakeProcess[] = [
-      { pid: 1001, vmName: 'symphony-1', alive: true, exitsOnSigterm: true },
-      { pid: 1002, vmName: 'symphony-2', alive: true, exitsOnSigterm: true },
-      { pid: 1003, vmName: 'symphony-3', alive: true, exitsOnSigterm: true },
+describe('VmResource reaper (Gondolin sessions)', () => {
+  it('3 orphan symphony-* sessions not in the intended set → reconciler kills all three by pid', async () => {
+    // The 2026-05-22 incident shape, Gondolin edition: live runner processes
+    // backing symphony sessions that the orchestrator no longer intends. Each
+    // is SIGTERM'd by its host pid — none survive the pass.
+    const sessions: FakeSession[] = [
+      { pid: 1001, label: 'symphony-1', alive: true, exitsOnSigterm: true },
+      { pid: 1002, label: 'symphony-2', alive: true, exitsOnSigterm: true },
+      { pid: 1003, label: 'symphony-3', alive: true, exitsOnSigterm: true },
     ];
-    const rec = makeKillRecorder(procs);
+    const rec = makeReaperHarness(sessions);
     const vm = new VmResource({
-      smolvm: smolvm.client,
       intended: provider([]),
-      listBootWorkers: rec.list,
-      killProcess: rec.kill,
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
       killGraceMs: 10,
     });
 
     await vm.reconcile();
 
-    assert.deepEqual(smolvm.destroyed, [], 'no daemon destroys (registry was empty)');
+    assert.equal(rec.gcCalls, 1, 'gondolin gc invoked once per pass');
     const sigterm = rec.signals.filter((s) => s.signal === 'SIGTERM').map((s) => s.pid).sort();
-    assert.deepEqual(sigterm, [1001, 1002, 1003], 'SIGTERM sent to all three workers');
+    assert.deepEqual(sigterm, [1001, 1002, 1003], 'SIGTERM sent to all three orphan pids');
     assert.deepEqual(
       rec.signals.filter((s) => s.signal === 'SIGKILL'),
       [],
       'no SIGKILL needed when SIGTERM is honored',
     );
-    assert.equal(procs.filter((p) => p.alive).length, 0, 'all three workers exited');
+    assert.equal(sessions.filter((s) => s.alive).length, 0, 'all three runners exited');
   });
 
-  it('stale symphony-99 in registry + no current dispatch → reconciler destroys it', async () => {
-    // The daemon registry remembers a VM from a prior process, but the running
-    // map is empty. The reaper destroys via the daemon.
-    const smolvm = makeFakeSmolvm(['symphony-99', 'operator-personal-vm']);
-    const rec = makeKillRecorder([]);
-    const vm = new VmResource({
-      smolvm: smolvm.client,
-      intended: provider([]),
-      listBootWorkers: rec.list,
-      killProcess: rec.kill,
-      killGraceMs: 10,
-    });
-
-    await vm.reconcile();
-
-    assert.deepEqual(smolvm.destroyed, ['symphony-99'], 'only the symphony-* registry entry torn down');
-    assert.deepEqual(rec.signals, [], 'no signals when the registry destroy handled it');
-  });
-
-  it('active dispatch for issue 42 + matching VM + matching boot-vm worker → reconciler leaves everything alone', async () => {
-    // The race condition the issue body calls out: in-flight dispatch must
-    // appear in the intended set so the reaper doesn't kill the VM out from
-    // under the runner.
-    const smolvm = makeFakeSmolvm(['symphony-42']);
-    const procs: FakeProcess[] = [
-      { pid: 4242, vmName: 'symphony-42', alive: true, exitsOnSigterm: true },
+  it('active dispatch for issue 42 + matching session → reconciler leaves it alone', async () => {
+    // The race condition the issue body calls out: an in-flight dispatch must
+    // appear in the intended set (by its sessionLabel) so the reaper doesn't
+    // kill the VM out from under the runner.
+    const sessions: FakeSession[] = [
+      { pid: 4242, label: 'symphony-42', alive: true, exitsOnSigterm: true },
     ];
-    const rec = makeKillRecorder(procs);
+    const rec = makeReaperHarness(sessions);
     const vm = new VmResource({
-      smolvm: smolvm.client,
       intended: provider(['symphony-42']),
-      listBootWorkers: rec.list,
-      killProcess: rec.kill,
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
       killGraceMs: 10,
     });
 
     await vm.reconcile();
 
-    assert.deepEqual(smolvm.destroyed, [], 'no daemon destroy for the active dispatch');
-    assert.deepEqual(rec.signals, [], 'no signals sent to the active worker');
-    assert.equal(procs[0]!.alive, true, 'worker stayed alive');
+    assert.equal(rec.gcCalls, 1, 'gc still runs even when nothing is reaped');
+    assert.deepEqual(rec.signals, [], 'no signals sent to the active session');
+    assert.equal(sessions[0]!.alive, true, 'session stayed alive');
   });
 
-  it('SIGTERM-then-SIGKILL grace: a worker that ignores SIGTERM is killed after the grace period', async () => {
+  it('SIGTERM-then-SIGKILL grace: a session that ignores SIGTERM is killed after the grace period', async () => {
     // Issue 33 explicitly requires the grace path: send SIGTERM, wait, then
     // SIGKILL if the process is still alive. This pins the escalation order so
-    // a misbehaving boot worker never accumulates.
-    const smolvm = makeFakeSmolvm([]);
-    const stubborn: FakeProcess = {
+    // a misbehaving runner never accumulates.
+    const stubborn: FakeSession = {
       pid: 7777,
-      vmName: 'symphony-stubborn',
+      label: 'symphony-stubborn',
       alive: true,
       exitsOnSigterm: false,
     };
-    const rec = makeKillRecorder([stubborn]);
+    const rec = makeReaperHarness([stubborn]);
     const vm = new VmResource({
-      smolvm: smolvm.client,
       intended: provider([]),
-      listBootWorkers: rec.list,
-      killProcess: rec.kill,
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
       killGraceMs: 20,
     });
 
@@ -210,131 +177,78 @@ describe('VmResource reaper', () => {
     assert.ok(elapsed >= 15, `grace elapsed: ${elapsed}ms`);
   });
 
-  it('non-symphony workers are left alone even when not in the intended set', async () => {
+  it('non-symphony and unlabelled sessions are left alone even when not in the intended set', async () => {
     // The reaper owns the `symphony-` namespace and only that namespace. An
-    // operator's personal `_boot-vm` (named e.g. `dev-shell`) MUST survive.
-    const smolvm = makeFakeSmolvm(['dev-shell']);
-    const procs: FakeProcess[] = [
-      { pid: 1, vmName: 'dev-shell', alive: true, exitsOnSigterm: true },
-      { pid: 2, vmName: 'symphony-leak', alive: true, exitsOnSigterm: true },
+    // operator's personal session (`dev-shell`) and a session with no label
+    // (a sibling tool's) MUST survive; the symphony-labelled orphan is reaped.
+    const sessions: FakeSession[] = [
+      { pid: 1, label: 'dev-shell', alive: true, exitsOnSigterm: true },
+      { pid: 2, label: undefined, alive: true, exitsOnSigterm: true },
+      { pid: 3, label: 'symphony-leak', alive: true, exitsOnSigterm: true },
     ];
-    const rec = makeKillRecorder(procs);
+    const rec = makeReaperHarness(sessions);
     const vm = new VmResource({
-      smolvm: smolvm.client,
       intended: provider([]),
-      listBootWorkers: rec.list,
-      killProcess: rec.kill,
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
       killGraceMs: 10,
     });
 
     await vm.reconcile();
 
-    assert.deepEqual(smolvm.destroyed, [], 'dev-shell is not symphony-prefixed; left in registry');
-    assert.equal(procs[0]!.alive, true, 'dev-shell process untouched');
-    assert.equal(procs[1]!.alive, false, 'symphony-leak got reaped');
+    assert.equal(sessions[0]!.alive, true, 'dev-shell session untouched');
+    assert.equal(sessions[1]!.alive, true, 'unlabelled session untouched');
+    assert.equal(sessions[2]!.alive, false, 'symphony-leak got reaped');
+    const killedPids = rec.signals.map((s) => s.pid);
+    assert.ok(!killedPids.includes(1), 'no signal to dev-shell');
+    assert.ok(!killedPids.includes(2), 'no signal to the unlabelled session');
   });
 
-  it('resolveBootWorkerVmName reads the persistent <dir>/name file when boot-config.json is gone', async () => {
-    // This is the running-VM shape: smolvm has consumed boot-config.json after
-    // boot, leaving only the sibling `name` file. Issue 51 — the prior
-    // implementation read boot-config.json and dropped every running VM from
-    // the reapable set; this test pins the persistent-name path.
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
-    try {
-      const vmDir = path.join(root, 'abc123');
-      await mkdir(vmDir, { recursive: true });
-      await writeFile(path.join(vmDir, 'name'), 'symphony-42\n', 'utf8');
-      const configPath = path.join(vmDir, 'boot-config.json');
-      // Deliberately do NOT create boot-config.json — that mirrors the live
-      // running-VM state.
-      const resolved = await resolveBootWorkerVmName(configPath);
-      assert.equal(resolved, 'symphony-42');
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+  it('gc is invoked even when there are no sessions to reap', async () => {
+    // Gondolin's STALE/dead-pid + orphan-socket collection must run every pass,
+    // independent of whether any LIVE orphan exists.
+    const rec = makeReaperHarness([]);
+    const vm = new VmResource({
+      intended: provider([]),
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
+      killGraceMs: 10,
+    });
 
-  it('resolveBootWorkerVmName falls back to boot-config.json when no name file is present', async () => {
-    // Older smolvm versions (pre-`name` sibling) and the narrow window before
-    // the daemon consumes boot-config.json both rely on the JSON fallback.
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
-    try {
-      const vmDir = path.join(root, 'def456');
-      await mkdir(vmDir, { recursive: true });
-      const configPath = path.join(vmDir, 'boot-config.json');
-      await writeFile(configPath, JSON.stringify({ name: 'symphony-legacy' }), 'utf8');
-      const resolved = await resolveBootWorkerVmName(configPath);
-      assert.equal(resolved, 'symphony-legacy');
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+    await vm.reconcile();
 
-  it('resolveBootWorkerVmName prefers <dir>/name over boot-config.json when both are present', async () => {
-    // If both exist, the persistent name file is authoritative — boot-config
-    // is what the daemon ate at boot time and may lag any subsequent rename.
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
-    try {
-      const vmDir = path.join(root, 'ghi789');
-      await mkdir(vmDir, { recursive: true });
-      await writeFile(path.join(vmDir, 'name'), 'symphony-current', 'utf8');
-      const configPath = path.join(vmDir, 'boot-config.json');
-      await writeFile(configPath, JSON.stringify({ name: 'symphony-stale' }), 'utf8');
-      const resolved = await resolveBootWorkerVmName(configPath);
-      assert.equal(resolved, 'symphony-current');
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('resolveBootWorkerVmName returns null when neither source yields a name', async () => {
-    // No name file, no boot-config — the reaper drops this worker rather than
-    // killing it on a guess.
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
-    try {
-      const vmDir = path.join(root, 'empty');
-      await mkdir(vmDir, { recursive: true });
-      const configPath = path.join(vmDir, 'boot-config.json');
-      const resolved = await resolveBootWorkerVmName(configPath);
-      assert.equal(resolved, null);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('resolveBootWorkerVmName ignores an empty name file and falls back to boot-config.json', async () => {
-    // A zero-byte `name` file shouldn't be treated as a confident identity.
-    // Fall through to the JSON config so a transient write race doesn't drop
-    // the worker.
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-vm-name-'));
-    try {
-      const vmDir = path.join(root, 'partial');
-      await mkdir(vmDir, { recursive: true });
-      await writeFile(path.join(vmDir, 'name'), '   \n', 'utf8');
-      const configPath = path.join(vmDir, 'boot-config.json');
-      await writeFile(configPath, JSON.stringify({ name: 'symphony-fallback' }), 'utf8');
-      const resolved = await resolveBootWorkerVmName(configPath);
-      assert.equal(resolved, 'symphony-fallback');
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+    assert.equal(rec.gcCalls, 1, 'gc ran');
+    assert.deepEqual(rec.signals, [], 'no signals when there is nothing to reap');
   });
 
   it('snapshot reports per-action ledger and last_error', async () => {
     // The dashboard reads from `snapshot()` to surface what the reaper just
-    // did. Verify both happy and failure shapes land in the ledger.
-    const smolvm = makeFakeSmolvm(['symphony-ok', 'symphony-broken']);
-    // Override destroy so symphony-broken fails.
-    (smolvm.client.destroy as (n: string) => Promise<void>) = async (name: string) => {
-      if (name === 'symphony-broken') throw new Error('synthetic destroy failure');
-      smolvm.destroyed.push(name);
+    // did. A killProcess that throws a non-ESRCH error (e.g. EPERM on the
+    // alive-probe) lands an error in the ledger + last_error.
+    const stubborn: FakeSession = {
+      pid: 5150,
+      label: 'symphony-eperm',
+      alive: true,
+      exitsOnSigterm: false,
     };
-    const rec = makeKillRecorder([]);
+    const rec = makeReaperHarness([stubborn]);
+    // Override killProcess: SIGTERM succeeds, but the post-grace alive-probe
+    // (signal 0) throws EPERM — surfaced as an error, not silently swallowed.
+    const killProcess = (pid: number, signal: NodeJS.Signals | 0): void => {
+      rec.signals.push({ pid, signal });
+      if (signal === 0) {
+        const err: NodeJS.ErrnoException = new Error('operation not permitted');
+        err.code = 'EPERM';
+        throw err;
+      }
+    };
     const vm = new VmResource({
-      smolvm: smolvm.client,
       intended: provider([]),
-      listBootWorkers: rec.list,
-      killProcess: rec.kill,
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess,
       killGraceMs: 10,
     });
 
@@ -343,55 +257,55 @@ describe('VmResource reaper', () => {
     const snap = vm.snapshot();
     assert.equal(snap.id, 'vm');
     assert.equal(snap.ready, true, 'vm reaping does not gate dispatch');
-    const errAction = snap.actions.find((a) => a.action.includes('symphony-broken'));
+    const errAction = snap.actions.find((a) => a.action.includes('5150'));
     assert.ok(errAction, 'failure recorded');
     assert.equal(errAction!.state, 'error');
-    assert.match(errAction!.error!, /synthetic destroy failure/);
-    assert.match(snap.last_error!, /synthetic destroy failure/);
+    assert.match(errAction!.error!, /operation not permitted/);
+    assert.match(snap.last_error!, /operation not permitted/);
   });
 });
 
 // Pure `decideVm` tests (issue 69). The class-level tests above exercise the
 // shell loop end-to-end; these pin the pure decision in isolation.
 describe('decideVm (pure)', () => {
-  const w = (pid: number, vmName: string): BootWorker => ({ pid, vmName });
+  const s = (pid: number, label?: string): ReaperSession => ({ pid, label });
 
   it('empty observed state → no effects', () => {
-    assert.deepEqual(
-      decideVm({ intended: new Set(), registry: [], workers: [] }),
-      [],
-    );
+    assert.deepEqual(decideVm({ intended: new Set(), sessions: [] }), []);
   });
 
-  it('non-symphony registry entries and workers are left untouched', () => {
+  it('non-symphony and unlabelled sessions are left untouched', () => {
     // The reaper owns only the `symphony-` namespace; an operator's personal
-    // VM or sibling tool's worker must never appear in the effect list.
+    // session, a sibling tool's labelled session, or one with no label must
+    // never appear in the effect list.
     assert.deepEqual(
       decideVm({
         intended: new Set(),
-        registry: ['dev-shell', 'operator-vm'],
-        workers: [w(1, 'dev-shell')],
+        sessions: [s(1, 'dev-shell'), s(2, 'operator-vm'), s(3, undefined)],
       }),
       [],
     );
   });
 
-  it('mixed: stray registry + stray worker + intended match → only the strays', () => {
+  it('case-sensitive prefix: SYMPHONY-* (uppercase) is not the symphony- namespace', () => {
+    assert.deepEqual(
+      decideVm({ intended: new Set(), sessions: [s(1, 'SYMPHONY-upper')] }),
+      [],
+    );
+  });
+
+  it('mixed: stray symphony session + intended match → only the stray', () => {
     const effects = decideVm({
       intended: new Set(['symphony-keep']),
-      registry: ['symphony-keep', 'symphony-stale'],
-      workers: [w(101, 'symphony-keep'), w(202, 'symphony-orphan')],
+      sessions: [s(101, 'symphony-keep'), s(202, 'symphony-orphan')],
     });
-    const expected: VmEffect[] = [
-      { kind: 'destroy_machine', vm_name: 'symphony-stale' },
-      { kind: 'kill_boot_worker', pid: 202, vm_name: 'symphony-orphan' },
-    ];
+    const expected: VmEffect[] = [{ kind: 'kill_session', pid: 202, label: 'symphony-orphan' }];
     assert.deepEqual(effects, expected);
   });
 
   it('is pure: same input → same output, no input mutation', () => {
     const intended = new Set(['symphony-keep']);
-    const observed = { intended, registry: ['symphony-stale'], workers: [w(1, 'symphony-orphan')] };
+    const observed = { intended, sessions: [s(1, 'symphony-orphan')] };
     const first = decideVm(observed);
     const second = decideVm(observed);
     assert.deepEqual(first, second);

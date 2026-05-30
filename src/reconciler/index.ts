@@ -17,12 +17,10 @@
 // `reconcile --force` (CLI flag) propagates `{ force: true }` through to each
 // resource so the bake can drop its cached artifact and rebuild.
 
-import { readFile, readdir } from 'node:fs/promises';
-import path from 'node:path';
 import { BakeResource, SmolvmBakeExecutor, type BakeExecutor } from './bake.js';
 import { defaultCacheRoot } from './cache.js';
 import type { ReconcilerSnapshot } from './types.js';
-import { VmResource, type BootWorker, type IntendedVmProvider } from './vm.js';
+import { VmResource, type IntendedVmProvider, type ReaperSession } from './vm.js';
 import {
   WorkspaceResource,
   type BaseRefProvider,
@@ -43,7 +41,7 @@ import {
 } from './pr.js';
 import { GhCliPrApi } from './pr-adapters.js';
 import type { ServiceConfig, SmolvmConfig } from '../types.js';
-import type { SmolvmClient } from '../agent/smolvm-port.js';
+import type { VmClient, VmSession } from '../agent/vm-port.js';
 import { log } from '../logging.js';
 
 export interface ReconcilerOptions {
@@ -54,13 +52,19 @@ export interface ReconcilerOptions {
   // Backstop tick interval (ms). Default 5 minutes so a missed config-watcher
   // signal can't park the reconciler forever; tests override to a small value.
   backstopIntervalMs?: number;
-  // VM reaper inputs (issue 33). Optional so test harnesses that don't exercise
-  // VM lifecycle can omit them; when either `smolvm` or an intended provider is
-  // missing, the vm resource is not constructed and `reapVms()` is a no-op.
-  smolvm?: SmolvmClient;
+  // VM reaper inputs (issue 33 / Gondolin migration Phase 4). Optional so test
+  // harnesses that don't exercise VM lifecycle can omit them; when either
+  // `vmClient` or an intended provider is missing, the vm resource is not
+  // constructed and `reapVms()` is a no-op. The reaper observes Gondolin's
+  // session registry (`vmClient.listSessions`) + runs Gondolin's GC
+  // (`vmClient.gc`) — no more smolvm `machine ls` / `_boot-vm` /proc scraping.
+  vmClient?: VmClient;
   vmIntendedProvider?: IntendedVmProvider;
-  // VmResource test hooks (mirror the same names on VmResourceOptions).
-  listBootWorkers?: () => Promise<BootWorker[]>;
+  // VmResource test hooks (mirror the same names on VmResourceOptions). Tests
+  // can override the session enumerator / gc directly instead of supplying a
+  // full VmClient.
+  listSessions?: () => Promise<ReaperSession[]>;
+  gc?: () => Promise<number>;
   killProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
   killGraceMs?: number;
   // Workspace resource inputs (issue 34). Optional so test harnesses that
@@ -88,13 +92,14 @@ export class Reconciler {
   private readonly bakeExecutor: BakeExecutor;
   private readonly backstopIntervalMs: number;
   private bake: BakeResource;
-  // VM reaper. Built at construction when smolvm + intended provider are
+  // VM reaper. Built at construction when a VmClient + intended provider are
   // already wired; otherwise lazily constructed via setIntendedVmProvider
   // (the production path — bin/symphony.ts builds the Reconciler before the
   // Orchestrator, then plugs the Orchestrator in as the intended-VM source).
   private vm: VmResource | null = null;
-  private smolvm: SmolvmClient | null = null;
-  private vmListBootWorkers?: () => Promise<BootWorker[]>;
+  private vmClient: VmClient | null = null;
+  private vmListSessions?: () => Promise<ReaperSession[]>;
+  private vmGc?: () => Promise<number>;
   private vmKillProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
   private vmKillGraceMs?: number;
   // Workspace janitor (issue 34). Constructed when an intended-set provider is
@@ -137,19 +142,43 @@ export class Reconciler {
   }
 
   private initVm(opts: ReconcilerOptions): void {
-    this.smolvm = opts.smolvm ?? null;
-    this.vmListBootWorkers = opts.listBootWorkers;
+    this.vmClient = opts.vmClient ?? null;
+    this.vmListSessions = opts.listSessions;
+    this.vmGc = opts.gc;
     this.vmKillProcess = opts.killProcess;
     this.vmKillGraceMs = opts.killGraceMs;
-    if (this.smolvm && opts.vmIntendedProvider) {
-      this.vm = new VmResource({
-        smolvm: this.smolvm,
-        intended: opts.vmIntendedProvider,
-        listBootWorkers: this.vmListBootWorkers ?? defaultListBootWorkers,
-        killProcess: this.vmKillProcess ?? defaultKillProcess,
-        killGraceMs: this.vmKillGraceMs,
-      });
+    // Build eagerly only when a session source AND an intended provider are
+    // both already wired. The session source is either the VmClient or the
+    // explicit `listSessions` test hook; `setIntendedVmProvider` rebuilds once
+    // the orchestrator lands.
+    if ((this.vmClient || this.vmListSessions) && opts.vmIntendedProvider) {
+      this.vm = this.buildVmResource(opts.vmIntendedProvider);
     }
+  }
+
+  /**
+   * Assemble the {@link VmResource} options against the wired Gondolin session
+   * source. `listSessions`/`gc` resolve from explicit test hooks first, then
+   * fall back to the {@link VmClient} (the production path) — the shell adapts
+   * `VmClient.listSessions()` (`VmSession[]`) into the reaper's local
+   * `ReaperSession` shape so vm.ts never imports the port/adapter.
+   */
+  private buildVmResource(intended: IntendedVmProvider): VmResource {
+    const client = this.vmClient;
+    const listSessions =
+      this.vmListSessions ??
+      (client ? async (): Promise<ReaperSession[]> => adaptSessions(await client.listSessions()) : null);
+    const gc = this.vmGc ?? (client ? (): Promise<number> => client.gc() : null);
+    if (!listSessions || !gc) {
+      throw new Error('vm reaper: no session source wired (need vmClient or listSessions+gc)');
+    }
+    return new VmResource({
+      intended,
+      listSessions,
+      gc,
+      killProcess: this.vmKillProcess ?? defaultKillProcess,
+      killGraceMs: this.vmKillGraceMs,
+    });
   }
 
   private initWorkspace(opts: ReconcilerOptions): void {
@@ -216,19 +245,13 @@ export class Reconciler {
    * needs the Reconciler at construction time. Calling this is idempotent —
    * the resource is replaced wholesale.
    *
-   * No-op when no SmolvmClient was wired at Reconciler construction; without
-   * one, the reaper has nothing to enumerate the daemon side of the actual
-   * set with.
+   * No-op when no session source (VmClient or explicit `listSessions` hook)
+   * was wired at Reconciler construction; without one, the reaper has nothing
+   * to enumerate Gondolin's session set with.
    */
   setIntendedVmProvider(provider: IntendedVmProvider): void {
-    if (!this.smolvm) return;
-    this.vm = new VmResource({
-      smolvm: this.smolvm,
-      intended: provider,
-      listBootWorkers: this.vmListBootWorkers ?? defaultListBootWorkers,
-      killProcess: this.vmKillProcess ?? defaultKillProcess,
-      killGraceMs: this.vmKillGraceMs,
-    });
+    if (!this.vmClient && !this.vmListSessions) return;
+    this.vm = this.buildVmResource(provider);
   }
 
   /**
@@ -505,101 +528,16 @@ function defaultConflictRouteTo(cfg: ServiceConfig): string {
 }
 
 /**
- * Resolve a `_boot-vm` worker's VM name from its on-disk identity. The
- * argv-referenced `boot-config.json` lives under
- * `~/.cache/smolvm/vms/<hash>/boot-config.json`, but smolvm consumes and
- * deletes that file shortly after the VM boots — so for a running VM it isn't
- * present on disk. The persistent sibling file `<dir>/name` holds the
- * daemon-registered VM name as plain text and survives the VM's lifetime.
- *
- * Prefer `<dir>/name`. Fall back to parsing `boot-config.json` for robustness
- * across smolvm versions and for the narrow pre-consume window. Returns null
- * if neither yields a non-empty string — the reaper only acts on
- * confidently-identified strays.
- *
- * Lives here (shell) rather than vm.ts (core) so the fs imports don't violate
- * the functional-core purity rule.
+ * Adapt Gondolin's `VmSession[]` (from `VmClient.listSessions()`) into the
+ * reaper's local `ReaperSession` shape. Keeping this projection in the shell
+ * lets `vm.ts` (the functional core) stay free of any `vm-port`/adapter import:
+ * the core only ever sees the minimal `{ pid, label? }` it acts on. The reaper
+ * doesn't care about a session's uuid, `alive` flag, or `createdAt` — STALE /
+ * dead-pid sessions are Gondolin `gc()`'s job, and the core decides on label +
+ * pid alone.
  */
-export async function resolveBootWorkerVmName(configPath: string): Promise<string | null> {
-  const dir = path.dirname(configPath);
-  const fromName = await readNameFile(dir);
-  if (fromName !== null) return fromName;
-  return readBootConfigName(configPath);
-}
-
-async function readNameFile(dir: string): Promise<string | null> {
-  try {
-    const raw = await readFile(path.join(dir, 'name'), 'utf8');
-    const name = raw.trim();
-    return name.length > 0 ? name : null;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== 'ENOENT') {
-      log.debug('vm reaper: name file read failed', { dir, error: (err as Error).message });
-    }
-    return null;
-  }
-}
-
-async function readBootConfigName(configPath: string): Promise<string | null> {
-  let body: string;
-  try {
-    body = await readFile(configPath, 'utf8');
-  } catch {
-    log.debug('vm reaper: boot-config read failed', { configPath });
-    return null;
-  }
-  let parsed: { name?: unknown };
-  try {
-    parsed = JSON.parse(body) as { name?: unknown };
-  } catch {
-    log.debug('vm reaper: boot-config malformed', { configPath });
-    return null;
-  }
-  const name = parsed.name;
-  if (typeof name !== 'string' || name.length === 0) return null;
-  return name;
-}
-
-/**
- * Enumerate every `_boot-vm` host worker and map it to its symphony VM name
- * via the persistent `<vmdir>/name` file (with a `boot-config.json` fallback).
- * Linux-only (reads /proc). Workers whose name can't be resolved are dropped
- * silently — the reaper only acts on confidently-identified strays.
- */
-export async function defaultListBootWorkers(): Promise<BootWorker[]> {
-  const procDir = '/proc';
-  let entries: string[];
-  try {
-    entries = await readdir(procDir);
-  } catch {
-    return [];
-  }
-  const out: BootWorker[] = [];
-  for (const ent of entries) {
-    const worker = await inspectProcEntry(procDir, ent);
-    if (worker !== null) out.push(worker);
-  }
-  return out;
-}
-
-async function inspectProcEntry(procDir: string, ent: string): Promise<BootWorker | null> {
-  const pid = Number(ent);
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  let raw: string;
-  try {
-    raw = await readFile(path.join(procDir, ent, 'cmdline'), 'utf8');
-  } catch {
-    return null;
-  }
-  const argv = raw.split('\0').filter((s) => s.length > 0);
-  if (argv.length === 0) return null;
-  if (!argv.some((a) => path.basename(a) === '_boot-vm')) return null;
-  const configPath = argv.find((a) => a.endsWith('boot-config.json'));
-  if (!configPath) return null;
-  const vmName = await resolveBootWorkerVmName(configPath);
-  if (vmName === null) return null;
-  return { pid, vmName };
+function adaptSessions(sessions: VmSession[]): ReaperSession[] {
+  return sessions.map((s) => ({ pid: s.pid, label: s.label }));
 }
 
 function defaultKillProcess(pid: number, signal: NodeJS.Signals | 0): void {
@@ -608,7 +546,7 @@ function defaultKillProcess(pid: number, signal: NodeJS.Signals | 0): void {
 
 export type { BakeExecutor } from './bake.js';
 export type { ReconcilerSnapshot, ResourceSnapshot, ActionStatus } from './types.js';
-export type { IntendedVmProvider, BootWorker, VmEffect, VmObservedState } from './vm.js';
+export type { IntendedVmProvider, ReaperSession, VmEffect, VmObservedState } from './vm.js';
 export { decideVm } from './vm.js';
 export type {
   WorkspaceIntendedProvider,

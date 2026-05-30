@@ -12,6 +12,7 @@ export type ReconcilerAction =
   | BakeAction
   | DestroyMachineAction
   | KillBootWorkerAction
+  | KillSessionAction
   | RemoveWorkspaceAction
   | CreateWorkspaceAction;
 
@@ -42,6 +43,21 @@ export interface KillBootWorkerAction {
   kind: 'kill_boot_worker';
   pid: number;
   vm_name: string;
+}
+
+// SIGTERM (with SIGKILL fallback after grace) the host Gondolin runner process
+// backing a `symphony-*`-labelled session that is not in the orchestrator's
+// intended set (Gondolin migration, Phase 4). Replaces `kill_boot_worker`: the
+// reaper now observes Gondolin's session registry (`listSessions`) instead of
+// `_boot-vm` /proc scraping, and a LIVE orphan (a botched teardown / a SIGKILL'd
+// symphony whose runner child survived) is reaped by its host `pid`. STALE
+// (dead-pid) sessions and orphan sockets are collected by Gondolin's own `gc()`
+// before this effect is computed, so `kill_session` only ever targets a session
+// whose host process is still alive.
+export interface KillSessionAction {
+  kind: 'kill_session';
+  pid: number;
+  label: string;
 }
 
 // Remove a per-issue workspace directory under `workspace.root` whose owning

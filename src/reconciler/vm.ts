@@ -1,43 +1,45 @@
-// VM reaper resource (issue 33 / reconciler stage 2). Owns the lifecycle of
-// `symphony-*` libkrun VMs: anything outside the orchestrator's intended set is
-// an orphan and gets reaped.
+// VM reaper resource (issue 33 / reconciler stage 2; Gondolin migration Phase 4).
+// Owns the lifecycle of `symphony-*` VMs: anything outside the orchestrator's
+// intended set is an orphan and gets reaped.
 //
-// The 2026-05-22 incident motivated a two-source actual set. The smolvm daemon
-// keeps a machine registry (`smolvm machine ls`) — that's the easy half. The
-// other half is the host-side `_boot-vm` worker process that wraps each libkrun
-// VM. Upstream smolvm has a known bug where `machine delete -f` returns success
-// but leaves the `_boot-vm` worker alive; over enough restarts those workers
-// accumulate, hold their VMs' guest memory, and the host OOMs. We treat the
-// process list as a second authoritative source and SIGTERM→SIGKILL anything
-// that names a `symphony-` VM but isn't in the intended set.
+// Observation source = Gondolin's session registry, NOT the smolvm machine
+// registry + `_boot-vm` /proc scraping. Gondolin owns one host runner process
+// per VM and tracks it in a session registry keyed by uuid, carrying the
+// `sessionLabel` the orchestrator minted (`symphony-<identifier>`) and the host
+// `pid`. The reaper reaps in two complementary ways:
 //
-// VM-name mapping (`_boot-vm` → symphony VM):
-//   `_boot-vm` argv contains the path to `~/.cache/smolvm/vms/<hash>/boot-config.json`.
-//   smolvm consumes and deletes that file shortly after boot, so for a running
-//   VM it isn't present on disk. The persistent sibling `<dir>/name` (plain
-//   text = the daemon-registered VM name) is what we read instead. A
-//   `boot-config.json` fallback remains for robustness across smolvm versions
-//   and for the narrow window before the daemon removes it. We only kill
-//   workers whose resolved name starts with `symphony-`; anything else (an
-//   operator's personal VM, a sibling tool's workers) is left alone. The IO
-//   side of this mapping lives in `./index.ts`; this module stays pure.
+//   1. STALE sessions (dead-pid orphans + orphan socket files) are collected by
+//      Gondolin's own `gc()` — the shell calls it at the start of each pass.
+//      This subsumes the old "`machine delete -f` succeeded but left the worker
+//      alive" cleanup: Gondolin reconciles its own registry against live pids.
+//   2. LIVE orphans — a session whose host process is still alive but whose
+//      `symphony-` label is NOT in the intended set (a botched teardown, or a
+//      SIGKILL'd symphony whose runner child survived) — are reaped HERE by
+//      SIGTERM→SIGKILL on the host `pid`. `gc()` can't touch these because the
+//      pid is alive; only the orchestrator knows the intended set.
+//
+// Label safety: a session with no label, or a label outside the
+// `symphony-` namespace (an operator's own VM, a sibling tool's session), is
+// never touched. The reaper acts only on confidently-symphony-owned, never-
+// intended sessions.
 //
 // Effects-as-data (issue 69): the decision of WHAT to do is a pure function
-// (`decideVm`) of the observed state; HOW it's done (smolvm CLI, /proc reads,
-// process.kill, sleep) is the shell's job. This module is import-pure:
-// no `node:fs`, no timers, no adapter imports.
+// (`decideVm`) of the observed session state; HOW it's done (Gondolin gc,
+// listSessions, process.kill, sleep) is the shell's job. This module is
+// import-pure: no `node:fs`, no timers, no adapter imports. The reaper's local
+// session shape (`ReaperSession`) is declared here — mirroring the existing
+// `VmRegistryPort` local-interface convention — so vm.ts never reaches for the
+// concrete `VmClient` adapter or the `vm-port` module; the shell adapts
+// `VmClient.listSessions()` → `ReaperSession[]`.
 
 import { log } from '../logging.js';
 import { ResourceActionLedger } from './ledger.js';
-import type {
-  DestroyMachineAction,
-  KillBootWorkerAction,
-  ResourceSnapshot,
-} from './types.js';
+import type { KillSessionAction, ResourceSnapshot } from './types.js';
 
-// Domain constant. Every VM the orchestrator creates is named with this
-// prefix; the reaper only acts on names that match. The smolvm-port adapter
-// mirrors the same value where it mints VM names — keep them in sync.
+// Domain constant. Every VM the orchestrator creates is labelled with this
+// prefix (the runner mints `sessionLabel = symphony-<identifier>`); the reaper
+// only acts on labels that match. The vm-port adapter mirrors the same value —
+// keep them in sync.
 export const SYMPHONY_VM_PREFIX = 'symphony-';
 
 const DEFAULT_KILL_GRACE_MS = 3_000;
@@ -47,37 +49,48 @@ const MAX_ACTION_HISTORY = 32;
  * Source of the orchestrator's currently-intended VM set. Returned each
  * reconcile pass so the reaper sees the latest snapshot of running +
  * about-to-be-allocated dispatches. The reaper compares this against the
- * union of (daemon registry, _boot-vm process list) and kills the difference.
+ * Gondolin session set (filtered by `SYMPHONY_VM_PREFIX`) and reaps the
+ * difference. The intended names ARE the session labels: the orchestrator's
+ * `intendedVmNames()` returns one `symphony-<identifier>` per running dispatch,
+ * matching the `sessionLabel` the runner minted for that dispatch.
  */
 export interface IntendedVmProvider {
   intendedVmNames(): Set<string>;
 }
 
-/** Result of inspecting one `_boot-vm` host process. */
-export interface BootWorker {
+/**
+ * Minimal Gondolin session surface the reaper consumes. Subset of `VmSession`
+ * (`agent/vm-port.ts`); declared locally so vm.ts stays adapter- and
+ * port-import-free (same convention as the old `VmRegistryPort`). The shell
+ * (`./index.ts`) adapts `VmClient.listSessions()` into this shape.
+ */
+export interface ReaperSession {
+  /** Host pid of the Gondolin runner process backing this session. */
   pid: number;
-  vmName: string;
+  /** The orchestrator-minted `sessionLabel`, when set. Absent ⇒ left alone. */
+  label?: string;
 }
 
 /**
- * Minimal smolvm surface the reaper consumes. Subset of the `SmolvmClient`
- * port; declared locally so vm.ts stays adapter-import-free.
+ * Reaper IO surface, injected by the shell. `gc` collects STALE sessions
+ * (dead-pid orphans + orphan sockets) — Gondolin's own registry reconciliation.
+ * `listSessions` enumerates the live session set the pure decision compares
+ * against the intended set. `killProcess` sends a host signal.
  */
-export interface VmRegistryPort {
-  list(): Promise<string[]>;
-  destroy(name: string): Promise<void>;
-}
-
 export interface VmResourceOptions {
-  smolvm: VmRegistryPort;
   intended: IntendedVmProvider;
   /**
-   * Process enumerator. Production wiring (defaultListBootWorkers in
-   * `./index.ts`) returns workers whose VM name could be resolved from the
-   * persistent `<vmdir>/name` file (with a `boot-config.json` fallback).
-   * Workers with no resolvable name are dropped at the source.
+   * Gondolin session GC. Collects STALE sessions (dead-pid orphans) and orphan
+   * socket files; returns the count reaped. Run first each pass so the
+   * subsequent `listSessions` only surfaces live sessions. Production wiring
+   * delegates to `VmClient.gc()`.
    */
-  listBootWorkers: () => Promise<BootWorker[]>;
+  gc: () => Promise<number>;
+  /**
+   * Enumerate the host's Gondolin sessions. Production wiring adapts
+   * `VmClient.listSessions()` → `ReaperSession[]` in `./index.ts`.
+   */
+  listSessions: () => Promise<ReaperSession[]>;
   /**
    * Send a signal to a host PID. Production wiring delegates to `process.kill`
    * in `./index.ts`. Receivers throw nothing on success and ESRCH/EPERM via
@@ -85,9 +98,9 @@ export interface VmResourceOptions {
    */
   killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
   /**
-   * SIGTERM-to-SIGKILL grace period (ms). A boot worker that ignores SIGTERM
-   * is SIGKILL'd after this delay. Default 3s; tests pass a small value so
-   * the grace path is observable in fast suites.
+   * SIGTERM-to-SIGKILL grace period (ms). A session runner that ignores SIGTERM
+   * is SIGKILL'd after this delay. Default 3s; tests pass a small value so the
+   * grace path is observable in fast suites.
    */
   killGraceMs?: number;
 }
@@ -97,56 +110,49 @@ export interface VmResourceOptions {
  * observation pass — `decideVm` is a pure function of this record.
  */
 export interface VmObservedState {
-  /** Names the orchestrator wants to keep alive (current dispatch set). */
+  /** Labels the orchestrator wants to keep alive (current dispatch set). */
   intended: ReadonlySet<string>;
-  /** Names known to the smolvm daemon (`smolvm machine ls`). */
-  registry: readonly string[];
-  /** Host `_boot-vm` workers whose VM name resolved from disk. */
-  workers: readonly BootWorker[];
+  /** Live Gondolin sessions on the host (`listSessions`, post-`gc`). */
+  sessions: readonly ReaperSession[];
 }
 
 /**
- * Reaper effect, applied by the shell. Reuses the typed action records from
+ * Reaper effect, applied by the shell. Reuses the typed action record from
  * `./types.ts` so the dashboard's existing `ReconcilerAction` taxonomy doubles
  * as the effect language.
  */
-export type VmEffect = DestroyMachineAction | KillBootWorkerAction;
+export type VmEffect = KillSessionAction;
 
 /**
- * Pure decision: given the observed VM/worker state, return the effects the
- * shell should apply. No IO, no clock reads, no logging.
+ * Pure decision: given the observed Gondolin session state, return the effects
+ * the shell should apply. No IO, no clock reads, no logging.
  *
- * Effect rules:
- *   • Registry entry starts with SYMPHONY_VM_PREFIX and isn't intended
- *     → `destroy_machine`.
- *   • Worker's vmName starts with SYMPHONY_VM_PREFIX and isn't intended
- *     → `kill_boot_worker`.
+ * Effect rule:
+ *   • Session has a `label` that starts with SYMPHONY_VM_PREFIX and isn't
+ *     intended → `kill_session` (SIGTERM→SIGKILL its host pid).
  *
- * Anything outside the symphony-prefixed namespace is left untouched
- * (operator VMs, sibling tools' workers).
+ * Anything outside the symphony-prefixed namespace — a session with no label,
+ * or a label that doesn't start with the prefix — is left untouched (operator
+ * VMs, sibling tools' sessions). STALE/dead-pid sessions and orphan sockets are
+ * NOT this function's concern; Gondolin's `gc()` collects them in the shell
+ * before the live session set reaches here.
  */
 export function decideVm(state: VmObservedState): VmEffect[] {
   const out: VmEffect[] = [];
-  for (const name of state.registry) {
-    if (name.startsWith(SYMPHONY_VM_PREFIX) && !state.intended.has(name)) {
-      out.push({ kind: 'destroy_machine', vm_name: name });
-    }
-  }
-  for (const w of state.workers) {
-    if (!w.vmName.startsWith(SYMPHONY_VM_PREFIX)) continue;
-    if (state.intended.has(w.vmName)) continue;
-    out.push({ kind: 'kill_boot_worker', pid: w.pid, vm_name: w.vmName });
+  for (const s of state.sessions) {
+    const label = s.label;
+    if (label === undefined) continue;
+    if (!label.startsWith(SYMPHONY_VM_PREFIX)) continue;
+    if (state.intended.has(label)) continue;
+    out.push({ kind: 'kill_session', pid: s.pid, label });
   }
   return out;
 }
 
 /**
- * VM resource. Desired = orchestrator's intended VM set. Actual = union of
- * `smolvm machine ls` (filtered by `symphony-` prefix) and `_boot-vm` workers
- * (also `symphony-` filtered). `reconcile()` is the thin shell loop:
- * observe → `decideVm` → apply. The two-phase shape (destroy machines, then
- * re-observe and kill survivors) reuses `decideVm` on the survivor set so the
- * pure decision keeps owning what counts as a stray.
+ * VM resource. Desired = orchestrator's intended VM (session-label) set.
+ * Actual = Gondolin's live session set (filtered by `symphony-` label).
+ * `reconcile()` is the thin shell loop: gc → observe → `decideVm` → apply.
  *
  * Independent of bake (`dependsOn: []`). Doesn't gate dispatch.
  */
@@ -154,7 +160,8 @@ export class VmResource {
   readonly id = 'vm';
   readonly dependsOn: string[] = [];
 
-  private readonly listBootWorkers: () => Promise<BootWorker[]>;
+  private readonly gc: () => Promise<number>;
+  private readonly listSessions: () => Promise<ReaperSession[]>;
   private readonly killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
   private readonly killGraceMs: number;
 
@@ -162,7 +169,8 @@ export class VmResource {
   private lastError: string | null = null;
 
   constructor(private readonly opts: VmResourceOptions) {
-    this.listBootWorkers = opts.listBootWorkers;
+    this.gc = opts.gc;
+    this.listSessions = opts.listSessions;
     this.killProcess = opts.killProcess;
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   }
@@ -177,41 +185,20 @@ export class VmResource {
   async reconcile(): Promise<void> {
     const desired = this.opts.intended.intendedVmNames();
 
-    // The smolvm client's `list` swallows daemon-side failures and returns [].
-    // Treat that as an empty actual set on this axis — the process axis still
-    // catches surviving workers.
-    const registry = await this.opts.smolvm.list();
-    const workers = await this.observeWorkers();
+    // Gondolin's own GC first: collect STALE (dead-pid) sessions + orphan
+    // sockets. This subsumes the old smolvm "worker survived the daemon
+    // destroy" cleanup — Gondolin reconciles its registry against live pids.
+    await this.runGc();
 
-    const initial = decideVm({ intended: desired, registry, workers });
-    if (initial.length === 0) return;
+    // Now enumerate the LIVE session set. `decideVm` compares it against the
+    // intended set; survivors with a never-intended `symphony-` label are
+    // LIVE orphans (alive pid, so gc() can't reach them) and get SIGTERM'd.
+    const sessions = await this.observeSessions();
+    const effects = decideVm({ intended: desired, sessions });
+    if (effects.length === 0) return;
 
-    const strayMachines = initial.filter(
-      (e): e is DestroyMachineAction => e.kind === 'destroy_machine',
-    );
-    const strayWorkers = initial.filter(
-      (e): e is KillBootWorkerAction => e.kind === 'kill_boot_worker',
-    );
-    log.info('vm reaper: destroying strays', {
-      stray_machines: strayMachines.length,
-      stray_workers: strayWorkers.length,
-    });
-
-    // Destroy via the daemon first — that's the polite path; on success the
-    // upstream smolvm releases the registry slot and (in the bug-free path)
-    // also takes the `_boot-vm` worker down. Parallel: smolvm.destroy already
-    // bounds each call with its own timeout.
-    await Promise.all(strayMachines.map((e) => this.destroyMachine(e.vm_name)));
-
-    // Re-enumerate workers so the SIGTERM step skips PIDs the daemon destroy
-    // already brought down. `decideVm` runs again over the survivors so the
-    // pure function still owns what counts as a stray.
-    const survivors = await this.observeWorkers();
-    const followup = decideVm({ intended: desired, registry: [], workers: survivors });
-    const stillStray = followup.filter(
-      (e): e is KillBootWorkerAction => e.kind === 'kill_boot_worker',
-    );
-    await Promise.all(stillStray.map((e) => this.killWorker({ pid: e.pid, vmName: e.vm_name })));
+    log.info('vm reaper: killing orphan sessions', { orphans: effects.length });
+    await Promise.all(effects.map((e) => this.killSession(e)));
   }
 
   snapshot(): ResourceSnapshot {
@@ -224,32 +211,34 @@ export class VmResource {
     };
   }
 
-  private async observeWorkers(): Promise<BootWorker[]> {
+  private async runGc(): Promise<void> {
     try {
-      return await this.listBootWorkers();
+      const reaped = await this.gc();
+      if (reaped > 0) log.info('vm reaper: gondolin gc collected stale sessions', { reaped });
     } catch (err) {
       const msg = (err as Error).message;
-      this.lastError = `boot worker enumeration failed: ${msg}`;
-      log.warn('vm reaper: boot worker enumeration failed', { error: msg });
+      this.lastError = `gondolin gc failed: ${msg}`;
+      log.warn('vm reaper: gondolin gc failed', { error: msg });
+    }
+  }
+
+  private async observeSessions(): Promise<ReaperSession[]> {
+    try {
+      return await this.listSessions();
+    } catch (err) {
+      const msg = (err as Error).message;
+      this.lastError = `session enumeration failed: ${msg}`;
+      log.warn('vm reaper: session enumeration failed', { error: msg });
       return [];
     }
   }
 
-  private async destroyMachine(name: string): Promise<void> {
-    const key = `destroy_machine:${name}`;
-    const res = await this.ledger.run(key, () => this.opts.smolvm.destroy(name));
-    if (!res.ok) {
-      this.lastError = res.error;
-      log.warn('vm reaper: destroy_machine failed', { name, error: res.error });
-    }
-  }
-
-  private async killWorker(w: BootWorker): Promise<void> {
-    const key = `kill_boot_worker:${w.pid}`;
+  private async killSession(e: KillSessionAction): Promise<void> {
+    const key = `kill_session:${e.pid}`;
     this.ledger.start(key);
     // SIGTERM. If the process is already gone (ESRCH) treat as success.
     try {
-      this.killProcess(w.pid, 'SIGTERM');
+      this.killProcess(e.pid, 'SIGTERM');
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'ESRCH') {
@@ -259,7 +248,7 @@ export class VmResource {
       const msg = (err as Error).message;
       this.lastError = msg;
       this.ledger.error(key, msg);
-      log.warn('vm reaper: SIGTERM failed', { pid: w.pid, vm: w.vmName, error: msg });
+      log.warn('vm reaper: SIGTERM failed', { pid: e.pid, label: e.label, error: msg });
       return;
     }
     // Inline timer (rather than `node:timers/promises`) keeps the file
@@ -269,7 +258,7 @@ export class VmResource {
     // still alive, escalate to SIGKILL.
     let alive = false;
     try {
-      this.killProcess(w.pid, 0);
+      this.killProcess(e.pid, 0);
       alive = true;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
@@ -278,7 +267,7 @@ export class VmResource {
         const msg = (err as Error).message;
         this.lastError = msg;
         this.ledger.error(key, msg);
-        log.warn('vm reaper: alive-probe failed', { pid: w.pid, error: msg });
+        log.warn('vm reaper: alive-probe failed', { pid: e.pid, error: msg });
         return;
       }
     }
@@ -287,11 +276,11 @@ export class VmResource {
       return;
     }
     try {
-      this.killProcess(w.pid, 'SIGKILL');
+      this.killProcess(e.pid, 'SIGKILL');
       this.ledger.done(key);
       log.info('vm reaper: SIGKILL applied after grace', {
-        pid: w.pid,
-        vm: w.vmName,
+        pid: e.pid,
+        label: e.label,
         grace_ms: this.killGraceMs,
       });
     } catch (err) {
@@ -303,7 +292,7 @@ export class VmResource {
       const msg = (err as Error).message;
       this.lastError = msg;
       this.ledger.error(key, msg);
-      log.warn('vm reaper: SIGKILL failed', { pid: w.pid, vm: w.vmName, error: msg });
+      log.warn('vm reaper: SIGKILL failed', { pid: e.pid, label: e.label, error: msg });
     }
   }
 }

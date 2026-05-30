@@ -349,7 +349,7 @@ interface OrchestratorGraph {
  * The Reconciler is constructed before the Orchestrator (the runner needs the
  * reconciler at its own construction time for the bake-artifact path), so the
  * vm reaper's IntendedVmProvider and workspace providers are plugged in after
- * the orchestrator exists. The vm resource is only built when both `smolvm`
+ * the orchestrator exists. The vm resource is only built when both `vmClient`
  * (passed at Reconciler construction) and an intended provider are wired.
  */
 async function buildOrchestratorGraph(opts: {
@@ -369,11 +369,13 @@ async function buildOrchestratorGraph(opts: {
     await bailStartup(`error: tracker init failed: ${(err as Error).message}\n`, { src });
   }
   const workspaces = new WorkspaceManager(config);
+  // smolvm CLI client. No longer on any live path (dispatch + reaper both run
+  // on Gondolin as of Phase 4); kept constructed only so the graph shape is
+  // unchanged until Phase 6 deletes SmolvmClient + the config migration.
   const smolvm = new SmolvmClient(config.smolvm);
   // Gondolin VM substrate (replaced the smolvm CLI backend for the dispatch
-  // path). The runner builds a per-dispatch GondolinDispatcher over this client.
-  // `smolvm` is still passed to the Reconciler below for the (Phase-4-pending) VM
-  // reaper; the dispatch path no longer touches it.
+  // path). The runner builds a per-dispatch GondolinDispatcher over this client,
+  // and the Reconciler's VM reaper observes its session registry / runs its GC.
   const vmClient = new GondolinVmClient();
   const gondolinVmConfig = resolveGondolinVmConfig(config);
   // Always instantiate the registry so a workflow reload that flips mcp.enabled from
@@ -392,11 +394,13 @@ async function buildOrchestratorGraph(opts: {
   // failure surfaces before we accept any dispatches.
   const acpBridge = new AcpBridge({ loopbackOnly: true });
   const { credentialRegistry, adapterHooks, credentialTicker } = buildCredentialPipeline(config);
-  // Reconciler (issues 32, 33, 34). Still owns the (Phase-4-pending) smolvm VM
-  // reaper + per-issue workspace convergence. Bake is bypassed on the Gondolin
-  // dispatch path (the runner uses the prebuilt image directly); the bake
-  // resource stays for now and is deleted in a later PR.
-  const reconciler = new Reconciler(config, { smolvm });
+  // Reconciler (issues 32, 33, 34). Owns the VM reaper (now Gondolin-backed:
+  // observes `vmClient.listSessions()` + runs `vmClient.gc()`, reaping
+  // `symphony-`-labelled sessions not in the orchestrator's intended set) + the
+  // per-issue workspace convergence. Bake is bypassed on the Gondolin dispatch
+  // path (the runner uses the prebuilt image directly); the bake resource stays
+  // for now and is deleted in a later PR.
+  const reconciler = new Reconciler(config, { vmClient });
   // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
