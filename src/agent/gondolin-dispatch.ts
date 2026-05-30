@@ -35,7 +35,7 @@ import {
   type VmHandle,
   type VmMount,
 } from './vm-port.js';
-import { buildAcpTcpDns, type AcpTcpDns } from './vm-acp-mapping.js';
+import { buildAcpTcpDns, buildMcpTcpHostEntry, type AcpTcpDns } from './vm-acp-mapping.js';
 import {
   assertNoCredentialMounts,
   stripCredentialEnv,
@@ -72,6 +72,16 @@ export interface GondolinDispatchOptions {
   /** ACP bridge bind host + bound port (loopback). */
   bridgeHost: string;
   bridgePort: number;
+  /**
+   * Host MCP HTTP endpoint (orchestrator loopback `host:port`) to tunnel into the
+   * guest via `tcp.hosts`, so the in-VM agent can reach the control plane
+   * (`symphony.transition` / `propose_issue`). Without this the agent runs inference
+   * turns but cannot transition state. Undefined when MCP is disabled, the HTTP
+   * server hasn't bound a port, or an `explicit_host_url` already points the guest at
+   * a directly-reachable URL — the runner mirrors that decision when building the
+   * guest MCP URL so the URL and the tunnel stay consistent.
+   */
+  mcp?: { host: string; port: number };
   /** Per-dispatch ACP bridge bearer token → `SYMPHONY_ACP_TOKEN`. */
   acpToken: string;
   /** Adapter binary the in-VM launcher spawns → `SYMPHONY_ADAPTER_BIN`. */
@@ -201,6 +211,16 @@ export class GondolinDispatcher {
       this.hooksConfig.options,
     );
     const mapping = buildAcpTcpDns(opts.bridgeHost, opts.bridgePort);
+    // Add the guest→host MCP control-plane tunnel into the SAME tcp.hosts record
+    // (the synthetic per-host DNS already resolves both names). Without this the
+    // agent can run inference turns but cannot reach `symphony.transition` — so it
+    // completes work but never transitions state (the gap dogfooding surfaced).
+    if (opts.mcp) {
+      mapping.tcp = {
+        ...mapping.tcp,
+        hosts: { ...mapping.tcp.hosts, ...buildMcpTcpHostEntry(opts.mcp.host, opts.mcp.port) },
+      };
+    }
     const fakeCreds = await this.buildFakeCreds(opts, placeholderEnv);
 
     // Phase 3 enforcement, BEFORE createVm: a credential mount throws here, and the

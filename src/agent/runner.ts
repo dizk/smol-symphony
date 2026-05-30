@@ -24,6 +24,7 @@ import {
   type GondolinVmConfig,
 } from './gondolin-dispatch.js';
 import type { AdapterHooksConfig, CredentialSecretRegistry } from './credential-secrets.js';
+import { MCP_GUEST_BASE_URL } from './vm-acp-mapping.js';
 import { stripCredentialEnv } from './vm-guards.js';
 import { AcpClient } from './acp.js';
 import {
@@ -1146,6 +1147,7 @@ export class AgentRunner {
       workdir: args.workspacePath,
       bridgeHost: args.bridgeHost,
       bridgePort: args.bridgePort,
+      mcp: this.mcpDispatchTarget(),
       acpToken: args.bridgeReg.token,
       adapterBin: args.adapter.adapterBin,
       adapterArgs: args.adapter.effectiveAdapterArgs,
@@ -1154,6 +1156,21 @@ export class AgentRunner {
       opencodeModel: args.resolved.model,
       onStderr: (chunk) => this.onAgentStderr(chunk, args.issue, args.runLog, args.logger),
     };
+  }
+
+  /**
+   * The host MCP endpoint to tunnel into the guest via `tcp.hosts`, or undefined
+   * when MCP is disabled, the HTTP server hasn't bound a port, or an
+   * `explicit_host_url` already points the guest at a directly-reachable URL.
+   * MUST mirror `setupMcpForAttempt`'s synthetic-vs-explicit decision so the guest
+   * MCP URL and the tunnel that backs it stay consistent — under Gondolin the guest
+   * cannot reach the host loopback directly, so a missing tunnel means the agent
+   * can never reach `symphony.transition`.
+   */
+  private mcpDispatchTarget(): { host: string; port: number } | undefined {
+    if (!this.cfg.mcp.enabled || this.cfg.mcp.explicit_host_url || !this.mcp) return undefined;
+    const port = this.mcp.getEffectivePort();
+    return port === null ? undefined : { host: this.cfg.mcp.host, port };
   }
 
   private buildVmMounts(
@@ -1375,10 +1392,18 @@ export class AgentRunner {
         cleanupReason: 'mcp_registry_unavailable',
       };
     }
-    const url = this.mcp.buildUrl(ctx.runningEntry.identifier, {
-      host: this.cfg.mcp.host,
-      explicit_host_url: this.cfg.mcp.explicit_host_url,
-    });
+    // Under Gondolin the guest can't reach the host loopback directly, so when no
+    // `explicit_host_url` is configured the agent dials the fixed synthetic MCP host
+    // (`MCP_GUEST_BASE_URL`) that `mcpDispatchTarget()` tunnelled via `tcp.hosts`.
+    // The condition MUST match `mcpDispatchTarget()` exactly (enabled, no explicit
+    // URL, port bound) so the advertised URL is always backed by a live tunnel.
+    const useSyntheticGuestHost =
+      !this.cfg.mcp.explicit_host_url && this.mcp.getEffectivePort() !== null;
+    const url = this.mcp.buildUrl(
+      ctx.runningEntry.identifier,
+      { host: this.cfg.mcp.host, explicit_host_url: this.cfg.mcp.explicit_host_url },
+      useSyntheticGuestHost ? MCP_GUEST_BASE_URL : undefined,
+    );
     if (!url) {
       ctx.logger.error('mcp is required but no reachable URL is configured', {
         host: this.cfg.mcp.host,
