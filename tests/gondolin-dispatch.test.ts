@@ -208,8 +208,9 @@ const VM_CONFIG: GondolinVmConfig = { imagePath: 'symphony-agents:latest', cpus:
 
 // Hermetic host-identity readers: a fixed non-secret codex account_id + claude
 // identity, NEVER a token. Keeps the fake-creds staging off the real ~/.codex and
-// ~/.claude.json.
-const FAKE_ACCOUNT_ID = 'acct_test_12345';
+// ~/.claude.json. The account_id is UUID-shaped (the real chatgpt_account_id is a
+// UUID; the staging guards accept only a UUID — a token-shaped value is omitted).
+const FAKE_ACCOUNT_ID = '00000000-0000-4000-8000-000000000abc';
 const FAKE_HOST_READERS = {
   readClaudeIdentity: async () => ({
     accountUuid: '11111111-2222-3333-4444-555555555555',

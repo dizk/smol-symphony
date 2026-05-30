@@ -23,7 +23,11 @@ import {
 const JUNK_REFRESH = 'JUNK-PLACEHOLDER-REFRESH-not-a-real-token';
 
 // Injected host readers: a fixed non-secret identity/metadata, NEVER a token.
-const FAKE_ACCOUNT_ID = 'acct_test_98765';
+// The real host account_id is a UUID (the routing `chatgpt_account_id`); the
+// account_id validators (extractCodexAccountId + extractCodexMetadata + the JWT
+// chokepoint in assemblePlaceholderJwt) accept ONLY a UUID, so this fixture must
+// be UUID-shaped for the happy path to embed/stage it.
+const FAKE_ACCOUNT_ID = '00000000-0000-4000-8000-000000000abc';
 const FAKE_AUTH_MODE = 'chatgpt';
 const FAKE_LAST_REFRESH = '2026-05-22T08:59:06.309350255Z';
 function fakeReaders(overrides: Partial<HostIdentityReaders> = {}): HostIdentityReaders {
@@ -189,6 +193,57 @@ describe('buildGondolinFakeCreds — codex', () => {
   });
 });
 
+// --- JWT-bearer flow (flow 1): account_id → placeholder JWT → guest bearer ---
+//
+// `assemblePlaceholderJwt(sig, accountId)` builds the codex placeholder, which is
+// staged VERBATIM as `tokens.access_token` (the guest BEARER) and held by Gondolin
+// for exact-match substitution. The account_id ends up in the
+// `https://api.openai.com/auth.chatgpt_account_id` claim. The HIGH finding: a
+// hostile/malformed host account_id (a real token/api-key string) must NEVER reach
+// that claim. The shared UUID guard at this chokepoint OMITS a non-UUID id.
+
+function decodeJwtPayload(jwt: string): Record<string, unknown> {
+  return JSON.parse(Buffer.from(jwt.split('.')[1]!, 'base64url').toString('utf8')) as Record<
+    string,
+    unknown
+  >;
+}
+
+describe('assemblePlaceholderJwt — account_id JWT-bearer claim (flow 1)', () => {
+  it('embeds a UUID account_id in the chatgpt_account_id claim (happy path unchanged)', () => {
+    const jwt = assemblePlaceholderJwt('SIG', FAKE_ACCOUNT_ID);
+    const payload = decodeJwtPayload(jwt);
+    assert.equal(payload.exp, PLACEHOLDER_JWT_EXP_SECONDS);
+    const authClaim = payload['https://api.openai.com/auth'] as { chatgpt_account_id?: string };
+    assert.equal(authClaim?.chatgpt_account_id, FAKE_ACCOUNT_ID, 'UUID id embedded in the bearer claim');
+  });
+
+  it('OMITS the auth claim when account_id is null (well-formed JWT, no id to embed)', () => {
+    const payload = decodeJwtPayload(assemblePlaceholderJwt('SIG', null));
+    assert.ok(!('https://api.openai.com/auth' in payload), 'no auth claim');
+    assert.equal(payload.exp, PLACEHOLDER_JWT_EXP_SECONDS, 'still a well-formed placeholder JWT');
+  });
+
+  it('OMITS a token-shaped / JWT-shaped / sk- account_id from the bearer claim (never embedded)', () => {
+    for (const hostile of [
+      'eyJhbGc.REAL.ACCESS_TOKEN', // JWT-shaped real token
+      'sk-proj-REAL-apikey-value', // OpenAI api-key shaped
+      'rt_REAL_refresh_token', // refresh-token shaped
+      'acct_test_98765', // the OLD non-UUID fixture shape
+    ]) {
+      const jwt = assemblePlaceholderJwt('SIG', hostile);
+      const payload = decodeJwtPayload(jwt);
+      assert.ok(
+        !('https://api.openai.com/auth' in payload),
+        `token-shaped account_id "${hostile}" must NOT produce an auth claim`,
+      );
+      assert.ok(!jwt.includes(Buffer.from(hostile).toString('base64url')), 'value not encoded into the JWT');
+      // The JWT stays well-formed (the SAFE failure: codex may prompt, not leak).
+      assert.equal(payload.exp, PLACEHOLDER_JWT_EXP_SECONDS, 'JWT still well-formed');
+    }
+  });
+});
+
 // --- opencode --------------------------------------------------------------
 
 describe('buildGondolinFakeCreds — opencode', () => {
@@ -214,13 +269,13 @@ describe('buildGondolinFakeCreds — opencode', () => {
 describe('buildGondolinFakeCreds — invariant (no real token escapes to the guest)', () => {
   it('never emits a real-looking refresh token even when readers try to smuggle one', async () => {
     const REAL = 'rt_REAL_refresh_token_should_never_leave_host';
-    // Readers that return a real token where a UUID/account_id is expected: the
-    // builders must IGNORE non-whitelisted shapes (extractors validate UUIDs are
-    // strings; the codex reader returns only account_id). Even a hostile string
-    // here only lands in the (non-secret) account_id / UUID slots — never as a
-    // bearer or refresh — and we assert the literal real-refresh token is absent.
+    // Readers that return a real token where a UUID/account_id is expected. The
+    // codex builder reads ONLY readCodexMetadata, whose account_id is now UUID-guarded
+    // (a non-UUID like REAL is dropped to null → omitted). We assert the literal
+    // real-refresh token is absent from every staged file regardless.
     const hostile = fakeReaders({
-      readCodexAccountId: async () => REAL, // would only ever land in account_id
+      readCodexAccountId: async () => REAL,
+      readCodexMetadata: async () => ({ accountId: REAL, authMode: REAL, lastRefresh: REAL }),
     });
     for (const adapterId of ['claude', 'codex', 'opencode'] as const) {
       const out = await buildGondolinFakeCreds(adapterId, {
@@ -230,6 +285,9 @@ describe('buildGondolinFakeCreds — invariant (no real token escapes to the gue
         hostReaders: hostile,
       });
       const blob = out.files.map((f) => f.content).join('\n');
+      // The smuggled REAL string must appear NOWHERE in any staged file (it is
+      // neither a valid account_id/auth_mode/last_refresh, so all three are omitted).
+      assert.ok(!blob.includes(REAL), `${adapterId}: smuggled token absent from staged files`);
       // refresh_token / refreshToken slots must be the junk literal, never REAL.
       assert.ok(!blob.includes(JUNK_REFRESH.replace('PLACEHOLDER', 'REAL')), `${adapterId}: no real refresh`);
       assert.ok(blob.includes(JUNK_REFRESH) || adapterId === 'opencode', `${adapterId}: junk refresh used`);
@@ -240,10 +298,11 @@ describe('buildGondolinFakeCreds — invariant (no real token escapes to the gue
 
   it('codex: a real access/refresh token smuggled through the metadata reader NEVER lands in auth.json', async () => {
     // Worst case: the host metadata reader is compromised and tries to return the
-    // REAL access/refresh token in EVERY metadata slot. The builder only routes
-    // metadata into the non-secret account_id / auth_mode / last_refresh slots and
-    // ALWAYS overrides the bearer/refresh with the placeholder + junk. A real token
-    // must never appear ANYWHERE in the staged file.
+    // REAL access/refresh token in EVERY metadata slot. Two defenses fire: (1) the
+    // builder ALWAYS overrides the bearer/refresh with the placeholder + junk, and
+    // (2) the strict account_id/auth_mode/last_refresh format guards reject the
+    // token-shaped values, so they are OMITTED entirely. A real token must never
+    // appear ANYWHERE in the staged file.
     const REAL_ACCESS = 'eyJREAL.ACCESS.TOKEN_must_never_leave_host';
     const REAL_REFRESH = 'rt_REAL_refresh_must_never_leave_host';
     const placeholder = assemblePlaceholderJwt('uniqsig');
@@ -252,24 +311,31 @@ describe('buildGondolinFakeCreds — invariant (no real token escapes to the gue
       secretName: 'OPENAI_API_KEY',
       hostReaders: fakeReaders({
         readCodexMetadata: async () => ({
-          accountId: REAL_ACCESS, // hostile: lands ONLY in the non-secret account_id slot
-          authMode: REAL_REFRESH, // hostile: lands ONLY in the non-secret auth_mode slot
-          lastRefresh: REAL_REFRESH,
+          accountId: REAL_ACCESS, // hostile: NOT a UUID → guarded out
+          authMode: REAL_REFRESH, // hostile: NOT a known auth_mode → guarded out
+          lastRefresh: REAL_REFRESH, // hostile: NOT an ISO timestamp → guarded out
         }),
       }),
     });
     const auth = out.files.find((f) => f.guestPath === '/root/.codex/auth.json')!;
-    const parsed = JSON.parse(auth.content) as { tokens: Record<string, unknown> };
+    const parsed = JSON.parse(auth.content) as {
+      auth_mode?: unknown;
+      last_refresh?: unknown;
+      tokens: Record<string, unknown>;
+    };
     // The bearer + refresh slots are NEVER the host-supplied value — they are the
     // placeholder + junk literal, by construction.
     assert.equal(parsed.tokens.access_token, placeholder, 'bearer is the placeholder, not a smuggled token');
     assert.equal(parsed.tokens.id_token, placeholder);
     assert.equal(parsed.tokens.refresh_token, JUNK_REFRESH, 'refresh is the junk literal');
-    // The smuggled string only ever reaches NON-SECRET identity/metadata slots; it
-    // is never used as a credential. (This documents that those slots are not a
-    // secret-bearing channel; the real reader allowlists non-secret keys only.)
-    assert.notEqual(parsed.tokens.access_token, REAL_ACCESS);
-    assert.notEqual(parsed.tokens.refresh_token, REAL_REFRESH);
+    // The token-shaped strings are NOT a valid account_id/auth_mode/last_refresh, so
+    // the strict guards OMIT them from the (non-secret) metadata slots entirely.
+    assert.ok(!('account_id' in parsed.tokens), 'token-shaped account_id omitted, not embedded');
+    assert.ok(!('auth_mode' in parsed), 'token-shaped auth_mode omitted, not embedded');
+    assert.ok(!('last_refresh' in parsed), 'token-shaped last_refresh omitted, not embedded');
+    // Belt-and-suspenders: the smuggled strings appear NOWHERE in the staged file.
+    assert.ok(!auth.content.includes(REAL_ACCESS), 'no smuggled access token anywhere in auth.json');
+    assert.ok(!auth.content.includes(REAL_REFRESH), 'no smuggled refresh token anywhere in auth.json');
   });
 
   it('claude/codex refresh slots hold ONLY the junk literal, not the placeholder or any real token', async () => {
@@ -301,11 +367,11 @@ describe('extractClaudeIdentity / extractCodexAccountId (pure, non-secret only)'
     assert.equal(extractClaudeIdentity(null), null);
   });
 
-  it('extracts only tokens.account_id, never the access/refresh token', () => {
+  it('extracts only tokens.account_id (UUID), never the access/refresh token', () => {
     const acct = extractCodexAccountId({
-      tokens: { account_id: 'acct_X', access_token: 'JWT.REAL', refresh_token: 'rt_REAL' },
+      tokens: { account_id: FAKE_ACCOUNT_ID, access_token: 'JWT.REAL', refresh_token: 'rt_REAL' },
     });
-    assert.equal(acct, 'acct_X');
+    assert.equal(acct, FAKE_ACCOUNT_ID);
   });
 
   it('returns null when the codex tokens block or account_id is absent', () => {
@@ -313,29 +379,65 @@ describe('extractClaudeIdentity / extractCodexAccountId (pure, non-secret only)'
     assert.equal(extractCodexAccountId({ tokens: {} }), null);
     assert.equal(extractCodexAccountId(null), null);
   });
+
+  it('rejects a token-shaped (non-UUID) account_id so it never reaches the JWT-bearer flow', () => {
+    // This is the value symphony.ts feeds into the placeholder JWT bearer claim.
+    // A token / sk- / JWT string is not a UUID → must be dropped to null here.
+    assert.equal(
+      extractCodexAccountId({ tokens: { account_id: 'eyJabc.DEF.ghi_real_jwt' } }),
+      null,
+    );
+    assert.equal(extractCodexAccountId({ tokens: { account_id: 'sk-REAL-apikey-value' } }), null);
+    assert.equal(extractCodexAccountId({ tokens: { account_id: 'acct_test_98765' } }), null);
+    assert.equal(extractCodexAccountId({ tokens: { account_id: 'rt_refresh_token' } }), null);
+  });
 });
 
 describe('extractCodexMetadata (pure, allowlisted non-secret fields only)', () => {
-  it('extracts ONLY account_id + auth_mode + last_refresh, never any token', () => {
+  it('extracts ONLY account_id (UUID) + auth_mode + last_refresh, never any token', () => {
     const meta = extractCodexMetadata({
       auth_mode: 'chatgpt',
       last_refresh: '2026-05-22T08:59:06.309350255Z',
       OPENAI_API_KEY: 'sk-REAL-apikey-should-be-ignored',
       tokens: {
-        account_id: 'acct_X',
+        account_id: FAKE_ACCOUNT_ID,
         access_token: 'JWT.REAL.ACCESS',
         id_token: 'JWT.REAL.ID',
         refresh_token: 'rt_REAL',
       },
     });
     assert.deepEqual(meta, {
-      accountId: 'acct_X',
+      accountId: FAKE_ACCOUNT_ID,
       authMode: 'chatgpt',
       lastRefresh: '2026-05-22T08:59:06.309350255Z',
     });
     // Belt-and-suspenders: the serialized struct contains none of the real tokens.
     const blob = JSON.stringify(meta);
     assert.ok(!/JWT\.REAL|rt_REAL|sk-REAL/.test(blob), 'no real token leaked into metadata');
+  });
+
+  it('rejects token-shaped / out-of-allowlist account_id, auth_mode, last_refresh (all guarded out)', () => {
+    // Each field carries a hostile token-shaped value; the strict guards must drop
+    // each to null so NONE is staged into the (non-secret) metadata slots.
+    const meta = extractCodexMetadata({
+      auth_mode: 'eyJREAL.ACCESS.jwt', // not in {chatgpt,apikey}
+      last_refresh: 'sk-REAL-not-a-timestamp', // not ISO-charset
+      tokens: {
+        account_id: 'eyJREAL.ACCESS.jwt', // not a UUID
+        access_token: 'JWT.REAL.ACCESS',
+        refresh_token: 'rt_REAL',
+      },
+    });
+    assert.deepEqual(meta, { accountId: null, authMode: null, lastRefresh: null });
+  });
+
+  it('rejects an sk- / apikey-shaped account_id and an out-of-charset last_refresh', () => {
+    const meta = extractCodexMetadata({
+      auth_mode: 'apikey', // valid allowlisted mode — kept
+      last_refresh: '2026-05-22T08:59:06Z; rm -rf', // contains illegal chars → dropped
+      tokens: { account_id: 'sk-proj-REAL-apikey-value' }, // not a UUID → dropped
+    });
+    assert.deepEqual(meta, { accountId: null, authMode: 'apikey', lastRefresh: null });
   });
 
   it('returns a struct with null fields when present-but-sparse, null only when unparseable', () => {

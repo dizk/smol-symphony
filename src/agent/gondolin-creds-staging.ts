@@ -259,21 +259,30 @@ async function buildCodexFiles(
   readers: HostIdentityReaders,
 ): Promise<GuestCredFile[]> {
   const meta = await safeReadCodexMetadata(readers);
+  // Re-validate at this STAGING chokepoint (codex review, HIGH). `HostIdentityReaders`
+  // is an injectable boundary, so even though the default reader already guards via
+  // `extractCodexMetadata`, a custom/buggy/hostile reader could hand us a non-UUID
+  // `accountId` (or an out-of-allowlist `authMode`/`lastRefresh`). The same shared
+  // guards run again here so a token-shaped value is OMITTED from the staged
+  // auth.json regardless of which reader produced it (defense-in-depth).
+  const accountId = validAccountId(meta?.accountId ?? null);
+  const authMode = validAuthMode(meta?.authMode ?? null);
+  const lastRefresh = validLastRefresh(meta?.lastRefresh ?? null);
   const tokens: Record<string, unknown> = {
     access_token: placeholder,
     id_token: placeholder,
     refresh_token: JUNK_REFRESH,
-    ...(meta?.accountId != null ? { account_id: meta.accountId } : {}),
+    ...(accountId !== null ? { account_id: accountId } : {}),
   };
   // Top-level non-secret completeness fields. `OPENAI_API_KEY: null` mirrors the
   // host (codex stores the OAuth tokens block, NOT an api key); `auth_mode` /
   // `last_refresh` are the markers codex 0.135's completeness check requires (see
-  // the doc comment). All are non-secret; absent ⇒ omitted (best-effort).
+  // the doc comment). All are non-secret; absent/invalid ⇒ omitted (best-effort).
   const auth: Record<string, unknown> = {
     OPENAI_API_KEY: null,
-    ...(meta?.authMode != null ? { auth_mode: meta.authMode } : {}),
+    ...(authMode !== null ? { auth_mode: authMode } : {}),
     tokens,
-    ...(meta?.lastRefresh != null ? { last_refresh: meta.lastRefresh } : {}),
+    ...(lastRefresh !== null ? { last_refresh: lastRefresh } : {}),
   };
   return [credFile(CODEX_AUTH_GUEST_PATH, JSON.stringify(auth))];
 }
@@ -374,11 +383,19 @@ export function extractClaudeIdentity(parsed: unknown): ClaudeIdentity | null {
  * `tokens` block. The parsed object also holds the real access/refresh tokens (the
  * caller parsed the whole file), but this function reads + returns ONLY `account_id`
  * — the tokens are never returned or emitted.
+ *
+ * SAFETY-CRITICAL (codex review, HIGH): this value flows (via `symphony.ts` →
+ * `buildAdapterCredentialSpecs({ codexAccountId })` → `codexPlaceholder` →
+ * `assemblePlaceholderJwt`) into the placeholder JWT's `chatgpt_account_id` claim,
+ * and that JWT IS the guest's staged `tokens.access_token` BEARER. So we validate
+ * the value through the SHARED {@link validAccountId} UUID guard here: a hostile /
+ * malformed `account_id` (a token / `sk-…` / JWT string) is NOT a UUID → returns
+ * null → the claim is OMITTED from the bearer (the SAFE failure), never embedded.
  */
 export function extractCodexAccountId(parsed: unknown): string | null {
   const tokens = pickObject(parsed, 'tokens');
   if (tokens === null) return null;
-  return pickString(tokens, 'account_id');
+  return validAccountId(pickString(tokens, 'account_id'));
 }
 
 /**
@@ -396,11 +413,49 @@ export function extractCodexMetadata(parsed: unknown): CodexIdentity | null {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
   const top = parsed as Record<string, unknown>;
   const tokens = pickObject(parsed, 'tokens');
+  // Strict format guards (codex review, HIGH): account_id flows into the placeholder
+  // JWT payload → the guest BEARER, so a hostile/malformed host auth.json must not be
+  // able to smuggle a token-shaped value through it. Real tokens (JWT/`sk-…`/refresh)
+  // don't match a UUID / a known auth_mode / an ISO-timestamp shape, so on a mismatch
+  // we OMIT the field — codex may then judge creds incomplete (the SAFE failure)
+  // rather than us staging a real-looking value into a bearer/metadata slot.
   return {
-    accountId: tokens !== null ? pickString(tokens, 'account_id') : null,
-    authMode: pickString(top, 'auth_mode'),
-    lastRefresh: pickString(top, 'last_refresh'),
+    accountId: validAccountId(tokens !== null ? pickString(tokens, 'account_id') : null),
+    authMode: validAuthMode(pickString(top, 'auth_mode')),
+    lastRefresh: validLastRefresh(pickString(top, 'last_refresh')),
   };
+}
+
+/** A ChatGPT account_id is a UUID; a real token (JWT/`sk-…`/refresh) never matches this. */
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+/** codex auth modes are a tiny closed set. */
+const KNOWN_AUTH_MODES: ReadonlySet<string> = new Set(['chatgpt', 'apikey']);
+/** `last_refresh` is an ISO-8601 timestamp: digits + `-:.TZ+`, bounded length. */
+const ISO_TIMESTAMP_RE = /^[0-9T:.Z+-]{1,40}$/;
+
+/**
+ * SHARED account_id guard (codex review, HIGH). The `account_id` is a non-secret
+ * UUID routing identifier; a real token (JWT / `sk-…` / refresh) NEVER matches a
+ * UUID. Both account_id flows MUST validate through THIS one definition so a
+ * hostile/malformed host `~/.codex/auth.json` cannot smuggle a token-shaped value
+ * into either sink:
+ *   1. the placeholder JWT's `https://api.openai.com/auth.chatgpt_account_id`
+ *      claim — which becomes the guest BEARER (`credential-secrets.ts`
+ *      `assemblePlaceholderJwt` imports this); and
+ *   2. the staged `~/.codex/auth.json` `tokens.account_id` metadata
+ *      (`extractCodexMetadata`, below).
+ * On a non-UUID value we return null so the field is OMITTED from BOTH sinks (the
+ * JWT stays well-formed; codex may then prompt — the SAFE failure) rather than
+ * embed a real-looking value.
+ */
+export function validAccountId(v: string | null): string | null {
+  return v !== null && UUID_RE.test(v) ? v : null;
+}
+function validAuthMode(v: string | null): string | null {
+  return v !== null && KNOWN_AUTH_MODES.has(v) ? v : null;
+}
+function validLastRefresh(v: string | null): string | null {
+  return v !== null && ISO_TIMESTAMP_RE.test(v) ? v : null;
 }
 
 function pickObject(value: unknown, key: string): Record<string, unknown> | null {

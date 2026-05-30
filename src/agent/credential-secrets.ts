@@ -47,6 +47,7 @@ import {
   opencodeGithubTokenFromAuth,
   opencodeGithubTokenFromEnv,
 } from './adapter-names.js';
+import { validAccountId } from './gondolin-creds-staging.js';
 import {
   extractClaudeToken,
   extractCodexToken,
@@ -151,13 +152,22 @@ export const PLACEHOLDER_JWT_EXP_SECONDS = 4_102_444_800;
  * the auth claim mirrors the spike's proven C7 placeholder. When null (host has no
  * account_id) the claim is omitted — the JWT is still well-formed; codex may then
  * refresh, but there is no id to embed.
+ *
+ * SAFETY-CRITICAL (codex review, HIGH): this JWT becomes the guest's staged BEARER,
+ * so this is the LAST chokepoint before a host `account_id` lands in a bearer slot.
+ * The id is re-validated through the SHARED {@link validAccountId} UUID guard here
+ * (defense-in-depth — independent of the caller's own validation): a non-UUID /
+ * token-shaped value is NOT embedded; the claim is simply OMITTED (the well-formed,
+ * SAFE failure). A real token (JWT / `sk-…` / refresh) never matches a UUID, so it
+ * can never reach the `chatgpt_account_id` claim via this path.
  */
 export function assemblePlaceholderJwt(signature: string, accountId: string | null = null): string {
+  const safeAccountId = validAccountId(accountId);
   const header = base64urlJson({ alg: 'RS256', typ: 'JWT' });
   const payload = base64urlJson({
     exp: PLACEHOLDER_JWT_EXP_SECONDS,
-    ...(accountId !== null
-      ? { 'https://api.openai.com/auth': { chatgpt_account_id: accountId } }
+    ...(safeAccountId !== null
+      ? { 'https://api.openai.com/auth': { chatgpt_account_id: safeAccountId } }
       : {}),
   });
   return `${header}.${payload}.${signature}`;
