@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, stat, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -8,6 +8,7 @@ import {
   isKnownAdapter,
   deriveAcpCommand,
   stageRuntimeFile,
+  stageClaudeIdentity,
   stageCodexPlaceholderAuth,
   stageOpencodeConfig,
   buildOpencodeConfig,
@@ -632,5 +633,82 @@ describe('validateDispatch', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('stageClaudeIdentity', () => {
+  let prevHome: string | undefined;
+  let tmpHome: string;
+  let tmpWs: string;
+
+  beforeEach(async () => {
+    prevHome = process.env.HOME;
+    tmpHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-identity-home-'));
+    tmpWs = await mkdtemp(path.join(os.tmpdir(), 'symphony-identity-ws-'));
+    process.env.HOME = tmpHome;
+  });
+
+  afterEach(async () => {
+    process.env.HOME = prevHome;
+    await rm(tmpHome, { recursive: true, force: true });
+    await rm(tmpWs, { recursive: true, force: true });
+  });
+
+  it('writes a minimal identity file with only oauthAccount.{accountUuid,organizationUuid}', async () => {
+    // Host ~/.claude.json may carry a lot of operator-local state: prompt history pointers,
+    // session_id, device_id, theme. None of that should reach the VM.
+    await writeFile(
+      path.join(tmpHome, '.claude.json'),
+      JSON.stringify({
+        oauthAccount: {
+          accountUuid: 'ACCT-uuid-abc',
+          organizationUuid: 'ORG-uuid-xyz',
+          emailAddress: 'operator@example.com',
+        },
+        device_id: 'device-leak-me',
+        session_id: 'session-leak-me',
+        recent_paths: ['/operator/private/dir'],
+        access_token_should_never_be_here: 'sk-ant-oat-fake-token',
+        refreshToken: 'sk-ant-oar-fake-refresh',
+      }),
+      'utf8',
+    );
+    const staged = await stageClaudeIdentity(tmpWs);
+    assert.ok(staged, 'staging should succeed when oauthAccount is present');
+    const onDisk = await readFile(staged!.absPath, 'utf8');
+    const parsed = JSON.parse(onDisk) as Record<string, unknown>;
+    assert.deepEqual(parsed, {
+      oauthAccount: {
+        accountUuid: 'ACCT-uuid-abc',
+        organizationUuid: 'ORG-uuid-xyz',
+      },
+    });
+    // Defensive scan against the literal token + leakable identifier substrings.
+    assert.equal(onDisk.includes('accessToken'), false);
+    assert.equal(onDisk.includes('refreshToken'), false);
+    assert.equal(onDisk.includes('device-leak-me'), false);
+    assert.equal(onDisk.includes('session-leak-me'), false);
+    assert.equal(onDisk.includes('sk-ant'), false);
+    assert.equal(onDisk.includes('operator@example.com'), false);
+    // Path matches the documented layout.
+    assert.match(staged!.relPath, /symphony-runtime\/identity\/claude\.json$/);
+    // Mode is restrictive (0600).
+    const st = await stat(staged!.absPath);
+    assert.equal(st.mode & 0o777, 0o600);
+  });
+
+  it('returns null when ~/.claude.json is missing', async () => {
+    const result = await stageClaudeIdentity(tmpWs);
+    assert.equal(result, null);
+  });
+
+  it('returns null when oauthAccount is malformed or missing UUIDs', async () => {
+    await writeFile(
+      path.join(tmpHome, '.claude.json'),
+      JSON.stringify({ oauthAccount: { accountUuid: 'present-but-no-org' } }),
+      'utf8',
+    );
+    const result = await stageClaudeIdentity(tmpWs);
+    assert.equal(result, null);
   });
 });

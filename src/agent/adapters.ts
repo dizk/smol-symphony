@@ -61,12 +61,12 @@ export interface StagedFileSpec {
 /**
  * How symphony supplies upstream credentials to this adapter at dispatch time.
  *
- *  - `'proxy'`: the host credential proxy mints a per-dispatch sentinel; the
- *    in-VM client dials the proxy (via the adapter's base-URL env var) with the
- *    sentinel as its bearer, and the proxy substitutes the real upstream token
- *    host-side on every request. No credential bytes — and crucially no refresh
- *    token — ever enter the VM. Both claude and codex use this (see
- *    `src/agent/credential-proxy.ts`).
+ *  - `'proxy'`: the guest holds only a token-shaped placeholder; the host
+ *    substitutes the real upstream token into the outbound request at Gondolin
+ *    egress (TLS-MITM). No credential bytes — and crucially no refresh token —
+ *    ever enter the VM. Both claude and codex use this (the host-side credential
+ *    machinery lives in `src/agent/credential-secrets.ts`, which retired the old
+ *    HTTP-proxy + per-dispatch sentinel transport).
  *  - `'forward-env'`: the adapter reads a credential env var forwarded verbatim
  *    into the VM via `smolvm.forward_env`. The proxy is not involved. No shipped
  *    adapter uses this today; it remains for adapters the proxy cannot serve.
@@ -257,7 +257,7 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
   },
 };
 
-/** Provider id of the opencode → credential-proxy custom provider. */
+/** Provider id of the opencode custom (credential-substituted) provider. */
 export const OPENCODE_PROXY_PROVIDER_ID = 'symphony-copilot';
 
 /**
@@ -345,7 +345,7 @@ export async function stageOpencodeConfig(
   return stageRuntimeFile(workspacePath, 'opencode.json', buildOpencodeConfig(model));
 }
 
-/** Provider id for the codex → credential-proxy `model_providers` override. */
+/** Provider id for the codex (credential-substituted) `model_providers` override. */
 const CODEX_PROXY_PROVIDER_ID = 'symphony-proxy';
 
 /**
@@ -437,7 +437,7 @@ export async function stageRuntimeFile(
  * Defensive shape: NO token strings, NO `device_id`/`session_id` (those are
  * per-process — the in-VM client mints fresh ones on first run), NO local
  * config (prompt-history pointers, theme, recent paths). Identity only. See
- * the integration test in tests/credential-proxy.test.ts which greps the
+ * the `stageClaudeIdentity` test in tests/adapters.test.ts which greps the
  * staged file for `accessToken`/`refreshToken` substrings.
  *
  * When `~/.claude.json` is missing or contains no `oauthAccount` we skip the

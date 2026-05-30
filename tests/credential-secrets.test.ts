@@ -20,7 +20,7 @@ import {
   CredentialSecretRegistry,
   type AdapterCredentialSpec,
 } from '../src/agent/credential-secrets.js';
-import type { TokenInfo } from '../src/agent/credential-proxy.js';
+import type { TokenInfo } from '../src/agent/credential-extractors.js';
 
 // --- fakes -----------------------------------------------------------------
 

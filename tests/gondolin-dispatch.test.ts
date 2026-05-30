@@ -32,7 +32,7 @@ import type {
   VmMount,
   VmSession,
 } from '../src/agent/vm-port.js';
-import type { TokenInfo } from '../src/agent/credential-proxy.js';
+import type { TokenInfo } from '../src/agent/credential-extractors.js';
 
 const HOME = '/home/tester';
 
