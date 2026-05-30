@@ -67,6 +67,10 @@ export interface ReconcilerOptions {
   gc?: () => Promise<number>;
   killProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
   killGraceMs?: number;
+  // Override the reaper's "own pid" (defaults to `process.pid`). Tests inject a
+  // deterministic value so the self-pid exclusion path is observable without
+  // depending on the test runner's real pid.
+  selfPid?: number;
   // Workspace resource inputs (issue 34). Optional so test harnesses that
   // don't exercise workspace reconciliation can omit them; when
   // `workspaceIntendedProvider` is missing the workspace resource is not
@@ -102,6 +106,7 @@ export class Reconciler {
   private vmGc?: () => Promise<number>;
   private vmKillProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
   private vmKillGraceMs?: number;
+  private vmSelfPid?: number;
   // Workspace janitor (issue 34). Constructed when an intended-set provider is
   // wired; without one there's no desired set to compare against, so the
   // resource is null and the reconcile pass skips it.
@@ -147,6 +152,7 @@ export class Reconciler {
     this.vmGc = opts.gc;
     this.vmKillProcess = opts.killProcess;
     this.vmKillGraceMs = opts.killGraceMs;
+    this.vmSelfPid = opts.selfPid;
     // Build eagerly only when a session source AND an intended provider are
     // both already wired. The session source is either the VmClient or the
     // explicit `listSessions` test hook; `setIntendedVmProvider` rebuilds once
@@ -178,6 +184,10 @@ export class Reconciler {
       gc,
       killProcess: this.vmKillProcess ?? defaultKillProcess,
       killGraceMs: this.vmKillGraceMs,
+      // The reaper's own pid, injected so the pure core can exclude it (and so
+      // the shell can never `process.kill` itself). Sourced here in the shell —
+      // vm.ts must not read `process`.
+      selfPid: this.vmSelfPid ?? process.pid,
     });
   }
 
@@ -531,13 +541,20 @@ function defaultConflictRouteTo(cfg: ServiceConfig): string {
  * Adapt Gondolin's `VmSession[]` (from `VmClient.listSessions()`) into the
  * reaper's local `ReaperSession` shape. Keeping this projection in the shell
  * lets `vm.ts` (the functional core) stay free of any `vm-port`/adapter import:
- * the core only ever sees the minimal `{ pid, label? }` it acts on. The reaper
- * doesn't care about a session's uuid, `alive` flag, or `createdAt` — STALE /
- * dead-pid sessions are Gondolin `gc()`'s job, and the core decides on label +
- * pid alone.
+ * the core only ever sees the minimal `{ pid, label? }` it acts on.
+ *
+ * Safety: only `alive === true` sessions are forwarded to the core. A STALE
+ * (dead-pid, `alive: false`) session is Gondolin `gc()`'s job; if it reached the
+ * core it could be SIGTERM'd as a "live orphan" even though its recorded `pid`
+ * may since have been REUSED by an unrelated host process — signalling that pid
+ * would hit the wrong process. Dropping dead sessions here keeps the core
+ * minimal (it never needs an `alive` flag) and guarantees `decideVm` only ever
+ * sees genuinely-live pids.
  */
 function adaptSessions(sessions: VmSession[]): ReaperSession[] {
-  return sessions.map((s) => ({ pid: s.pid, label: s.label }));
+  return sessions
+    .filter((s) => s.alive === true)
+    .map((s) => ({ pid: s.pid, label: s.label }));
 }
 
 function defaultKillProcess(pid: number, signal: NodeJS.Signals | 0): void {

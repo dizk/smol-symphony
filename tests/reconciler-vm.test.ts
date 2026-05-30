@@ -25,6 +25,11 @@ import {
 
 // --- shared fixtures ---------------------------------------------------------
 
+// A fixed, deterministic "reaper's own pid" for the harness. Distinct from any
+// session pid the tests use, so the self-pid exclusion only fires where a test
+// deliberately collides a session pid with it.
+const SELF_PID = 99_999;
+
 function provider(names: string[]): IntendedVmProvider {
   return { intendedVmNames: () => new Set(names) };
 }
@@ -100,6 +105,7 @@ describe('VmResource reaper (Gondolin sessions)', () => {
     ];
     const rec = makeReaperHarness(sessions);
     const vm = new VmResource({
+      selfPid: SELF_PID,
       intended: provider([]),
       listSessions: rec.listSessions,
       gc: rec.gc,
@@ -129,6 +135,7 @@ describe('VmResource reaper (Gondolin sessions)', () => {
     ];
     const rec = makeReaperHarness(sessions);
     const vm = new VmResource({
+      selfPid: SELF_PID,
       intended: provider(['symphony-42']),
       listSessions: rec.listSessions,
       gc: rec.gc,
@@ -155,6 +162,7 @@ describe('VmResource reaper (Gondolin sessions)', () => {
     };
     const rec = makeReaperHarness([stubborn]);
     const vm = new VmResource({
+      selfPid: SELF_PID,
       intended: provider([]),
       listSessions: rec.listSessions,
       gc: rec.gc,
@@ -188,6 +196,7 @@ describe('VmResource reaper (Gondolin sessions)', () => {
     ];
     const rec = makeReaperHarness(sessions);
     const vm = new VmResource({
+      selfPid: SELF_PID,
       intended: provider([]),
       listSessions: rec.listSessions,
       gc: rec.gc,
@@ -210,6 +219,7 @@ describe('VmResource reaper (Gondolin sessions)', () => {
     // independent of whether any LIVE orphan exists.
     const rec = makeReaperHarness([]);
     const vm = new VmResource({
+      selfPid: SELF_PID,
       intended: provider([]),
       listSessions: rec.listSessions,
       gc: rec.gc,
@@ -245,6 +255,7 @@ describe('VmResource reaper (Gondolin sessions)', () => {
       }
     };
     const vm = new VmResource({
+      selfPid: SELF_PID,
       intended: provider([]),
       listSessions: rec.listSessions,
       gc: rec.gc,
@@ -263,15 +274,96 @@ describe('VmResource reaper (Gondolin sessions)', () => {
     assert.match(errAction!.error!, /operation not permitted/);
     assert.match(snap.last_error!, /operation not permitted/);
   });
+
+  it('symphony orphans with unsafe pids (0 / NaN / negative) are never signalled', async () => {
+    // codex review HIGH: `process.kill(pid, sig)` signals the whole process
+    // GROUP for pid <= 0 and throws on NaN. A never-intended symphony- session
+    // carrying such a pid must reach NO host signal — the only thing sparing it
+    // is the pid-safety guard (decideVm + the shell's belt-and-suspenders).
+    const sessions: FakeSession[] = [
+      { pid: 0, label: 'symphony-zero', alive: true, exitsOnSigterm: true },
+      { pid: Number.NaN, label: 'symphony-nan', alive: true, exitsOnSigterm: true },
+      { pid: -4242, label: 'symphony-neg', alive: true, exitsOnSigterm: true },
+    ];
+    const rec = makeReaperHarness(sessions);
+    const vm = new VmResource({
+      selfPid: SELF_PID,
+      intended: provider([]),
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
+      killGraceMs: 10,
+    });
+
+    await vm.reconcile();
+
+    assert.deepEqual(rec.signals, [], 'no host signal sent for any unsafe pid');
+  });
+
+  it('a symphony orphan whose pid equals the reaper self pid is never signalled', async () => {
+    // codex review HIGH: a label collision / registry surfacing our own pid must
+    // not make the orchestrator SIGTERM itself. The session is alive and a
+    // never-intended symphony- orphan; only the self-pid exclusion spares it.
+    const sessions: FakeSession[] = [
+      { pid: SELF_PID, label: 'symphony-self', alive: true, exitsOnSigterm: true },
+    ];
+    const rec = makeReaperHarness(sessions);
+    const vm = new VmResource({
+      selfPid: SELF_PID,
+      intended: provider([]),
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
+      killGraceMs: 10,
+    });
+
+    await vm.reconcile();
+
+    assert.deepEqual(rec.signals, [], 'reaper never signals its own pid');
+    assert.equal(sessions[0]!.alive, true, 'self session left alive');
+  });
+
+  it('a dead (alive:false) symphony session is left to gc() — never signalled as a live orphan', async () => {
+    // codex review MEDIUM: a STALE (dead-pid) session whose recorded pid may
+    // have been REUSED by an unrelated host process must never be SIGTERM'd.
+    // The shell forwards only `alive === true` sessions to the core; gc() owns
+    // the dead ones. Here a live orphan and a dead orphan share the pass: only
+    // the live one is reaped, the dead one's pid is never signalled.
+    const sessions: FakeSession[] = [
+      { pid: 3030, label: 'symphony-dead', alive: false, exitsOnSigterm: true },
+      { pid: 4040, label: 'symphony-live', alive: true, exitsOnSigterm: true },
+    ];
+    const rec = makeReaperHarness(sessions);
+    const vm = new VmResource({
+      selfPid: SELF_PID,
+      intended: provider([]),
+      listSessions: rec.listSessions,
+      gc: rec.gc,
+      killProcess: rec.killProcess,
+      killGraceMs: 10,
+    });
+
+    await vm.reconcile();
+
+    const killedPids = rec.signals.map((sig) => sig.pid);
+    assert.ok(!killedPids.includes(3030), 'dead session pid never signalled (gc owns it)');
+    const sigterm = rec.signals.filter((sig) => sig.signal === 'SIGTERM').map((sig) => sig.pid);
+    assert.deepEqual(sigterm, [4040], 'the live orphan is still reaped');
+    assert.equal(sessions[1]!.alive, false, 'live orphan exited on SIGTERM');
+  });
 });
 
 // Pure `decideVm` tests (issue 69). The class-level tests above exercise the
 // shell loop end-to-end; these pin the pure decision in isolation.
 describe('decideVm (pure)', () => {
+  // The pure decision now consumes `selfPid` to exclude the reaper's own
+  // process. Pick a value that never collides with any session pid below, so
+  // the self-pid path only fires in the test that deliberately collides.
+  const PURE_SELF_PID = 88_888;
   const s = (pid: number, label?: string): ReaperSession => ({ pid, label });
 
   it('empty observed state → no effects', () => {
-    assert.deepEqual(decideVm({ intended: new Set(), sessions: [] }), []);
+    assert.deepEqual(decideVm({ intended: new Set(), sessions: [], selfPid: PURE_SELF_PID }), []);
   });
 
   it('non-symphony and unlabelled sessions are left untouched', () => {
@@ -282,6 +374,7 @@ describe('decideVm (pure)', () => {
       decideVm({
         intended: new Set(),
         sessions: [s(1, 'dev-shell'), s(2, 'operator-vm'), s(3, undefined)],
+        selfPid: PURE_SELF_PID,
       }),
       [],
     );
@@ -289,7 +382,7 @@ describe('decideVm (pure)', () => {
 
   it('case-sensitive prefix: SYMPHONY-* (uppercase) is not the symphony- namespace', () => {
     assert.deepEqual(
-      decideVm({ intended: new Set(), sessions: [s(1, 'SYMPHONY-upper')] }),
+      decideVm({ intended: new Set(), sessions: [s(1, 'SYMPHONY-upper')], selfPid: PURE_SELF_PID }),
       [],
     );
   });
@@ -298,14 +391,49 @@ describe('decideVm (pure)', () => {
     const effects = decideVm({
       intended: new Set(['symphony-keep']),
       sessions: [s(101, 'symphony-keep'), s(202, 'symphony-orphan')],
+      selfPid: PURE_SELF_PID,
     });
     const expected: VmEffect[] = [{ kind: 'kill_session', pid: 202, label: 'symphony-orphan' }];
     assert.deepEqual(effects, expected);
   });
 
+  it('symphony-labelled orphan with an unsafe pid (0 / NaN / negative) is NOT killed', () => {
+    // `process.kill(pid, sig)` signals the whole PROCESS GROUP for pid <= 0 and
+    // throws on NaN — a registry anomaly must never produce a kill effect.
+    // Each of these has a never-intended symphony- label, so the ONLY thing
+    // sparing them is the pid-safety guard.
+    assert.deepEqual(
+      decideVm({
+        intended: new Set(),
+        sessions: [
+          s(0, 'symphony-zero'),
+          s(Number.NaN, 'symphony-nan'),
+          s(-4242, 'symphony-neg'),
+        ],
+        selfPid: PURE_SELF_PID,
+      }),
+      [],
+      'no kill_session emitted for pid 0 / NaN / negative',
+    );
+  });
+
+  it("a symphony orphan whose pid equals selfPid is NOT killed (don't signal ourselves)", () => {
+    // A label collision (or a registry that surfaced our own pid) must never
+    // make the orchestrator SIGTERM itself.
+    assert.deepEqual(
+      decideVm({
+        intended: new Set(),
+        sessions: [s(PURE_SELF_PID, 'symphony-self')],
+        selfPid: PURE_SELF_PID,
+      }),
+      [],
+      'self pid is excluded even with a never-intended symphony- label',
+    );
+  });
+
   it('is pure: same input → same output, no input mutation', () => {
     const intended = new Set(['symphony-keep']);
-    const observed = { intended, sessions: [s(1, 'symphony-orphan')] };
+    const observed = { intended, sessions: [s(1, 'symphony-orphan')], selfPid: PURE_SELF_PID };
     const first = decideVm(observed);
     const second = decideVm(observed);
     assert.deepEqual(first, second);

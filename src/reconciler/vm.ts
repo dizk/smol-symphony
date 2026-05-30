@@ -80,6 +80,13 @@ export interface ReaperSession {
 export interface VmResourceOptions {
   intended: IntendedVmProvider;
   /**
+   * The reaper's OWN host pid (`process.pid`, injected by the shell so the core
+   * stays process-free — it's just a number). A session whose `pid` equals this
+   * is never signalled: it would be the orchestrator killing itself. Threaded
+   * into both the pure decision and the shell's belt-and-suspenders kill guard.
+   */
+  selfPid: number;
+  /**
    * Gondolin session GC. Collects STALE sessions (dead-pid orphans) and orphan
    * socket files; returns the count reaped. Run first each pass so the
    * subsequent `listSessions` only surfaces live sessions. Production wiring
@@ -114,6 +121,12 @@ export interface VmObservedState {
   intended: ReadonlySet<string>;
   /** Live Gondolin sessions on the host (`listSessions`, post-`gc`). */
   sessions: readonly ReaperSession[];
+  /**
+   * The reaper's own host pid. Any session whose `pid` matches is skipped so the
+   * orchestrator can never signal itself (a session label collision, or a
+   * registry that surfaced our own pid, must not be reaped).
+   */
+  selfPid: number;
 }
 
 /**
@@ -129,7 +142,15 @@ export type VmEffect = KillSessionAction;
  *
  * Effect rule:
  *   • Session has a `label` that starts with SYMPHONY_VM_PREFIX and isn't
- *     intended → `kill_session` (SIGTERM→SIGKILL its host pid).
+ *     intended, AND a sane, non-self host pid → `kill_session` (SIGTERM→SIGKILL
+ *     its host pid).
+ *
+ * Pid safety: a host signal is only ever emitted for a `pid` that is a safe
+ * positive integer and is NOT the reaper's own pid. This matters because the
+ * shell delivers the signal with `process.kill(pid, sig)`, which signals the
+ * whole PROCESS GROUP for `pid <= 0` and would target the orchestrator itself
+ * for `pid === selfPid`. A session carrying a `0`/`NaN`/negative/self pid is a
+ * registry anomaly, never a legitimate orphan, so it is left untouched here.
  *
  * Anything outside the symphony-prefixed namespace — a session with no label,
  * or a label that doesn't start with the prefix — is left untouched (operator
@@ -144,6 +165,10 @@ export function decideVm(state: VmObservedState): VmEffect[] {
     if (label === undefined) continue;
     if (!label.startsWith(SYMPHONY_VM_PREFIX)) continue;
     if (state.intended.has(label)) continue;
+    // Pid safety: skip anomalous pids (0/NaN/negative — process-group / invalid)
+    // and never signal the reaper's own process.
+    if (!Number.isSafeInteger(s.pid) || s.pid <= 0) continue;
+    if (s.pid === state.selfPid) continue;
     out.push({ kind: 'kill_session', pid: s.pid, label });
   }
   return out;
@@ -164,6 +189,7 @@ export class VmResource {
   private readonly listSessions: () => Promise<ReaperSession[]>;
   private readonly killProcess: (pid: number, signal: NodeJS.Signals | 0) => void;
   private readonly killGraceMs: number;
+  private readonly selfPid: number;
 
   private readonly ledger = new ResourceActionLedger(this.id, { maxHistory: MAX_ACTION_HISTORY });
   private lastError: string | null = null;
@@ -173,6 +199,7 @@ export class VmResource {
     this.listSessions = opts.listSessions;
     this.killProcess = opts.killProcess;
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+    this.selfPid = opts.selfPid;
   }
 
   ready(): boolean {
@@ -194,7 +221,7 @@ export class VmResource {
     // intended set; survivors with a never-intended `symphony-` label are
     // LIVE orphans (alive pid, so gc() can't reach them) and get SIGTERM'd.
     const sessions = await this.observeSessions();
-    const effects = decideVm({ intended: desired, sessions });
+    const effects = decideVm({ intended: desired, sessions, selfPid: this.selfPid });
     if (effects.length === 0) return;
 
     log.info('vm reaper: killing orphan sessions', { orphans: effects.length });
@@ -235,6 +262,18 @@ export class VmResource {
 
   private async killSession(e: KillSessionAction): Promise<void> {
     const key = `kill_session:${e.pid}`;
+    // Belt-and-suspenders: `decideVm` already excludes self / anomalous pids,
+    // but a bad pid reaching the actual `process.kill` is catastrophic
+    // (`pid <= 0` signals the whole process group; `selfPid` signals the
+    // orchestrator). Guard once more before the signal ever leaves the shell.
+    if (e.pid === this.selfPid || !Number.isSafeInteger(e.pid) || e.pid <= 0) {
+      const msg = `refused to signal unsafe pid ${e.pid}`;
+      this.lastError = msg;
+      this.ledger.start(key);
+      this.ledger.error(key, msg);
+      log.warn('vm reaper: refused unsafe pid', { pid: e.pid, label: e.label, self_pid: this.selfPid });
+      return;
+    }
     this.ledger.start(key);
     // SIGTERM. If the process is already gone (ESRCH) treat as success.
     try {
