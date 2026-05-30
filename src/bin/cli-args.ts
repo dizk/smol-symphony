@@ -85,8 +85,8 @@ export function parseCli(argv: string[]): Cli {
           `symphony reconcile [path-to-WORKFLOW.md] [--force] [--port PORT]\n` +
           `symphony rerun --check=<name> [path-to-WORKFLOW.md]\n\n` +
           `If path is omitted, ./WORKFLOW.md is used.\n` +
-          `\`reconcile --force\` (or the alias \`--reconcile-force\`) invalidates the\n` +
-          `cached bake artifact and rebakes before dispatching.\n` +
+          `\`reconcile --force\` (or the alias \`--reconcile-force\`) requests an\n` +
+          `immediate reconcile pass (VM / workspace / PR janitors) at startup.\n` +
           `\`rerun --check=<name>\` invalidates the named run_in_vm action's content-hash\n` +
           `cache entry so the next dispatch into its state re-executes it.\n` +
           `\`--verbose\` (alias \`--foreground\`, \`-v\`) mirrors structured logs to the\n` +

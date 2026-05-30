@@ -7,9 +7,9 @@
 // Default workflow path is ./WORKFLOW.md.
 //
 // The `reconcile` subcommand boots symphony exactly the same way as the bare
-// form; `--force` additionally invalidates any cached bake artifact for the
-// current Smolfile hash before dispatch so the next bake is guaranteed to
-// rebuild. `--reconcile-force` is kept as a top-level alias for ergonomics.
+// form; `--force` additionally requests an immediate reconcile pass (VM /
+// workspace / PR janitors) instead of waiting on the backstop tick.
+// `--reconcile-force` is kept as a top-level alias for ergonomics.
 //
 // The `rerun` subcommand (issue 36) invalidates one `run_in_vm` action's
 // content-hash cache entries so the next dispatch into the state hosting it
@@ -32,7 +32,6 @@ import { invalidateRunInVmByName } from '../actions/index.js';
 import type { RunInVmAction, WorkflowAction } from '../actions/index.js';
 import { LocalMarkdownTracker } from '../trackers/local.js';
 import { WorkspaceManager } from '../workspace.js';
-import { SmolvmClient } from '../agent/smolvm.js';
 import { GondolinVmClient } from '../agent/gondolin.js';
 import {
   CredentialSecretRegistry,
@@ -332,7 +331,6 @@ function resolveGondolinVmConfig(config: ServiceConfig): GondolinVmConfig {
 interface OrchestratorGraph {
   tracker: LocalMarkdownTracker;
   workspaces: WorkspaceManager;
-  smolvm: SmolvmClient;
   mcp: McpRegistry;
   acpBridge: AcpBridge;
   credentialTicker: CredentialTicker;
@@ -346,16 +344,16 @@ interface OrchestratorGraph {
 }
 
 /**
- * Build the in-process graph: tracker, workspaces, smolvm, mcp, acpBridge,
+ * Build the in-process graph: tracker, workspaces, vmClient, mcp, acpBridge,
  * reconciler, runner, orchestrator. Wires the post-construction provider
  * hooks (`reconciler.setIntendedVmProvider` / `setWorkspaceProviders` /
  * `setPrAutopilotProviders`) and the reload callback that propagates config
  * updates through every component.
  *
  * The Reconciler is constructed before the Orchestrator (the runner needs the
- * reconciler at its own construction time for the bake-artifact path), so the
- * vm reaper's IntendedVmProvider and workspace providers are plugged in after
- * the orchestrator exists. The vm resource is only built when both `vmClient`
+ * reconciler at its own construction time), so the vm reaper's
+ * IntendedVmProvider and workspace providers are plugged in after the
+ * orchestrator exists. The vm resource is only built when both `vmClient`
  * (passed at Reconciler construction) and an intended provider are wired.
  */
 async function buildOrchestratorGraph(opts: {
@@ -375,10 +373,6 @@ async function buildOrchestratorGraph(opts: {
     await bailStartup(`error: tracker init failed: ${(err as Error).message}\n`, { src });
   }
   const workspaces = new WorkspaceManager(config);
-  // smolvm CLI client. No longer on any live path (dispatch + reaper both run
-  // on Gondolin as of Phase 4); kept constructed only so the graph shape is
-  // unchanged until Phase 6 deletes SmolvmClient + the config migration.
-  const smolvm = new SmolvmClient(config.smolvm);
   // Gondolin VM substrate (replaced the smolvm CLI backend for the dispatch
   // path). The runner builds a per-dispatch GondolinDispatcher over this client,
   // and the Reconciler's VM reaper observes its session registry / runs its GC.
@@ -465,7 +459,6 @@ async function buildOrchestratorGraph(opts: {
   return {
     tracker,
     workspaces,
-    smolvm,
     mcp,
     acpBridge,
     credentialTicker,

@@ -1,11 +1,10 @@
 // Generalized VM-substrate port (Gondolin object model).
 //
-// Successor to `smolvm-port.ts`. Where the smolvm port mirrored the CLI's
-// name-keyed verbs (`create`/`start`/`stop`/`destroy`/`exec`), this port
-// mirrors Gondolin's object model: `createVm(opts)` hands back a `VmHandle`
-// that owns `exec()` / `close()`, and session discovery/GC is global —
-// Gondolin owns the lifecycle registry, replacing the smolvm machine registry
-// + the `_boot-vm` reaper.
+// Where the old smolvm port mirrored the CLI's name-keyed verbs
+// (`create`/`start`/`stop`/`destroy`/`exec`), this port mirrors Gondolin's
+// object model: `createVm(opts)` hands back a `VmHandle` that owns `exec()` /
+// `close()`, and session discovery/GC is global — Gondolin owns the lifecycle
+// registry, replacing the smolvm machine registry + the `_boot-vm` reaper.
 //
 // Domain code imports only this module (the hexagonal `domain↛adapters`
 // direction holds); the concrete adapter lives in `./gondolin.ts`. The handful
