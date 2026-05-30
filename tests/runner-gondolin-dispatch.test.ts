@@ -37,7 +37,13 @@ import {
   buildAdapterHooksConfig,
   type AdapterHooksConfig,
 } from '../src/agent/credential-secrets.js';
-import { ACP_GUEST_PORT, ACP_SYNTHETIC_HOST } from '../src/agent/vm-acp-mapping.js';
+import {
+  ACP_GUEST_PORT,
+  ACP_SYNTHETIC_HOST,
+  MCP_GUEST_PORT,
+  MCP_SYNTHETIC_HOST,
+} from '../src/agent/vm-acp-mapping.js';
+import { McpRegistry } from '../src/mcp.js';
 import type { GondolinVmConfig } from '../src/agent/gondolin-dispatch.js';
 import { AcpBridge } from '../src/acp-bridge.js';
 import type { AcpAdapterId } from '../src/agent/adapter-names.js';
@@ -206,7 +212,12 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
     await rm(trackerRoot, { recursive: true, force: true });
   });
 
-  function buildRunner(client: FakeVmClient, registry: CredentialSecretRegistry, adapter: AcpAdapterId) {
+  function buildRunner(
+    client: FakeVmClient,
+    registry: CredentialSecretRegistry,
+    adapter: AcpAdapterId,
+    mcpReg: McpRegistry | null = null,
+  ) {
     const cfg = buildServiceConfig(
       {
         workspace: { root: wsRoot },
@@ -215,7 +226,7 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
           // Fail the in-VM connect fast (the fake VM never dials back).
           bridge: { connect_timeout_ms: 150 },
         },
-        mcp: { enabled: false },
+        mcp: { enabled: mcpReg !== null, host: '127.0.0.1' },
         states: { Todo: { role: 'active', adapter }, Done: { role: 'terminal' } },
         tracker: { kind: 'local', root: trackerRoot },
       },
@@ -241,7 +252,7 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
       tracker,
       client,
       events,
-      null, // mcp
+      mcpReg,
       bridge,
       null, // followupSink
       null, // actionSnapshotSink
@@ -277,6 +288,9 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
       [`${ACP_SYNTHETIC_HOST}:${ACP_GUEST_PORT}`]: `127.0.0.1:${bridgePort}`,
     });
     assert.equal(opts.allowWebSockets, false);
+    // mcp disabled here → no MCP tunnel (the agent couldn't transition, but this
+    // attempt fails at the bridge connect anyway).
+    assert.ok(!Object.keys(opts.tcp!.hosts).some((k) => k.startsWith(MCP_SYNTHETIC_HOST)));
 
     // The launch exec (last exec; the `/bin/sh` creds writes precede it) carries
     // the ACP url/token + adapter bin, and the placeholder bearer (NOT a real
@@ -293,6 +307,31 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
     // dispatch owns lifecycle now — no deferral to the reconciler).
     assert.equal(client.handle.closed, 1, 'VM closed on teardown');
     assert.equal(registry.size(), 0, 'secret manager deregistered on teardown');
+  });
+
+  it('wires the MCP control-plane tunnel into tcp.hosts when mcp is enabled (so the agent can transition)', async () => {
+    const client = makeFakeVmClient();
+    const registry = new CredentialSecretRegistry({
+      readToken: async () => ({ accessToken: 'real-host-token', expiresAtMs: null }),
+      refresh: async () => {},
+    });
+    const mcpReg = new McpRegistry({} as unknown as IssueTracker);
+    mcpReg.setEffectivePort(8787); // the bound HTTP server port the guest must reach
+    const runner = buildRunner(client, registry, 'claude', mcpReg);
+
+    // Fails at the bridge connect (fake VM never dials back) — but the createVm opts
+    // are built BEFORE that, so the MCP tunnel decision is observable.
+    await runner.runAttempt(makeIssue(), 0, { cancelled: false });
+
+    const opts = client.createCalls[0]!;
+    const bridgePort = bridge.port()!;
+    // The MCP control plane (host 127.0.0.1:8787) is tunnelled alongside the ACP
+    // bridge in the SAME tcp.hosts record. This is the gap dogfooding surfaced:
+    // without it the agent runs turns but can't reach symphony.transition.
+    assert.deepEqual(opts.tcp!.hosts, {
+      [`${ACP_SYNTHETIC_HOST}:${ACP_GUEST_PORT}`]: `127.0.0.1:${bridgePort}`,
+      [`${MCP_SYNTHETIC_HOST}:${MCP_GUEST_PORT}`]: '127.0.0.1:8787',
+    });
   });
 
   it('TEARS DOWN the dispatch (close VM + deregister) when a post-dispatch step throws', async () => {

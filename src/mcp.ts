@@ -200,16 +200,36 @@ export class McpRegistry {
   }
 
   /**
+   * The bound HTTP port, or null until the server binds. Exposed so the Gondolin
+   * dispatch can wire the guest→host MCP `tcp.hosts` tunnel to the real
+   * `mcp.host:effectivePort` while the guest dials a fixed synthetic host.
+   */
+  getEffectivePort(): number | null {
+    return this.effectivePort;
+  }
+
+  /**
    * Build the URL the ACP agent will be told to POST to. Returns null when no HTTP server
    * is available and no explicit URL is configured; the runner uses that to skip MCP
    * injection (with a warning) instead of advertising an unreachable endpoint.
+   *
+   * `baseOverride` (e.g. the Gondolin guest synthetic base `http://symphony-mcp:7001`)
+   * wins over both `explicit_host_url` and the real host:port: under Gondolin the
+   * guest cannot reach the host loopback directly, so the runner passes the synthetic
+   * base that a per-dispatch `tcp.hosts` entry tunnels to the real MCP server.
    */
-  buildUrl(identifier: string, mcp: { host: string; explicit_host_url: string | null }): string | null {
-    const base = mcp.explicit_host_url
-      ? mcp.explicit_host_url.replace(/\/+$/, '')
-      : this.effectivePort === null
-        ? null
-        : `http://${mcp.host}:${this.effectivePort}`;
+  buildUrl(
+    identifier: string,
+    mcp: { host: string; explicit_host_url: string | null },
+    baseOverride?: string,
+  ): string | null {
+    const base = baseOverride
+      ? baseOverride.replace(/\/+$/, '')
+      : mcp.explicit_host_url
+        ? mcp.explicit_host_url.replace(/\/+$/, '')
+        : this.effectivePort === null
+          ? null
+          : `http://${mcp.host}:${this.effectivePort}`;
     if (!base) return null;
     return `${base}/api/v1/issues/${encodeURIComponent(identifier)}/mcp`;
   }

@@ -63,3 +63,31 @@ export function buildAcpTcpDns(
     acpUrl: `tcp://${syntheticName}:${ACP_GUEST_PORT}`,
   };
 }
+
+/** The synthetic guest hostname the in-VM agent dials for the MCP control plane. */
+export const MCP_SYNTHETIC_HOST = 'symphony-mcp';
+/**
+ * The fixed guest-side port the MCP synthetic name is reached on. Distinct from
+ * {@link ACP_GUEST_PORT} so the two mapped channels never collide in `tcp.hosts`.
+ */
+export const MCP_GUEST_PORT = 7001;
+
+/** Guest-facing base URL the in-VM agent dials for MCP (the `/api/v1/...` path is appended by the caller). */
+export const MCP_GUEST_BASE_URL = `http://${MCP_SYNTHETIC_HOST}:${MCP_GUEST_PORT}`;
+
+/**
+ * Build the `tcp.hosts` entry that tunnels the in-VM agent's MCP control-plane
+ * HTTP requests (`symphony.transition` / `propose_issue` / steering) to the host's
+ * orchestrator HTTP server on its loopback `mcpHost:mcpPort`. Same mechanism +
+ * security posture as {@link buildAcpTcpDns}: Gondolin blocks guest→host loopback,
+ * so without this mapping the agent can run inference turns but CANNOT reach the
+ * control plane (it could complete work but never transition state). The channel
+ * carries only the per-dispatch MCP bearer (the URL + token is the capability),
+ * never an upstream secret, and is PORT-SPECIFIC so it can never be reused to
+ * reach another host-loopback service. Merge the returned entry into the same
+ * `tcp.hosts` record the ACP mapping uses; the synthetic per-host DNS already
+ * resolves any synthetic name, so no extra DNS config is needed.
+ */
+export function buildMcpTcpHostEntry(mcpHost: string, mcpPort: number): Record<string, string> {
+  return { [`${MCP_SYNTHETIC_HOST}:${MCP_GUEST_PORT}`]: `${mcpHost}:${mcpPort}` };
+}

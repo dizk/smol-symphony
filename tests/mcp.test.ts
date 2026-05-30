@@ -1350,3 +1350,46 @@ describe('McpRegistry transition', () => {
     }
   });
 });
+
+describe('McpRegistry.buildUrl', () => {
+  it('uses host:effectivePort by default, and a baseOverride wins (Gondolin synthetic guest host)', async () => {
+    const { root, cleanup } = await setupTree();
+    try {
+      const reg = new McpRegistry(makeTracker(root));
+      const mcp = { host: '127.0.0.1', explicit_host_url: null };
+
+      // No bound port yet → null (runner skips MCP injection).
+      assert.equal(reg.buildUrl('SYM-1', mcp), null);
+      assert.equal(reg.getEffectivePort(), null);
+
+      reg.setEffectivePort(8787);
+      assert.equal(reg.getEffectivePort(), 8787);
+      // Default: the real host:port.
+      assert.equal(reg.buildUrl('SYM-1', mcp), 'http://127.0.0.1:8787/api/v1/issues/SYM-1/mcp');
+      // baseOverride (the Gondolin synthetic guest base) wins over the real host:port,
+      // and the path (with the encoded identifier) is preserved.
+      assert.equal(
+        reg.buildUrl('SYM/1', mcp, 'http://symphony-mcp:7001'),
+        'http://symphony-mcp:7001/api/v1/issues/SYM%2F1/mcp',
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('explicit_host_url wins over the real host:port but a baseOverride still wins over it', async () => {
+    const { root, cleanup } = await setupTree();
+    try {
+      const reg = new McpRegistry(makeTracker(root));
+      reg.setEffectivePort(8787);
+      const mcp = { host: '127.0.0.1', explicit_host_url: 'https://proxy.example/' };
+      assert.equal(reg.buildUrl('SYM-1', mcp), 'https://proxy.example/api/v1/issues/SYM-1/mcp');
+      assert.equal(
+        reg.buildUrl('SYM-1', mcp, 'http://symphony-mcp:7001'),
+        'http://symphony-mcp:7001/api/v1/issues/SYM-1/mcp',
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+});

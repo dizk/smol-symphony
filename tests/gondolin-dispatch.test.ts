@@ -15,8 +15,11 @@ import {
 } from '../src/agent/gondolin-dispatch.js';
 import {
   buildAcpTcpDns,
+  buildMcpTcpHostEntry,
   ACP_GUEST_PORT,
   ACP_SYNTHETIC_HOST,
+  MCP_GUEST_PORT,
+  MCP_SYNTHETIC_HOST,
 } from '../src/agent/vm-acp-mapping.js';
 import {
   CredentialSecretRegistry,
@@ -261,6 +264,17 @@ describe('buildAcpTcpDns', () => {
   });
 });
 
+// --- buildMcpTcpHostEntry ---------------------------------------------------
+
+describe('buildMcpTcpHostEntry', () => {
+  it('maps the synthetic MCP name+port to the host MCP loopback (distinct from the ACP port)', () => {
+    const entry = buildMcpTcpHostEntry('127.0.0.1', 8787);
+    assert.deepEqual(entry, { [`${MCP_SYNTHETIC_HOST}:${MCP_GUEST_PORT}`]: '127.0.0.1:8787' });
+    assert.notEqual(MCP_GUEST_PORT, ACP_GUEST_PORT, 'MCP + ACP guest ports must not collide');
+    assert.ok(!Object.keys(entry).some((k) => k.includes('*')), 'no wildcard key');
+  });
+});
+
 // --- dispatch: createVm opts ------------------------------------------------
 
 describe('GondolinDispatcher.dispatch — createVm options', () => {
@@ -287,6 +301,34 @@ describe('GondolinDispatcher.dispatch — createVm options', () => {
     });
     assert.deepEqual(opts.dns, { mode: 'synthetic', syntheticHostMapping: 'per-host' });
     assert.ok(opts.httpHooks, 'httpHooks threaded through');
+  });
+
+  it('adds the MCP control-plane tunnel into tcp.hosts (alongside ACP) when opts.mcp is set', async () => {
+    const client = makeFakeVmClient();
+    const { registry } = makeRegistry({ accessToken: 'tok', expiresAtMs: null });
+    const d = new GondolinDispatcher(client, registry, stubHooksConfig(), VM_CONFIG);
+
+    await d.dispatch(baseOptions({ mcp: { host: '127.0.0.1', port: 8787 } }));
+
+    const opts = client.createCalls[0]!;
+    // BOTH channels share one tcp.hosts record + the single synthetic DNS config —
+    // without the MCP entry the agent runs turns but can't reach symphony.transition.
+    assert.deepEqual(opts.tcp!.hosts, {
+      [`${ACP_SYNTHETIC_HOST}:${ACP_GUEST_PORT}`]: '127.0.0.1:55123',
+      [`${MCP_SYNTHETIC_HOST}:${MCP_GUEST_PORT}`]: '127.0.0.1:8787',
+    });
+    assert.deepEqual(opts.dns, { mode: 'synthetic', syntheticHostMapping: 'per-host' });
+  });
+
+  it('omits the MCP tunnel when opts.mcp is undefined (only the ACP mapping)', async () => {
+    const client = makeFakeVmClient();
+    const { registry } = makeRegistry({ accessToken: 'tok', expiresAtMs: null });
+    const d = new GondolinDispatcher(client, registry, stubHooksConfig(), VM_CONFIG);
+
+    await d.dispatch(baseOptions()); // no mcp
+
+    const opts = client.createCalls[0]!;
+    assert.deepEqual(Object.keys(opts.tcp!.hosts), [`${ACP_SYNTHETIC_HOST}:${ACP_GUEST_PORT}`]);
   });
 
   it('STRIPS credential env vars from the boot env (no real token reaches the guest)', async () => {
