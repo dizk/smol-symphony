@@ -133,6 +133,21 @@ export interface GondolinDispatchHandle {
  */
 const VM_AGENT_COMMAND: readonly string[] = ['node', '/opt/symphony/vm-agent.mjs'];
 
+/**
+ * PATH for the launched agent's exec. Gondolin's `vm.exec` runs the command
+ * WITHOUT a login shell, so the guest's profile-set PATH does not apply — the
+ * default exec PATH is only `/usr/sbin:/usr/bin:/sbin:/bin`, which EXCLUDES
+ * `/usr/local/bin` where the image installs `node` and every agent CLI
+ * (`claude-agent-acp` / `codex-acp` / `opencode`). Without this, the launch
+ * command `node …` fails to spawn (ENOENT) and the in-VM agent never dials the
+ * bridge back — and even if `node` were found, the adapter the agent spawns
+ * (`SYMPHONY_ADAPTER_BIN`, also in `/usr/local/bin`) would not resolve either.
+ * Set it explicitly on the launch exec env (which the adapter child inherits) so
+ * the production dispatch path does not depend on a login shell. This carries no
+ * secret — it is a fixed search path. (Go-live validation finding.)
+ */
+const GUEST_AGENT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
 /** Bound on each fake-creds write exec (a tiny mkdir+write; never hangs). */
 const STAGE_TIMEOUT_MS = 15_000;
 
@@ -300,8 +315,9 @@ export class GondolinDispatcher {
       httpHooks,
       tcp: mapping.tcp,
       dns: mapping.dns,
-      // codex stays on the HTTP Responses transport; WS upgrades are opaque
-      // post-101 so default-deny (design §4.1).
+      // codex stays on the HTTP Responses transport (its codex-acp WS default is
+      // killed by the profile's `force_http_fallback=true` native arg); WS upgrades
+      // are opaque post-101 so default-deny (design §4.1).
       allowWebSockets: false,
       sessionLabel: `${SYMPHONY_VM_PREFIX}${opts.identifier}`,
       workdir: opts.workdir,
@@ -358,6 +374,10 @@ export class GondolinDispatcher {
     placeholderEnv: Record<string, string>,
   ): Record<string, string> {
     return {
+      // PATH first so a non-login exec resolves `node` + the agent CLIs in
+      // `/usr/local/bin` (see GUEST_AGENT_PATH). A runtimeEnv-supplied PATH (rare)
+      // would override it via the spread below.
+      PATH: GUEST_AGENT_PATH,
       SYMPHONY_ACP_URL: acpUrl,
       SYMPHONY_ACP_TOKEN: opts.acpToken,
       SYMPHONY_ADAPTER_BIN: opts.adapterBin,

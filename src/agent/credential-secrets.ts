@@ -107,10 +107,20 @@ function claudePlaceholder(): () => string {
  * placeholder out of `createHttpHooks().env` verbatim). The header + payload are
  * fixed; the signature segment is a high-entropy random string so each VM's
  * placeholder is unique + exact-matchable. Built once at `createHttpHooks()` time.
+ *
+ * GO-LIVE FINDING: codex-acp's local auth manager reads the
+ * `https://api.openai.com/auth` claim (specifically `chatgpt_account_id`) out of
+ * the bearer JWT *before* any egress. A placeholder with only `{ exp }` (no auth
+ * claim) makes codex-acp consider the token incomplete and attempt a token
+ * REFRESH mid-turn — which is egress-blocked → 403 → the turn is refused. The
+ * spike's C7 placeholder embedded that claim and passed; production had dropped
+ * it. So when the host `account_id` is known we embed it in the placeholder's
+ * auth claim. The id is a NON-SECRET identifier (same one staged into auth.json's
+ * `tokens.account_id`), never a token.
  */
-function codexPlaceholder(): () => string {
+function codexPlaceholder(accountId: string | null): () => string {
   const randomSig = makePlaceholderFunc({ length: 86, alphabet: BASE64URL_ALPHABET });
-  return () => assemblePlaceholderJwt(randomSig());
+  return () => assemblePlaceholderJwt(randomSig(), accountId);
 }
 function opencodePlaceholder(): () => string {
   // The opencode custom provider forwards this as its bearer; a `gho_`-shaped
@@ -129,14 +139,27 @@ export const PLACEHOLDER_JWT_EXP_SECONDS = 4_102_444_800;
 /**
  * Assemble a structurally-valid (but cryptographically meaningless) JWT-shaped
  * placeholder: `base64url(header).base64url(payload).<signature>`. codex never
- * verifies the signature — it only reads `exp` — and the real token replaces this
- * whole string at egress. The `signature` segment is the caller's high-entropy
- * random string, making each VM's placeholder unique + exact-matchable by
- * Gondolin's header substitution.
+ * verifies the signature — it reads `exp` (must be far-future, so it never tries
+ * to refresh) and the `https://api.openai.com/auth.chatgpt_account_id` claim
+ * (which it uses to route + to consider the token complete; a missing claim
+ * triggers a refresh, see `codexPlaceholder`). The real token replaces this whole
+ * string at egress. The `signature` segment is the caller's high-entropy random
+ * string, making each VM's placeholder unique + exact-matchable by Gondolin's
+ * header substitution.
+ *
+ * `accountId` is the NON-SECRET `chatgpt_account_id` (when known); embedding it in
+ * the auth claim mirrors the spike's proven C7 placeholder. When null (host has no
+ * account_id) the claim is omitted — the JWT is still well-formed; codex may then
+ * refresh, but there is no id to embed.
  */
-export function assemblePlaceholderJwt(signature: string): string {
+export function assemblePlaceholderJwt(signature: string, accountId: string | null = null): string {
   const header = base64urlJson({ alg: 'RS256', typ: 'JWT' });
-  const payload = base64urlJson({ exp: PLACEHOLDER_JWT_EXP_SECONDS });
+  const payload = base64urlJson({
+    exp: PLACEHOLDER_JWT_EXP_SECONDS,
+    ...(accountId !== null
+      ? { 'https://api.openai.com/auth': { chatgpt_account_id: accountId } }
+      : {}),
+  });
   return `${header}.${payload}.${signature}`;
 }
 
@@ -253,6 +276,15 @@ export interface BuildSpecsOptions {
   claudeRefresher?: () => Promise<void>;
   /** opencode GitHub→Copilot exchange (default: real https); tests inject a stub. */
   copilotExchange?: CopilotTokenExchange;
+  /**
+   * The host's NON-SECRET codex `chatgpt_account_id`. Embedded in the codex
+   * placeholder JWT's `https://api.openai.com/auth` claim so codex-acp considers
+   * the (placeholder) bearer complete and does NOT attempt a mid-turn refresh
+   * (egress-blocked → 403 → refusal — the go-live finding). Resolve it once at
+   * composition (see `defaultHostIdentityReaders().readCodexAccountId`) and pass
+   * it here. Null/absent ⇒ the claim is omitted (best-effort).
+   */
+  codexAccountId?: string | null;
 }
 
 /**
@@ -291,7 +323,9 @@ export function buildAdapterCredentialSpecs(
       adapterId: 'codex',
       secretName: CODEX_SECRET_NAME,
       allowedHosts: [CODEX_UPSTREAM_HOST],
-      placeholder: codexPlaceholder,
+      // Bind the host account_id into the placeholder JWT's auth claim so
+      // codex-acp does not refresh the placeholder (go-live finding).
+      placeholder: () => codexPlaceholder(opts.codexAccountId ?? null),
       billingHeaders: CODEX_BILLING_TELL_HEADERS,
       // codex tokens are long-TTL (~8 days): re-read on demand, never drive an
       // OpenAI refresh dance — identical to the proxy's posture.

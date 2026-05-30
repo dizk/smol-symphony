@@ -51,7 +51,11 @@ fi
 echo ">> using lz4: $(command -v lz4 || echo MISSING)"
 
 echo ">> [1/2] docker build glibc rootfs image ${ROOTFS_IMG} (agents baked in) ..."
-docker build -t "${ROOTFS_IMG}" -f Dockerfile.agents .
+# Build context = repo root so the Dockerfile can COPY scripts/vm-agent.mjs (the
+# in-VM ACP launcher) into the image at /opt/symphony. The dispatcher launches
+# `node /opt/symphony/vm-agent.mjs` with NO runtime mount, so the launcher MUST be
+# baked here (go-live finding: it was previously neither baked nor mounted).
+docker build -t "${ROOTFS_IMG}" -f "$PWD/Dockerfile.agents" "$REPO_ROOT"
 
 echo ">> [2/2] gondolin build (OCI rootfs) → ${TAG} ..."
 $GONDOLIN build --config build-config.oci.json --tag "${TAG}"

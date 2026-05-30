@@ -214,6 +214,23 @@ export const ADAPTERS: Record<AcpAdapterId, AdapterProfile> = {
     // kills the wss attempt; the explicit `base_url` sends `/v1/responses` over
     // HTTPS to the path-transparent proxy.
     proxyProviderArgs: ({ baseUrl, tokenVar }) => codexProxyProviderArgs(baseUrl, tokenVar),
+    // KNOWN GO-LIVE BLOCKER (codex over Gondolin, native ChatGPT-OAuth): codex-acp
+    // 0.15 streams `/backend-api/codex/responses` over a WebSocket. Through the
+    // Gondolin substrate that stream disconnects (`ResponseStreamDisconnected`,
+    // http_status_code: None) — codex then misreads the drop as an auth failure and
+    // attempts a token refresh, which is egress-blocked (auth.openai.com not
+    // allowlisted) → 403 → the turn is REFUSED. The placeholder-JWT account-id fix
+    // (credential-secrets.ts) is necessary (it stops the *pre-emptive* refresh so
+    // codex reaches `/responses` at all) but NOT sufficient. Neither
+    // `allowWebSockets:true` (the WS still drops) nor a config override resolves it:
+    // codex 0.135 forbids overriding the reserved built-in `openai` provider
+    // (`supports_websockets=false` → "Built-in providers cannot be overridden"),
+    // and codex-acp has no user-facing knob to force the HTTP transport
+    // (`force_http_fallback` is an internal Rust symbol, not a TOML config key).
+    // `codex exec` (the CLI, HTTP SSE) works fine through Gondolin — so this is
+    // specific to codex-acp's WebSocket Responses transport vs Gondolin's WS-MITM.
+    // Resolving it needs a substrate-level or codex-acp-version change (escalate);
+    // claude is fully green on the same path.
   },
   opencode: {
     id: 'opencode',

@@ -42,6 +42,7 @@ import {
   type AdapterHooksConfig,
 } from '../agent/credential-secrets.js';
 import type { GondolinVmConfig } from '../agent/gondolin-dispatch.js';
+import { defaultHostIdentityReaders } from '../agent/gondolin-creds-staging.js';
 import { KNOWN_ADAPTER_IDS, type AcpAdapterId } from '../agent/adapter-names.js';
 import { AgentRunner } from '../agent/runner.js';
 import { Orchestrator } from '../orchestrator.js';
@@ -267,12 +268,17 @@ async function loadAndValidateConfig(workflowPath: string): Promise<LoadedConfig
  * + token-shaped placeholder + request/response hooks) thread into each dispatch's
  * `createHttpHooks`. The ticker fans `refreshAdapter` over every live adapter.
  */
-function buildCredentialPipeline(config: ServiceConfig): {
+async function buildCredentialPipeline(config: ServiceConfig): Promise<{
   credentialRegistry: CredentialSecretRegistry;
   adapterHooks: Record<AcpAdapterId, AdapterHooksConfig>;
   credentialTicker: CredentialTicker;
-} {
-  const specs = buildAdapterCredentialSpecs();
+}> {
+  // Resolve the host's NON-SECRET codex `chatgpt_account_id` once and bind it into
+  // the codex placeholder JWT's auth claim — without it codex-acp attempts a
+  // mid-turn token refresh (egress-blocked → 403 → refusal; the go-live finding).
+  // Best-effort: a missing/malformed auth.json yields null (claim omitted).
+  const codexAccountId = await defaultHostIdentityReaders().readCodexAccountId();
+  const specs = buildAdapterCredentialSpecs({ codexAccountId });
   const adapterHooks = buildAllAdapterHooks(specs);
   const credentialRegistry = new CredentialSecretRegistry({
     readToken: (adapterId) => specs[adapterId].readToken(),
@@ -393,7 +399,7 @@ async function buildOrchestratorGraph(opts: {
   // exposed to the host LAN. Started below alongside the HTTP server so a bind
   // failure surfaces before we accept any dispatches.
   const acpBridge = new AcpBridge({ loopbackOnly: true });
-  const { credentialRegistry, adapterHooks, credentialTicker } = buildCredentialPipeline(config);
+  const { credentialRegistry, adapterHooks, credentialTicker } = await buildCredentialPipeline(config);
   // Reconciler (issues 32, 33, 34). Owns the VM reaper (now Gondolin-backed:
   // observes `vmClient.listSessions()` + runs `vmClient.gc()`, reaping
   // `symphony-`-labelled sessions not in the orchestrator's intended set) + the
