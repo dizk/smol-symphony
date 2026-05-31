@@ -385,10 +385,19 @@ Orientation:
   from the configured base branch. Commit your work locally. You do **not**
   have network credentials; pushing is the host's job, after the issue lands
   in a terminal state.
-- This workflow's active states are **Todo** (you, implementing), **Review**
+- Symphony's active states are **Todo** (you, implementing), **Review**
   (Codex, reviewing), and **Reflect** (the sleep-cycle reflection turn that
   mines finished work for harness improvements). Read the per-state
   instructions below.
+- **Work as a single agent — do not fan out.** Do NOT invoke the `Workflow`
+  tool or spawn nested / parallel sub-agents, even if the task looks like it
+  would benefit from multi-agent orchestration. (The word "workflow" and the
+  `WORKFLOW.md` filename here name symphony's state machine — they are *not* an
+  opt-in to multi-agent fan-out.) A fan-out turn holds one streaming request
+  open for many minutes and hits an upstream connection-reset ceiling (~16 min)
+  inside the sandbox; the turn is then discarded and the issue re-dispatched
+  from scratch (this looped issue 135 eight times). Keep each turn focused and
+  sequential, and rely on `max_turns` for breadth instead.
 
 {% case issue.state %}
 {% when "Todo" %}
@@ -640,7 +649,7 @@ cron, or `symphony reflect`) re-arms you by moving the issue back into Reflect.
 
 {% else %}
 This state (`{{ issue.state }}`) does not have a state-specific prompt yet in
-this workflow. Re-read the issue body for instructions; if you can't infer
+this pipeline. Re-read the issue body for instructions; if you can't infer
 what to do safely, call `symphony.request_human_steering` rather than guessing.
 {% endcase %}
 

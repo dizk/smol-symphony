@@ -72,7 +72,7 @@ gondolin:
 server:
   port: 8787
 ---
-You are picking up a single issue and shepherding it through the workflow.
+You are picking up a single issue and shepherding it through the pipeline.
 
 Issue: **{{ issue.identifier }} — {{ issue.title }}**
 State: {{ issue.state }}
@@ -99,6 +99,12 @@ Goals:
    \`symphony.propose_issue({ title, description?, labels?, priority? })\`. It
    lands in the first declared \`role: holding\` state directory (defaults to
    \`Triage/\`); the operator approves or discards from the dashboard.
+6. Work as a single agent: do NOT invoke the \`Workflow\` tool or spawn nested /
+   parallel sub-agents. A long fan-out turn can hold one streaming request open
+   for many minutes and hit an upstream connection-reset ceiling inside the
+   sandbox, getting discarded and re-dispatched; keep turns focused and rely on
+   \`max_turns\` for breadth. ("workflow" / \`WORKFLOW.md\` name this state
+   machine, not an opt-in to multi-agent orchestration.)
 `;
 
 export interface ScaffoldOptions {

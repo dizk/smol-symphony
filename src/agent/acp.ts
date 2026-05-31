@@ -73,9 +73,25 @@ export interface AcpClientOptions {
 export type PromptOutcome =
   | { reason: 'end_turn'; message: string }
   | { reason: 'max_tokens' | 'max_turn_requests' | 'refusal' | 'cancelled'; message: string }
-  | { reason: 'prompt_timeout'; message: string }
+  | { reason: 'prompt_timeout' | 'transport_error'; message: string }
   | { reason: 'subprocess_exit'; message: string }
   | { reason: 'startup_failed'; message: string };
+
+// Connection/transport faults surfaced by the in-VM agent's model API client
+// (ECONNRESET, socket hang up, "Unable to connect to API", …) arrive as a thrown
+// JSON-RPC error on session/prompt — they are NOT an agent decision. Issue 135:
+// bucketing these as `refusal` made a transient upstream stream reset look like
+// the agent giving up, so a long turn's transport blip got scored an "agent turn
+// refusal", the whole run was discarded, and the issue re-dispatched in a loop.
+// Label them distinctly (`transport_error`) so the run log / summary stay honest
+// and downstream policy can treat them as transient rather than as a refusal.
+const TRANSPORT_ERROR_RE =
+  /econnreset|etimedout|econnrefused|epipe|enetunreach|ehostunreach|eai_again|socket hang up|unable to connect to api|fetch failed|network error|other side closed|terminated/i;
+
+/** True when a thrown prompt error is a connection/transport fault, not an agent decision. */
+export function isTransportError(message: string): boolean {
+  return TRANSPORT_ERROR_RE.test(message);
+}
 
 export class AcpProtocolError extends Error {
   constructor(public code: string, message: string) {
@@ -484,7 +500,9 @@ export class AcpClient {
         return { reason: 'prompt_timeout', message: err.message };
       }
       if (this.closed) return { reason: 'subprocess_exit', message: (err as Error).message };
-      return { reason: 'refusal', message: (err as Error).message };
+      const message = (err as Error).message;
+      if (isTransportError(message)) return { reason: 'transport_error', message };
+      return { reason: 'refusal', message };
     }
     return mapStopReason(resp.stopReason, this.lastAssistantText);
   }

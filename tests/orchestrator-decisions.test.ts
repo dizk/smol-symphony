@@ -219,15 +219,53 @@ describe('decideCircuitBreaker', () => {
     assert.ok(tripped, 'breaker should trip on the 5th identical failure');
     assert.deepEqual(counts, [1, 2, 3, 4, 5]);
   });
-  it('a different failure reason resets the streak instead of tripping', () => {
+  it('a different failure reason still increments (issue 135: count by streak, not by reason)', () => {
+    // Pre-issue-135 this reset the streak to 1; now any consecutive abnormal exit
+    // increments, so the 5th consecutive failure trips even though the reason changed.
     const r = decideCircuitBreaker({
       normal: false,
       reason: 'before_run hook error',
       prior: { normalizedReason: normalizeFailureReason('gondolin bring-up error'), count: 4 },
       threshold: 5,
     });
-    assert.equal(r.kind, 'continue');
-    if (r.kind === 'continue') assert.equal(r.count, 1);
+    assert.equal(r.kind, 'trip');
+    if (r.kind === 'trip') assert.equal(r.count, 5);
+  });
+  it('issue 135 repro: flapping ECONNRESET/401 reasons still trip the breaker', () => {
+    // The exact sequence that looped forever before the fix: four transport resets,
+    // a single interleaved auth failure, then more resets. The lone 401 used to reset
+    // the same-reason streak one short of the threshold and re-arm the breaker from 0.
+    const reasons = [
+      'agent turn transport_error: API Error: Unable to connect to API (ECONNRESET)',
+      'agent turn transport_error: API Error: Unable to connect to API (ECONNRESET)',
+      'agent turn transport_error: API Error: Unable to connect to API (ECONNRESET)',
+      'agent turn refusal: Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'agent turn transport_error: API Error: Unable to connect to API (ECONNRESET)',
+    ];
+    let prior = null as { normalizedReason: string; count: number } | null;
+    let tripped = false;
+    for (const reason of reasons) {
+      const r = decideCircuitBreaker({ normal: false, reason, prior, threshold: 5 });
+      if (r.kind === 'trip') {
+        tripped = true;
+        assert.equal(r.count, 5);
+        break;
+      }
+      assert.equal(r.kind, 'continue');
+      if (r.kind === 'continue') prior = { normalizedReason: r.normalizedReason, count: r.count };
+    }
+    assert.ok(tripped, 'flapping transport/auth failures must still trip the breaker');
+  });
+  it('a clean exit between failures resets the streak (progress = no trip)', () => {
+    // Counting consecutive failures must still reset on a clean exit, so an issue
+    // that intermittently succeeds is never tripped.
+    const afterProgress = decideCircuitBreaker({
+      normal: true,
+      reason: '',
+      prior: { normalizedReason: 'x', count: 4 },
+      threshold: 5,
+    });
+    assert.deepEqual(afterProgress, { kind: 'reset' });
   });
   it('threshold 0 disables tripping (streak still tracked)', () => {
     const prior = { normalizedReason: normalizeFailureReason('boom'), count: 99 };
