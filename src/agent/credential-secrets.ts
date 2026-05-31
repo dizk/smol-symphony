@@ -54,9 +54,6 @@ import {
   defaultClaudeRefresher,
   defaultCopilotExchange,
   defaultFlockAcquire,
-  CLAUDE_BILLING_TELL_HEADERS,
-  CODEX_BILLING_TELL_HEADERS,
-  COPILOT_BILLING_TELL_HEADERS,
   COPILOT_EGRESS_HEADERS,
   COPILOT_EXCHANGE_HOST,
   COPILOT_EXCHANGE_PATH,
@@ -191,7 +188,6 @@ function base64urlJson(obj: unknown): string {
  *                      but only `substitutionHosts` are wired into `secrets[].hosts`,
  *                      so a general egress host never receives a real token.
  *   - `placeholder`    the token-shaped placeholder generator (§4.3)
- *   - `billingHeaders` the billing-tell response header set (`onResponse` logging)
  *   - `readToken()`    resolve the current host-side access token (or null)
  *   - `refresh()`      drive a host-side refresh (claude `claude -p`; opencode mint)
  *   - `egressHeaders`  static headers attached at egress (opencode editor headers)
@@ -204,7 +200,6 @@ export interface AdapterCredentialSpec {
    *  NOT the general egress firewall — see the interface doc above. */
   substitutionHosts: readonly string[];
   placeholder(): () => string;
-  billingHeaders: readonly string[];
   readToken(): Promise<TokenInfo | null>;
   refresh(): Promise<void>;
   egressHeaders?: Record<string, string>;
@@ -343,7 +338,6 @@ export function buildAdapterCredentialSpecs(
       secretName: CLAUDE_SECRET_NAME,
       substitutionHosts: [CLAUDE_UPSTREAM_HOST],
       placeholder: claudePlaceholder,
-      billingHeaders: CLAUDE_BILLING_TELL_HEADERS,
       readToken: async () => extractClaudeToken(await readJsonFile(claudeCredsPath)),
       refresh: claudeRefresher,
       allowWebSockets: false, // plain HTTPS
@@ -368,7 +362,6 @@ export function buildAdapterCredentialSpecs(
       // Bind the host account_id into the placeholder JWT's auth claim so
       // codex-acp does not refresh the placeholder (go-live finding).
       placeholder: () => codexPlaceholder(opts.codexAccountId ?? null),
-      billingHeaders: CODEX_BILLING_TELL_HEADERS,
       // codex tokens are long-TTL (~8 days): re-read on demand, never drive an
       // OpenAI refresh dance — identical to the proxy's posture.
       readToken: async () =>
@@ -426,7 +419,6 @@ function buildOpencodeSpec(args: {
     // exchange host (the placeholder never egresses).
     substitutionHosts: [COPILOT_INFERENCE_HOST, COPILOT_EXCHANGE_HOST],
     placeholder: opencodePlaceholder,
-    billingHeaders: COPILOT_BILLING_TELL_HEADERS,
     egressHeaders: COPILOT_EGRESS_HEADERS,
     // The minted Copilot token is the secret value; reading it returns the cache
     // (null until the first mint runs as `refresh`).
@@ -450,6 +442,43 @@ async function readOpencodeGithubToken(credentialsPath: string): Promise<string 
 // ---------------------------------------------------------------------------
 // onRequest guards.
 // ---------------------------------------------------------------------------
+
+/**
+ * Egress audit. Wraps an adapter's optional `onRequest` guard with a log line for
+ * EVERY guest egress request. Gondolin invokes `onRequest` before its host allow/deny
+ * check, so this sees every request the guest attempts — allowed, about-to-be-blocked,
+ * and TLS-MITM'd inference calls alike — the only host-side visibility into in-VM
+ * egress (the ACP run log captures only ACP frames + adapter stderr). The `allowed`
+ * flag is a best-effort match against this adapter's resolved allowlist (exact or
+ * subdomain), so an `allowed:false` line pinpoints a blocked host the SDK reached.
+ * NEVER logs the URL query or any header (a placeholder/real token can ride either) —
+ * only method + host + pathname. Pure pass-through: logs, then delegates to `inner`
+ * (if any) unchanged. (Originally added while diagnosing issue 135; kept as standing
+ * observability.)
+ */
+export function makeEgressAuditHook(
+  adapterId: AcpAdapterId,
+  allowedHosts: readonly string[],
+  inner: HttpHooks['onRequest'] | undefined,
+): NonNullable<HttpHooks['onRequest']> {
+  return async (request: Request) => {
+    try {
+      const u = new URL(request.url);
+      const host = u.hostname;
+      const allowed = allowedHosts.some((h) => host === h || host.endsWith(`.${h}`));
+      log.info('egress request', {
+        adapter: adapterId,
+        method: request.method,
+        host,
+        path: u.pathname,
+        allowed,
+      });
+    } catch {
+      // Logging must never break egress.
+    }
+    return inner ? inner(request) : undefined;
+  };
+}
 
 /**
  * opencode's `api.github.com` durable-token-oracle guard (§4.4). Gondolin secret
@@ -487,33 +516,6 @@ export function makeGithubExchangePathGuard(): NonNullable<HttpHooks['onRequest'
     return new Response('blocked: only GET /copilot_internal/v2/token is permitted', {
       status: 403,
     });
-  };
-}
-
-// ---------------------------------------------------------------------------
-// onResponse: billing-tell logging (ports the proxy's logRateLimitHeaders).
-// ---------------------------------------------------------------------------
-
-/**
- * Port the proxy's billing-tell logging onto an `onResponse` hook: log whichever
- * of `billingHeaders` (`anthropic-ratelimit-unified-*` / `x-ratelimit-*` / org
- * id) appear so operators can observe subscription consumption. NEVER logs the
- * Authorization header or the full URL.
- */
-export function makeBillingTellResponseHook(
-  adapterId: AcpAdapterId,
-  billingHeaders: readonly string[],
-): NonNullable<HttpHooks['onResponse']> {
-  return (response: Response): void => {
-    const observed: Record<string, string> = {};
-    for (const name of billingHeaders) {
-      const v = response.headers.get(name);
-      if (v === null) continue;
-      observed[name] = v;
-    }
-    if (Object.keys(observed).length > 0) {
-      log.info('credential-secrets: upstream ratelimit', { adapter: adapterId, ...observed });
-    }
   };
 }
 
@@ -557,10 +559,27 @@ export function buildAdapterHooksConfig(
   spec: AdapterCredentialSpec,
   egressAllowlist: readonly string[] = [],
 ): AdapterHooksConfig {
-  const onRequest = spec.onRequest;
-  const onResponse = makeBillingTellResponseHook(spec.adapterId, spec.billingHeaders);
+  const allowedHosts = [...new Set([...egressAllowlist, ...spec.substitutionHosts])];
+  // Host-side egress audit (standing observability): wrap the adapter's optional
+  // onRequest guard so every guest egress request is logged with an `allowed` flag.
+  // Gondolin runs onRequest BEFORE its allow/deny check, so this is the only host-side
+  // window into in-VM egress. Safe with streaming (onRequest never disables it; only
+  // onResponse does — see the no-onResponse note below). To quiet it, unwrap to
+  // `spec.onRequest`.
+  const onRequest = makeEgressAuditHook(spec.adapterId, allowedHosts, spec.onRequest);
+  // FIX (issue 135, 2026-05-31): do NOT register an `onResponse` hook. Gondolin only
+  // streams a response when there is no onResponse — `canStream = Boolean(body) &&
+  // !httpHooks.onResponse` (qemu/http.js). With onResponse set, Gondolin FULLY BUFFERS
+  // every response (`bufferResponseBodyWithLimit`) before the guest sees a byte. For a
+  // long streaming model turn (~400 KB SSE over ~90–120 s) the in-VM SDK — a streaming
+  // client — gets nothing for the whole generation window, trips its stream timeout,
+  // silently retries, and after ~16 min dies with ECONNRESET → re-dispatch loop. The
+  // old `onResponse` was a pure billing-tell (rate-limit header logging), no functional
+  // role; dropping it restores streaming. To restore that logging without breaking
+  // streaming, Gondolin needs a header-only response hook (it has none today) — see the
+  // still-exported `makeBillingTellResponseHook` and the "vendor Gondolin" option.
   const options: CreateHttpHooksOptions = {
-    allowedHosts: [...new Set([...egressAllowlist, ...spec.substitutionHosts])],
+    allowedHosts,
     secrets: {
       [spec.secretName]: {
         hosts: [...spec.substitutionHosts],
@@ -570,8 +589,7 @@ export function buildAdapterHooksConfig(
         placeholder: spec.placeholder(),
       },
     },
-    onResponse,
-    ...(onRequest ? { onRequest } : {}),
+    onRequest,
   };
   return {
     adapterId: spec.adapterId,

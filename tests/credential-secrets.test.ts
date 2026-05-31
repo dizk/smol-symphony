@@ -16,7 +16,6 @@ import {
   buildAdapterCredentialSpecs,
   buildAdapterHooksConfig,
   makeGithubExchangePathGuard,
-  makeBillingTellResponseHook,
   CredentialSecretRegistry,
   type AdapterCredentialSpec,
 } from '../src/agent/credential-secrets.js';
@@ -68,7 +67,7 @@ function stubSpecs(opts: {
 // --- per-adapter hooks-config shape ----------------------------------------
 
 describe('buildAdapterHooksConfig — per-adapter shape', () => {
-  it('claude → api.anthropic.com with an sk-ant- placeholder and billing onResponse', () => {
+  it('claude → api.anthropic.com with an sk-ant- placeholder and NO onResponse (streaming)', async () => {
     const specs = stubSpecs();
     const cfg = buildAdapterHooksConfig(specs.claude!);
     assert.equal(cfg.adapterId, 'claude');
@@ -79,11 +78,17 @@ describe('buildAdapterHooksConfig — per-adapter shape', () => {
     assert.equal(secret.value, '', 'initial value is empty; seeded via updateSecret');
     const placeholder = typeof secret.placeholder === 'function' ? secret.placeholder() : secret.placeholder;
     assert.ok(placeholder!.startsWith('sk-ant-'), `placeholder ${placeholder} should be token-shaped`);
-    assert.equal(typeof cfg.options.onResponse, 'function');
-    assert.equal(cfg.options.onRequest, undefined, 'claude has no onRequest guard');
+    // issue 135: NO onResponse hook — its presence makes Gondolin fully buffer every
+    // response (disables streaming), which breaks long streaming model turns. Must be unset.
+    assert.equal(cfg.options.onResponse, undefined, 'onResponse must be unset so Gondolin streams');
+    // Every adapter now carries the issue-135 egress audit hook; claude enforces no
+    // path-allowlist, so it passes every request through (returns undefined).
+    assert.equal(typeof cfg.options.onRequest, 'function', 'audit hook present');
+    const passthrough = await cfg.options.onRequest!(new Request('https://api.anthropic.com/v1/messages'));
+    assert.equal(passthrough, undefined, 'claude audit hook does not block');
   });
 
-  it('codex → chatgpt.com with a JWT-shaped placeholder (native ChatGPT-OAuth, far-future exp)', () => {
+  it('codex → chatgpt.com with a JWT-shaped placeholder (native ChatGPT-OAuth, far-future exp)', async () => {
     const specs = stubSpecs();
     const cfg = buildAdapterHooksConfig(specs.codex!);
     assert.equal(cfg.secretName, 'OPENAI_API_KEY');
@@ -97,7 +102,10 @@ describe('buildAdapterHooksConfig — per-adapter shape', () => {
     assert.equal(segs.length, 3, `placeholder ${placeholder} should be JWT-shaped`);
     const payload = JSON.parse(Buffer.from(segs[1]!, 'base64url').toString('utf8')) as { exp: number };
     assert.ok(payload.exp > 4_000_000_000, 'far-future exp ⇒ no refresh');
-    assert.equal(cfg.options.onRequest, undefined, 'codex has no onRequest guard');
+    // Audit hook present (issue 135); codex enforces no path-allowlist → pass-through.
+    assert.equal(typeof cfg.options.onRequest, 'function', 'audit hook present');
+    const passthrough = await cfg.options.onRequest!(new Request('https://chatgpt.com/backend-api/codex'));
+    assert.equal(passthrough, undefined, 'codex audit hook does not block');
   });
 
   it('opencode → githubcopilot.com + api.github.com (host-mint) with an onRequest guard', () => {
@@ -171,19 +179,6 @@ describe('makeGithubExchangePathGuard — durable-token-oracle guard', () => {
 
   it('leaves other hosts untouched', () => {
     const out = guard(new Request('https://api.githubcopilot.com/chat/completions', { method: 'POST' }));
-    assert.equal(out, undefined);
-  });
-});
-
-// --- onResponse billing-tell -----------------------------------------------
-
-describe('makeBillingTellResponseHook', () => {
-  it('does not throw and returns void regardless of headers', () => {
-    const hook = makeBillingTellResponseHook('claude', ['anthropic-ratelimit-unified-5h-status']);
-    const res = new Response(null, {
-      headers: { 'anthropic-ratelimit-unified-5h-status': 'allowed' },
-    });
-    const out = hook(res, new Request('https://api.anthropic.com/v1/messages'));
     assert.equal(out, undefined);
   });
 });
