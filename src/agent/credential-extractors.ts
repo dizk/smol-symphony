@@ -55,32 +55,6 @@ export type CopilotTokenExchange = (githubToken: string) => Promise<TokenInfo>;
  */
 export type LockAcquire = (timeoutMs: number) => Promise<() => Promise<void>>;
 
-// Anthropic's subscription billing tell: the unified-window ratelimit family +
-// org id. Logged per response so operators can observe Max-window consumption.
-// Used by `credential-secrets`' `onResponse` hook.
-export const CLAUDE_BILLING_TELL_HEADERS: readonly string[] = [
-  'anthropic-organization-id',
-  'anthropic-ratelimit-unified-5h-status',
-  'anthropic-ratelimit-unified-5h-reset',
-  'anthropic-ratelimit-unified-5h-utilization',
-  'anthropic-ratelimit-unified-7d-status',
-  'anthropic-ratelimit-unified-7d-reset',
-  'anthropic-ratelimit-unified-7d-utilization',
-];
-
-// OpenAI's billing tell. The exact subscription-vs-metered discriminator was
-// NOT measurable without a live ChatGPT-OAuth token (research Q4 /
-// docs/research/codex-proxy-accept-matrix.md §1), so this is the documented
-// `x-ratelimit-*` candidate family; whichever appear are logged.
-export const CODEX_BILLING_TELL_HEADERS: readonly string[] = [
-  'x-ratelimit-limit-requests',
-  'x-ratelimit-remaining-requests',
-  'x-ratelimit-reset-requests',
-  'x-ratelimit-limit-tokens',
-  'x-ratelimit-remaining-tokens',
-  'x-ratelimit-reset-tokens',
-];
-
 /**
  * Default claude refresher: spawn `claude -p "ok"` and resolve when it exits.
  * Claude Code's own OAuth path detects the stale access token, refreshes against
@@ -332,18 +306,6 @@ const COPILOT_EXCHANGE_HEADERS: Record<string, string> = {
   'user-agent': COPILOT_USER_AGENT,
   'x-github-api-version': COPILOT_GH_API_VERSION,
 };
-
-// GitHub Copilot's billing-tell response headers. UNMEASURED candidate set (no
-// live Copilot credential on the implementer's host — see the accept-matrix
-// doc); whichever appear are logged, but there is no reliable subscription-vs-
-// metered assertion until a live measurement lands.
-export const COPILOT_BILLING_TELL_HEADERS: readonly string[] = [
-  'x-ratelimit-limit-requests',
-  'x-ratelimit-remaining-requests',
-  'x-ratelimit-limit-tokens',
-  'x-ratelimit-remaining-tokens',
-  'x-github-request-id',
-];
 
 /**
  * Default GitHub→Copilot token exchange: `GET api.github.com/copilot_internal/v2/token`

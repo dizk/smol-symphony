@@ -947,7 +947,7 @@ describe('Orchestrator circuit breaker (issue 128)', () => {
     }
   });
 
-  it('does not trip when failures differ each attempt (streak resets)', async () => {
+  it('still trips when the failure reason differs each attempt (issue 135: count by streak, not reason)', async () => {
     const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb2-home-'));
     const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb2-tracker-'));
     const logsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-cb2-logs-'));
@@ -982,10 +982,14 @@ describe('Orchestrator circuit breaker (issue 128)', () => {
         state: 'Todo', branch_name: null, url: null, labels: [], blocked_by: [],
         created_at: null, updated_at: null,
       };
-      const moves: string[] = [];
+      const moves: Array<{ toState: string; notes?: string }> = [];
       const tracker: IssueTracker = {
         async fetchCandidateIssues(): Promise<CandidateFetchResult> {
-          return { issues: [{ ...current }], root: trackerRoot };
+          // Filter by state so a tripped (Triage) issue stops being a candidate,
+          // mirroring the real tracker — this is what makes the trip restart-safe
+          // (and keeps the loop from re-dispatching a routed issue forever).
+          const issues = current.state.toLowerCase() === 'todo' ? [{ ...current }] : [];
+          return { issues, root: trackerRoot };
         },
         async fetchIssuesByStates(names: string[]): Promise<Issue[]> {
           const set = new Set(names.map((s) => s.toLowerCase()));
@@ -997,9 +1001,10 @@ describe('Orchestrator circuit breaker (issue 128)', () => {
         currentRoot(): string | null {
           return trackerRoot;
         },
-        async moveIssueToState(_id, toState) {
-          moves.push(toState);
-          return { fromState: 'Todo', toState, newPath: '' };
+        async moveIssueToState(issueId, toState, opts) {
+          moves.push({ toState, notes: opts?.notes });
+          current.state = toState;
+          return { fromState: 'Todo', toState, newPath: path.join(trackerRoot, toState, `${issueId}.md`) };
         },
       };
 
@@ -1008,8 +1013,9 @@ describe('Orchestrator circuit breaker (issue 128)', () => {
         vmNameFor: (i: Issue) => `symphony-${i.identifier}`,
         async runAttempt(): Promise<RunAttemptResult> {
           dispatchCount++;
-          // A DIFFERENT failure class each attempt: the normalized reasons never
-          // match two in a row, so the streak resets and the breaker never trips.
+          // A DIFFERENT failure class each attempt — exactly the flapping that let
+          // issue 135 dodge the old same-reason breaker. Post-fix the breaker counts
+          // consecutive failures regardless of reason, so it must still trip.
           const reasons = [
             'gondolin bring-up error',
             'before_run hook error',
@@ -1046,14 +1052,22 @@ describe('Orchestrator circuit breaker (issue 128)', () => {
       );
       await orch.start();
 
-      // Let several retries accumulate; with distinct reasons the streak resets
-      // each time and the breaker must never route the issue.
-      const deadline = Date.now() + 500;
-      while (dispatchCount < 6 && Date.now() < deadline) {
+      // Pre-issue-135 the distinct reasons reset the streak and the breaker never
+      // tripped (infinite loop). Now it counts consecutive failures regardless of
+      // reason, so it must route the issue exactly once on the 3rd failure.
+      const deadline = Date.now() + 3_000;
+      while (moves.length === 0 && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 10));
       }
-      assert.ok(dispatchCount >= 6, `expected the loop to keep retrying; saw ${dispatchCount}`);
-      assert.deepEqual(moves, [], 'breaker must not route when failures differ each attempt');
+      assert.equal(moves.length, 1, 'breaker should route the issue once despite flapping reasons');
+      assert.equal(moves[0]!.toState, 'Triage');
+      assert.match(moves[0]!.notes ?? '', /Circuit breaker tripped/);
+      assert.match(moves[0]!.notes ?? '', /3 consecutive attempts/);
+      assert.equal(dispatchCount, 3, `breaker should trip on the 3rd consecutive failure; saw ${dispatchCount}`);
+
+      // No further dispatches after the trip — give the loop time to misbehave.
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(dispatchCount, 3, 'no dispatch should occur after the breaker trips');
 
       await orch.stop();
     } finally {

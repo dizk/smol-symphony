@@ -186,33 +186,40 @@ export function decideRetryAfterIneligible(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Circuit breaker (issue 128). The retry path retries an abnormally-exited
-// dispatch with exponential backoff and NO upper bound on identical failures:
-// a deterministically-failing dispatch (e.g. a persistent `401
-// invalid_api_key`) loops indefinitely, booting + reaping a VM every backoff
-// interval. These pure helpers let the orchestrator bound that loop — count
-// consecutive same-reason failures and decide when to stop retrying — without
-// the streak bookkeeping leaking into the shell.
+// Circuit breaker (issue 128; hardened in issue 135). The retry path retries an
+// abnormally-exited dispatch with exponential backoff and NO upper bound: a
+// deterministically-failing dispatch loops indefinitely, booting + reaping a VM
+// every backoff interval. These pure helpers let the orchestrator bound that
+// loop — count CONSECUTIVE failed dispatches and stop once an issue has made no
+// progress for `threshold` attempts in a row — without the streak bookkeeping
+// leaking into the shell.
+//
+// Issue 135 fix — count by streak length, NOT by same-reason. The original
+// breaker only incremented when the *normalized reason matched the prior one*,
+// so a dispatch that kept failing with FLAPPING reasons reset the counter every
+// time the reason changed and never tripped. Issue 135 looped 8× exactly this
+// way — four `ECONNRESET` turns (streak → 4), then a single `401` (different
+// reason → streak reset to 1), then `ECONNRESET` again (reset to 1) — the lone
+// interleaved 401 landed one short of the threshold and re-armed the breaker
+// from zero. The signal we actually want is "this issue has made no progress
+// for N attempts in a row", which is reason-independent: increment on every
+// consecutive abnormal exit; reset only when a dispatch exits cleanly (the
+// issue progressed). The normalized reason is still tracked, but only to label
+// the trip — it no longer gates counting.
 
 /**
- * Normalize a failure `reason` so two attempts that failed *the same way*
- * compare equal even when the message embeds volatile tokens (request ids,
- * status codes, timestamps, hashes, per-dispatch sentinels). Without this, a
- * reason carrying a varying id would never repeat verbatim and the breaker
- * would never trip.
+ * Normalize a failure `reason` for the trip log / holding-state route note so
+ * the human-facing message is stable even when the underlying message embeds
+ * volatile tokens (request ids, status codes, timestamps, hashes, per-dispatch
+ * sentinels).
  *
  * Rule: lowercase, then collapse every whitespace-delimited token that
  * contains a digit into `<id>` — volatile identifiers almost always carry a
  * digit (a request id, an HTTP status, a timestamp fragment, a counter, a hex
  * hash), whereas the human-readable words that carry a failure's *identity*
- * (`agent turn refusal`, `vm bring-up error`, `invalid_api_key`) do not.
- *
- * The collapse is deliberately one-way and aggressive (a `401` and a `403`
- * both become `<id>`): for a breaker keyed on "same failure every attempt",
- * merging near-identical persistent errors is the safe direction — the
- * alternative (never tripping because an embedded id varies) is the regression
- * this closes. Genuinely different failure *classes* keep distinct words and
- * so reset the streak rather than accumulating toward a trip.
+ * (`agent turn refusal`, `agent turn transport_error`, `vm bring-up error`) do
+ * not. Used only for reporting now (see the note above on why counting no
+ * longer keys on it).
  */
 export function normalizeFailureReason(reason: string): string {
   return reason
@@ -223,9 +230,9 @@ export function normalizeFailureReason(reason: string): string {
 }
 
 /**
- * Per-issue circuit-breaker streak: the last failure's normalized reason and
- * how many consecutive attempts have failed with it. Held in orchestrator
- * memory across the dispatch→exit→retry cycle.
+ * Per-issue circuit-breaker streak: how many consecutive dispatches have failed
+ * (any reason), plus the most recent normalized reason (for the trip message
+ * only). Held in orchestrator memory across the dispatch→exit→retry cycle.
  */
 export interface CircuitBreakerState {
   normalizedReason: string;
@@ -238,17 +245,18 @@ export type CircuitBreakerDecision =
   // Abnormal exit recorded; under threshold — keep retrying. Caller persists
   // the returned state.
   | { kind: 'continue'; normalizedReason: string; count: number }
-  // Threshold reached on identical consecutive failures — stop retrying and
-  // route the issue to a holding state.
+  // Threshold reached on consecutive failures — stop retrying and route the
+  // issue to a holding state.
   | { kind: 'trip'; normalizedReason: string; count: number };
 
 /**
  * Fold one worker exit into the circuit-breaker streak. A clean exit (`normal`)
- * resets it — the issue made progress. An abnormal exit increments the streak
- * when its normalized reason matches the prior one, otherwise restarts the
- * count at 1. When `threshold > 0` and the streak reaches it, the breaker
- * trips. `threshold <= 0` disables tripping entirely (the streak is still
- * tracked but never trips), so an operator can turn the breaker off.
+ * resets it — the issue made progress. Any abnormal exit increments the streak
+ * by one REGARDLESS of reason (issue 135: keying on same-reason let flapping
+ * failures dodge the breaker forever). When `threshold > 0` and the streak
+ * reaches it, the breaker trips. `threshold <= 0` disables tripping entirely
+ * (the streak is still tracked but never trips), so an operator can turn the
+ * breaker off. `reason` is normalized only to label the eventual trip.
  */
 export function decideCircuitBreaker(input: {
   normal: boolean;
@@ -258,8 +266,7 @@ export function decideCircuitBreaker(input: {
 }): CircuitBreakerDecision {
   if (input.normal) return { kind: 'reset' };
   const normalizedReason = normalizeFailureReason(input.reason);
-  const count =
-    input.prior && input.prior.normalizedReason === normalizedReason ? input.prior.count + 1 : 1;
+  const count = input.prior ? input.prior.count + 1 : 1;
   if (input.threshold > 0 && count >= input.threshold) {
     return { kind: 'trip', normalizedReason, count };
   }
