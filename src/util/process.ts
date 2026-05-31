@@ -1,5 +1,5 @@
 // Unified child_process wrapper (issue 44). Owns spawn lifecycle for every
-// host-side shell-out: hook scripts, git, gh. Replaces seven near-
+// host-side shell-out: git, gh, and similar tooling. Replaces seven near-
 // identical wrappers that had each independently re-encoded the same spawn
 // quirks (pipe both streams, accumulate with a max-bytes clamp, optional
 // onChunk capture, optional timeout that SIGKILLs on overrun, optional
@@ -21,9 +21,8 @@ export const DEFAULT_MAX_BYTES = 65_536;
 
 export interface RunResult {
   /**
-   * Always true once `spawn()` returned. Distinguishes "we attempted this"
-   * from the hook convention of `ran: false` meaning "no hook configured"
-   * (which lives at the call site, not here — runProcess always tries).
+   * Always true once `spawn()` returned — every call that reaches here
+   * attempts the spawn, so there is no "did not run" sentinel to distinguish.
    */
   ran: true;
   /** Process exit code, or null if the process was signalled or spawn errored. */
@@ -117,7 +116,7 @@ export function runProcess(
       // Spawn failures emit both `error` and `close` for the same child (Node
       // emits ENOENT as `error` then synthesizes a `close` with code=-2). Both
       // handlers route here, so guard against double-settling — `onResult` is
-      // documented as firing once, and downstream consumers (run-log, hooks,
+      // documented as firing once, and downstream consumers (run-log and
       // action results) rely on that.
       if (settled) return;
       settled = true;
@@ -184,14 +183,4 @@ export function describeRunFailure(r: RunResult): string {
   if (r.timed_out) return 'timed out';
   if (r.signal !== null) return `terminated by signal ${r.signal}`;
   return `exited with code ${r.exit_code}`;
-}
-
-/**
- * Hook script convenience: `sh -lc <script>` with the same options bag. The
- * hook protocol distinguishes "hook configured but failed" from "no hook";
- * the latter is the caller's concern (they don't call this function at all).
- * This wrapper always reports `ran: true` via {@link runProcess}.
- */
-export function runHookScript(script: string, opts: RunOptions = {}): Promise<RunResult> {
-  return runProcess('sh', ['-lc', script], opts);
 }

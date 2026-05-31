@@ -6,7 +6,6 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import {
   runProcess,
   runProcessExpect,
-  runHookScript,
   RunProcessError,
   describeRunFailure,
   DEFAULT_MAX_BYTES,
@@ -195,15 +194,6 @@ describe('runProcessExpect', () => {
       runProcessExpect('this-binary-does-not-exist-xyz', []),
       (err: unknown) => err instanceof RunProcessError,
     );
-  });
-});
-
-describe('runHookScript', () => {
-  it('runs `sh -lc <script>` and captures the result', async () => {
-    const r = await runHookScript('printf "%s" "$SHELL_OUT"', { env: { SHELL_OUT: 'value' } });
-    assert.equal(r.exit_code, 0);
-    assert.equal(r.stdout, 'value');
-    assert.equal(r.ran, true);
   });
 });
 
