@@ -3,8 +3,8 @@
 // PR is mergeable, routes non-mergeable PRs back to the implementing state
 // (where the agent rebases onto a freshly-fetched base as part of its normal
 // flow), and reaps workspace + remote branch once GitHub merges or closes
-// the PR. Sits behind `pr_autopilot.enabled` so a workflow that hasn't opted
-// in observes no behavior change at runtime.
+// the PR. Sits behind the PR engine toggle (`pr.enabled`) so a workflow that
+// hasn't opted in observes no behavior change at runtime.
 //
 // Desired state per issue:
 //   - identifier in `merge_state` (e.g. Done) with a MERGEABLE open PR:
@@ -128,8 +128,8 @@ export interface PrResourceOptions {
   transition: PrTransitionApi;
   cleanup: PrCleanupApi;
   /**
-   * GitHub auto-merge strategy. Mirrors the workflow's
-   * `pr_autopilot.auto_merge_strategy`; the resource doesn't hardcode 'squash'
+   * GitHub auto-merge strategy. Derived from the merge state's
+   * `pr.auto_merge` (issue 139); the resource doesn't hardcode 'squash'
    * because some projects prefer 'merge' (preserve every agent commit) or
    * 'rebase' (linear history).
    */

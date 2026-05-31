@@ -15,6 +15,7 @@ import type {
 import type { IssueTracker } from './trackers/types.js';
 import type { WorkflowSource } from './workflow.js';
 import {
+  derivePrRouting,
   resolveHooksForState,
   validateDispatch,
   warnOnHooksAndActionsConflict,
@@ -1378,20 +1379,22 @@ export class Orchestrator
     }
     const issues = await this.tracker.fetchIssuesByStates(nonTerminal);
     for (const i of issues) out.set(i.identifier, i.state);
-    // Issue 38: when pr_autopilot is enabled, the merge-state issues' workspaces
-    // are owned by the pr resource (it rebases inside them and cleans them up
-    // post-merge). Include those identifiers in the desired set so the
+    // Issue 38/139: when the PR engine is enabled, the merge-state issues'
+    // workspaces are owned by the pr resource (it rebases inside them and cleans
+    // them up post-merge). Include those identifiers in the desired set so the
     // workspace janitor doesn't reap a workspace the pr resource is actively
-    // driving. The orchestrator's `createWorkspace` callback declines to
-    // eagerly recreate a missing merge-state workspace — so adding it here is
-    // safe: the workspace either already exists from the dispatch that ran
-    // the issue into the merge state, or it doesn't and the autopilot just
-    // skips the rebase step for that PR.
-    if (this.cfg.pr_autopilot.enabled) {
-      const mergeIssues = await this.tracker.fetchIssuesByStates([
-        this.cfg.pr_autopilot.merge_state,
-      ]);
-      for (const i of mergeIssues) out.set(i.identifier, i.state);
+    // driving. The merge state is derived by scanning states for `pr.auto_merge`
+    // (no named-string sibling block). The orchestrator's `createWorkspace`
+    // callback declines to eagerly recreate a missing merge-state workspace — so
+    // adding it here is safe: the workspace either already exists from the
+    // dispatch that ran the issue into the merge state, or it doesn't and the
+    // autopilot just skips the rebase step for that PR.
+    if (this.cfg.pr.enabled) {
+      const mergeState = derivePrRouting(this.cfg.states).mergeState;
+      if (mergeState) {
+        const mergeIssues = await this.tracker.fetchIssuesByStates([mergeState]);
+        for (const i of mergeIssues) out.set(i.identifier, i.state);
+      }
     }
     return out;
   }
@@ -1503,12 +1506,11 @@ export class Orchestrator
     // but a fresh clone would still need a separate fetch to pick it up).
     // Operators who genuinely want a recreated workspace can cancel the
     // issue (Cancelled triggers the close path + normal cleanup) and refile.
-    if (
-      this.cfg.pr_autopilot.enabled &&
-      state !== null &&
-      state.toLowerCase() === this.cfg.pr_autopilot.merge_state.toLowerCase()
-    ) {
-      return;
+    if (this.cfg.pr.enabled && state !== null) {
+      const mergeState = derivePrRouting(this.cfg.states).mergeState;
+      if (mergeState && state.toLowerCase() === mergeState.toLowerCase()) {
+        return;
+      }
     }
     const hooks = state !== null ? resolveHooksForState(this.cfg, state) : this.cfg.hooks;
     await this.workspaces.ensureFor(identifier, hooks);
@@ -1532,22 +1534,23 @@ export class Orchestrator
    * and surfaces in last_error so a transient tracker hiccup doesn't blank
    * the autopilot's intended set).
    *
-   * When `pr_autopilot.enabled` is false this method is never invoked
-   * (the reconciler skips its pr pass entirely), but the early return keeps
-   * the public surface idempotent.
+   * When `pr.enabled` is false this method is never invoked (the reconciler
+   * skips its pr pass entirely), but the early return keeps the public surface
+   * idempotent. The merge/close targets are derived by scanning states for the
+   * per-state `pr:` field (issue 139), not read from named strings.
    */
   async prIntended(): Promise<PrIntent[]> {
-    if (!this.cfg.pr_autopilot.enabled) return [];
-    const mergeState = this.cfg.pr_autopilot.merge_state;
-    const closeState = this.cfg.pr_autopilot.close_state;
+    if (!this.cfg.pr.enabled) return [];
+    const { mergeState, closeState } = derivePrRouting(this.cfg.states);
+    if (!mergeState && !closeState) return [];
     const baseBranch = baseBranchName();
-    const states = closeState ? [mergeState, closeState] : [mergeState];
-    const issues = await this.tracker.fetchIssuesByStates(states);
+    const fetchStates = [mergeState, closeState].filter((s): s is string => s !== null);
+    const issues = await this.tracker.fetchIssuesByStates(fetchStates);
     const out: PrIntent[] = [];
     for (const issue of issues) {
       const intent = classifyPrIntent({
         issue,
-        mergeState,
+        mergeState: mergeState ?? '',
         closeState,
         baseBranch,
         mergeWorkspacePath: this.workspaces.workspacePathFor(issue.identifier),
@@ -1566,9 +1569,9 @@ export class Orchestrator
    * No workspace flag is touched here: the target state's `role` decides
    * cleanup at the transition's own level (active/holding never trigger
    * cleanup), and the workspace was preserved across the move into the merge
-   * state in the first place because `pr_autopilot.enabled` suppresses the
-   * terminal cleanup for that target. See {@link McpRegistry.performTransition}
-   * for the role-driven rule.
+   * state in the first place because the PR engine suppresses the terminal
+   * cleanup for that target. See {@link McpRegistry.performTransition} for the
+   * role-driven rule.
    */
   async routeIssueForAutopilot(input: {
     identifier: string;

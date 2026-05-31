@@ -164,6 +164,29 @@ tracker:
 #             under `~/.cache/symphony/actions/run_in_vm/<name>/<sha256>/`.
 #             `symphony rerun --check=<name>` drops the whole `<name>/`
 #             namespace dir so the next dispatch re-runs that one check.
+#   pr        (map, optional): PR autopilot routing for this state (issue 139).
+#             Valid only on a `terminal` state, and only acts when the
+#             top-level `pr:` engine block (below) has `enabled: true`. This is
+#             where the routing the engine used to name by string now lives —
+#             on the state it describes. Two shapes:
+#               • Merge state:  pr: { auto_merge: squash|merge|rebase,
+#                                     on_conflict: { route_to: <active state> } }
+#                 A MERGEABLE PR for an issue in this state has GitHub
+#                 auto-merge armed with `auto_merge`; a CONFLICTING one is
+#                 routed back to `on_conflict.route_to` (defaults to the first
+#                 declared active state when omitted) for the dispatched agent
+#                 to rebase. While the engine is enabled, transitions INTO this
+#                 state do not fire the standard terminal workspace cleanup —
+#                 the pr resource owns the workspace until the PR merges/closes.
+#               • Close state:  pr: { close: true }
+#                 An open PR for an issue in this state is closed without merge
+#                 and its remote branch is best-effort-deleted. Standard
+#                 terminal cleanup still runs (the close path needs no workspace).
+#             The merge/close/route targets are DERIVED by scanning states for
+#             this field — there is no named-string sibling block. At most one
+#             terminal state may declare `auto_merge`, and at most one may
+#             declare `close`; an `on_conflict.route_to` naming an undeclared
+#             state is rejected at parse time.
 #
 # Declaration order matters: role-filtered listings (active states, terminal
 # states) follow it, and the dashboard renders state columns in the same order.
@@ -184,6 +207,12 @@ states:
     allowed_transitions: [Todo, Done]
   Done:
     role: terminal
+    # PR autopilot merge state (issue 139). Acts only when the top-level `pr:`
+    # engine block (below) is enabled. Derived as the merge state because it
+    # declares `auto_merge`.
+    # pr:
+    #   auto_merge: squash
+    #   on_conflict: { route_to: Todo }
     # Terminal-state handoff via typed actions (issue 36). On transition into
     # Done, push the branch (if SYMPHONY_REPO is set → $repo non-empty) and
     # open a PR if one does not already exist. Templates resolve against the
@@ -199,6 +228,10 @@ states:
     #     if: $repo
   Cancelled:
     role: terminal
+    # PR autopilot close state (issue 139). Derived as the close state because
+    # it declares `close: true` — an open PR is closed without merge.
+    # pr:
+    #   close: true
   Triage:
     role: holding
 
@@ -282,64 +315,64 @@ states:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
-# pr_autopilot — arm GitHub auto-merge when a terminal-state PR is
-# mergeable; route non-mergeable PRs back to the implementing state.
+# pr — PR autopilot engine toggle: arm GitHub auto-merge when a terminal-state
+# PR is mergeable; route non-mergeable PRs back to the implementing state.
 #
-# Optional. When `enabled: true` the reconciler grows a `pr` resource that, on
-# every tick, looks up each issue in `merge_state` (default `Done`) via
-# `gh pr list --head agent/<id>`, fetches its detail with `gh pr view`, and:
+# Optional. This is the SLIM host-global half only — the on/off switch and the
+# per-PR `gh pr view` cache TTL. The merge/close/route targets and the
+# auto-merge strategy live ON the terminal states they describe, as
+# `states.<name>.pr` (see the `pr:` field doc in the states block above):
+#   • the MERGE state declares `pr: { auto_merge: <strategy>,
+#     on_conflict: { route_to: <active state> } }`
+#   • the CLOSE state declares `pr: { close: true }`
+# The reconciler derives the targets by scanning states for that field — there
+# is no named-string sibling block here.
+#
+# When `enabled: true` the reconciler grows a `pr` resource that, on every tick,
+# looks up each issue in the merge state via `gh pr list --head agent/<id>`,
+# fetches its detail with `gh pr view`, and:
 #
 #   • Arms GitHub's auto-merge when the PR is `mergeable: MERGEABLE`
-#     (`gh pr merge --auto --<strategy> --delete-branch`). GitHub merges as
-#     soon as required checks pass and review requirements are satisfied.
-#   • When the PR is `mergeable: CONFLICTING`, appends a structured notes
-#     block to the issue file and routes the issue from `merge_state` back
-#     to `conflict_route_to` (default: the first declared `role: active`
-#     state). The workspace + `agent/<id>` branch are preserved. Before the
-#     next dispatch symphony runs `git fetch origin <base>` so
-#     `origin/<base>` is current in the workspace, and the Todo prompt's
-#     first step is `git rebase origin/<base>` — so resolving the conflict
-#     is the agent's normal flow, not an out-of-band autopilot operation.
-#   • For issues in `close_state` (default `Cancelled`) with an open PR,
-#     closes the PR without merge and best-effort-deletes the remote branch.
+#     (`gh pr merge --auto --<strategy> --delete-branch`, where `<strategy>` is
+#     the merge state's `pr.auto_merge`). GitHub merges as soon as required
+#     checks pass and review requirements are satisfied.
+#   • When the PR is `mergeable: CONFLICTING`, appends a structured notes block
+#     to the issue file and routes the issue from the merge state back to that
+#     state's `pr.on_conflict.route_to` (default: the first declared
+#     `role: active` state). The workspace + `agent/<id>` branch are preserved.
+#     Before the next dispatch symphony runs `git fetch origin <base>` so
+#     `origin/<base>` is current, and the Todo prompt's first step is
+#     `git rebase origin/<base>` — resolving the conflict is the agent's normal
+#     flow, not an out-of-band autopilot operation.
+#   • For an issue in the close state with an open PR, closes the PR without
+#     merge and best-effort-deletes the remote branch.
 #
 # Requires `gh` authenticated on the host (`gh auth status` clean). The token
 # never enters the VM. Auto-merge ALSO requires at least one branch protection
 # rule on the base branch, or `gh pr merge --auto` will error — set one in
 # the repo's GitHub settings before flipping `enabled: true`.
 #
-# When `enabled: false` (or the block is absent) the autopilot is fully
-# inert: the resource is never constructed and the orchestrator's existing
-# Done-state behavior (workspace cleanup + the Done-state `actions:` block
-# that pushes the branch and opens the PR + operator-merge) is unchanged.
+# When `enabled: false` (or the block is absent) the autopilot is fully inert:
+# the resource is never constructed and the orchestrator's existing Done-state
+# behavior (workspace cleanup + the Done-state `actions:` block that pushes the
+# branch and opens the PR + operator-merge) is unchanged.
 #
-# Workspace lifecycle gotcha: when `enabled: true`, transitions into
-# `merge_state` no longer fire the standard terminal workspace cleanup. The
-# pr resource owns the workspace from that point on and removes it once the
-# PR has merged (or been closed). Transitions into `close_state` (and any
-# other terminal state) keep the standard cleanup-on-transition behavior.
+# Workspace lifecycle gotcha: when `enabled: true`, transitions into the merge
+# state no longer fire the standard terminal workspace cleanup. The pr resource
+# owns the workspace from that point on and removes it once the PR has merged
+# (or been closed). Transitions into the close state (and any other terminal
+# state) keep the standard cleanup-on-transition behavior.
+#
+# MIGRATION (one release): a legacy top-level `pr_autopilot:` block —
+# `{ enabled, merge_state, close_state, conflict_route_to, auto_merge_strategy,
+# poll_interval_ms }` — is still read. Its routing is folded onto the states it
+# named (a state that already declares its own `pr:` wins), its engine half
+# fills this `pr:` block when absent, and a single deprecation warning is logged
+# at startup. Migrate to `states.<name>.pr` + this two-field block.
 # ─────────────────────────────────────────────────────────────────────────────
-pr_autopilot:
+pr:
   # enabled (bool): master switch. Default false.
   enabled: false
-
-  # merge_state (string): terminal state whose issues should have their PRs
-  # auto-merged. Default 'Done'.
-  merge_state: Done
-
-  # close_state (string, optional): terminal state whose issues should have
-  # their PRs closed without merge. Default 'Cancelled'. Set to null (or
-  # omit by setting an empty string) to disable the close path.
-  close_state: Cancelled
-
-  # conflict_route_to (string, optional): active state to route a non-
-  # mergeable issue back into. Defaults to the first declared `role: active`
-  # state — for symphony's two-stage Todo/Review workflow that's Todo.
-  conflict_route_to: Todo
-
-  # auto_merge_strategy (enum: squash|merge|rebase): forwarded to
-  # `gh pr merge --auto --<strategy>`. Default 'squash'.
-  auto_merge_strategy: squash
 
   # poll_interval_ms (int): per-PR GitHub view cache TTL, milliseconds. The
   # reconciler may tick more often than this; a single PR view is reused

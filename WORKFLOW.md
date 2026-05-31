@@ -96,6 +96,20 @@ states:
     allowed_transitions: [Dormant]
   Done:
     role: terminal
+    # PR autopilot routing (issue 38; moved onto the state in issue 139). Done
+    # is the merge state: a MERGEABLE Done-state PR has GitHub auto-merge armed
+    # with `squash` (matches the repo's `NN: title (#PR)` history); a
+    # CONFLICTING one is routed back to `on_conflict.route_to` (Todo) for the
+    # dispatched agent to rebase. The host-global on/off switch + poll TTL live
+    # in the top-level `pr:` block below; the merge/close/route targets are
+    # derived by scanning states for this `pr:` field (no named-string sibling
+    # block). While the engine is enabled, transitions into Done no longer fire
+    # the standard terminal workspace cleanup — the pr resource owns the
+    # workspace until its PR merges or closes.
+    pr:
+      auto_merge: squash
+      on_conflict:
+        route_to: Todo
     # Issue 36 (reconciler v2 / typed action DAG): the legacy `after_run`
     # shell that pushed the branch and opened a PR is replaced by two typed
     # actions. The host pre-stages SYMPHONY_PR_TITLE / SYMPHONY_PR_BODY_FILE /
@@ -125,6 +139,12 @@ states:
     role: terminal
     # Cancelled means the work was abandoned; no patch, no PR. The workspace is
     # cleaned up after the run unwinds and the commits are discarded with it.
+    # PR autopilot close state (issue 139): when the engine is enabled, an open
+    # PR for a Cancelled issue is closed without merge and its remote branch is
+    # best-effort-deleted. Unlike the merge state, the close path needs no
+    # workspace, so standard terminal cleanup still runs on transition in.
+    pr:
+      close: true
   Triage:
     # Landing directory for `symphony.propose_issue`. Never dispatched; the
     # operator approves or discards from the dashboard. Declared FIRST among
@@ -152,29 +172,28 @@ tracker:
   # auto-mkdirs every declared state directory under this root on startup.
   root: ~/.symphony/trackers/smol-symphony
 
-# PR autopilot (issue 38, simplified by issue 101). Enabled 2026-05-25 so
-# Done-state PRs that are MERGEABLE have GitHub auto-merge armed; PRs reported
-# as CONFLICTING are routed back to Todo for the dispatched agent to rebase
-# (the host runs `git fetch origin <base>` before each dispatch so
-# `origin/<base>` is current in the workspace, and the Todo prompt's first
-# step is `git rebase origin/<base>`). There is no autopilot-side rebase
-# machinery and no consecutive-failure circuit breaker — the same route +
-# redispatch path handles a stale-base branch and a genuinely-conflicting
-# one. Strategy `squash` matches the repo's `NN: title (#PR)` history.
+# PR autopilot engine toggle (issue 38, simplified by issue 101; routing moved
+# onto states in issue 139). This is the slim host-global half only — the
+# on/off switch and the per-PR `gh pr view` cache TTL. The merge/close/route
+# targets and the auto-merge strategy now live ON the states they describe:
+# `states.Done.pr` (merge state — auto_merge + on_conflict.route_to) and
+# `states.Cancelled.pr` (close state — close: true), above. The reconciler
+# derives those by scanning states; there is no named-string sibling block.
+#
+# Enabled 2026-05-25 so MERGEABLE Done-state PRs have GitHub auto-merge armed
+# and CONFLICTING ones are routed back to Todo for the dispatched agent to
+# rebase (the host runs `git fetch origin <base>` before each dispatch so
+# `origin/<base>` is current, and the Todo prompt's first step is
+# `git rebase origin/<base>`). There is no autopilot-side rebase machinery and
+# no consecutive-failure circuit breaker.
 #
 # PREREQUISITE: `gh pr merge --auto` requires at least one branch-protection
 # rule on `main`, or arming auto-merge errors. Ensure one exists in the repo's
 # GitHub settings. To disable, set `enabled: false` (the resource is then never
-# constructed and Done-state behavior reverts to the after_run PR-create hook +
-# operator merge). Note: while enabled, transitions into Done no longer fire the
-# standard terminal workspace cleanup — the pr resource owns the workspace until
-# its PR merges or closes.
-pr_autopilot:
+# constructed and Done-state behavior reverts to the actions-block PR-create +
+# operator merge).
+pr:
   enabled: true
-  merge_state: Done
-  close_state: Cancelled
-  conflict_route_to: Todo
-  auto_merge_strategy: squash
   poll_interval_ms: 30000
 
 # Sleep-cycle auto-arm (issue 125, the deferred follow-up to issue 122). The

@@ -8,6 +8,7 @@ import type {
   ServiceConfig,
   StateConfig,
   StateHooksConfig,
+  StatePrConfig,
   WorkflowDefinition,
   TrackerConfig,
   PollingConfig,
@@ -20,6 +21,7 @@ import type {
   EgressConfig,
   ServerConfig,
   McpConfig,
+  PrConfig,
   PrAutopilotConfig,
   SleepCycleConfig,
   CredentialsConfig,
@@ -384,53 +386,50 @@ export function buildServiceConfig(
     explicit_host_url: asString(mcpRaw['host_url']),
   };
 
-  // pr_autopilot (issue 38). Optional block; default off. When enabled the
-  // reconciler keeps each terminal-state issue's PR rebased on origin/<base>
-  // and arms GitHub auto-merge. State-name fields are resolved against the
-  // declared states map at validation time — the parser only normalizes the
-  // raw string, so an undeclared name surfaces in `validateDispatch` with a
-  // clearer error than a runtime lookup failure.
-  const prAutopilotRaw = getObject(raw, 'pr_autopilot');
-  const prAutopilotEnabledRaw = prAutopilotRaw['enabled'];
-  const prAutopilotEnabled = prAutopilotEnabledRaw === true;
-  const mergeStateRaw = asString(prAutopilotRaw['merge_state']);
-  // close_state is "string with default Cancelled" when the key is absent, but
-  // an explicit `close_state: null` (or empty string) disables the close path
-  // entirely — see WORKFLOW.template.md. Distinguish "key absent" from "key
-  // present with a falsy value" so the default doesn't silently re-enable a
-  // path the operator turned off.
-  const closeStateKeyPresent = Object.prototype.hasOwnProperty.call(
-    prAutopilotRaw,
-    'close_state',
-  );
-  const closeStateRaw = asString(prAutopilotRaw['close_state']);
-  const closeStateTrimmed = closeStateRaw?.trim() ?? '';
-  const closeState: string | null = closeStateKeyPresent
-    ? closeStateTrimmed.length > 0
-      ? closeStateTrimmed
-      : null
-    : 'Cancelled';
-  const conflictRouteToRaw = asString(prAutopilotRaw['conflict_route_to']);
-  const strategyRaw = asString(prAutopilotRaw['auto_merge_strategy']) ?? 'squash';
-  const autoMergeStrategy: 'squash' | 'merge' | 'rebase' =
-    strategyRaw === 'merge' || strategyRaw === 'rebase' ? strategyRaw : 'squash';
-  const prAutopilot: PrAutopilotConfig = {
-    enabled: prAutopilotEnabled,
-    merge_state: mergeStateRaw && mergeStateRaw.trim().length > 0 ? mergeStateRaw.trim() : 'Done',
-    close_state: closeState,
-    conflict_route_to:
-      conflictRouteToRaw && conflictRouteToRaw.trim().length > 0
-        ? conflictRouteToRaw.trim()
-        : null,
-    auto_merge_strategy: autoMergeStrategy,
-    poll_interval_ms: asInt(prAutopilotRaw['poll_interval_ms'], 30_000),
-  };
-  if (prAutopilot.poll_interval_ms < 0) {
-    throw new WorkflowError(
-      'workflow_parse_error',
-      'pr_autopilot.poll_interval_ms must be non-negative',
-    );
+  // pr (issue 38, slimmed in issue 139). Optional block; default off. The slim
+  // host-global engine toggle: `pr: { enabled, poll_interval_ms }`. The
+  // merge/close/route targets and auto-merge strategy live ON the terminal
+  // states they describe (`states.<name>.pr`, parsed in parseStatesBlock) and
+  // are derived by scanning states (`derivePrRouting`), never named here.
+  //
+  // Migration (one release): a legacy top-level `pr_autopilot:` block is folded
+  // onto the states it named (foldLegacyPrAutopilot) with a deprecation warning;
+  // its engine half (enabled / poll) fills the new `pr:` block when that block
+  // is absent. The new `pr:` block wins on conflict.
+  const prRaw = getObject(raw, 'pr');
+  const prKeyPresent = Object.prototype.hasOwnProperty.call(raw, 'pr');
+  const legacyRaw = getObject(raw, 'pr_autopilot');
+  const legacyKeyPresent = Object.prototype.hasOwnProperty.call(raw, 'pr_autopilot');
+
+  foldLegacyPrAutopilot(states, legacyRaw, legacyKeyPresent);
+
+  // enabled: new `pr:` wins; else legacy `pr_autopilot.enabled`; else false.
+  const prEnabled = prKeyPresent
+    ? prRaw['enabled'] === true
+    : legacyKeyPresent
+      ? legacyRaw['enabled'] === true
+      : false;
+  // poll TTL: new `pr:` wins; else legacy; else 30000.
+  const legacyPoll = legacyKeyPresent ? asInt(legacyRaw['poll_interval_ms'], 30_000) : 30_000;
+  const pollIntervalMs = prKeyPresent ? asInt(prRaw['poll_interval_ms'], legacyPoll) : legacyPoll;
+  const pr: PrConfig = { enabled: prEnabled, poll_interval_ms: pollIntervalMs };
+  if (pr.poll_interval_ms < 0) {
+    throw new WorkflowError('workflow_parse_error', 'pr.poll_interval_ms must be non-negative');
   }
+
+  // Derived compatibility view for mcp.ts + bin/symphony.ts (out of this
+  // issue's allowed_paths). Routing comes from the state scan; enabled/poll
+  // mirror the engine toggle. A follow-up migrates those consumers to read
+  // `pr` + `derivePrRouting` directly and deletes this struct.
+  const routing = derivePrRouting(states);
+  const prAutopilot: PrAutopilotConfig = {
+    enabled: pr.enabled,
+    merge_state: routing.mergeState ?? '',
+    close_state: routing.closeState,
+    conflict_route_to: routing.conflictRouteTo,
+    auto_merge_strategy: routing.strategy,
+    poll_interval_ms: pr.poll_interval_ms,
+  };
 
   const sleepCycle = parseSleepCycle(raw);
 
@@ -448,6 +447,7 @@ export function buildServiceConfig(
     egress,
     server,
     mcp,
+    pr,
     pr_autopilot: prAutopilot,
     sleep_cycle: sleepCycle,
     credentials,
@@ -592,6 +592,7 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
         `state "${name}": eval_mode must be a boolean (true/false)`,
       );
     }
+    const statePr = parseStatePrBlock(name, m['pr']);
     const sc: StateConfig = { role: roleRaw };
     if (adapter !== null) sc.adapter = adapter;
     if (model !== undefined) sc.model = model;
@@ -602,6 +603,7 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     if (stateHooks !== undefined) sc.hooks = stateHooks;
     if (stateActions !== undefined) sc.actions = stateActions;
     if (evalModeRaw === true) sc.eval_mode = true;
+    if (statePr !== undefined) sc.pr = statePr;
     out[name] = sc;
   }
   return out;
@@ -634,6 +636,173 @@ function foldLegacyConcurrencyCaps(
         break;
       }
     }
+  }
+}
+
+/**
+ * Per-state `pr:` block (issue 139). Optional, valid on a terminal state.
+ * `auto_merge` (squash|merge|rebase) marks the merge state and picks the
+ * `gh pr merge --auto` strategy; `on_conflict.route_to` names the active state
+ * a non-mergeable PR is routed back into; `close: true` marks the close state.
+ * Returns `undefined` when the block is absent or declares nothing meaningful
+ * (so an empty `pr: {}` doesn't shadow a legacy fold). The structural shape is
+ * validated here; the cross-reference (route_to is a declared state, pr only on
+ * terminal states, merge/close uniqueness) is in `validateStates`.
+ */
+function parseStatePrBlock(stateName: string, raw: unknown): StatePrConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new WorkflowError(
+      'workflow_parse_error',
+      `state "${stateName}": pr must be a map (auto_merge / on_conflict / close)`,
+    );
+  }
+  const m = raw as Record<string, unknown>;
+  const out: StatePrConfig = {};
+  if (m['auto_merge'] !== undefined && m['auto_merge'] !== null) {
+    const s = asString(m['auto_merge']);
+    if (s !== 'squash' && s !== 'merge' && s !== 'rebase') {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${stateName}": pr.auto_merge must be one of squash|merge|rebase`,
+      );
+    }
+    out.auto_merge = s;
+  }
+  if (m['on_conflict'] !== undefined && m['on_conflict'] !== null) {
+    const oc = m['on_conflict'];
+    if (typeof oc !== 'object' || Array.isArray(oc)) {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${stateName}": pr.on_conflict must be a map with a route_to field`,
+      );
+    }
+    const routeTo = asString((oc as Record<string, unknown>)['route_to']);
+    if (!routeTo || routeTo.trim().length === 0) {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${stateName}": pr.on_conflict.route_to must be a non-empty state name`,
+      );
+    }
+    out.on_conflict = { route_to: routeTo.trim() };
+  }
+  if (m['close'] !== undefined && m['close'] !== null) {
+    if (typeof m['close'] !== 'boolean') {
+      throw new WorkflowError(
+        'workflow_parse_error',
+        `state "${stateName}": pr.close must be a boolean`,
+      );
+    }
+    if (m['close'] === true) out.close = true;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Derive the PR autopilot routing by scanning states for the per-state `pr:`
+ * field (issue 139) — the replacement for the old `pr_autopilot:` named
+ * strings. The merge state is the terminal state declaring `pr.auto_merge`
+ * (its strategy + `on_conflict.route_to` come along); the close state is the
+ * terminal state declaring `pr.close: true`. First match wins; `validateStates`
+ * enforces at-most-one of each so the choice is unambiguous at dispatch time.
+ * Pure: a plain scan over the states map, no IO. The reconciler and the
+ * orchestrator's PR intent provider call this to get their targets.
+ */
+export interface PrRouting {
+  mergeState: string | null;
+  closeState: string | null;
+  conflictRouteTo: string | null;
+  strategy: 'squash' | 'merge' | 'rebase';
+}
+
+export function derivePrRouting(states: Record<string, StateConfig>): PrRouting {
+  let mergeState: string | null = null;
+  let closeState: string | null = null;
+  let conflictRouteTo: string | null = null;
+  let strategy: 'squash' | 'merge' | 'rebase' = 'squash';
+  for (const [name, sc] of Object.entries(states)) {
+    if (sc.role !== 'terminal' || !sc.pr) continue;
+    if (sc.pr.auto_merge && mergeState === null) {
+      mergeState = name;
+      strategy = sc.pr.auto_merge;
+      conflictRouteTo = sc.pr.on_conflict?.route_to ?? null;
+    }
+    if (sc.pr.close && closeState === null) {
+      closeState = name;
+    }
+  }
+  return { mergeState, closeState, conflictRouteTo, strategy };
+}
+
+/**
+ * Fold a deprecated top-level `pr_autopilot:` block onto the states it named
+ * (issue 139). Mirrors {@link foldLegacyConcurrencyCaps}: the routing that used
+ * to live as named strings (`merge_state` / `close_state` / `conflict_route_to`
+ * / `auto_merge_strategy`) is injected onto the matching state's `pr:` field so
+ * the state scan (`derivePrRouting`) is the single runtime source of truth. A
+ * state that already declares `pr:` wins on conflict (its config is not
+ * overwritten). Emits one deprecation warning when the block is present. The
+ * engine half (enabled / poll_interval_ms) is handled by the caller. The legacy
+ * close_state defaults to 'Cancelled' when the key is absent but is disabled by
+ * an explicit null/empty/blank value — preserving the old parser's semantics.
+ * A legacy name that matches no declared state is a silent no-op (the block is
+ * deprecated; the operator's warning points at the new shape).
+ */
+function foldLegacyPrAutopilot(
+  states: Record<string, StateConfig>,
+  legacyRaw: Record<string, unknown>,
+  present: boolean,
+): void {
+  if (!present) return;
+  log.warn(
+    'pr_autopilot: is deprecated; declare the engine toggle in `pr: { enabled, poll_interval_ms }` and the routing on terminal states as `states.<name>.pr` (auto_merge / on_conflict.route_to / close)',
+    {},
+  );
+  const mergeRaw = asString(legacyRaw['merge_state']);
+  const mergeState = mergeRaw && mergeRaw.trim().length > 0 ? mergeRaw.trim() : 'Done';
+  const strategyRaw = asString(legacyRaw['auto_merge_strategy']) ?? 'squash';
+  const strategy: 'squash' | 'merge' | 'rebase' =
+    strategyRaw === 'merge' || strategyRaw === 'rebase' ? strategyRaw : 'squash';
+  const conflictRaw = asString(legacyRaw['conflict_route_to']);
+  const conflictRouteTo =
+    conflictRaw && conflictRaw.trim().length > 0 ? conflictRaw.trim() : null;
+  injectStatePr(states, mergeState, (pr) => {
+    pr.auto_merge = strategy;
+    if (conflictRouteTo) pr.on_conflict = { route_to: conflictRouteTo };
+  });
+
+  const closeKeyPresent = Object.prototype.hasOwnProperty.call(legacyRaw, 'close_state');
+  const closeTrimmed = asString(legacyRaw['close_state'])?.trim() ?? '';
+  const closeState: string | null = closeKeyPresent
+    ? closeTrimmed.length > 0
+      ? closeTrimmed
+      : null
+    : 'Cancelled';
+  if (closeState) {
+    injectStatePr(states, closeState, (pr) => {
+      pr.close = true;
+    });
+  }
+}
+
+/**
+ * Inject a derived `pr:` block onto the (case-insensitively) named state, but
+ * only when that state declares no `pr:` of its own — state-level config always
+ * wins over a folded legacy value. No-op when the name matches no state.
+ */
+function injectStatePr(
+  states: Record<string, StateConfig>,
+  name: string,
+  set: (pr: StatePrConfig) => void,
+): void {
+  const lower = name.toLowerCase();
+  for (const [stateName, sc] of Object.entries(states)) {
+    if (stateName.toLowerCase() !== lower) continue;
+    if (sc.pr) return;
+    const pr: StatePrConfig = {};
+    set(pr);
+    sc.pr = pr;
+    return;
   }
 }
 
@@ -818,13 +987,10 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   if (!isKnownAdapter(cfg.acp.adapter)) {
     return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex, opencode`;
   }
-  // pr_autopilot is always populated by buildServiceConfig, but test harnesses
-  // sometimes hand-build a ServiceConfig from an earlier shape; treat a
-  // missing block as `{ enabled: false }` so legacy fixtures keep validating.
-  if (cfg.pr_autopilot && cfg.pr_autopilot.enabled) {
-    const prError = validatePrAutopilot(cfg.pr_autopilot, cfg.states);
-    if (prError) return prError;
-  }
+  // PR autopilot routing (issue 139) is validated structurally inside
+  // `validateStates` (pr: only on terminal states; on_conflict.route_to must be
+  // a declared state; at most one merge/close state). The state's own `role` is
+  // authoritative, so the old `validatePrAutopilot` role re-validator is gone.
   // sleep_cycle is always populated by buildServiceConfig, but legacy
   // hand-built ServiceConfigs (older test fixtures) may omit it; treat a
   // missing block as disabled so those fixtures keep validating.
@@ -867,50 +1033,6 @@ function validateSleepCycle(
   }
   if (states[reflectCanonical]!.role !== 'active') {
     return `sleep_cycle.reflect_state "${cfg.reflect_state}" must be an active state (got role: ${states[reflectCanonical]!.role})`;
-  }
-
-  return null;
-}
-
-/**
- * Cross-reference the pr_autopilot block against the declared states map.
- * Only fires when `pr_autopilot.enabled` is true so a workflow that hasn't
- * opted in isn't gated on the `merge_state` / `close_state` / conflict-state
- * names referring to live states.
- */
-function validatePrAutopilot(
-  cfg: PrAutopilotConfig,
-  states: Record<string, StateConfig>,
-): string | null {
-  const byLower = new Map<string, string>();
-  for (const name of Object.keys(states)) byLower.set(name.toLowerCase(), name);
-
-  const mergeCanonical = byLower.get(cfg.merge_state.toLowerCase());
-  if (!mergeCanonical) {
-    return `pr_autopilot.merge_state references undeclared state "${cfg.merge_state}"`;
-  }
-  if (states[mergeCanonical]!.role !== 'terminal') {
-    return `pr_autopilot.merge_state "${cfg.merge_state}" must be a terminal state (got role: ${states[mergeCanonical]!.role})`;
-  }
-
-  if (cfg.close_state !== null) {
-    const closeCanonical = byLower.get(cfg.close_state.toLowerCase());
-    if (!closeCanonical) {
-      return `pr_autopilot.close_state references undeclared state "${cfg.close_state}"`;
-    }
-    if (states[closeCanonical]!.role !== 'terminal') {
-      return `pr_autopilot.close_state "${cfg.close_state}" must be a terminal state (got role: ${states[closeCanonical]!.role})`;
-    }
-  }
-
-  if (cfg.conflict_route_to !== null) {
-    const routeCanonical = byLower.get(cfg.conflict_route_to.toLowerCase());
-    if (!routeCanonical) {
-      return `pr_autopilot.conflict_route_to references undeclared state "${cfg.conflict_route_to}"`;
-    }
-    if (states[routeCanonical]!.role !== 'active') {
-      return `pr_autopilot.conflict_route_to "${cfg.conflict_route_to}" must be an active state (got role: ${states[routeCanonical]!.role})`;
-    }
   }
 
   return null;
@@ -970,6 +1092,12 @@ function validateStates(states: Record<string, StateConfig>): string | null {
     }
     seen.set(key, name);
   }
+  // PR autopilot routing (issue 139): `pr:` is only meaningful on a terminal
+  // state, `on_conflict.route_to` must name a declared state, and at most one
+  // terminal state may declare the merge (`auto_merge`) or close (`close`)
+  // behavior so `derivePrRouting`'s first-match is unambiguous.
+  let mergeStateCount = 0;
+  let closeStateCount = 0;
   for (const [name, cfg] of Object.entries(states)) {
     if (cfg.allowed_transitions) {
       for (const target of cfg.allowed_transitions) {
@@ -981,6 +1109,23 @@ function validateStates(states: Record<string, StateConfig>): string | null {
     if (cfg.adapter !== undefined && !isKnownAdapter(cfg.adapter)) {
       return `state "${name}": adapter "${cfg.adapter}" is not a known profile; use one of: claude, codex, opencode`;
     }
+    if (cfg.pr) {
+      if (cfg.role !== 'terminal') {
+        return `state "${name}": pr: is only valid on a terminal state (got role: ${cfg.role})`;
+      }
+      if (cfg.pr.auto_merge) mergeStateCount += 1;
+      if (cfg.pr.close) closeStateCount += 1;
+      const routeTo = cfg.pr.on_conflict?.route_to;
+      if (routeTo && !seen.has(routeTo.toLowerCase())) {
+        return `state "${name}": pr.on_conflict.route_to references undeclared state "${routeTo}"`;
+      }
+    }
+  }
+  if (mergeStateCount > 1) {
+    return `states: at most one terminal state may declare pr.auto_merge (found ${mergeStateCount})`;
+  }
+  if (closeStateCount > 1) {
+    return `states: at most one terminal state may declare pr.close (found ${closeStateCount})`;
   }
   return null;
 }

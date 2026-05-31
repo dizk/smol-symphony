@@ -47,6 +47,31 @@ export interface StateHooksConfig {
   before_remove?: string | null;
 }
 
+/**
+ * Per-state PR autopilot behavior (issue 139). Declared on a `terminal` state,
+ * this is where the routing that used to live in the top-level `pr_autopilot:`
+ * block as named strings now lives — on the state it describes. A merge state
+ * sets `auto_merge` (the `gh pr merge --auto --<strategy>` strategy) and, when
+ * a non-mergeable PR should be sent back to the implementing state, an
+ * `on_conflict.route_to`. A close state sets `close: true`. The engine on/off
+ * switch + poll TTL stay host-global in the slim top-level `pr:` block
+ * ({@link PrConfig}); the merge/close/route targets are derived by scanning
+ * states for this field (`derivePrRouting` in src/workflow.ts), never by name.
+ */
+export interface StatePrConfig {
+  /** Merge state: arm GitHub auto-merge with this strategy. */
+  auto_merge?: 'squash' | 'merge' | 'rebase';
+  /**
+   * Merge state: where to route the issue when its PR is non-mergeable so the
+   * dispatched agent rebases. `route_to` is cross-referenced against the
+   * declared states map at validation time (an undeclared target is rejected).
+   * Reuses the `actions` `on_conflict: { route_to }` vocabulary for consistency.
+   */
+  on_conflict?: { route_to: string };
+  /** Close state: close the PR without merging (typically Cancelled). */
+  close?: boolean;
+}
+
 // Per-state configuration declared in the `states:` block of a workflow file. The
 // orchestrator dispatches against `active`; `terminal` ends a run and triggers
 // workspace cleanup; `holding` keeps a file in the tracker tree without ever
@@ -110,6 +135,15 @@ export interface StateConfig {
    * routine implement/review flow.
    */
   eval_mode?: boolean;
+  /**
+   * Per-state PR autopilot routing (issue 139). Valid only on a `terminal`
+   * state. The merge state carries `{ auto_merge, on_conflict }`; the close
+   * state carries `{ close: true }`. The reconciler / orchestrator derive the
+   * merge/close/route targets by scanning states for this field instead of
+   * reading named strings from a sibling `pr_autopilot:` block. See
+   * {@link StatePrConfig}.
+   */
+  pr?: StatePrConfig;
 }
 
 export interface TrackerConfig {
@@ -310,33 +344,43 @@ export interface McpConfig {
   explicit_host_url: string | null;
 }
 
-// PR autopilot (issue 38). When `enabled` is true the reconciler grows a `pr`
-// resource that arms GitHub's auto-merge on each terminal-state issue's PR
-// when mergeable, routes non-mergeable PRs back to the implementing state
-// (where the agent rebases onto a freshly-fetched base as part of its normal
-// flow), and reaps the workspace + remote branch once GitHub merges or
-// closes the PR. Default off so a workflow that does not declare the block
-// (or declares it with enabled:false) behaves exactly as before — the
-// orchestrator's old "Done → cleanup workspace, terminal hook opens the PR,
-// operator merges by hand" path is unchanged.
+// PR autopilot engine toggle (issue 38; slimmed in issue 139). When `enabled`
+// is true the reconciler grows a `pr` resource that arms GitHub's auto-merge on
+// each merge-state issue's PR when mergeable, routes non-mergeable PRs back to
+// the implementing state (where the agent rebases onto a freshly-fetched base
+// as part of its normal flow), and reaps the workspace + remote branch once
+// GitHub merges or closes the PR. Default off so a workflow that does not
+// declare the block (or declares it with enabled:false) behaves exactly as
+// before.
 //
-// `merge_state` is the terminal state whose issues should have auto-merge
-// armed. `close_state` is the terminal state whose issues should have their
-// PRs closed without merge (typically Cancelled). Both are case-insensitive
-// lookups against the declared `states:` map; missing entries disable the
-// corresponding action.
-//
-// `conflict_route_to` is the state the reconciler routes a non-mergeable
-// issue back into (defaults to the first declared `active` state — for
-// symphony's WORKFLOW that's `Todo`). The dispatched agent owns the rebase;
-// the host runs `git fetch origin <base>` into the workspace before each
-// dispatch so `origin/<base>` is current. There is no autopilot-side
-// circuit breaker — the route + redispatch cycle is the same path for a
-// stale-base branch and a genuinely-conflicting one.
+// This is the host-global half only — the engine on/off switch and the per-PR
+// `gh pr view` cache TTL. The merge/close/route targets and the auto-merge
+// strategy moved ONTO the states they describe ({@link StatePrConfig} on a
+// terminal state) and are derived by scanning states (`derivePrRouting`), not
+// named here.
 //
 // `poll_interval_ms` is the per-PR GitHub view cache TTL. The reconciler may
 // run more often than this (its own backstop tick is independent), but a
 // single PR view is reused within the window.
+export interface PrConfig {
+  enabled: boolean;
+  poll_interval_ms: number;
+}
+
+// Derived compatibility view of the old top-level `pr_autopilot:` block. The
+// authored surface is now {@link PrConfig} (engine) + {@link StatePrConfig}
+// (per-state routing); this struct is materialized in `buildServiceConfig` from
+// the engine toggle + the state scan (`derivePrRouting`) PURELY so the two
+// consumers that still read the old shape keep working without churn:
+// `src/mcp.ts` (reads `enabled` + `merge_state` to suppress terminal workspace
+// cleanup on the merge state) and `src/bin/symphony.ts` (feeds it to the MCP
+// registry). Both are outside issue 139's allowed_paths; a follow-up migrates
+// them to read `pr` + `derivePrRouting` and deletes this field.
+//
+// `merge_state` is the terminal state declaring `pr.auto_merge` (empty string
+// when none does). `close_state` is the terminal state declaring
+// `pr.close: true`. `conflict_route_to` is that merge state's
+// `pr.on_conflict.route_to`. All are derived, never authored.
 export interface PrAutopilotConfig {
   enabled: boolean;
   merge_state: string;
@@ -416,6 +460,12 @@ export interface ServiceConfig {
   egress: EgressConfig;
   server: ServerConfig;
   mcp: McpConfig;
+  // Slim host-global PR engine toggle (issue 139). Authoritative for enabled +
+  // poll TTL; merge/close/route targets are derived from the states map.
+  pr: PrConfig;
+  // Derived compatibility view of `pr` + the state scan, kept only for the
+  // out-of-allowed-paths consumers (mcp.ts, bin/symphony.ts). See
+  // {@link PrAutopilotConfig}.
   pr_autopilot: PrAutopilotConfig;
   sleep_cycle: SleepCycleConfig;
   credentials: CredentialsConfig;

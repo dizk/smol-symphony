@@ -40,6 +40,7 @@ import {
   type PrTransitionApi,
 } from './pr.js';
 import { GhCliPrApi } from './pr-adapters.js';
+import { derivePrRouting } from '../workflow.js';
 import type { ServiceConfig } from '../types.js';
 import type { VmClient, VmSession } from '../agent/vm-port.js';
 import { log } from '../logging.js';
@@ -77,10 +78,10 @@ export interface ReconcilerOptions {
   workspaceInspect?: WorkspaceResourceOptions['inspect'];
   workspaceRemove?: WorkspaceResourceOptions['remove'];
   workspaceCreate?: WorkspaceResourceOptions['create'];
-  // PR autopilot resource (issue 38). When `pr_autopilot.enabled` is false the
-  // resource is not constructed and `reconcile()` skips the pass. Wired via
-  // `setPrAutopilotProviders` after construction so the orchestrator (which
-  // implements every callback) can be built after the Reconciler.
+  // PR autopilot resource (issue 38). When the PR engine (`pr.enabled`) is
+  // false the resource is not constructed and `reconcile()` skips the pass.
+  // Wired via `setPrAutopilotProviders` after construction so the orchestrator
+  // (which implements every callback) can be built after the Reconciler.
   prIntendedProvider?: PrIntendedProvider;
   prApi?: PrApi;
   prTransition?: PrTransitionApi;
@@ -109,8 +110,8 @@ export class Reconciler {
   private workspaceCreate?: WorkspaceResourceOptions['create'];
   private workspaceBaseRef?: BaseRefProvider;
   private workspaceIntended: WorkspaceIntendedProvider | null = null;
-  // PR autopilot (issue 38). Built only when `pr_autopilot.enabled` and
-  // providers have been wired. Null otherwise; reconcile() skips the pass.
+  // PR autopilot (issue 38). Built only when the PR engine (`pr.enabled`) is on
+  // and providers have been wired. Null otherwise; reconcile() skips the pass.
   private pr: PrResource | null = null;
   private prIntended: PrIntendedProvider | null = null;
   private prApi: PrApi | null = null;
@@ -197,26 +198,30 @@ export class Reconciler {
 
   /**
    * Construct (or rebuild) the PR autopilot resource against the current
-   * config + wired providers. Returns null when `pr_autopilot.enabled` is
+   * config + wired providers. Returns null when the PR engine (`pr.enabled`) is
    * false OR any required provider is missing — the latter happens on the
    * production path during the brief window between Reconciler construction
    * and the orchestrator wiring its callbacks via {@link setPrAutopilotProviders}.
+   *
+   * The auto-merge strategy and conflict-route target are derived by scanning
+   * states for the per-state `pr:` field (issue 139); only the engine on/off +
+   * poll TTL are read from the top-level `pr:` block.
    */
   private buildPrResource(): PrResource | null {
-    if (!this.cfg.pr_autopilot.enabled) return null;
+    if (!this.cfg.pr.enabled) return null;
     if (!this.prIntended || !this.prApi || !this.prTransition || !this.prCleanup) {
       return null;
     }
-    const conflictRouteTo =
-      this.cfg.pr_autopilot.conflict_route_to ?? defaultConflictRouteTo(this.cfg);
+    const routing = derivePrRouting(this.cfg.states);
+    const conflictRouteTo = routing.conflictRouteTo ?? defaultConflictRouteTo(this.cfg);
     return new PrResource({
       intended: this.prIntended,
       pr: this.prApi,
       transition: this.prTransition,
       cleanup: this.prCleanup,
-      strategy: this.cfg.pr_autopilot.auto_merge_strategy,
+      strategy: routing.strategy,
       conflictRouteTo,
-      pollIntervalMs: this.cfg.pr_autopilot.poll_interval_ms,
+      pollIntervalMs: this.cfg.pr.poll_interval_ms,
       actor: 'pr-autopilot',
     });
   }
@@ -256,8 +261,8 @@ export class Reconciler {
    * provider but is built after the Reconciler. Idempotent — the resource
    * is rebuilt against the latest providers on each call.
    *
-   * Calling this with `pr_autopilot.enabled` false in the live config is a
-   * no-op (the resource stays null).
+   * Calling this with the PR engine (`pr.enabled`) false in the live config is
+   * a no-op (the resource stays null).
    */
   setPrAutopilotProviders(opts: {
     intended: PrIntendedProvider;
