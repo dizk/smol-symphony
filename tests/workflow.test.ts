@@ -434,6 +434,150 @@ describe('workflow states block', () => {
   });
 });
 
+describe('per-state max_concurrent (issue 137)', () => {
+  // Capture stderr while `fn` runs so the deprecation warning can be asserted.
+  // `log.warn` writes to stderr inline when no file sink is active (the test
+  // default). Mirrors tests/logging.test.ts's helper.
+  function captureStderr(fn: () => void): string {
+    const original = process.stderr.write.bind(process.stderr);
+    let captured = '';
+    (process.stderr as unknown as { write: (chunk: string) => boolean }).write = (chunk: string) => {
+      captured += chunk;
+      return true;
+    };
+    try {
+      fn();
+    } finally {
+      (process.stderr as unknown as { write: typeof original }).write = original;
+    }
+    return captured;
+  }
+
+  it('parses a per-state max_concurrent cap, omitted → undefined', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        agent: { max_concurrent_agents: 4 },
+        states: {
+          Todo: { role: 'active', max_concurrent: 2 },
+          Review: { role: 'active' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.states.Todo!.max_concurrent, 2);
+    // Omitted → undefined: no per-state cap, only the global ceiling applies.
+    assert.equal(cfg.states.Review!.max_concurrent, undefined);
+  });
+
+  it('rejects a non-positive max_concurrent', () => {
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          {
+            tracker: { kind: 'local', root: '/tmp/issues' },
+            states: {
+              Todo: { role: 'active', max_concurrent: 0 },
+              Done: { role: 'terminal' },
+              Triage: { role: 'holding' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        ),
+      /max_concurrent must be a positive integer/,
+    );
+  });
+
+  it('folds the deprecated by-state map into per-state caps with a warning', () => {
+    let cfg: ReturnType<typeof buildServiceConfig> | undefined;
+    const stderr = captureStderr(() => {
+      cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root: '/tmp/issues' },
+          agent: {
+            max_concurrent_agents: 4,
+            // Mixed-case keys exercise the case-insensitive fold against the
+            // declared state names.
+            max_concurrent_agents_by_state: { Todo: 1, Review: 2 },
+          },
+          states: {
+            Todo: { role: 'active' },
+            Review: { role: 'active' },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+    });
+    assert.ok(cfg);
+    // Legacy entries fold onto the matching state so the orchestrator only
+    // reads states.<name>.max_concurrent.
+    assert.equal(cfg!.states.Todo!.max_concurrent, 1);
+    assert.equal(cfg!.states.Review!.max_concurrent, 2);
+    assert.match(stderr, /max_concurrent_agents_by_state is deprecated/);
+  });
+
+  it('lets a per-state cap win over a conflicting legacy by-state entry', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        agent: {
+          max_concurrent_agents: 4,
+          max_concurrent_agents_by_state: { Todo: 3 },
+        },
+        states: {
+          Todo: { role: 'active', max_concurrent: 1 },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    // Per-state value wins; the legacy 3 is dropped for Todo.
+    assert.equal(cfg.states.Todo!.max_concurrent, 1);
+  });
+
+  it('rejects per-state caps that sum above the global ceiling', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        agent: { max_concurrent_agents: 2 },
+        states: {
+          Todo: { role: 'active', max_concurrent: 2 },
+          Review: { role: 'active', max_concurrent: 1 },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.match(
+      validateDispatch(cfg) ?? '',
+      /sum of per-state max_concurrent caps \(3\) exceeds agent\.max_concurrent_agents \(2\)/,
+    );
+  });
+
+  it('accepts per-state caps that sum to exactly the global ceiling', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        agent: { max_concurrent_agents: 2 },
+        states: {
+          Todo: { role: 'active', max_concurrent: 1 },
+          Review: { role: 'active', max_concurrent: 1 },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(validateDispatch(cfg), null);
+  });
+});
+
 describe('resolveHooksForState', () => {
   it('falls through to workflow-level hooks when the state declares none', () => {
     const cfg = buildServiceConfig(

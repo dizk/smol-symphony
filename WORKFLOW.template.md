@@ -67,6 +67,15 @@ tracker:
 #             adapter default for this state"). Valid values are adapter- and
 #             model-specific (see `acp.effort`).
 #   max_turns (int, optional): override `agent.max_turns` for this state.
+#   max_concurrent (int, optional): cap on agents the orchestrator runs
+#             simultaneously for issues in THIS state. Symmetric with
+#             `max_turns` — concurrency and turn budget both live on the state.
+#             Omit for "no per-state cap; only the global
+#             `agent.max_concurrent_agents` ceiling applies". The sum of every
+#             state's `max_concurrent` must not exceed that global ceiling
+#             (validated at startup). Replaces the deprecated top-level
+#             `agent.max_concurrent_agents_by_state` map (see the `agent:`
+#             section below).
 #   allowed_transitions (string[]|null, optional): when set, restricts which
 #             states agents in this state may transition to via the MCP
 #             `transition` tool. Each entry must be a declared state. Omit (or
@@ -166,6 +175,7 @@ states:
     model: claude-opus-4-7
     effort: xhigh
     max_turns: 10
+    max_concurrent: 1          # at most one implementer agent at a time
   Review:
     role: active
     adapter: codex
@@ -569,8 +579,12 @@ hooks:
 # agent — concurrency and turn budget.
 # ─────────────────────────────────────────────────────────────────────────────
 agent:
-  # max_concurrent_agents (int): cap on simultaneously-running agents across
-  # the whole workflow. Default: 10
+  # max_concurrent_agents (int): GLOBAL host ceiling on simultaneously-running
+  # agents across the whole workflow. This is the cross-state RAM bound that
+  # memory admission clamps (see memory_admission_enabled below); the sum of
+  # every state's `max_concurrent` is validated against it at startup. It stays
+  # top-level — not on a state — because it bounds total host memory across all
+  # VMs at once. Default: 10
   max_concurrent_agents: 2
 
   # max_turns (int): hard ceiling on autonomous turns per issue. Steering-reply
@@ -581,11 +595,15 @@ agent:
   # after recoverable failures. Default: 300000
   max_retry_backoff_ms: 120000
 
-  # max_concurrent_agents_by_state (map<string, int>): optional per-state
-  # concurrency cap. Sums must not exceed max_concurrent_agents. Default: {}.
-  max_concurrent_agents_by_state:
-    Todo: 1
-    In Progress: 1
+  # max_concurrent_agents_by_state (map<string, int>): DEPRECATED — per-state
+  # concurrency now lives on the state as `states.<name>.max_concurrent` (see
+  # the `states:` block above), symmetric with the per-state `max_turns`
+  # override. This top-level by-name map is still read for one release: its
+  # entries are folded into the matching state's `max_concurrent` (a per-state
+  # value wins on conflict) and a single deprecation warning is logged at
+  # startup. Move the caps onto the states and delete this block.
+  #   max_concurrent_agents_by_state:
+  #     Todo: 1
 
   # memory_admission_enabled (bool): when true, before each dispatch the
   # orchestrator reads `/proc/meminfo` (MemAvailable) and clamps the effective

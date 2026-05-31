@@ -671,9 +671,28 @@ export class Orchestrator
     };
   }
 
+  /**
+   * Resolve a state's per-state concurrency cap (`states.<name>.max_concurrent`)
+   * with a case-insensitive name lookup, mirroring how issue states arrive from
+   * the tracker in arbitrary case. Returns undefined when the state is unknown
+   * or declares no cap.
+   */
+  private perStateConcurrencyCap(stateName: string): number | undefined {
+    const lower = stateName.toLowerCase();
+    for (const [name, sc] of Object.entries(this.cfg.states)) {
+      if (name.toLowerCase() === lower) return sc.max_concurrent;
+    }
+    return undefined;
+  }
+
   /** Per-state slot accounting using current running entries. */
   private hasPerStateSlot(stateName: string): boolean {
-    const cap = this.cfg.agent.max_concurrent_agents_by_state[stateName.toLowerCase()];
+    // Per-state concurrency now lives on the state (issue 137): read
+    // `states.<name>.max_concurrent` (case-insensitively) rather than the
+    // deprecated `agent.max_concurrent_agents_by_state` by-name map, whose
+    // entries the parser has already folded into this field. Undefined → no
+    // per-state cap, so only the global ceiling applies.
+    const cap = this.perStateConcurrencyCap(stateName);
     if (!cap) return this.availableGlobalSlots() > 0;
     let inState = 0;
     for (const e of this.running.values()) {

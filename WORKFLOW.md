@@ -27,9 +27,12 @@
 # separate active/terminal lists to keep in sync.
 #
 # Per-state `adapter` / `model` / `max_turns` override the workflow-level
-# `acp.*` and `agent.max_turns` defaults at dispatch time. `allowed_transitions`
-# narrows the targets the agent can pass to `symphony.transition` while
-# operating in this state (omit for "any declared state is reachable").
+# `acp.*` and `agent.max_turns` defaults at dispatch time, and `max_concurrent`
+# caps how many agents run at once in this state (the global
+# `agent.max_concurrent_agents` stays the cross-state host ceiling).
+# `allowed_transitions` narrows the targets the agent can pass to
+# `symphony.transition` while operating in this state (omit for "any declared
+# state is reachable").
 states:
   Todo:
     role: active
@@ -41,6 +44,10 @@ states:
     # adapter via ANTHROPIC_MODEL. Review stays on codex (cross-model review).
     model: claude-opus-4-8[1m]
     max_turns: 10
+    # Per-state concurrency cap (issue 137): at most one implementer agent at a
+    # time. Lives on the state now, symmetric with max_turns; the global
+    # `agent.max_concurrent_agents` below remains the cross-state host ceiling.
+    max_concurrent: 1
   Review:
     # Codex picks up the implementer's branch and approves or rejects. On
     # approval it transitions the issue to Done with PR-body notes; on
