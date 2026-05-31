@@ -14,12 +14,7 @@ import type {
 } from './types.js';
 import type { IssueTracker } from './trackers/types.js';
 import type { WorkflowSource } from './workflow.js';
-import {
-  resolveHooksForState,
-  validateDispatch,
-  warnOnHooksAndActionsConflict,
-  WorkflowError,
-} from './workflow.js';
+import { validateDispatch, WorkflowError } from './workflow.js';
 import { validateDispatchIo } from './workflow-loader.js';
 import { writeIssueFile, pickHoldingState } from './issues.js';
 import type { ResourceSnapshot } from './reconciler/index.js';
@@ -58,7 +53,7 @@ import {
 // ACP rate-limit signals are out of band today; this is kept as a generic value type so the
 // snapshot endpoint can attach whatever shape a future ACP `_meta` extension produces.
 type JsonValue = unknown;
-import type { WorkspaceManager, HookCapture, HookResult } from './workspace.js';
+import type { WorkspaceManager } from './workspace.js';
 import { withIssue, log } from './logging.js';
 import { openRunLog, type RunLog } from './runlog.js';
 import { defaultMemProbe, computeMemoryAdmission, type MemProbe } from './memory.js';
@@ -148,8 +143,8 @@ const SLEEP_CYCLE_ACTOR = 'symphony/sleep-cycle';
 
 /**
  * Resolve the base branch the autopilot should rebase against. Mirrors the
- * after_create hook contract — operators export `SYMPHONY_BASE_BRANCH` to
- * override; default is `main`.
+ * canonical workspace-setup contract — operators export `SYMPHONY_BASE_BRANCH`
+ * to override; default is `main`.
  */
 function baseBranchName(): string {
   const env = process.env.SYMPHONY_BASE_BRANCH;
@@ -192,11 +187,11 @@ export class Orchestrator
   // retries so the file is one chronological stream per issue, and closed only when the
   // issue finally unwinds (terminal cleanup, claim release without redispatch, or stop()).
   private runLogs = new Map<string, RunLog>();
-  // Set of issue ids whose terminal cleanup (workspaces.remove + before_remove hook) is
-  // still in flight. Used by closeRunLog to defer the close until the cleanup hook
-  // capture has stopped writing; otherwise the retry-timer's "claim released" close fires
-  // ~1s after worker exit (before the hook finishes) and we'd lose the cleanup hook lines
-  // in the JSONL log.
+  // Set of issue ids whose terminal cleanup (workspaces.remove) is still in
+  // flight. Used by closeRunLog to defer the close until the terminal-state
+  // actions capture has stopped writing; otherwise the retry-timer's "claim
+  // released" close fires ~1s after worker exit (before the actions finish)
+  // and we'd lose the action output lines in the JSONL log.
   private cleanupInFlight = new Set<string>();
   private sessionTotals: SessionTotals = {
     input_tokens: 0,
@@ -212,8 +207,8 @@ export class Orchestrator
   private lastValidationError: string | null = null;
 
   // Optional callback used to propagate reloaded config to components that hold their own
-  // tracker/runner/workspace state (so prompt body, hooks, gondolin config, etc., take effect
-  // on the next dispatch).
+  // tracker/runner/workspace state (so prompt body, per-state actions, gondolin config, etc.,
+  // take effect on the next dispatch).
   private onConfigReloaded?: (cfg: ServiceConfig, workflow: WorkflowDefinition) => void;
 
   // Last clamp-active state observed by availableGlobalSlots. Used to log
@@ -272,10 +267,6 @@ export class Orchestrator
       log.error('startup validation failed', { error: validation });
       throw new WorkflowError('workflow_parse_error', validation);
     }
-    // Issue 36 AC2: warn once at startup for every state that declares both
-    // `hooks:` and `actions:`. The actions list wins at runtime; this log line
-    // is the operator-visible "we noticed your hooks but ignored them" signal.
-    warnOnHooksAndActionsConflict(this.cfg);
     await this.assertAdapterCredentials();
     await this.runStartupReconcile();
     this.scheduleTick(0);
@@ -715,7 +706,7 @@ export class Orchestrator
     const cancel = { cancelled: false };
     const startedAt = new Date().toISOString();
     const workspacePath = this.workspaces.workspacePathFor(issue.identifier);
-    // Snapshot tracker.root BEFORE workspace setup, before_run, or Gondolin VM
+    // Snapshot tracker.root BEFORE workspace setup or Gondolin VM
     // bring-up. A WORKFLOW.md reload during that window (or even between
     // fetchCandidateIssues returning and this iteration of the dispatch loop)
     // can mutate the live tracker config; pinning here closes that window.
@@ -854,9 +845,9 @@ export class Orchestrator
     opts: { viaCleanup?: boolean } = {},
   ): void {
     // If a terminal cleanup (`workspaces.remove`) is mid-flight for this issue, the
-    // before_remove hook capture is still writing to the run log. Closing the log here
-    // would truncate those lines on disk. Defer until the cleanup's .finally fires the
-    // close with `viaCleanup: true`.
+    // terminal-state actions capture may still be writing to the run log. Closing the
+    // log here would truncate those lines on disk. Defer until the cleanup's .finally
+    // fires the close with `viaCleanup: true`.
     if (!opts.viaCleanup && this.cleanupInFlight.has(issueId)) return;
     const rl = this.runLogs.get(issueId);
     if (!rl) return;
@@ -1155,38 +1146,18 @@ export class Orchestrator
   }
 
   /**
-   * Workspace removal deferred until the worker has fully unwound (including
-   * after_run hook execution) so we never delete the dir while the agent is
-   * still inside it. The before_remove hook runs inside `workspaces.remove`
-   * and is mirrored into the per-issue run log. The hook is resolved against
-   * the issue's terminal state so a state-specific before_remove fires
-   * instead of the workflow-level fallback.
+   * Workspace removal deferred until the worker has fully unwound (including the
+   * terminal-state `actions:` block) so we never delete the dir while the agent
+   * is still inside it.
    */
   private scheduleWorkspaceCleanup(
     issueId: string,
     entry: RunningEntry,
     logger: ReturnType<typeof withIssue>,
   ): void {
-    const runLog = this.runLogs.get(issueId);
-    const capture: HookCapture | undefined = runLog
-      ? {
-          onChunk: (stream, text) =>
-            runLog.record({ channel: 'hook', hook: 'before_remove', stream, text }),
-          onResult: (r: HookResult) =>
-            runLog.record({
-              channel: 'hook',
-              hook: 'before_remove',
-              kind: 'result',
-              exit_code: r.exit_code,
-              signal: r.signal,
-              timed_out: r.timed_out,
-            }),
-        }
-      : undefined;
     this.cleanupInFlight.add(issueId);
-    const removalHooks = resolveHooksForState(this.cfg, entry.issue.state);
     this.workspaces
-      .remove(entry.identifier, removalHooks, capture)
+      .remove(entry.identifier)
       .catch((err) => logger.warn('workspace removal failed', { error: (err as Error).message }))
       .finally(() => {
         this.cleanupInFlight.delete(issueId);
@@ -1337,10 +1308,9 @@ export class Orchestrator
    *     reflecting it is brief but real; without this, a fresh dispatch's
    *     workspace could be reaped seconds after creation.
    *
-   * The state value is carried so the reconciler's `create` callback can
-   * resolve per-state hook overrides (a state-level `after_create` block
-   * must fire for reconciler-driven eager creation, matching the runner's
-   * resolution at dispatch time).
+   * The state value is carried so the reconciler's `create` callback can apply
+   * the merge-state guard (it skips eager recreation of a workspace whose issue
+   * sits in the autopilot's merge state).
    *
    * Tracker errors propagate. Catching them here would cause an empty set
    * to be returned, which the reconciler would treat as authoritative and
@@ -1379,11 +1349,10 @@ export class Orchestrator
 
   /**
    * Identifiers the orchestrator has claimed for dispatch but the tracker may
-   * not yet reflect as active, with the state used to resolve per-state hooks
-   * for an eager workspace create. Running entries carry the state the
+   * not yet reflect as active, with the state the eager workspace create should
+   * see (used for the merge-state guard). Running entries carry the state the
    * dispatch was claimed from (`issue.state`); pending retries carry their
-   * `target_state` (where the next attempt will run). Both match what the
-   * runner would resolve hooks against if it created the workspace itself.
+   * `target_state` (where the next attempt will run).
    */
   inFlightIdentifiers(): Map<string, string> {
     const out = new Map<string, string>();
@@ -1448,15 +1417,12 @@ export class Orchestrator
 
   /**
    * Workspace removal callback the reconciler invokes for stale dirs (issue
-   * 34). Defers to `WorkspaceManager.remove`, resolved against the live
-   * workflow-level hooks so a reload that changed `before_remove` takes
-   * effect on subsequent reaper passes. Orphan dirs have no matching issue
-   * file and therefore no per-state hook to resolve — workflow-level is the
-   * only meaningful choice. Failures are logged at warn (the reconciler's
-   * action ledger also records them).
+   * 34). Defers to `WorkspaceManager.remove` (a best-effort `rm -rf`).
+   * Failures are logged at warn (the reconciler's action ledger also records
+   * them).
    */
   async removeWorkspace(identifier: string): Promise<void> {
-    await this.workspaces.remove(identifier, this.cfg.hooks);
+    await this.workspaces.remove(identifier);
   }
 
   /**
@@ -1465,15 +1431,13 @@ export class Orchestrator
    * `WorkspaceManager.ensureFor` so the same canonical clone+branch+remote
    * setup the dispatch path runs also fires here.
    *
-   * Hooks are resolved against the issue's current state via
-   * `resolveHooksForState`, so a state-level `after_create` override fires
-   * the same way it would if the runner created the workspace itself. The
-   * intended-set provider supplies the state alongside the identifier; the
-   * `null` fallback is defensive — production callers always pass a state.
+   * The intended-set provider supplies the state alongside the identifier so
+   * the merge-state guard below can fire; the `null` fallback is defensive —
+   * production callers always pass a state.
    *
    * Race with the runner's dispatch-time `ensureFor` is handled inside
    * `WorkspaceManager` via a per-identifier in-flight promise lock: both
-   * callers coalesce into one setup pass, so `after_create` fires exactly
+   * callers coalesce into one setup pass, so the canonical setup runs exactly
    * once whether the reconciler or the runner wins the race.
    */
   async createWorkspace(identifier: string, state: string | null): Promise<void> {
@@ -1491,8 +1455,7 @@ export class Orchestrator
     ) {
       return;
     }
-    const hooks = state !== null ? resolveHooksForState(this.cfg, state) : this.cfg.hooks;
-    await this.workspaces.ensureFor(identifier, hooks);
+    await this.workspaces.ensureFor(identifier);
   }
 
   /**
@@ -1506,8 +1469,7 @@ export class Orchestrator
    *     `kind: 'close'` intents. The autopilot closes the PR without merge
    *     and best-effort-deletes the remote branch. The workspace is NOT
    *     supplied — Cancelled cleanup goes through the orchestrator's
-   *     standard terminal path so the per-state `before_remove` hook still
-   *     fires.
+   *     standard terminal path.
    *
    * Both queries hit the tracker; failures bubble (the pr resource catches
    * and surfaces in last_error so a transient tracker hiccup doesn't blank
@@ -1610,7 +1572,7 @@ export class Orchestrator
     return sha.length > 0 ? { branch, sha } : null;
   }
 
-  // Public hooks the runner uses to feed events back.
+  // Public callbacks the runner uses to feed events back.
   reportTokenUsage(issueId: string, usage: { input_tokens: number; output_tokens: number; total_tokens: number }) {
     const e = this.running.get(issueId);
     if (!e) return;

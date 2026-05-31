@@ -510,12 +510,10 @@ describe('WorkspaceResource — create_workspace', () => {
     }
   });
 
-  it('passes the issue state to the create callback so per-state hooks can resolve', async () => {
-    // Regression test for the per-state hook resolution path. The orchestrator's
-    // production wiring uses the state to call `resolveHooksForState`; the
-    // resource must forward the value the provider declares so a state-level
-    // `after_create` override fires for reconciler-driven creation the same way
-    // it does for runner-driven creation.
+  it('passes the issue state to the create callback', async () => {
+    // The orchestrator's createWorkspace(identifier, state) uses the state for
+    // its merge-state guard, so the workspace resource must forward the value
+    // the intended provider declares rather than dropping it.
     const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-ws-state-'));
     try {
       const received: Array<{ identifier: string; state: string | null }> = [];

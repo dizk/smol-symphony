@@ -7,21 +7,18 @@
 
 import { mkdir, rm, lstat, stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { Workspace, HooksConfig, ServiceConfig } from './types.js';
-import {
-  runProcess,
-  runHookScript as runHookScriptUtil,
-  type RunResult,
-} from './util/process.js';
+import type { Workspace, ServiceConfig } from './types.js';
+import { runProcess, type RunResult } from './util/process.js';
 import { sanitizeWorkspaceKey } from './util/workspace-key.js';
-import type { HookCapture, HookResult } from './workspace-types.js';
 
 // Re-exported so existing shell/entry importers (agent/runner.ts, tests) keep their
 // `from '../workspace.js'` import path. The canonical definitions live in the
 // foundation layer (util/workspace-key, workspace-types) so domain modules can
-// import them directly without crossing the adapters↛inward boundary.
+// import them directly without crossing the adapters↛inward boundary. The
+// `HookCapture`/`HookResult` shapes are the shared run-log/shell-out capture
+// types the actions executor and the per-issue run log key off of.
 export { sanitizeWorkspaceKey };
-export type { HookCapture, HookResult };
+export type { HookCapture, HookResult } from './workspace-types.js';
 
 export class WorkspaceError extends Error {
   constructor(public code: string, message: string) {
@@ -61,48 +58,8 @@ export function assertContained(workspaceRoot: string, candidate: string): void 
   }
 }
 
-// A hook failed when it timed out, exited with a non-zero status, or was terminated by a
-// signal. The signal-termination case is important — otherwise a fatal `before_run` script
-// that calls `kill -TERM $$` would look successful (exit_code=null, timed_out=false).
-function hookFailed(res: HookResult): boolean {
-  return res.timed_out || res.signal !== null || res.exit_code !== 0;
-}
-
-function hookFailureReason(res: HookResult): string {
-  if (res.timed_out) return 'timed out';
-  if (res.signal !== null) return `terminated by signal ${res.signal}`;
-  return `exited with code ${res.exit_code}`;
-}
-
-// Execute a hook script (POSIX `sh -lc`). Returns result so callers can decide on failure
-// semantics (§5.4). Optional `capture` streams output in real time (used by per-issue JSONL
-// run logs) and reports the final result to the same callback. Optional `extraEnv` is
-// merged on top of `process.env` so callers (e.g. the runner's after_run handoff) can
-// stage hook-specific values without polluting the host process environment.
-//
-// Positional arity is preserved so callers (orchestrator, runner, tests) don't have to be
-// touched; the body delegates to the unified `runHookScriptUtil` in `util/process.ts`.
-export async function runHookScript(
-  script: string,
-  cwd: string,
-  timeoutMs: number,
-  capture?: HookCapture,
-  extraEnv?: Record<string, string>,
-): Promise<HookResult> {
-  return runHookScriptUtil(script, {
-    cwd,
-    timeoutMs,
-    env: extraEnv,
-    capture,
-    // The legacy hook wrapper did not append the spawn error message to
-    // stderr (`child.on('error', () => { ... })` discarded `err`). Keep that
-    // behavior so existing hook-failure diagnostics still read identically.
-    appendErrorToStderr: false,
-  });
-}
-
 // Inputs for the canonical per-issue clone+branch+remote setup (issue 34).
-// Previously lived as the `hooks.after_create` shell in WORKFLOW.md; lifted
+// Previously lived as a repo-local `after_create` shell in WORKFLOW.md; lifted
 // into TypeScript so the canonical setup is unit-testable and the reconciler's
 // `workspace` resource owns it as a typed action instead of an opaque shell
 // blob. See `setupWorkspaceDir` below.
@@ -116,8 +73,9 @@ export interface SetupWorkspaceDirOptions {
   baseBranch: string;
   // Per-issue branch to cut from base (e.g. `agent/42`).
   branch: string;
-  // GitHub `owner/repo` when the operator wants the after_run hook to push
-  // back. `null` leaves the workspace network-isolated (no origin remote).
+  // GitHub `owner/repo` when the operator wants the host-side Done-state push
+  // to reach a remote. `null` leaves the workspace network-isolated (no origin
+  // remote).
   originRepo: string | null;
   // Explicit origin URL override. Defaults to the canonical
   // `https://github.com/<originRepo>.git`. Exists so tests (and non-github
@@ -147,13 +105,13 @@ async function runGitExpect(args: string[], cwd: string): Promise<RunResult> {
 
 /**
  * Canonical per-issue clone+branch+remote setup (issue 34). Performs the work
- * the old `hooks.after_create` shell did, but in TypeScript so:
+ * a repo-local `after_create` shell once did, but in TypeScript so:
  *
- *   1. The setup is unit-testable independent of a workflow-defined shell hook.
+ *   1. The setup is unit-testable independent of any workflow-defined glue.
  *   2. The reconciler's `workspace` resource owns it as a typed `create_workspace`
  *      action instead of an opaque shell blob.
- *   3. State-machine behavior (origin restoration, identity pinning) stays on
- *      the orchestrator side of the runner/hook seam.
+ *   3. State-machine behavior (origin restoration, identity pinning) is owned by
+ *      the orchestrator, not a shell script.
  *
  * Behavior (mirroring the shell version's invariants minus the origin-fetch
  * reset — see "Base ref source-of-truth" below):
@@ -166,7 +124,7 @@ async function runGitExpect(args: string[], cwd: string): Promise<RunResult> {
  *   - When `originRepo` is set, restore an `origin` pointing at the canonical
  *     HTTPS URL (no token; auth comes from the host's `gh` and never enters the
  *     VM). `gh auth setup-git` runs best-effort so a later host-side `git push`
- *     from the Done hook can authenticate.
+ *     from the Done-state `push_branch` action can authenticate.
  *   - Pin `user.name`/`user.email` to the symphony-agent identity.
  *   - `git checkout -b <branch>` to cut the per-issue branch.
  *
@@ -224,8 +182,8 @@ export async function setupWorkspaceDir(opts: SetupWorkspaceDirOptions): Promise
   await runGit(['config', '--local', '--unset', 'credential.helper'], workspacePath);
 
   // 4. Conditional origin restore. SYMPHONY_REPO is the documented "I want
-  //    the after_run hook to push" opt-in; without it the workspace stays
-  //    purely local and no origin is configured. The remote URL is the
+  //    the Done-state push to reach a remote" opt-in; without it the workspace
+  //    stays purely local and no origin is configured. The remote URL is the
   //    canonical HTTPS form (no token); auth comes from the host's `gh`,
   //    which never enters the VM. Unlike the prior shell version, we do
   //    NOT fetch `origin/<base>` and reset — see the function comment for
@@ -377,8 +335,8 @@ export async function fetchBaseInWorkspace(
 
 /**
  * Inputs the WorkspaceManager passes to its `createWorkspace` action so the
- * canonical setup can run before the optional repo-local `after_create` shell.
- * Falls back to env-derived defaults (SYMPHONY_*) when fields are omitted.
+ * canonical setup can run on first creation. Falls back to env-derived defaults
+ * (SYMPHONY_*) when fields are omitted.
  */
 export interface ResolveSetupOptionsArgs {
   identifier: string;
@@ -389,7 +347,7 @@ export interface ResolveSetupOptionsArgs {
 /**
  * Resolve the env-driven SetupWorkspaceDirOptions for an issue at dispatch
  * time. Centralized so the runner/manager and tests can share the same
- * mapping. Mirrors the shell heuristic the old after_create used:
+ * mapping:
  *
  *   - SYMPHONY_SOURCE_REPO override else fall back to `workflowDir`
  *     (the directory containing WORKFLOW.md, which in the canonical
@@ -422,12 +380,12 @@ export function resolveSetupOptions(args: ResolveSetupOptionsArgs): SetupWorkspa
 
 // Resolve the workspace dir, creating it if missing. Returns true when this call
 // performed the mkdir (so the caller can gate one-time setup like the canonical
-// clone and `after_create` on first-mkdir). Rejects symlinks (containment risk)
-// and non-directory entries.
+// clone on first-mkdir). Rejects symlinks (containment risk) and non-directory
+// entries.
 async function ensureWorkspaceDirExists(wsPath: string): Promise<boolean> {
   try {
     // lstat (not stat) so a symlink at the workspace path is rejected: a symlink
-    // could redirect hook execution and the returned cwd outside the workspace
+    // could redirect the canonical setup and the returned cwd outside the workspace
     // root, which violates the §5.5 containment invariant.
     const st = await lstat(wsPath);
     if (st.isSymbolicLink()) {
@@ -483,23 +441,6 @@ async function runCanonicalSetup(
   }
 }
 
-// Run the optional repo-local `after_create` hook on a freshly created workspace.
-// §5.4: failure is fatal — unwind the partially prepared dir before rethrowing.
-async function runAfterCreateHook(
-  wsPath: string,
-  hooks: HooksConfig,
-  capture: HookCapture | undefined,
-): Promise<void> {
-  if (!hooks.after_create) return;
-  const res = await runHookScript(hooks.after_create, wsPath, hooks.timeout_ms, capture);
-  if (!hookFailed(res)) return;
-  await unwindWorkspaceDir(wsPath);
-  throw new WorkspaceError(
-    'after_create_failed',
-    `after_create hook ${hookFailureReason(res)}`,
-  );
-}
-
 export class WorkspaceManager {
   // Per-identifier in-flight promise map. Coalesces concurrent ensureFor
   // calls for the same identifier into a single setup pass so the dispatch
@@ -526,32 +467,22 @@ export class WorkspaceManager {
 
   // Ensure the per-issue workspace directory exists. On first creation, runs
   // the canonical TypeScript `create_workspace` action (clone + branch +
-  // optional origin/identity setup) BEFORE the optional repo-local
-  // `after_create` shell. The shell is now a thin glue surface for workflow
-  // authors who need to add additional setup — the canonical clone+branch+remote
-  // work is owned by `setupWorkspaceDir` and unit-tested independently.
-  //
-  // `hooks` is resolved per the issue's current state by the caller (so a
-  // state-level hooks override applies); pass the workflow-level hooks for
-  // state-agnostic callers.
+  // optional origin/identity setup). The canonical clone+branch+remote work is
+  // owned by `setupWorkspaceDir` and unit-tested independently; additional
+  // per-VM tooling lives in the agent image, not in a workspace-setup shell.
   //
   // Concurrent callers for the same identifier (dispatch runner + reconciler
   // eager-create) coalesce via `ensureInFlight`: the second caller awaits
   // the first's result and observes `created_now: false` from the cached
   // workspace shape (since the first's promise already resolved with the
   // created-now=true outcome). Callers must NOT rely on `created_now`
-  // distinguishing "I created it" from "someone else did, just before me" —
-  // the bool exists only to gate the `after_create` hook on first-mkdir,
-  // and the lock guarantees it fires exactly once.
-  async ensureFor(
-    identifier: string,
-    hooks: HooksConfig,
-    captureAfterCreate?: HookCapture,
-  ): Promise<Workspace> {
+  // distinguishing "I created it" from "someone else did, just before me";
+  // the lock guarantees the canonical setup runs exactly once.
+  async ensureFor(identifier: string): Promise<Workspace> {
     const key = sanitizeWorkspaceKey(identifier);
     const existing = this.ensureInFlight.get(key);
     if (existing) return existing;
-    const p = this.doEnsureFor(identifier, hooks, captureAfterCreate);
+    const p = this.doEnsureFor(identifier);
     this.ensureInFlight.set(key, p);
     try {
       return await p;
@@ -560,11 +491,7 @@ export class WorkspaceManager {
     }
   }
 
-  private async doEnsureFor(
-    identifier: string,
-    hooks: HooksConfig,
-    captureAfterCreate?: HookCapture,
-  ): Promise<Workspace> {
+  private async doEnsureFor(identifier: string): Promise<Workspace> {
     const workspaceRoot = this.cfg.workspace.root;
     await mkdir(workspaceRoot, { recursive: true });
     const wsPath = this.workspacePathFor(identifier);
@@ -572,7 +499,6 @@ export class WorkspaceManager {
     const createdNow = await ensureWorkspaceDirExists(wsPath);
     if (createdNow) {
       await runCanonicalSetup(identifier, wsPath, this.cfg.workflow_dir);
-      await runAfterCreateHook(wsPath, hooks, captureAfterCreate);
     }
     return {
       path: wsPath,
@@ -581,48 +507,17 @@ export class WorkspaceManager {
     };
   }
 
-  // Run before_run; throw on failure/timeout (§5.4).
-  async runBeforeRun(workspacePath: string, hooks: HooksConfig, capture?: HookCapture): Promise<void> {
-    if (!hooks.before_run) return;
-    const res = await runHookScript(hooks.before_run, workspacePath, hooks.timeout_ms, capture);
-    if (hookFailed(res)) {
-      throw new WorkspaceError('before_run_failed', `before_run hook ${hookFailureReason(res)}`);
-    }
-  }
-
-  // Best-effort after_run hook (§5.4: failure logged and ignored — caller logs).
-  // `extraEnv` is merged into the hook process env; callers use this to stage
-  // values (e.g. SYMPHONY_PR_TITLE, SYMPHONY_PR_BODY_FILE) that the hook script
-  // would otherwise have to extract by hand.
-  async runAfterRunBestEffort(
-    workspacePath: string,
-    hooks: HooksConfig,
-    capture?: HookCapture,
-    extraEnv?: Record<string, string>,
-  ): Promise<HookResult | null> {
-    if (!hooks.after_run) return null;
-    return runHookScript(hooks.after_run, workspacePath, hooks.timeout_ms, capture, extraEnv);
-  }
-
-  // Best-effort before_remove + filesystem removal (§5.4).
-  async remove(
-    identifier: string,
-    hooks: HooksConfig,
-    capture?: HookCapture,
-  ): Promise<HookResult | null> {
+  // Best-effort filesystem removal of the per-issue workspace dir. A symlink or
+  // non-directory at the path is a no-op (containment safety).
+  async remove(identifier: string): Promise<void> {
     const wsPath = this.workspacePathFor(identifier);
     assertContained(this.cfg.workspace.root, wsPath);
-    let hookResult: HookResult | null = null;
     try {
       const st = await lstat(wsPath);
-      if (st.isSymbolicLink() || !st.isDirectory()) return null;
+      if (st.isSymbolicLink() || !st.isDirectory()) return;
     } catch {
-      return null;
-    }
-    if (hooks.before_remove) {
-      hookResult = await runHookScript(hooks.before_remove, wsPath, hooks.timeout_ms, capture);
+      return;
     }
     await rm(wsPath, { recursive: true, force: true });
-    return hookResult;
   }
 }

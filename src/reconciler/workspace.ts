@@ -10,10 +10,10 @@
 //     on every reconcile tick.
 //   • Creating workspace dirs for non-terminal issues that don't yet have one
 //     on disk. The action body (clone source repo, cut `agent/<id>`, optional
-//     origin restore, after_create hook) is delegated to
-//     `WorkspaceManager.ensureFor` so dispatch-time and reconciler-driven
-//     eager creation share a single code path. Idempotency / race safety is
-//     enforced inside `ensureFor` via a per-identifier in-flight promise lock.
+//     origin restore) is delegated to `WorkspaceManager.ensureFor` so
+//     dispatch-time and reconciler-driven eager creation share a single code
+//     path. Idempotency / race safety is enforced inside `ensureFor` via a
+//     per-identifier in-flight promise lock.
 //   • Reporting drift between an active workspace's HEAD and the current
 //     base-branch tip (e.g. base advanced while the issue was paused). v1 is
 //     non-destructive: drift is surfaced as a `stale` / `stuck` annotation in
@@ -40,9 +40,9 @@ import type { ResourceSnapshot } from './types.js';
  * in-flight allocations.
  *
  * Each map is keyed by raw issue identifier and carries the current state
- * name so the create callback can resolve per-state hook overrides the same
- * way the dispatch runner does (a state-level `after_create` block must fire
- * for reconciler-driven eager creation, not just for runner-driven creation).
+ * name so the create callback can apply the orchestrator's merge-state guard
+ * (it skips eager recreation of a workspace whose issue sits in the autopilot's
+ * merge state).
  *
  * `activeIdentifiers` is the long-lived desired set (non-terminal issues with
  * a file on disk). It MUST throw on tracker errors rather than fail open —
@@ -53,8 +53,8 @@ import type { ResourceSnapshot } from './types.js';
  * `inFlightIdentifiers` covers the window between dispatch claiming an issue
  * and the tracker reflecting it, mirroring VmResource's intended-set rule.
  * The state value is the dispatched-from state (for running entries) or
- * target state (for pending retries) — whichever is the resolution context
- * the runner would use for its own `after_create` resolution.
+ * target state (for pending retries) — whichever the create callback's
+ * merge-state guard should see.
  */
 export interface WorkspaceIntendedProvider {
   activeIdentifiers(): Promise<Map<string, string>>;
@@ -138,14 +138,14 @@ export interface WorkspaceResourceOptions {
    * Remove a workspace dir. Receives the sanitized dir name (which is what
    * `WorkspaceManager.workspacePathFor` resolves to since sanitization is
    * idempotent) and the reason. Production defers to `WorkspaceManager.remove`
-   * so before_remove fires; tests pass a stub.
+   * (a best-effort `rm -rf`); tests pass a stub.
    */
   remove: (identifier: string, reason: RemoveReason) => Promise<void>;
   /**
    * Override for the create action (tests pass a stub). Receives the raw
    * identifier (not the sanitized dir name — `WorkspaceManager.ensureFor`
    * does its own sanitization) plus the issue's current state name so the
-   * orchestrator can resolve per-state hook overrides for `after_create`.
+   * orchestrator can apply its merge-state guard before creating.
    * `state` is null only on the defensive path where the provider failed to
    * supply one (e.g. an in-flight retry whose target state has been pruned);
    * production callers always pass a string. Production defers to
@@ -175,8 +175,7 @@ const MAX_ACTION_HISTORY = 32;
  *
  *   • create_workspace — identifier in the desired set with no matching dir
  *                        on disk. Delegates to `WorkspaceManager.ensureFor`,
- *                        which runs the canonical clone+branch+remote setup
- *                        and the optional `after_create` hook.
+ *                        which runs the canonical clone+branch+remote setup.
  *   • remove_workspace — dir has no matching non-terminal issue.
  *   • mark_stale       — dir matches but HEAD is behind base and the
  *                        workspace has no uncommitted / ahead work. Non-
@@ -228,8 +227,8 @@ export class WorkspaceResource {
     }
     const inFlight = this.opts.intended.inFlightIdentifiers();
     // Map sanitized key → { identifier, state } so the create callback gets
-    // the operator-visible identifier AND the current state name (used to
-    // resolve per-state `after_create` hook overrides). Sanitize-then-set so
+    // the operator-visible identifier AND the current state name (used by the
+    // orchestrator's merge-state guard). Sanitize-then-set so
     // the dir-name comparison matches `workspacePathFor`'s post-sanitize
     // layout. Active issues take precedence over in-flight in case of
     // overlap so the tracker's authoritative state wins over an in-flight

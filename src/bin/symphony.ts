@@ -224,7 +224,7 @@ interface LoadedConfig {
  * tracker (currently `kind=local` only), and resolve the persistent log file
  * path. Mirrors stderr to disk so an agent reviewing a run after the fact
  * (typically inside a VM with the workspace + .symphony/logs/ mounted in) can
- * read orchestrator-side events — workflow reloads, dispatch decisions, hook
+ * read orchestrator-side events — workflow reloads, dispatch decisions, action
  * results, reconciler ticks — alongside the per-issue JSONL run logs in the
  * same directory.
  *
@@ -350,7 +350,7 @@ interface OrchestratorGraph {
 /**
  * Build the in-process graph: tracker, workspaces, vmClient, mcp, acpBridge,
  * reconciler, runner, orchestrator. Wires the post-construction provider
- * hooks (`reconciler.setIntendedVmProvider` / `setWorkspaceProviders` /
+ * callbacks (`reconciler.setIntendedVmProvider` / `setWorkspaceProviders` /
  * `setPrAutopilotProviders`) and the reload callback that propagates config
  * updates through every component.
  *
@@ -405,7 +405,7 @@ async function buildOrchestratorGraph(opts: {
   // path (the runner uses the prebuilt image directly); the bake resource stays
   // for now and is deleted in a later PR.
   const reconciler = new Reconciler(config, { vmClient });
-  // Build the runner with stubs first; we attach the orchestrator's hook callbacks after
+  // Build the runner with stubs first; we attach the orchestrator's provider callbacks after
   // construction since they reference the orchestrator instance.
   let orch!: Orchestrator;
   const runner = new AgentRunner(
@@ -448,7 +448,7 @@ async function buildOrchestratorGraph(opts: {
   wirePostConstructionProviders({ reconciler, orch });
   // The tracker view is resolved through a getter so reloaded config (e.g. a moved
   // tracker.root, changed active/terminal states) is reflected by both the propagation
-  // hook and the HTTP UI without rebinding the server.
+  // callback and the HTTP UI without rebinding the server.
   let liveCfg = config;
   orch.setOnConfigReloaded(buildReloadHandler({
     tracker,
@@ -476,11 +476,11 @@ async function buildOrchestratorGraph(opts: {
 /**
  * Plug the orchestrator into the reconciler as the IntendedVmProvider, the
  * workspace intended/baseRef provider (with remove + create delegating back
- * through the orchestrator so workspace hooks fire on reconciler-driven
- * passes), and the PR autopilot's set of providers (intended set, PR/git
- * adapters, transition router, cleanup hook, and workspace re-materializer).
- * Kept as a separate function so `buildOrchestratorGraph` stays within the
- * imperative-shell statement budget.
+ * through the orchestrator so the canonical workspace setup runs on
+ * reconciler-driven passes), and the PR autopilot's set of providers (intended
+ * set, PR/git adapters, transition router, cleanup callback, and workspace
+ * re-materializer). Kept as a separate function so `buildOrchestratorGraph`
+ * stays within the imperative-shell statement budget.
  */
 function wirePostConstructionProviders(opts: {
   reconciler: Reconciler;
@@ -488,23 +488,20 @@ function wirePostConstructionProviders(opts: {
 }): void {
   const { reconciler, orch } = opts;
   reconciler.setIntendedVmProvider(orch);
-  // Removal is delegated to WorkspaceManager so the workflow-level
-  // `before_remove` hook fires on janitor removals — the closure captures
+  // Removal is delegated to WorkspaceManager (a best-effort `rm -rf`) so janitor
+  // removals reuse the same path the runner does — the closure captures
   // `workspaces` (whose config is kept live via updateConfig on reload), so a
-  // rotated `workspace.root` or hooks block takes effect without rebuilding
-  // the reconciler.
+  // rotated `workspace.root` takes effect without rebuilding the reconciler.
   reconciler.setWorkspaceProviders(orch, {
     baseRef: orch,
     remove: (identifier) => orch.removeWorkspace(identifier),
     // Create callback for the reconciler's eager-workspace pass (issue 34).
     // Delegates to `WorkspaceManager.ensureFor` via the orchestrator so the
-    // canonical clone+branch+remote setup AND any per-state `after_create`
-    // hook fire on reconciler-driven creates the same way they do on
-    // dispatch. The intended-set provider supplies the issue's current state
-    // alongside the identifier so `resolveHooksForState` picks up a
-    // state-level override (e.g. `states.Todo.hooks.after_create`); the
-    // per-identifier ensureFor lock collapses any race with concurrent
-    // dispatch into one setup pass.
+    // canonical clone+branch+remote setup fires on reconciler-driven creates
+    // the same way it does on dispatch. The intended-set provider supplies the
+    // issue's current state alongside the identifier (used for the merge-state
+    // guard); the per-identifier ensureFor lock collapses any race with
+    // concurrent dispatch into one setup pass.
     create: (identifier, state) => orch.createWorkspace(identifier, state),
   });
   // PR autopilot wiring (issue 38). The Reconciler ignores this when

@@ -82,35 +82,24 @@ tracker:
 #               • `tracker.root` → `/symphony/issues` (every issue file across
 #                 every state directory)
 #               • `logs.root`    → `/symphony/logs`   (per-issue JSONL run-log
-#                 transcripts captured by RunLog — ACP frames, stderr, hooks,
-#                 system events — plus the compact `<key>.summary.json` outcome
-#                 records the reflector reads; see the `logs:` block below)
+#                 transcripts captured by RunLog — ACP frames, stderr,
+#                 typed-action output, system events — plus the compact
+#                 `<key>.summary.json` outcome records the reflector reads; see
+#                 the `logs:` block below)
 #             Either mount is skipped silently if the corresponding root is
 #             unset. Each VFS mount has a cost, so this is opt-in per state rather
 #             than a workflow-wide default — flip it on for a dedicated eval
 #             state, not for the routine implement/review flow. Default: false.
 #             The canonical consumer is the "sleep cycle" reflection pattern —
 #             see the SLEEP CYCLE section below the states block.
-#   hooks     (map, optional): per-state overrides for the workflow-level `hooks:`
-#             block. Each of `after_create`, `before_run`, and `before_remove`
-#             is optional; an omitted key inherits the workflow-level hook, an
-#             explicit `null` suppresses it for this state, and a string
-#             replaces it. Resolution is by the issue's state at hook-fire time
-#             — when the agent calls `symphony.transition`, `before_remove` is
-#             resolved against the POST-transition state so a terminal-state's
-#             hook can drive a state-specific artifact rescue. The shared
-#             `timeout_ms` is not overridable per state. The Done-state push +
-#             PR-create handoff lives in `actions:` (below); `hooks.after_run`
-#             is no longer a recognized kind and a workflow that declares it
-#             gets a startup warning + the value dropped on the floor.
-#
-#             DEPRECATED for new work: prefer `actions:` (below) over shell
-#             hooks for state-specific glue. A state that declares both
-#             `hooks:` and `actions:` runs `actions:` and logs a startup-time
-#             deprecation warning naming the hook fields that were ignored.
 #   actions   (list, optional): typed action DAG (issue 36, reconciler v2).
-#             When set on a `terminal` state, this list runs on transition
-#             INTO the state, replacing the per-state `after_run` shell.
+#             The single glue mechanism attached to a state — there is no shell
+#             `hooks:` surface. When set on a `terminal` state, this list runs
+#             on transition INTO the state (the canonical Done-state pair is
+#             push_branch + create_pr_if_missing). For arbitrary in-sandbox
+#             commands use a `run_in_vm` action; per-VM tooling belongs in the
+#             agent image (`images/agents/`); first-creation workspace setup is
+#             owned by the orchestrator's `setupWorkspaceDir`.
 #             Each entry is a closed-kind record:
 #
 #                 - kind: push_branch
@@ -204,8 +193,8 @@ states:
 # "reflection" turn closes that feedback loop — it reads completed-task history
 # (the read-only mounts `eval_mode` exposes), distils *recurring* friction, and
 # files improvement proposals against the HARNESS (this WORKFLOW.md's prompt
-# branches and per-state model/max_turns/allowed_transitions/effort, hooks, the
-# the gondolin image config, acceptance criteria, timeouts) — never the product code under
+# branches and per-state model/max_turns/allowed_transitions/effort/actions, the
+# gondolin image config, acceptance criteria, timeouts) — never the product code under
 # review. Proposals land in Triage via `propose_issue`, so a human stays the
 # gate. This is the "self-improving agent" pattern aimed at the harness rather
 # than the product.
@@ -412,8 +401,8 @@ workspace:
   root: ./.symphony/workspaces
 
 # ─────────────────────────────────────────────────────────────────────────────
-# logs — per-issue JSONL run logs (everything to/from the VM, plus hooks) AND
-# the orchestrator-side text log mirrored to disk for offline debugging.
+# logs — per-issue JSONL run logs (everything to/from the VM, plus typed-action
+# output) AND the orchestrator-side text log mirrored to disk for offline debugging.
 #
 # Per-issue: one file per issue at `<root>/<sanitized-identifier>.jsonl`,
 # appended across attempts AND across symphony process restarts. Each line is
@@ -424,10 +413,11 @@ workspace:
 #                        `direction` ("host_to_vm" | "vm_to_host") and `frame`
 #                        (parsed JSON) — or `kind: "unparseable"` + `raw`.
 #   channel: "stderr"  — raw byte chunk from the adapter / VM stderr.
-#   channel: "hook"    — stdout/stderr chunk from a host-side hook, plus a final
-#                        `kind: "result"` line (exit_code, signal, timed_out).
-#                        `hook` field names which hook: after_create | before_run
-#                        | before_remove.
+#   channel: "hook"    — stdout/stderr chunk from a terminal-state `actions:`
+#                        run, plus a final `kind: "result"` line (exit_code,
+#                        signal, timed_out). The `hook` field names the action
+#                        group (e.g. `actions`). (The channel name is a holdover
+#                        from the retired workflow-hook surface.)
 #   channel: "system"  — orchestrator lifecycle events (attempt_started — which
 #                        also carries the per-state `max_turns` budget,
 #                        attempt_ended, transition, reconciliation_terminating,
@@ -465,7 +455,7 @@ workspace:
 #
 # Orchestrator-side: a single `<root>/symphony.log` (created on demand) gets
 # every structured log line symphony emits — workflow loads, dispatch
-# decisions, hook results, reconciler ticks, shutdown — in `key=value` text
+# decisions, action results, reconciler ticks, shutdown — in `key=value` text
 # format. Lets an agent reviewing a finished run (typically with
 # `.symphony/logs/` mounted into a VM) replay orchestrator-side events
 # alongside the per-issue JSONL traces in the same directory. Set the
@@ -489,81 +479,35 @@ logs:
   root: ./.symphony/logs
 
 # ─────────────────────────────────────────────────────────────────────────────
-# hooks — shell scripts the orchestrator runs at workspace lifecycle points.
+# workspace lifecycle — no shell `hooks:` surface.
 #
-# All hooks run on the HOST (not inside the VM), with cwd set to the per-issue
-# workspace path. Each hook is a multi-line shell snippet. Available context:
+# Symphony has no `hooks:` block (workflow-level or per-state). The behaviors
+# the old `after_create` / `before_run` / `after_run` / `before_remove` hooks
+# covered now live in typed, testable homes:
 #
-#   PWD                  — the workspace directory (cwd at hook start). The
-#                          per-issue workspace path is `<workspace.root>/<id>`,
-#                          so `basename "$PWD"` gives the issue identifier.
+#   • First-creation workspace setup (clone + base checkout + `agent/<id>`
+#     branch cut + origin/identity) is owned by the orchestrator's TypeScript
+#     `setupWorkspaceDir`. The workspace arrives at the agent with: a hardlinked
+#     `git clone --local --no-tags` of the source repo (`SYMPHONY_SOURCE_REPO`,
+#     default: the dir containing WORKFLOW.md) on the base branch
+#     (`SYMPHONY_BASE_BRANCH`, default `main`); all network remotes stripped; an
+#     `origin` restored to the canonical HTTPS URL when `SYMPHONY_REPO` is set
+#     (so the Done-state push can reach a remote — `gh auth setup-git` runs
+#     host-side; the token never enters the VM); pinned `--local` git identity;
+#     and `agent/<id>` checked out off the base SHA.
+#   • Per-VM tooling (extra CLIs, language runtimes, dependency bootstrap) is
+#     baked into the agent image — see `gondolin.image` and `images/agents/`.
+#   • Arbitrary in-sandbox commands run from a state's `actions:` via a
+#     `run_in_vm` action (executes inside the per-issue VM, not on the host).
+#   • The post-attempt handoff (push branch, open PR) is the Done state's
+#     `actions:` block — see `states.Done.actions` above for the canonical pair
+#     (push_branch + create_pr_if_missing). The action executor exposes
+#     `$branch`, `$base_branch`, `$pr_title`, `$pr_body_file`, `$repo`.
 #
-# Plus any env var the operator exports before launching `symphony` — the
-# orchestrator forwards the parent process env unchanged. The common pattern
-# is to plumb tracker root / repo / base via env so the same workflow file
-# works against multiple checkouts.
-#
-# `after_run` is not a hook kind any more: the Done-state push + PR-create
-# handoff is a typed `actions:` block (see `states.Done.actions` above). The
-# action executor exposes the same context — `$branch`, `$base_branch`,
-# `$pr_title`, `$pr_body_file` — that the old hook read from `SYMPHONY_*` env
-# vars. A workflow that still declares `hooks.after_run` (workflow-level or
-# per-state) is warned at startup and the value is dropped on the floor.
-#
-# Per-state overrides: any state can declare its own `hooks:` block under
-# `states.<name>.hooks` that overrides individual fields here for issues in
-# that state. See the `states:` block above for details.
+# Workspace removal is a plain best-effort `rm -rf` of the per-issue dir once
+# the run unwinds; there is no pre-removal artifact-rescue hook (rescue what you
+# need via a terminal-state action before transitioning).
 # ─────────────────────────────────────────────────────────────────────────────
-hooks:
-  # timeout_ms (int): max wall time for a single hook invocation.
-  # Default: 60000
-  timeout_ms: 120000
-
-  # after_create (string | null): additional repo-local glue run AFTER the
-  # built-in canonical workspace setup, before the first dispatch. Default: null.
-  #
-  # The orchestrator now performs the canonical clone + branch + remote setup
-  # in TypeScript (`setupWorkspaceDir`) on first creation, BEFORE this hook
-  # runs. The workspace cwd already has:
-  #
-  #   • a hardlinked `git clone --local --no-tags` of the source repo (selected
-  #     via `SYMPHONY_SOURCE_REPO`, default: the directory containing
-  #     WORKFLOW.md) on the base branch (`SYMPHONY_BASE_BRANCH`, default `main`)
-  #   • all network remotes stripped (in-VM `git push`/`git fetch` fail closed)
-  #   • when `SYMPHONY_REPO` is set: `origin` restored to the canonical HTTPS
-  #     URL `https://github.com/<owner>/<repo>.git` so a host-side terminal
-  #     hook can push; `gh auth setup-git` runs best-effort on the host so the
-  #     push has credentials (the token never enters the VM). Without
-  #     `SYMPHONY_REPO` the workspace stays local-only with no remotes
-  #   • `user.name = symphony-agent` / `user.email = agent@symphony.local`
-  #     pinned in `--local` config
-  #   • `agent/<id>` checked out off the base SHA
-  #
-  # Use `after_create` only for additional setup on top of that — dependency
-  # bootstrap, code generation, etc. The canonical clone/branch/remote work
-  # is owned by the orchestrator and SHOULD NOT be re-implemented here. Leave
-  # this block unset if no additional glue is needed.
-  after_create: |
-    set -eu
-    # ... your additional repo-local setup, if any ...
-
-  # before_run (string | null): runs before each turn. Default: null. Use for
-  # cheap "make sure the workspace is sane" checks; one-time expensive setup
-  # belongs in after_create (which fires only on first workspace creation).
-  before_run: |
-    set -eu
-    # ... pre-turn checks ...
-
-  # NOTE: `after_run` is no longer a hook kind. The post-attempt handoff (push
-  # branch, open PR) lives in `states.Done.actions:` as typed records — see
-  # the `states:` block above for the canonical pair (push_branch +
-  # create_pr_if_missing).
-
-  # before_remove (string | null): runs before the workspace directory is
-  # deleted. Use to extract artifacts you want to keep. Default: null.
-  before_remove: |
-    set -eu
-    # ... rescue artifacts ...
 
 # ─────────────────────────────────────────────────────────────────────────────
 # agent — concurrency and turn budget.
@@ -599,7 +543,7 @@ agent:
   memory_admission_enabled: true
 
   # host_memory_reserve_mib (int): headroom (MiB) the memory admission cap
-  # keeps for the orchestrator process itself, hooks, the per-VM Gondolin runners, and
+  # keeps for the orchestrator process itself, the per-VM Gondolin runners, and
   # the kernel's own working set. Only consulted when
   # `memory_admission_enabled` is true. Raise on hosts with heavy non-symphony
   # workloads; lower on dedicated worker hosts. Default: 2048.

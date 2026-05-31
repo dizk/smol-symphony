@@ -284,17 +284,16 @@ export class Reconciler {
       baseRef?: BaseRefProvider;
       /**
        * Override the remove callback used by the workspace reaper. Production
-       * passes a closure over `WorkspaceManager.remove` so the configured
-       * `before_remove` hook fires on janitor removals; tests omit it to use
+       * passes a closure over `WorkspaceManager.remove`; tests omit it to use
        * the default `rm -rf`.
        */
       remove?: WorkspaceResourceOptions['remove'];
       /**
        * Override the create callback. Production passes a closure over
        * `WorkspaceManager.ensureFor` so the same canonical clone+branch+remote
-       * setup (and after_create hook) that dispatch uses also fires for
-       * reconciler-driven eager creation. Omitted ⇒ the reconciler only
-       * reaps; useful for tests that don't exercise creation.
+       * setup that dispatch uses also fires for reconciler-driven eager
+       * creation. Omitted ⇒ the reconciler only reaps; useful for tests that
+       * don't exercise creation.
        */
       create?: WorkspaceResourceOptions['create'];
     } = {},

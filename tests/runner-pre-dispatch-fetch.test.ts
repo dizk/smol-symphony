@@ -2,18 +2,17 @@
 // is a dispatch precondition, not a best-effort warm-up. If the host-side
 // `git fetch origin <base>` fails in a workspace with an `origin` configured
 // (auth, network, missing ref), `runAttempt` MUST abort the attempt before
-// the `before_run` hook or any agent launch — otherwise the agent's first
-// `git rebase origin/<base>` rebases against a stale local ref and we
-// reproduce exactly the stale-base behavior issue 101 eliminates.
+// any agent launch — otherwise the agent's first `git rebase origin/<base>`
+// rebases against a stale local ref and we reproduce exactly the stale-base
+// behavior issue 101 eliminates.
 //
 // Strategy: stand up a real workspace whose origin points at a bare remote
 // that does NOT carry the requested base branch (so `git fetch origin main`
 // is guaranteed to exit non-zero), hand it to a minimal AgentRunner via a
 // stub WorkspaceManager, and assert the failure shape + that no downstream
-// orchestration ran. The stub records `runBeforeRun` calls; the other
-// runner ports (tracker, vmClient, events) are wired as never-called values
-// so a regression that lets execution leak past the fetch surfaces as a
-// thrown tripwire rather than a silent pass.
+// orchestration ran. The other runner ports (tracker, vmClient, events) are
+// wired as never-called values so a regression that lets execution leak past
+// the fetch surfaces as a thrown tripwire rather than a silent pass.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -78,16 +77,8 @@ describe('runAttempt pre-dispatch base fetch (issue 101 precondition)', () => {
       );
       const def: WorkflowDefinition = { config: {}, prompt_template: '' };
 
-      let runBeforeRunCalls = 0;
       const fakeWorkspaces = {
         ensureFor: async () => ({ path: wsPath, workspace_key: '42', created_now: false }),
-        runBeforeRun: async () => {
-          runBeforeRunCalls += 1;
-        },
-        runAfterRunBestEffort: async () => {
-          // Should also not fire when the attempt aborts before any agent run.
-          throw new Error('tripwire: runAfterRunBestEffort called before agent launch');
-        },
       } as unknown as WorkspaceManager;
 
       const tracker = {} as unknown as IssueTracker;
@@ -146,11 +137,6 @@ describe('runAttempt pre-dispatch base fetch (issue 101 precondition)', () => {
         if (prev === undefined) delete process.env.SYMPHONY_BASE_BRANCH;
         else process.env.SYMPHONY_BASE_BRANCH = prev;
       }
-      assert.equal(
-        runBeforeRunCalls,
-        0,
-        'before_run hook must not run when origin/<base> cannot be refreshed',
-      );
     } finally {
       await rm(bareRemote, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });

@@ -117,13 +117,14 @@ Parsed `WORKFLOW.md` payload:
 
 Typed runtime values derived from `WorkflowDefinition.config` plus environment
 resolution: poll interval, workspace root, active/terminal states, concurrency
-limits, coding-agent executable/args/timeouts, workspace hooks.
+limits, coding-agent executable/args/timeouts.
 
 #### 3.1.4 Workspace
 
 Filesystem workspace assigned to one issue identifier. Logical fields:
 `path` (absolute), `workspace_key` (sanitized identifier), `created_now`
-(boolean, gates `after_create`).
+(boolean; true only when this call created the directory, gating the
+one-time canonical setup).
 
 #### 3.1.5 Live Session
 
@@ -187,7 +188,7 @@ Returned workflow object:
 
 ### 4.3 Front Matter Schema
 
-Top-level keys: `tracker`, `states`, `polling`, `workspace`, `hooks`, `agent`,
+Top-level keys: `tracker`, `states`, `polling`, `workspace`, `agent`,
 `acp`. Unknown keys SHOULD be ignored for forward compatibility. Extensions
 MAY define additional top-level keys without changing the core schema.
 
@@ -199,7 +200,7 @@ this section captures the contract the loader enforces.
 - `kind` (string) — REQUIRED for dispatch; tracker-specific.
 
 The set of recognised states and their roles is declared in the top-level
-`states:` block (see §4.3.7), not under `tracker`. The tracker reads role
+`states:` block (see §4.3.6), not under `tracker`. The tracker reads role
 membership via `activeStateNames(states)` / `terminalStateNames(states)` (or
 by inspecting `states[*].role` directly).
 
@@ -218,22 +219,7 @@ supported kind.
   containing `WORKFLOW.md`. The effective workspace root is normalized to an
   absolute path before use.
 
-#### 4.3.4 `hooks` (object)
-
-- `after_create` (multiline shell script, OPTIONAL) — runs only when a
-  workspace directory is newly created. Failure aborts workspace creation.
-- `before_run` (multiline shell script, OPTIONAL) — runs before each agent
-  attempt. Failure aborts the current attempt.
-- `before_remove` (multiline shell script, OPTIONAL) — runs before workspace
-  deletion if the directory exists. Failure is logged but ignored.
-- `timeout_ms` (integer, OPTIONAL, default `60000`) — applies to all hooks.
-
-The post-attempt push + PR-create handoff is a typed Done-state `actions:`
-block (push_branch + create_pr_if_missing). `hooks.after_run` is not a
-recognized kind any more; a workflow that still declares it gets a startup
-warning and the value is dropped.
-
-#### 4.3.5 `agent` (object)
+#### 4.3.4 `agent` (object)
 
 - `max_concurrent_agents` (integer, default `10`)
 - `max_turns` (positive integer, default `20`) — coding-agent turns within
@@ -243,7 +229,7 @@ warning and the value is dropped.
   default empty). State keys are normalized (`lowercase`) for lookup; invalid
   entries are ignored.
 
-#### 4.3.6 `acp` (object)
+#### 4.3.5 `acp` (object)
 
 Coding-agent launch is mediated by the Agent Client Protocol. The runtime
 selects an adapter profile and runs it inside the per-issue sandbox; the host
@@ -266,7 +252,7 @@ Fields read by the runtime:
 - `bridge` (object) — `bind_host`, `bind_port`, `reach_host`, `reach_url`,
   `connect_timeout_ms`; see `WORKFLOW.template.md`.
 
-#### 4.3.7 `states` (map)
+#### 4.3.6 `states` (map)
 
 REQUIRED. Declares every tracker state the workflow recognises and the
 per-state dispatch configuration. A workflow that omits the block, or that
@@ -356,18 +342,18 @@ Algorithm summary:
    call; otherwise `created_now=false`.
 5. If `created_now=true`, run the built-in canonical workspace setup
    (§5.3).
-6. If `created_now=true`, run `after_create` hook if configured (after the
-   canonical setup).
 
 Concurrent callers for the same identifier MUST coalesce so the canonical
-setup and `after_create` hook each run exactly once per workspace creation.
+setup runs exactly once per workspace creation.
 
 ### 5.3 Built-in Workspace Population
 
 The workspace lifecycle is owned by the orchestrator, not the workflow. On
 first creation, the implementation MUST clone the source repository into the
 workspace path, check out the configured base branch, and cut a per-issue
-branch off the base, before running any optional `after_create` hook glue.
+branch off the base. There is no shell-glue step; per-VM tooling belongs in
+the agent image and arbitrary in-sandbox commands run via a `run_in_vm`
+action.
 
 Canonical setup steps, in order, against the empty workspace directory:
 
@@ -382,8 +368,8 @@ Canonical setup steps, in order, against the empty workspace directory:
 4. When configured for a remote repository (e.g. an `origin` URL known via
    env), restore `origin` pointing at the canonical HTTPS URL. The restore
    MUST NOT embed credentials; auth is provided host-side (e.g. by
-   `gh auth setup-git`) so a host-side terminal hook can push without the
-   token ever entering the workspace or any VM derived from it.
+   `gh auth setup-git`) so the host-side terminal-state push action can push
+   without the token ever entering the workspace or any VM derived from it.
 5. Pin commit identity in `--local` git config so commits carry a stable
    author/committer that never leaks into the operator's global git config.
 6. `git checkout -b <branch>` for the per-issue branch (typically
@@ -400,29 +386,21 @@ Failure handling:
 
 - Failure of any canonical setup step is fatal to workspace creation. The
   partially prepared directory MUST be removed so the next dispatch tick
-  re-enters cleanly. `after_create` hook failure is also fatal.
+  re-enters cleanly.
 - Reused workspaces are NOT destructively reset on subsequent dispatches;
   canonical setup runs only when the directory was created during the
   current ensure call.
 
-### 5.4 Workspace Hooks
+### 5.4 Workspace Removal
 
-Supported hooks: `hooks.after_create`, `hooks.before_run`,
-`hooks.before_remove`.
+Once a run reaches a terminal tracker state and fully unwinds, the per-issue
+workspace directory is removed (a best-effort recursive delete). A symlink or
+non-directory at the workspace path is left untouched (containment safety).
 
-Execution contract:
-
-- Execute in a local shell context appropriate to the host OS, with the
-  workspace directory as `cwd`. On POSIX systems, `sh -lc <script>` (or
-  `bash -lc <script>`) is a conforming default.
-- Hook timeout uses `hooks.timeout_ms`; default `60000 ms`.
-- Log hook start, failures, and timeouts.
-
-Failure semantics:
-
-- `after_create` failure or timeout is fatal to workspace creation.
-- `before_run` failure or timeout is fatal to the current run attempt.
-- `before_remove` failure or timeout is logged and ignored.
+There is no pre-removal shell hook. Anything worth preserving past the run
+(e.g. a patch, a PR) is produced by a terminal-state `actions:` block before
+the workspace is torn down — the canonical example is the Done state's
+`push_branch` + `create_pr_if_missing`.
 
 ### 5.5 Safety Invariants
 
@@ -515,7 +493,7 @@ during a dispatch.
 `claude-agent-acp` MUST be mediated by a host-side credential proxy (reference
 implementation: `src/agent/credential-proxy.ts`). The proxy listens on host
 loopback; the VM reaches it transparently via the same guest→host loopback
-path the ACP bridge (§4.3.6) uses. The in-VM
+path the ACP bridge (§4.3.5) uses. The in-VM
 client never holds a real token — it authenticates to the proxy with a
 per-dispatch sentinel, and the proxy substitutes the real access token
 host-side before forwarding to `api.anthropic.com`.

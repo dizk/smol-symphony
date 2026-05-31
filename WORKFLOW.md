@@ -63,7 +63,7 @@ states:
     # agent can mine finished work for *recurring* harness friction, distil
     # lessons, and file improvement proposals via propose_issue (which land in
     # Triage — the human gate). It reflects on *how symphony runs work*
-    # (WORKFLOW.md prompt branches, per-state model/max_turns/effort, hooks,
+    # (WORKFLOW.md prompt branches, per-state model/max_turns/effort/actions,
     # the gondolin image config, acceptance criteria, timeouts), NOT the product code under
     # review. After filing it transitions to Dormant and waits to be re-armed.
     # See the Reflect prompt branch (the `when "Reflect"` case in the body) for
@@ -158,7 +158,7 @@ tracker:
 # PREREQUISITE: `gh pr merge --auto` requires at least one branch-protection
 # rule on `main`, or arming auto-merge errors. Ensure one exists in the repo's
 # GitHub settings. To disable, set `enabled: false` (the resource is then never
-# constructed and Done-state behavior reverts to the after_run PR-create hook +
+# constructed and Done-state behavior is the `actions:` push + PR-create with
 # operator merge). Note: while enabled, transitions into Done no longer fire the
 # standard terminal workspace cleanup — the pr resource owns the workspace until
 # its PR merges or closes.
@@ -203,54 +203,47 @@ sleep_cycle:
 polling:
   interval_ms: 5000
 
+# The canonical clone + base-branch checkout + `agent/<id>` branch cut +
+# origin/identity setup is owned by the orchestrator's TypeScript
+# `setupWorkspaceDir` action (issue 34 / reconciler stage 3) — there is no
+# shell `hooks:` surface. The per-issue workspace arrives at the dispatched
+# agent with:
+#
+#   • a hardlinked `git clone --local` of the source repo on the base branch
+#     (SYMPHONY_BASE_BRANCH or `main`) at the source repo's current local
+#     base SHA
+#   • all network remotes stripped (in-VM `git push`/`git fetch` fail closed)
+#   • when SYMPHONY_REPO is set: `origin` restored to the canonical HTTPS URL
+#     so the host's Done-state `push_branch` action can push (`gh auth
+#     setup-git` runs best-effort on the host so the push has credentials; the
+#     token never enters the VM)
+#   • `user.name = symphony-agent` / `user.email = agent@symphony.local`
+#   • `agent/<id>` checked out
+#
+# The source repo's local `<base>` is the single source of truth for the
+# workspace's base ref. To pick up a new base, update the source repo
+# (`git pull` / `git fetch && git checkout <base>`) before the next dispatch;
+# symphony does not implicitly fetch from `origin/<base>` at setup time.
+#
+# Need extra per-VM tooling on top of that? Bake it into the agent image
+# (`images/agents/`), or run arbitrary guest commands from a state's `actions:`
+# via `run_in_vm`. The post-attempt push + PR-create handoff is the Done
+# state's `actions:` block above.
 workspace:
   root: ./.symphony/workspaces
 
 # Per-issue JSONL run logs plus an orchestrator-side `symphony.log` mirror.
 # One JSONL file per issue, appended across attempts and process restarts;
 # captures every ACP JSON-RPC frame to/from the VM, raw adapter stderr,
-# host-side hook output, and orchestrator lifecycle events — intended for
+# typed-action output, and orchestrator lifecycle events — intended for
 # later evaluation by another agent. The sibling `symphony.log` captures the
-# orchestrator's structured log (dispatch, hooks, reconciler, shutdown) in the
+# orchestrator's structured log (dispatch, actions, reconciler, shutdown) in the
 # same `key=value` format so a post-hoc review has both surfaces in one
 # directory. While the file sink is active the console shows only the startup
 # banner; `tail -f symphony.log` follows the detail, and `--verbose` mirrors it
 # back to the console. See WORKFLOW.template.md for the full schema.
 logs:
   root: ./.symphony/logs
-
-hooks:
-  timeout_ms: 120000
-
-  # The canonical clone + base-branch checkout + `agent/<id>` branch cut +
-  # origin/identity setup moved into the orchestrator's TypeScript
-  # `setupWorkspaceDir` action (issue 34 / reconciler stage 3). The per-issue
-  # workspace arrives at the dispatched agent with:
-  #
-  #   • a hardlinked `git clone --local` of the source repo on the base branch
-  #     (SYMPHONY_BASE_BRANCH or `main`) at the source repo's current local
-  #     base SHA
-  #   • all network remotes stripped (in-VM `git push`/`git fetch` fail closed)
-  #   • when SYMPHONY_REPO is set: `origin` restored to the canonical HTTPS URL
-  #     so the host's Done hook can push (`gh auth setup-git` runs best-effort
-  #     on the host so the push has credentials; the token never enters the VM)
-  #   • `user.name = symphony-agent` / `user.email = agent@symphony.local`
-  #   • `agent/<id>` checked out
-  #
-  # The source repo's local `<base>` is the single source of truth for the
-  # workspace's base ref. To pick up a new base, update the source repo
-  # (`git pull` / `git fetch && git checkout <base>`) before the next dispatch;
-  # symphony does not implicitly fetch from `origin/<base>` at setup time.
-  #
-  # No `after_create:` block is declared because no repo-local glue is needed
-  # on top of that. Add an `after_create:` here if you need additional
-  # workspace setup — it fires AFTER the canonical setup against the prepared
-  # workspace cwd.
-  #
-  # No workflow-level after_run: the handoff (patch + optional PR) lives on
-  # the Done state's per-state hook (see `states.Done.hooks.after_run` above).
-  # It only fires on transition into Done, so we no longer need a script-level
-  # state check to short-circuit non-terminal turns.
 
 agent:
   # SERIALIZED to 1 (2026-05-27) to stop the FC/IS burn-down conflict storm:
@@ -424,14 +417,16 @@ the per-issue branch, then hand off to the reviewer.
 2. Read enough of the codebase to understand the change you need to make.
 3. Decide where the change belongs before writing it. The orchestrator
    (`src/agent/runner.ts`, `src/mcp.ts`, `src/orchestrator.ts`) owns the
-   state machine and the tracker. Hooks in `WORKFLOW.md` are for repo-local
-   glue: cloning the workspace, `git push`, `gh pr create`, rescuing
-   artifacts. State-machine behavior (new transitions, anything that
-   mutates tracker files or runtime entry state) belongs in the
-   orchestrator with typed APIs and tests — not in a shell hook. If you
-   find yourself adding a `SYMPHONY_*` env var so a hook can reach into
-   orchestrator state, or writing a hook that the runner then has to
-   re-detect via a post-hook scan, that is the signal you are on the wrong
+   state machine and the tracker. Repo-local glue (`git push`, `gh pr
+   create`, rescuing artifacts) lives in a state's typed `actions:` block
+   (or, for arbitrary guest commands, a `run_in_vm` action); workspace
+   setup is the orchestrator's `setupWorkspaceDir`, and per-VM tooling is
+   baked into the agent image. State-machine behavior (new transitions,
+   anything that mutates tracker files or runtime entry state) belongs in
+   the orchestrator with typed APIs and tests — not in an action. If you
+   find yourself adding a `SYMPHONY_*` env var so an action can reach into
+   orchestrator state, or writing an action that the runner then has to
+   re-detect via a post-action scan, that is the signal you are on the wrong
    side of the seam: stop and put the logic in the runner/MCP layer
    instead. The issue body may sketch a shell-shaped solution; treat that
    as one option, not a directive.
@@ -504,25 +499,26 @@ either approve (→ Done) or send it back (→ Todo) with specific findings.
 3. Placement check — is the change on the right side of the seam?
 
    The orchestrator (`src/agent/runner.ts`, `src/mcp.ts`, `src/orchestrator.ts`)
-   owns the state machine and tracker. Hooks in `WORKFLOW.md` are for
-   repo-local glue: cloning the workspace, `git push`, `gh pr create`,
-   rescuing artifacts. Reject when the diff crosses that line:
+   owns the state machine and tracker. Repo-local glue (`git push`, `gh pr
+   create`, rescuing artifacts) lives in a state's typed `actions:` block
+   (or a `run_in_vm` action for arbitrary guest commands). Reject when the
+   diff crosses that line:
 
-   - A hook implements a new state transition, or mutates the tracker
+   - An action implements a new state transition, or mutates the tracker
      filesystem the orchestrator owns (e.g. `mv issues/<state>/<id>.md
      issues/<other-state>/<id>.md`).
-   - A hook mutates runtime state the orchestrator committed earlier (e.g.
+   - An action mutates runtime state the orchestrator committed earlier (e.g.
      undoing a cleanup flag) and the runner now has to re-detect what the
-     hook did via a post-hook scan.
-   - A new `SYMPHONY_*` env var is added so a hook can reach into
+     action did via a post-action scan.
+   - A new `SYMPHONY_*` env var is added so an action can reach into
      orchestrator-owned state. The contract is growing because the logic is
      on the wrong side; surface it as a typed call in the runner/MCP layer
      instead.
 
    If any of the above fires, reject with a pointer to the right home
-   (runner, MCP tool, or orchestrator). Hook-only diffs that stay within
-   repo-local glue (push/PR/clone/format-patch) are fine — this check is
-   about state-machine logic leaking into shell.
+   (runner, MCP tool, or orchestrator). Action-only diffs that stay within
+   repo-local glue (push/PR/format-patch) are fine — this check is
+   about state-machine logic leaking into a state's `actions:`.
 
 4. Decide:
 
@@ -579,7 +575,7 @@ load-bearing — follow them exactly.
   went, not just the final result. `Triage/`, `Cancelled/`, and the active
   state dirs are visible too.
 - `/symphony/logs/<id>.jsonl` — the per-issue run log: every ACP frame, adapter
-  stderr line, hook output, and orchestrator lifecycle event for that issue.
+  stderr line, typed-action output, and orchestrator lifecycle event for that issue.
   This is where stalls, turn-budget exhaustion, retries, and timeouts show up
   in detail.
 - Your workspace is a clone of the symphony repo, so you can read `WORKFLOW.md`,
@@ -608,7 +604,7 @@ per-item). Each proposal must:
 
 - name a single concrete change to the **harness / operating config**: a
   `WORKFLOW.md` prompt branch, a per-state `model` / `max_turns` /
-  `allowed_transitions` / `effort`, a hook, the `gondolin` image config, an
+  `allowed_transitions` / `effort` / `actions`, the `gondolin` image config, an
   acceptance criterion, or a timeout;
 - include a **before → after** (what the config/prompt says now, what you'd
   change it to);
@@ -619,8 +615,8 @@ per-item). Each proposal must:
 **Hard guardrails — a proposal that violates any of these must NOT be filed:**
 
 - Propose changes to the **harness only** — `WORKFLOW.md` /
-  `WORKFLOW.template.md`, per-state config, hooks, the `gondolin` image config,
-  acceptance criteria, timeouts. Do **not** propose edits to product/source code under
+  `WORKFLOW.template.md`, per-state config (including `actions:`), the `gondolin`
+  image config, acceptance criteria, timeouts. Do **not** propose edits to product/source code under
   `src/` as a "fix" for a trajectory; if a genuine product bug is the root
   cause, that is an ordinary `propose_issue` for an implementer, not a harness
   change, and you should frame it that way.

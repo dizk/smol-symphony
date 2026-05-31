@@ -1,6 +1,6 @@
 // Pure decisions extracted from `runAttempt` / its cleanup closure (issues 62, 103).
 // The runner remains the imperative shell that drives ports (the Gondolin VM, bridge,
-// tracker, hooks); each helper here takes a snapshot of shell state and
+// tracker, typed actions); each helper here takes a snapshot of shell state and
 // returns the next decision so branches can be unit tested without spinning
 // up a VM or a workspace. Everything in this module is deterministic and
 // side-effect free.
@@ -149,16 +149,15 @@ export interface DeriveActionContextInput {
   issueDescription: string | null;
   /** Caller passes `process.env.SYMPHONY_REPO`; null/undefined → repo=null. */
   repoEnv: string | undefined;
-  /** Staged SYMPHONY_* env from buildAfterRunHookEnv; undefined → all fallbacks. */
+  /** Staged SYMPHONY_* env from `stageActionContextEnv`; undefined → all fallbacks. */
   extraEnv: Record<string, string> | undefined;
 }
 
 /**
  * Map a `RunningEntry` snapshot + optional staged SYMPHONY_* env into the
  * `ActionContext` the actions executor consumes. Mirrors the prior inline
- * fallback chain in `buildActionContext` so a Done state that previously
- * read `$SYMPHONY_BRANCH` from the hook env now reads `$branch` from the
- * action template namespace.
+ * fallback chain in `buildActionContext` so a Done state reads `$branch` from
+ * the action template namespace (the staged SYMPHONY_* env feeds the fallbacks).
  *
  * Lifting the ternary fallbacks here drops `buildActionContext`'s
  * complexity from 14 to 1 (single pass-through call), letting the shell

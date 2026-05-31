@@ -6,8 +6,7 @@
 //       propose_followup).
 //   (b) retry-on-error policy.
 //   (c) run_in_vm cache hit / miss.
-//   (d) `actions:` + `hooks:` deprecation detection at the workflow layer.
-//   (e) merge's `on_conflict: { route_to: ... }` routing.
+//   (d) merge's `on_conflict: { route_to: ... }` routing.
 //
 // We exercise git through real on-disk repos (mirroring tests/workspace-setup
 // style) and gh / npm / other binaries by stubbing them on PATH with a tiny
@@ -31,7 +30,6 @@ import {
   type RunInVmExecutor,
   type WorkflowAction,
 } from '../src/actions/index.js';
-import { findHooksAndActionsConflicts, buildServiceConfig } from '../src/workflow.js';
 
 // ----- Helpers ---------------------------------------------------------------
 
@@ -844,50 +842,6 @@ describe('action `if:` predicate', () => {
       await rm(source, { recursive: true, force: true });
       await rm(wsParent, { recursive: true, force: true });
     }
-  });
-});
-
-// ----- Deprecation detection ------------------------------------------------
-
-describe('hooks ∧ actions deprecation', () => {
-  it('findHooksAndActionsConflicts flags a state declaring both', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: {
-            role: 'terminal',
-            hooks: { before_remove: 'echo legacy' },
-            actions: [{ kind: 'push_branch', remote: 'origin', ref: 'main' }],
-          },
-          Triage: { role: 'holding' },
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    const conflicts = findHooksAndActionsConflicts(cfg);
-    assert.equal(conflicts.length, 1);
-    assert.equal(conflicts[0]!.state, 'Done');
-    assert.deepEqual(conflicts[0]!.hook_fields, ['before_remove']);
-  });
-
-  it('does not flag states with only one of the two declared', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: {
-            role: 'terminal',
-            actions: [{ kind: 'push_branch', remote: 'origin', ref: 'main' }],
-          },
-          Triage: { role: 'holding' },
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(findHooksAndActionsConflicts(cfg).length, 0);
   });
 });
 

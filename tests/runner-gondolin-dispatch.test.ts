@@ -235,8 +235,6 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
     const def: WorkflowDefinition = { config: {}, prompt_template: 'do work' };
     const workspaces = {
       ensureFor: async () => ({ path: wsPath, workspace_key: '7', created_now: false }),
-      runBeforeRun: async () => {},
-      runAfterRunBestEffort: async () => {},
     } as unknown as WorkspaceManager;
     const tracker = {} as unknown as IssueTracker;
     const events = {
@@ -400,8 +398,6 @@ describe('runner Gondolin dispatch seam (live flip)', () => {
     const def: WorkflowDefinition = { config: {}, prompt_template: 'x' };
     const workspaces = {
       ensureFor: async () => ({ path: wsPath, workspace_key: '7', created_now: false }),
-      runBeforeRun: async () => {},
-      runAfterRunBestEffort: async () => {},
     } as unknown as WorkspaceManager;
     // No registry / hooks / vmConfig → the dispatch must fail before createVm.
     const runner = new AgentRunner(

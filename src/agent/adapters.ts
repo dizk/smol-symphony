@@ -494,8 +494,8 @@ async function resolveStagingLocation(workspacePath: string): Promise<{
       if (ancestor !== null) {
         throw new Error(
           `cannot auto-stage runtime files: workspace ${workspacePath} has no .git of its own ` +
-            `but is inside an ancestor git repo at ${ancestor}. Create a nested clone ` +
-            `(e.g. via hooks.after_create).`,
+            `but is inside an ancestor git repo at ${ancestor}. The canonical workspace setup ` +
+            `clones each issue into its own repo; ensure the workspace is a nested clone.`,
         );
       }
       return {

@@ -1,16 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import {
   sanitizeWorkspaceKey,
   assertContained,
-  runHookScript,
   WorkspaceManager,
 } from '../src/workspace.js';
-import type { HooksConfig, ServiceConfig } from '../src/types.js';
+import type { ServiceConfig } from '../src/types.js';
 
 describe('workspace', () => {
   it('sanitizes identifiers to allowed charset', () => {
@@ -82,46 +81,30 @@ describe('WorkspaceManager.ensureFor — concurrency lock', () => {
     // create_workspace pass can race: both lstat the dir, both get ENOENT,
     // both mkdir, and both invoke `setupWorkspaceDir` -> `git clone --local`
     // into the same path. The second clone fails because the dir is no
-    // longer empty. The lock collapses both callers into one setup; the
-    // after_create hook (configured here) must run exactly once.
+    // longer empty. The lock collapses both callers into one setup, so neither
+    // call rejects and exactly one of them reports `created_now`.
     const source = await makeSourceRepo();
     const wsRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-wsmgr-lock-'));
-    const markerDir = await mkdtemp(path.join(os.tmpdir(), 'symphony-wsmgr-markers-'));
     try {
       const cfg = buildCfg(wsRoot, source);
       const mgr = new WorkspaceManager(cfg);
-      const hooks: HooksConfig = {
-        // Append a line on every invocation so we can count fires via line
-        // count. Workflow author's `after_create` glue is meant to be
-        // idempotent, but it should still only fire once when two concurrent
-        // ensureFor calls collide.
-        after_create: `printf 'fired\\n' >> "${markerDir}/after_create.log"`,
-        before_run: null,
-        after_run: null,
-        before_remove: null,
-        timeout_ms: 30_000,
-      };
       const [a, b] = await Promise.all([
-        mgr.ensureFor('42', hooks),
-        mgr.ensureFor('42', hooks),
+        mgr.ensureFor('42'),
+        mgr.ensureFor('42'),
       ]);
       // Both resolved to the same workspace shape (coalesced on the same
       // promise — second caller observed the first's result).
       assert.equal(a.path, b.path);
       assert.equal(a.workspace_key, '42');
-      // Clone produced a real branch checkout.
+      // Coalesced: exactly one canonical setup ran, so both observers see the
+      // same created_now (the second never re-ran setup against a populated dir).
+      assert.equal(a.created_now, b.created_now);
+      // Clone produced a real branch checkout — proof the single setup pass ran.
       const head = await git(['symbolic-ref', '--short', 'HEAD'], a.path);
       assert.equal(head, 'agent/42');
-      // after_create hook fired exactly once.
-      const log = await stat(path.join(markerDir, 'after_create.log'));
-      assert.ok(log.isFile());
-      const { readFile } = await import('node:fs/promises');
-      const body = await readFile(path.join(markerDir, 'after_create.log'), 'utf8');
-      assert.equal(body, 'fired\n', 'after_create runs exactly once across two concurrent ensureFor calls');
     } finally {
       await rm(source, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });
-      await rm(markerDir, { recursive: true, force: true });
     }
   });
 
@@ -135,70 +118,16 @@ describe('WorkspaceManager.ensureFor — concurrency lock', () => {
     try {
       const cfg = buildCfg(wsRoot, source);
       const mgr = new WorkspaceManager(cfg);
-      const hooks: HooksConfig = {
-        after_create: null,
-        before_run: null,
-        after_run: null,
-        before_remove: null,
-        timeout_ms: 30_000,
-      };
-      const first = await mgr.ensureFor('7', hooks);
+      const first = await mgr.ensureFor('7');
       assert.equal(first.created_now, true);
       // ensureFor again: workspace already on disk, lock slot is gone, no
       // duplicate setup, created_now is false.
-      const second = await mgr.ensureFor('7', hooks);
+      const second = await mgr.ensureFor('7');
       assert.equal(second.created_now, false);
       assert.equal(second.path, first.path);
     } finally {
       await rm(source, { recursive: true, force: true });
       await rm(wsRoot, { recursive: true, force: true });
-    }
-  });
-});
-
-describe('runHookScript extraEnv', () => {
-  it('merges extraEnv on top of process.env without leaking back to the host', async () => {
-    // The Done state's after_run hook reads SYMPHONY_PR_TITLE / SYMPHONY_PR_BODY_FILE
-    // staged by the orchestrator; the runner threads those through as extraEnv. Verify the
-    // merge happens and that the host environment is not mutated as a side effect.
-    const cwd = await mkdtemp(path.join(os.tmpdir(), 'symphony-hook-env-'));
-    try {
-      const sentinel = `prior-${Date.now()}`;
-      process.env.SYMPHONY_HOST_VAR = sentinel;
-      const res = await runHookScript(
-        'printf "%s|%s" "$SYMPHONY_HOST_VAR" "$SYMPHONY_EXTRA_VAR"',
-        cwd,
-        5_000,
-        undefined,
-        { SYMPHONY_EXTRA_VAR: 'staged-value' },
-      );
-      assert.equal(res.exit_code, 0);
-      assert.equal(res.stdout, `${sentinel}|staged-value`);
-      // Host env still carries the original sentinel; staged-only var did not leak in.
-      assert.equal(process.env.SYMPHONY_HOST_VAR, sentinel);
-      assert.equal(process.env.SYMPHONY_EXTRA_VAR, undefined);
-    } finally {
-      delete process.env.SYMPHONY_HOST_VAR;
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it('extraEnv overrides a same-named process.env var for the hook only', async () => {
-    const cwd = await mkdtemp(path.join(os.tmpdir(), 'symphony-hook-env-override-'));
-    try {
-      process.env.SYMPHONY_OVERRIDE_ME = 'host-value';
-      const res = await runHookScript(
-        'printf "%s" "$SYMPHONY_OVERRIDE_ME"',
-        cwd,
-        5_000,
-        undefined,
-        { SYMPHONY_OVERRIDE_ME: 'staged-wins' },
-      );
-      assert.equal(res.stdout, 'staged-wins');
-      assert.equal(process.env.SYMPHONY_OVERRIDE_ME, 'host-value');
-    } finally {
-      delete process.env.SYMPHONY_OVERRIDE_ME;
-      await rm(cwd, { recursive: true, force: true });
     }
   });
 });

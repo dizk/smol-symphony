@@ -8,7 +8,6 @@ import {
   buildServiceConfig,
   expandVar,
   parseWorkflow,
-  resolveHooksForState,
   validateDispatch,
 } from '../src/workflow.js';
 import { validateDispatchIo } from '../src/workflow-loader.js';
@@ -36,9 +35,9 @@ describe('workflow', () => {
   });
 
   it('does not treat indented `---` inside YAML as closing fence', () => {
-    const text = ['---', 'hooks:', '  after_create: |', '    echo a', '    ---', '    echo b', '---', 'prompt body'].join('\n');
+    const text = ['---', 'agent:', '  preamble: |', '    echo a', '    ---', '    echo b', '---', 'prompt body'].join('\n');
     const r = splitFrontMatter(text);
-    assert.equal((r.config as any).hooks.after_create.trim(), 'echo a\n---\necho b');
+    assert.equal((r.config as any).agent.preamble.trim(), 'echo a\n---\necho b');
     assert.equal(r.body, 'prompt body');
   });
 
@@ -298,97 +297,6 @@ describe('workflow states block', () => {
     assert.equal(cfg.states.Review!.model, null);
   });
 
-  it('parses a per-state hooks block', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: {
-            role: 'terminal',
-            hooks: {
-              before_run: 'echo before',
-              before_remove: 'echo cleanup',
-            },
-          },
-          Cancelled: {
-            role: 'terminal',
-            hooks: { before_remove: null },
-          },
-          Triage: { role: 'holding' },
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.deepEqual(cfg.states.Done!.hooks, {
-      before_run: 'echo before',
-      before_remove: 'echo cleanup',
-    });
-    // Explicit null suppresses a workflow-level hook for that state.
-    assert.deepEqual(cfg.states.Cancelled!.hooks, { before_remove: null });
-    // Omitted hooks block stays undefined so resolution falls through to workflow-level.
-    assert.equal(cfg.states.Todo!.hooks, undefined);
-  });
-
-  it('drops a deprecated after_run hook value on the floor', () => {
-    // Issue 108: after_run is no longer a recognized hook kind — the Done-state
-    // push/PR-create handoff lives in `actions:` now. The parser warns + drops
-    // the value rather than threading it through to a runtime branch that no
-    // longer exists.
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: {
-            role: 'terminal',
-            hooks: { after_run: 'echo legacy', before_remove: 'echo keep' },
-          },
-          Triage: { role: 'holding' },
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    // before_remove survives; after_run is stripped silently.
-    assert.deepEqual(cfg.states.Done!.hooks, { before_remove: 'echo keep' });
-  });
-
-  it('rejects a non-string non-null hook value', () => {
-    assert.throws(
-      () =>
-        buildServiceConfig(
-          {
-            tracker: { kind: 'local', root: '/tmp/issues' },
-            states: {
-              Todo: { role: 'active' },
-              Done: { role: 'terminal', hooks: { before_run: 42 } },
-              Triage: { role: 'holding' },
-            },
-          },
-          '/tmp/WORKFLOW.md',
-        ),
-      /hooks\.before_run must be a string or null/,
-    );
-  });
-
-  it('rejects a hooks block that is not a map', () => {
-    assert.throws(
-      () =>
-        buildServiceConfig(
-          {
-            tracker: { kind: 'local', root: '/tmp/issues' },
-            states: {
-              Todo: { role: 'active' },
-              Done: { role: 'terminal', hooks: ['before_run'] },
-              Triage: { role: 'holding' },
-            },
-          },
-          '/tmp/WORKFLOW.md',
-        ),
-      /hooks must be a map/,
-    );
-  });
-
   it('parses per-state eval_mode boolean opt-in', () => {
     // Issue 40: per-state opt-in for symphony self-introspection mounts. Only
     // `true` enables it; absent / false / any non-boolean is rejected so a
@@ -431,116 +339,6 @@ describe('workflow states block', () => {
         ),
       /eval_mode must be a boolean/,
     );
-  });
-});
-
-describe('resolveHooksForState', () => {
-  it('falls through to workflow-level hooks when the state declares none', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: { role: 'terminal' },
-          Triage: { role: 'holding' },
-        },
-        hooks: {
-          after_create: 'echo create',
-          before_run: 'echo before',
-          before_remove: 'echo remove',
-          timeout_ms: 60000,
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    const resolved = resolveHooksForState(cfg, 'Todo');
-    assert.equal(resolved.after_create, 'echo create');
-    assert.equal(resolved.before_run, 'echo before');
-    assert.equal(resolved.before_remove, 'echo remove');
-    assert.equal(resolved.timeout_ms, 60000);
-  });
-
-  it('overrides workflow-level hook fields with per-state ones', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: {
-            role: 'terminal',
-            hooks: { before_remove: 'echo state-remove' },
-          },
-          Triage: { role: 'holding' },
-        },
-        hooks: {
-          before_run: 'echo before',
-          before_remove: 'echo workflow-remove',
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    const todoHooks = resolveHooksForState(cfg, 'Todo');
-    // Todo declares no hooks; falls through.
-    assert.equal(todoHooks.before_remove, 'echo workflow-remove');
-    const doneHooks = resolveHooksForState(cfg, 'Done');
-    // Done's before_remove wins; before_run still falls through.
-    assert.equal(doneHooks.before_remove, 'echo state-remove');
-    assert.equal(doneHooks.before_run, 'echo before');
-  });
-
-  it('respects explicit null to suppress a workflow-level hook for a state', () => {
-    // Cancelled wants no artifact-rescue behavior, even though the workflow
-    // declares a default before_remove. Setting before_remove: null in
-    // Cancelled's hooks overrides the fallback rather than inheriting it.
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Cancelled: { role: 'terminal', hooks: { before_remove: null } },
-          Triage: { role: 'holding' },
-        },
-        hooks: { before_remove: 'echo workflow-remove' },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    const hooks = resolveHooksForState(cfg, 'Cancelled');
-    assert.equal(hooks.before_remove, null);
-  });
-
-  it('matches state names case-insensitively', () => {
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: { role: 'terminal', hooks: { before_remove: 'echo state' } },
-          Triage: { role: 'holding' },
-        },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(resolveHooksForState(cfg, 'done').before_remove, 'echo state');
-    assert.equal(resolveHooksForState(cfg, 'DONE').before_remove, 'echo state');
-  });
-
-  it('returns workflow-level hooks when the state name is undeclared', () => {
-    // Defense in depth: a tracker file in an undeclared state should never reach a
-    // hook callsite (validateDispatch / reconcile both gate on declared states), but
-    // if it does we fall back to the workflow-level hooks rather than throwing.
-    const cfg = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: {
-          Todo: { role: 'active' },
-          Done: { role: 'terminal' },
-          Triage: { role: 'holding' },
-        },
-        hooks: { before_remove: 'echo fallback' },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(resolveHooksForState(cfg, 'Mystery').before_remove, 'echo fallback');
   });
 });
 

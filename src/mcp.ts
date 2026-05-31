@@ -247,7 +247,7 @@ export class McpRegistry {
     entry.steering_context = null;
     // Carry the dispatch-time tracker-root snapshot through verbatim. Reading
     // this.tracker.currentRoot() here would be wrong: activate runs AFTER
-    // workspace setup, before_run hook, and Gondolin VM bring-up — a window during
+    // workspace setup and Gondolin VM bring-up — a window during
     // which a WORKFLOW.md reload can mutate tracker.root. The dispatch-time
     // value is the only one that accurately reflects the world the run was
     // started in.
@@ -460,9 +460,9 @@ export class McpRegistry {
     active.entry.cleanup_workspace_on_exit = targetIsTerminal && !suppressCleanupForAutopilot;
     // Mutate the entry's view of the issue's state so downstream code (runner's
     // cleanup, orchestrator's terminal-state workspace removal) resolves the right
-    // state's hooks. Without this, after_run / before_remove would resolve against
-    // the pre-transition state and a terminal-state hook (e.g. Done's PR-create)
-    // would never fire.
+    // state's `actions:`. Without this, the terminal-state cleanup actions would
+    // resolve against the pre-transition state and a terminal-state handoff
+    // (e.g. Done's push_branch + create_pr_if_missing) would never fire.
     active.entry.issue.state = canonicalName ?? result.toState;
     // Stash the transition so the orchestrator shell can fold it into the run
     // log as a `transition` lifecycle event after the attempt unwinds (issue

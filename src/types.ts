@@ -26,27 +26,6 @@ export interface WorkflowDefinition {
   prompt_template: string;
 }
 
-// Per-state hook overrides. Any field set here replaces the workflow-level hook of
-// the same name when an issue is in this state at hook-fire time. `undefined` (key
-// absent) means "fall through to the workflow-level hook"; an explicit `null` means
-// "no hook for this state, even if workflow-level declares one". `timeout_ms` is
-// not overridable per state — it's a global safety bound, not behavior.
-//
-// `after_run` is intentionally absent: the post-attempt push + PR-create handoff
-// is a typed `actions:` block on the Done state now (push_branch +
-// create_pr_if_missing). The parser warns and drops `after_run` when an operator
-// still declares it; the three remaining hook kinds keep working.
-//
-// Deprecated for state-machine-mutating glue: prefer the `actions:` block on a state
-// (typed records, see src/actions/types.ts) over shell hooks for new work. A state
-// that declares both `hooks:` and `actions:` runs `actions:` and ignores `hooks:`;
-// a startup deprecation warning is logged in validateDispatch.
-export interface StateHooksConfig {
-  after_create?: string | null;
-  before_run?: string | null;
-  before_remove?: string | null;
-}
-
 // Per-state configuration declared in the `states:` block of a workflow file. The
 // orchestrator dispatches against `active`; `terminal` ends a run and triggers
 // workspace cleanup; `holding` keeps a file in the tracker tree without ever
@@ -54,10 +33,8 @@ export interface StateHooksConfig {
 // `max_turns` override the workflow-level defaults when set; null/undefined means
 // "use the workflow default at dispatch time". `allowed_transitions`, when non-null,
 // restricts which states the agent may move to via the MCP `transition` tool; null
-// means "any declared state is reachable". `hooks`, when set, overrides individual
-// workflow-level hook fields for issues in this state — used to give terminal states
-// (e.g. Done, Merge, Cancelled) divergent handoff behavior without an inline
-// terminal-state switch inside a single global hook.
+// means "any declared state is reachable". `actions`, when set on a terminal state,
+// drives the post-attempt handoff (push branch + open PR) as a typed DAG.
 export interface StateConfig {
   role: 'active' | 'terminal' | 'holding';
   adapter?: string;
@@ -70,12 +47,10 @@ export interface StateConfig {
   effort?: string | null;
   max_turns?: number;
   allowed_transitions?: string[] | null;
-  hooks?: StateHooksConfig;
   /**
    * Typed action DAG (issue 36, reconciler v2). When set on a `terminal` state,
-   * this list runs in place of `after_run` shell on transition into the state.
-   * When `actions:` and `hooks:` are both declared, the actions list wins and a
-   * startup-time deprecation warning is logged. Schema lives in
+   * this list runs on transition into the state — the canonical Done-state pair
+   * is push_branch + create_pr_if_missing. Schema lives in
    * src/actions/types.ts (`WorkflowAction` union); the field is typed via a
    * `type-only` import so the data model doesn't create a runtime cycle with
    * the action executor.
@@ -123,14 +98,6 @@ export interface LogsConfig {
   root: string;
 }
 
-export interface HooksConfig {
-  after_create: string | null;
-  before_run: string | null;
-  after_run: string | null;
-  before_remove: string | null;
-  timeout_ms: number;
-}
-
 export interface AgentConfig {
   max_concurrent_agents: number;
   max_turns: number;
@@ -146,7 +113,7 @@ export interface AgentConfig {
   memory_admission_enabled: boolean;
   /**
    * Headroom (MiB) the memory admission cap keeps for the orchestrator process itself,
-   * hooks, the per-VM Gondolin runners, and the kernel's own working set. Only consulted when
+   * the per-VM Gondolin runners, and the kernel's own working set. Only consulted when
    * `memory_admission_enabled` is true.
    */
   host_memory_reserve_mib: number;
@@ -381,7 +348,6 @@ export interface ServiceConfig {
   polling: PollingConfig;
   workspace: WorkspaceConfig;
   logs: LogsConfig;
-  hooks: HooksConfig;
   agent: AgentConfig;
   acp: AcpConfig;
   gondolin: GondolinConfig;
@@ -446,7 +412,7 @@ export interface RunningEntry {
   // Snapshot of `tracker.root` captured at dispatch time so a WORKFLOW.md reload
   // mid-flight cannot redirect an in-flight `transition` (or `propose_issue`) to
   // a different filesystem location. The orchestrator pins this in dispatchIssue
-  // BEFORE workspace setup, before_run hooks, or VM bring-up — anything that
+  // BEFORE workspace setup or VM bring-up — anything that
   // happens during that window (including a workflow reload that mutates
   // tracker.root) must not affect where the move lands. McpRegistry.activate
   // copies the value into the ActiveEntry as-is.

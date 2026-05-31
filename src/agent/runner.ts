@@ -37,7 +37,7 @@ import type { GuestCredFile } from './gondolin-creds-staging.js';
 import type { McpRegistry } from '../mcp.js';
 import { activeStateNames } from '../issues.js';
 import { withIssue } from '../logging.js';
-import { resolveActionsForState, resolveHooksForState } from '../workflow.js';
+import { resolveActionsForState } from '../workflow.js';
 import { parseFrontMatterLenient } from '../util/frontmatter.js';
 import {
   runActions,
@@ -98,7 +98,7 @@ function continuationPrompt(mcpEnabled: boolean): string {
   return mcpEnabled ? CONTINUATION_PROMPT_WITH_MCP : CONTINUATION_PROMPT_NO_MCP;
 }
 
-// Source of truth for "which state's cleanup hooks/actions should fire."
+// Source of truth for "which state's cleanup actions should fire."
 // Prefers the running-entry's current issue state (the runner may have moved
 // it during the attempt, e.g. via a typed-action reroute), otherwise falls
 // back to the issue snapshot the attempt was launched with.
@@ -142,8 +142,8 @@ async function stageActionContextEnv(
     }
   };
   const title = issue.title.trim();
-  // Mirror after_create's `${SYMPHONY_BASE_BRANCH:-main}` default so an
-  // operator who only exported SYMPHONY_REPO still gets a usable --base value.
+  // Mirror the canonical workspace setup's `SYMPHONY_BASE_BRANCH` default (main)
+  // so an operator who only exported SYMPHONY_REPO still gets a usable --base value.
   const baseBranch = process.env.SYMPHONY_BASE_BRANCH;
   const env: Record<string, string> = {
     SYMPHONY_ISSUE_ID: issue.id,
@@ -596,9 +596,8 @@ export class AgentRunner {
    * failure reason, or null when the cleanup succeeded / rerouted / was
    * skipped (no actions declared or no running entry).
    *
-   * The shell `hooks.after_run` arm that lived here historically is gone —
-   * the parser drops `after_run` from the hooks: surface and the Done-state
-   * handoff is a typed `actions:` block now.
+   * The Done-state push + PR-create handoff is a typed `actions:` block
+   * (push_branch + create_pr_if_missing) — there is no shell-hook arm here.
    */
   private async runCleanupActions(
     issue: Issue,
@@ -690,9 +689,8 @@ export class AgentRunner {
   ): Promise<RunAttemptResult> {
     const resolved = this.unwrap(this.resolveAttemptDispatch(issue, logger));
     const hookCapture = this.makeHookCapture(runLog);
-    const initialHooks = resolveHooksForState(this.cfg, issue.state);
     const ws = this.unwrap(
-      await this.setupWorkspace(issue, initialHooks, hookCapture, runLog, logger),
+      await this.setupWorkspace(issue, runLog, logger),
     );
     const adapter = this.unwrap(this.prepareAdapterRuntime(resolved, logger));
     const bridge = this.unwrap(this.validateAcpBridge(logger));
@@ -826,9 +824,10 @@ export class AgentRunner {
   }
 
   /**
-   * Build the per-issue hook capture closure used by every workspace hook
-   * invocation in this attempt. Returns `undefined` when no run log was
-   * provided (production always wires one in; tests may not).
+   * Build the per-issue capture closure used by the terminal-state `actions:`
+   * block to mirror its stdout/stderr into the run log's `hook` channel
+   * (`hook: "actions"`). Returns `undefined` when no run log was provided
+   * (production always wires one in; tests may not).
    */
   private makeHookCapture(
     runLog: RunLog | undefined,
@@ -852,35 +851,23 @@ export class AgentRunner {
   }
 
   // -------------------------------------------------------------------------
-  // Phase 2: workspace setup (ensureFor + base fetch + before_run)
+  // Phase 2: workspace setup (ensureFor + base fetch)
   // -------------------------------------------------------------------------
 
   private async setupWorkspace(
     issue: Issue,
-    initialHooks: ReturnType<typeof resolveHooksForState>,
-    hookCapture: (h: string) => HookCapture | undefined,
     runLog: RunLog | undefined,
     logger: ReturnType<typeof withIssue>,
   ): Promise<PhaseResult<{ workspace: Awaited<ReturnType<WorkspaceManager['ensureFor']>> }>> {
     let workspace: Awaited<ReturnType<WorkspaceManager['ensureFor']>>;
     try {
-      workspace = await this.workspaces.ensureFor(
-        issue.identifier,
-        initialHooks,
-        hookCapture('after_create'),
-      );
+      workspace = await this.workspaces.ensureFor(issue.identifier);
     } catch (err) {
       logger.error('workspace error', { error: (err as Error).message });
       return failPhase('workspace error');
     }
     const fetchRes = await this.fetchBaseBranch(workspace.path, runLog, logger);
     if (!fetchRes.ok) return fetchRes;
-    try {
-      await this.workspaces.runBeforeRun(workspace.path, initialHooks, hookCapture('before_run'));
-    } catch (err) {
-      logger.error('before_run hook failed', { error: (err as Error).message });
-      return failPhase('before_run hook error');
-    }
     return { ok: true, value: { workspace } };
   }
 

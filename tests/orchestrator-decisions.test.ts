@@ -343,7 +343,7 @@ describe('requiredAdapterIds', () => {
   function makeCfg(over: Partial<ServiceConfig> = {}): ServiceConfig {
     return {
       workflow_path: '', workflow_dir: '', tracker: {} as never, polling: {} as never,
-      workspace: {} as never, logs: {} as never, hooks: {} as never, agent: {} as never,
+      workspace: {} as never, logs: {} as never, agent: {} as never,
       acp: { adapter: 'claude' } as never, gondolin: {} as never, server: {} as never,
       mcp: {} as never, pr_autopilot: {} as never, credentials: {} as never,
       states: {}, ...over,

@@ -16,7 +16,7 @@ hand work off between them via a single MCP call.
   writes to stderr is also appended to `<logs.root>/symphony.log` (same
   `key=value` format, created on demand), so a post-hoc reviewer — typically
   an agent inside a VM with `.symphony/logs/` mounted in — can replay
-  orchestrator-side events (dispatch, hooks, reconciler ticks, shutdown)
+  orchestrator-side events (dispatch, actions, reconciler ticks, shutdown)
   alongside the per-issue JSONL run logs already in the same directory. Set
   `SYMPHONY_LOG_FILE` to override the path; set it to the empty string to
   disable the file sink (stderr remains).
@@ -95,6 +95,19 @@ hand work off between them via a single MCP call.
 
 ### Removed
 
+- **BREAKING:** the shell `hooks:` surface — the workflow-level `hooks:` block
+  (`after_create` / `before_run` / `after_run` / `before_remove` / `timeout_ms`)
+  and the per-state `states.<name>.hooks` override. Typed `actions:` on a state
+  are now the only state-attached glue mechanism. Migrate any custom hook:
+  first-creation workspace setup (clone + branch + remote) is already owned by
+  the orchestrator's `setupWorkspaceDir`; the post-attempt push + PR-create
+  handoff is the Done state's `actions:` block (`push_branch` +
+  `create_pr_if_missing`); per-VM tooling belongs in the agent image
+  (`images/agents/`); and arbitrary in-sandbox commands run from a state's
+  `actions:` via a `run_in_vm` action. Workspace removal is now a plain
+  best-effort `rm -rf` with no pre-removal hook — rescue artifacts via a
+  terminal-state action before transitioning. The shipped `WORKFLOW.md`
+  declared no hooks, so this is a no-op for this repo's own dogfooding run.
 - The smolvm microVM backend, the root `Smolfile` + `smolvm.smolfile`/`from`
   config and the `templates/Smolfile.*` starters, the per-issue bake/pack
   pipeline (the reconciler `bake` resource + its action cache), and the HTTP

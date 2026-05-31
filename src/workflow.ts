@@ -7,13 +7,11 @@ import { parseFrontMatter, FrontMatterError } from './util/frontmatter.js';
 import type {
   ServiceConfig,
   StateConfig,
-  StateHooksConfig,
   WorkflowDefinition,
   TrackerConfig,
   PollingConfig,
   WorkspaceConfig,
   LogsConfig,
-  HooksConfig,
   AgentConfig,
   AcpConfig,
   GondolinConfig,
@@ -24,7 +22,6 @@ import type {
   SleepCycleConfig,
   CredentialsConfig,
 } from './types.js';
-import { log } from './logging.js';
 import { isKnownAdapter } from './agent/adapter-names.js';
 import { parseActionsBlock } from './actions/parsing.js';
 import type { WorkflowAction } from './actions/types.js';
@@ -200,34 +197,14 @@ export function buildServiceConfig(
   }
   const logs: LogsConfig = { root: path.resolve(logsRoot) };
 
-  // hooks (§4.3.4)
-  const hooksRaw = getObject(raw, 'hooks');
-  // `after_run` is no longer a hook kind: the post-attempt push + PR-create handoff
-  // is now a typed Done-state `actions:` block (push_branch + create_pr_if_missing).
-  // A workflow that still declares it is honored as a no-op and logged so the
-  // operator can migrate to actions:.
-  if (asString(hooksRaw['after_run']) !== null) {
-    log.warn('hooks.after_run is deprecated and ignored; migrate to a Done-state actions: block', {});
-  }
-  const hooks: HooksConfig = {
-    after_create: asString(hooksRaw['after_create']),
-    before_run: asString(hooksRaw['before_run']),
-    after_run: null,
-    before_remove: asString(hooksRaw['before_remove']),
-    timeout_ms: asInt(hooksRaw['timeout_ms'], 60_000),
-  };
-  if (hooks.timeout_ms <= 0) {
-    throw new WorkflowError('workflow_parse_error', 'hooks.timeout_ms must be positive');
-  }
-
-  // agent (§4.3.5)
+  // agent (§4.3.4)
   const agentRaw = getObject(raw, 'agent');
   const maxTurns = asInt(agentRaw['max_turns'], 20);
   if (maxTurns <= 0) {
     throw new WorkflowError('workflow_parse_error', 'agent.max_turns must be positive');
   }
   // Memory-aware admission cap (issue 27). Default-on with a 2 GiB host reserve — that's
-  // enough headroom for the orchestrator process, hooks, the per-VM Gondolin runners,
+  // enough headroom for the orchestrator process, the per-VM Gondolin runners,
   // and the kernel's working set on a typical workstation. Operators can disable the cap (set
   // `memory_admission_enabled: false`) on hosts that don't expose /proc/meminfo or where
   // the static cap is already the binding constraint.
@@ -263,7 +240,7 @@ export function buildServiceConfig(
     circuit_breaker_threshold: circuitBreakerThreshold,
   };
 
-  // acp (Symphony extension; see §4.3.6). `adapter` selects
+  // acp (Symphony extension; see §4.3.5). `adapter` selects
   // one of symphony's known profiles (claude, codex, opencode); symphony auto-derives the
   // launch command from the adapter profile. Credentials are NOT staged into the workspace:
   // the guest only ever holds a token-shaped placeholder, and the host substitutes the real
@@ -433,7 +410,6 @@ export function buildServiceConfig(
     polling,
     workspace,
     logs,
-    hooks,
     agent,
     acp,
     gondolin,
@@ -556,7 +532,6 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
         `state "${name}": allowed_transitions must be a list of state names (or null/omitted)`,
       );
     }
-    const stateHooks = parseStateHooksBlock(name, m['hooks']);
     const stateActions = parseActionsBlock(name, m['actions']);
     // eval_mode is a strict boolean opt-in: only true enables it, any other
     // value (including undefined, null, "true" string) leaves it off. Strict
@@ -576,7 +551,6 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     if (effort !== undefined) sc.effort = effort;
     if (maxTurns !== undefined) sc.max_turns = maxTurns;
     if (allowed !== undefined) sc.allowed_transitions = allowed;
-    if (stateHooks !== undefined) sc.hooks = stateHooks;
     if (stateActions !== undefined) sc.actions = stateActions;
     if (evalModeRaw === true) sc.eval_mode = true;
     out[name] = sc;
@@ -584,56 +558,11 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
   return out;
 }
 
-// Per-state `hooks:` block. Each field is optional and accepts either a script string
-// or `null` to mean "explicitly suppress this hook for this state". A missing key falls
-// through to the workflow-level hook of the same name at resolution time.
-function parseStateHooksBlock(stateName: string, raw: unknown): StateHooksConfig | undefined {
-  if (raw === undefined) return undefined;
-  if (raw === null) return {};
-  if (typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new WorkflowError(
-      'workflow_parse_error',
-      `state "${stateName}": hooks must be a map of hook name → script (or null/omitted)`,
-    );
-  }
-  const m = raw as Record<string, unknown>;
-  const out: StateHooksConfig = {};
-  // `after_run` is no longer a hook kind (the Done-state push + PR-create handoff
-  // is a typed `actions:` block now). A state that still declares it is warned and
-  // its value is dropped on the floor; the three remaining hook kinds keep working.
-  if (Object.prototype.hasOwnProperty.call(m, 'after_run')) {
-    log.warn(
-      'state hooks.after_run is deprecated and ignored; migrate to a Done-state actions: block',
-      { state: stateName },
-    );
-  }
-  const fields: Array<keyof StateHooksConfig> = [
-    'after_create',
-    'before_run',
-    'before_remove',
-  ];
-  for (const name of fields) {
-    if (!Object.prototype.hasOwnProperty.call(m, name)) continue;
-    const v = m[name];
-    if (v === null) {
-      out[name] = null;
-    } else if (typeof v === 'string') {
-      out[name] = v;
-    } else {
-      throw new WorkflowError(
-        'workflow_parse_error',
-        `state "${stateName}": hooks.${name} must be a string or null`,
-      );
-    }
-  }
-  return out;
-}
-
 /**
  * Resolve the typed action list a given state should run on transition-in.
- * Mirrors {@link resolveHooksForState}'s case-insensitive lookup but returns
- * the parsed `WorkflowAction[]` (or undefined when the state has no actions
- * block). The runner consults this instead of `after_run` when present.
+ * Case-insensitive state lookup; returns the parsed `WorkflowAction[]` (or
+ * undefined when the state has no actions block). The runner consults this on
+ * transition into a terminal state to drive the push/PR handoff.
  */
 export function resolveActionsForState(
   cfg: ServiceConfig,
@@ -654,90 +583,6 @@ export function resolveActionsForState(
   }
   if (key === null) return undefined;
   return states[key]!.actions;
-}
-
-// Effective hooks for an issue currently in `stateName`. Per-state hook fields override
-// the workflow-level ones; absent fields fall through. An explicit `null` in a state's
-// hooks block suppresses that hook for the state even if the workflow declares it. The
-// shared `timeout_ms` is always the workflow-level value — it bounds runtime cost, not
-// behavior, and states are not allowed to weaken or strengthen it.
-export function resolveHooksForState(cfg: ServiceConfig, stateName: string): HooksConfig {
-  const base = cfg.hooks;
-  const states = cfg.states;
-  let key: string | null = null;
-  if (Object.prototype.hasOwnProperty.call(states, stateName)) {
-    key = stateName;
-  } else {
-    const lower = stateName.toLowerCase();
-    for (const name of Object.keys(states)) {
-      if (name.toLowerCase() === lower) {
-        key = name;
-        break;
-      }
-    }
-  }
-  if (key === null) return base;
-  const sh = states[key]!.hooks;
-  if (!sh) return base;
-  const pick = (k: keyof StateHooksConfig): string | null =>
-    Object.prototype.hasOwnProperty.call(sh, k) ? sh[k] ?? null : base[k];
-  return {
-    after_create: pick('after_create'),
-    before_run: pick('before_run'),
-    // `after_run` is no longer a live hook kind; the parser drops it. The field
-    // stays on HooksConfig so existing test fixtures and the workspace helper's
-    // method signature keep type-checking — it is permanently null at runtime.
-    after_run: null,
-    before_remove: pick('before_remove'),
-    timeout_ms: base.timeout_ms,
-  };
-}
-
-/**
- * Detect states that declare BOTH `hooks:` and `actions:`. The actions list
- * wins on those states (issue 36 AC2); we emit a single startup-time warning
- * per state so the operator knows the `hooks:` block is being ignored. Pure
- * function so the same surface is reachable from tests without the side
- * effect of the global log. Returns the list of (state, hook-fields) tuples
- * the caller can render however it likes; the production caller logs at
- * warn via {@link warnOnHooksAndActionsConflict}.
- */
-export function findHooksAndActionsConflicts(
-  cfg: ServiceConfig,
-): Array<{ state: string; hook_fields: string[] }> {
-  const out: Array<{ state: string; hook_fields: string[] }> = [];
-  for (const [name, sc] of Object.entries(cfg.states)) {
-    if (!sc.actions || sc.actions.length === 0) continue;
-    const hooks = sc.hooks;
-    if (!hooks) continue;
-    const setFields: string[] = [];
-    // `after_run` is parsed-and-dropped (see parseStateHooksBlock); only the
-    // three live hook kinds can conflict with an `actions:` block now.
-    for (const k of ['after_create', 'before_run', 'before_remove'] as const) {
-      if (Object.prototype.hasOwnProperty.call(hooks, k) && hooks[k] !== null && hooks[k] !== undefined) {
-        setFields.push(k);
-      }
-    }
-    if (setFields.length > 0) out.push({ state: name, hook_fields: setFields });
-  }
-  return out;
-}
-
-/**
- * Log a deprecation warning for every state that declares both `hooks:` and
- * `actions:`. Called from the orchestrator at startup so the warning fires
- * before the first dispatch into a terminal state. The action-list wins
- * silently in the runtime; this surface is the operator-visible "we saw
- * your hook and ignored it" signal.
- */
-export function warnOnHooksAndActionsConflict(cfg: ServiceConfig): void {
-  const conflicts = findHooksAndActionsConflicts(cfg);
-  for (const c of conflicts) {
-    log.warn('state declares both `hooks:` and `actions:`; running actions and ignoring hooks (deprecated)', {
-      state: c.state,
-      ignored_hook_fields: c.hook_fields,
-    });
-  }
 }
 
 // Dispatch preflight validation (structural, pure). The fs-touching probes —

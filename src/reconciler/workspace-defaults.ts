@@ -75,7 +75,7 @@ export async function defaultInspectWorkspace(
   return { head: headSha, workspaceBaseSha, hasUncommitted, commitsAheadOfBase: aheadCount };
 }
 
-/** Default removal: `rm -rf` the dir. Production wraps `WorkspaceManager.remove` so before_remove hooks fire; the two-callback design lets tests skip hooks. */
+/** Default removal: `rm -rf` the dir. Production wraps `WorkspaceManager.remove`; the two-callback design lets tests pass a stub. */
 export async function defaultRemoveWorkspace(
   workspaceRoot: string,
   identifier: string,

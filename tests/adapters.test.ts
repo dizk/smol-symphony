@@ -42,13 +42,6 @@ function bareCfg(over: Partial<ServiceConfig['acp']> = {}): ServiceConfig {
     },
     polling: { interval_ms: 30_000 },
     workspace: { root: '/tmp/ws' },
-    hooks: {
-      after_create: null,
-      before_run: null,
-      after_run: null,
-      before_remove: null,
-      timeout_ms: 60_000,
-    },
     agent: {
       max_concurrent_agents: 1,
       max_turns: 1,
