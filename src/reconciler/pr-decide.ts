@@ -313,7 +313,7 @@ function decideConflict(obs: PrObservation): PrEffect[] {
 export function buildConflictNotes(args: { intent: PrIntent; view: PrView }): string {
   const { intent, view } = args;
   const lines: string[] = [
-    'pr_autopilot — PR is not mergeable against base',
+    'pr autopilot — PR is not mergeable against base',
     '',
     `GitHub reports PR #${view.number} (${view.url}) as \`mergeable: ${view.mergeable}\` against \`origin/${intent.base_branch}\`.`,
     '',

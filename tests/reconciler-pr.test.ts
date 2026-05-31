@@ -27,6 +27,8 @@ import {
   type PrTransitionApi,
   type PrView,
 } from '../src/reconciler/pr.js';
+import { Reconciler } from '../src/reconciler/index.js';
+import { buildServiceConfig } from '../src/workflow.js';
 
 // ── shared fixtures ─────────────────────────────────────────────────────────
 
@@ -866,5 +868,65 @@ describe('PrResource — error surfaces', () => {
     });
     await res.reconcile();
     assert.match(res.snapshot().last_error ?? '', /tracker exploded/);
+  });
+});
+
+// ── Reconciler wiring: state-level pr: drives the PR resource (issue 139) ─────
+// The PrResource above is config-agnostic (strategy/conflictRouteTo are
+// injected). These tests cover the new seam: `Reconciler.buildPrResource`
+// derives those from the per-state `pr:` config (via `derivePrRouting`) and the
+// top-level `pr:` engine toggle, instead of the old named `pr_autopilot:`
+// strings. They go through the real `buildServiceConfig` → `Reconciler` path.
+
+describe('Reconciler wires PR routing from per-state pr: config (issue 139)', () => {
+  function makeCfg(donePr: unknown, engineEnabled = true): ReturnType<typeof buildServiceConfig> {
+    return buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal', pr: donePr },
+          Cancelled: { role: 'terminal', pr: { close: true } },
+          Triage: { role: 'holding' },
+        },
+        pr: { enabled: engineEnabled, poll_interval_ms: 0 },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+  }
+
+  it("arms auto-merge with the merge state's pr.auto_merge strategy", async () => {
+    const cfg = makeCfg({ auto_merge: 'rebase', on_conflict: { route_to: 'Todo' } });
+    const { api, calls } = makePrApi({ view: makeView() });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const recon = new Reconciler(cfg);
+    recon.setPrAutopilotProviders({ intended: intended([makeIntent()]), pr: api, transition, cleanup });
+    await recon.reconcile();
+    assert.deepEqual(calls.arm, [{ pr: 7, strategy: 'rebase' }]);
+  });
+
+  it("routes a CONFLICTING PR to the merge state's on_conflict.route_to", async () => {
+    const cfg = makeCfg({ auto_merge: 'squash', on_conflict: { route_to: 'Todo' } });
+    const { api, calls } = makePrApi({ view: makeView({ mergeable: 'CONFLICTING' }) });
+    const { transition, calls: trCalls } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const recon = new Reconciler(cfg);
+    recon.setPrAutopilotProviders({ intended: intended([makeIntent()]), pr: api, transition, cleanup });
+    await recon.reconcile();
+    assert.equal(calls.arm.length, 0, 'no arm on a CONFLICTING PR');
+    assert.equal(trCalls.length, 1);
+    assert.equal(trCalls[0]!.toState, 'Todo');
+  });
+
+  it('builds no PR resource when the engine is disabled', async () => {
+    const cfg = makeCfg({ auto_merge: 'squash' }, false);
+    const { api, calls } = makePrApi({ view: makeView() });
+    const { transition } = makeTransition();
+    const { cleanup } = makeCleanup();
+    const recon = new Reconciler(cfg);
+    recon.setPrAutopilotProviders({ intended: intended([makeIntent()]), pr: api, transition, cleanup });
+    await recon.reconcile();
+    assert.equal(calls.list.length, 0, 'disabled engine builds no PR resource');
   });
 });

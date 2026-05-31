@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   splitFrontMatter,
   buildServiceConfig,
+  derivePrRouting,
   expandVar,
   parseWorkflow,
   resolveHooksForState,
@@ -966,9 +967,9 @@ describe('workflow states validation', () => {
 
 });
 
-describe('pr_autopilot block', () => {
+describe('pr engine + per-state pr routing (issue 139)', () => {
   async function withTrackerRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-pr-autopilot-validate-'));
+    const root = await mkdtemp(path.join(os.tmpdir(), 'symphony-pr-validate-'));
     try {
       return await fn(root);
     } finally {
@@ -976,159 +977,281 @@ describe('pr_autopilot block', () => {
     }
   }
 
-  it('pr_autopilot defaults off when block is absent', () => {
+  // States carrying the migrated shape: Done is the merge state (auto_merge +
+  // on_conflict.route_to → Todo), Cancelled is the close state (close: true).
+  const prStates = {
+    Todo: { role: 'active' as const },
+    Done: {
+      role: 'terminal' as const,
+      pr: { auto_merge: 'squash', on_conflict: { route_to: 'Todo' } },
+    },
+    Cancelled: { role: 'terminal' as const, pr: { close: true } },
+    Triage: { role: 'holding' as const },
+  };
+
+  it('pr engine defaults off when the block is absent', () => {
     const cfg = buildServiceConfig(
       { tracker: { kind: 'local', root: '/tmp/issues' }, states: minimalStates },
       '/tmp/WORKFLOW.md',
     );
+    assert.equal(cfg.pr.enabled, false);
+    assert.equal(cfg.pr.poll_interval_ms, 30000);
+    // No state declares pr:, so the derived compat view names no merge/close state.
     assert.equal(cfg.pr_autopilot.enabled, false);
-    assert.equal(cfg.pr_autopilot.merge_state, 'Done');
-    assert.equal(cfg.pr_autopilot.close_state, 'Cancelled');
-    assert.equal(cfg.pr_autopilot.auto_merge_strategy, 'squash');
+    assert.equal(cfg.pr_autopilot.merge_state, '');
+    assert.equal(cfg.pr_autopilot.close_state, null);
   });
 
-  it('pr_autopilot parses explicit fields and normalizes auto_merge_strategy', () => {
+  it('pr engine parses enabled + poll_interval_ms', () => {
     const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
+        states: prStates,
+        pr: { enabled: true, poll_interval_ms: 15000 },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.pr.enabled, true);
+    assert.equal(cfg.pr.poll_interval_ms, 15000);
+  });
+
+  it('pr engine rejects poll_interval_ms < 0 at parse time', () => {
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          {
+            tracker: { kind: 'local', root: '/tmp/issues' },
+            states: prStates,
+            pr: { enabled: true, poll_interval_ms: -1 },
+          },
+          '/tmp/WORKFLOW.md',
+        ),
+      /pr\.poll_interval_ms must be non-negative/,
+    );
+  });
+
+  it('derivePrRouting reads a terminal state with pr.auto_merge as the merge state', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal', pr: { auto_merge: 'rebase', on_conflict: { route_to: 'Todo' } } },
+          Triage: { role: 'holding' },
+        },
+        pr: { enabled: true },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    const routing = derivePrRouting(cfg.states);
+    assert.equal(routing.mergeState, 'Done');
+    assert.equal(routing.strategy, 'rebase');
+    assert.equal(routing.conflictRouteTo, 'Todo');
+    assert.equal(routing.closeState, null);
+    // Derived compat view (mcp.ts / bin/symphony.ts) mirrors the scan.
+    assert.equal(cfg.pr_autopilot.merge_state, 'Done');
+    assert.equal(cfg.pr_autopilot.auto_merge_strategy, 'rebase');
+    assert.equal(cfg.pr_autopilot.conflict_route_to, 'Todo');
+  });
+
+  it('derivePrRouting reads a terminal state with pr.close as the close state', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: prStates,
+        pr: { enabled: true },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    const routing = derivePrRouting(cfg.states);
+    assert.equal(routing.closeState, 'Cancelled');
+    assert.equal(cfg.pr_autopilot.close_state, 'Cancelled');
+  });
+
+  it('a merge state without on_conflict leaves the route target unset (engine falls back)', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal', pr: { auto_merge: 'squash' } },
+          Triage: { role: 'holding' },
+        },
+        pr: { enabled: true },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    const routing = derivePrRouting(cfg.states);
+    assert.equal(routing.mergeState, 'Done');
+    assert.equal(routing.conflictRouteTo, null);
+  });
+
+  it('validateDispatch passes when on_conflict.route_to names a declared state', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        { tracker: { kind: 'local', root }, states: prStates, pr: { enabled: true } },
+        '/tmp/WORKFLOW.md',
+      );
+      assert.equal(validateDispatch(cfg), null);
+    });
+  });
+
+  it('validateDispatch rejects an undeclared on_conflict.route_to target', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active' },
+            Done: { role: 'terminal', pr: { auto_merge: 'squash', on_conflict: { route_to: 'Nowhere' } } },
+            Triage: { role: 'holding' },
+          },
+          pr: { enabled: true },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /pr\.on_conflict\.route_to references undeclared state "Nowhere"/);
+    });
+  });
+
+  it('validateDispatch rejects pr: declared on a non-terminal state', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active', pr: { auto_merge: 'squash' } },
+            Done: { role: 'terminal' },
+            Triage: { role: 'holding' },
+          },
+          pr: { enabled: true },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /pr: is only valid on a terminal state/);
+    });
+  });
+
+  it('validateDispatch rejects two terminal states declaring pr.auto_merge', async () => {
+    await withTrackerRoot(async (root) => {
+      const cfg = buildServiceConfig(
+        {
+          tracker: { kind: 'local', root },
+          states: {
+            Todo: { role: 'active' },
+            Done: { role: 'terminal', pr: { auto_merge: 'squash' } },
+            Merged: { role: 'terminal', pr: { auto_merge: 'merge' } },
+            Triage: { role: 'holding' },
+          },
+          pr: { enabled: true },
+        },
+        '/tmp/WORKFLOW.md',
+      );
+      const err = validateDispatch(cfg);
+      assert.match(err ?? '', /at most one terminal state may declare pr\.auto_merge/);
+    });
+  });
+
+  it('parser rejects pr.auto_merge with an unknown strategy', () => {
+    assert.throws(
+      () =>
+        buildServiceConfig(
+          {
+            tracker: { kind: 'local', root: '/tmp/issues' },
+            states: {
+              Todo: { role: 'active' },
+              Done: { role: 'terminal', pr: { auto_merge: 'fast-forward' } },
+              Triage: { role: 'holding' },
+            },
+          },
+          '/tmp/WORKFLOW.md',
+        ),
+      /pr\.auto_merge must be one of squash\|merge\|rebase/,
+    );
+  });
+
+  it('legacy pr_autopilot: block is folded onto the states it named (one-release migration)', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: {
+          Todo: { role: 'active' },
+          Done: { role: 'terminal' },
+          Cancelled: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+        // No `pr:` block, no per-state `pr:` — only the deprecated top-level block.
         pr_autopilot: {
           enabled: true,
           merge_state: 'Done',
           close_state: 'Cancelled',
           conflict_route_to: 'Todo',
           auto_merge_strategy: 'rebase',
-          poll_interval_ms: 15000,
+          poll_interval_ms: 12345,
         },
       },
       '/tmp/WORKFLOW.md',
     );
-    assert.equal(cfg.pr_autopilot.enabled, true);
-    assert.equal(cfg.pr_autopilot.conflict_route_to, 'Todo');
-    assert.equal(cfg.pr_autopilot.auto_merge_strategy, 'rebase');
-    assert.equal(cfg.pr_autopilot.poll_interval_ms, 15000);
+    // Engine half folds in from the legacy block.
+    assert.equal(cfg.pr.enabled, true);
+    assert.equal(cfg.pr.poll_interval_ms, 12345);
+    // Routing is injected onto the named states.
+    assert.deepEqual(cfg.states.Done!.pr, {
+      auto_merge: 'rebase',
+      on_conflict: { route_to: 'Todo' },
+    });
+    assert.deepEqual(cfg.states.Cancelled!.pr, { close: true });
+    const routing = derivePrRouting(cfg.states);
+    assert.equal(routing.mergeState, 'Done');
+    assert.equal(routing.closeState, 'Cancelled');
+    assert.equal(routing.strategy, 'rebase');
   });
 
-  it('pr_autopilot distinguishes absent close_state (default Cancelled) from explicit null/empty (disabled)', () => {
-    // Key absent → default 'Cancelled'.
-    const absent = buildServiceConfig(
+  it('a per-state pr: wins over a legacy pr_autopilot fold for the same state', () => {
+    const cfg = buildServiceConfig(
       {
         tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
+        states: {
+          Todo: { role: 'active' },
+          // Done already declares its own pr: — the legacy fold must not clobber it.
+          Done: { role: 'terminal', pr: { auto_merge: 'squash', on_conflict: { route_to: 'Todo' } } },
+          Cancelled: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+        pr_autopilot: { enabled: true, merge_state: 'Done', auto_merge_strategy: 'rebase' },
+      },
+      '/tmp/WORKFLOW.md',
+    );
+    assert.equal(cfg.states.Done!.pr!.auto_merge, 'squash');
+    // Legacy close_state default (Cancelled) still folds in where the state is bare.
+    assert.deepEqual(cfg.states.Cancelled!.pr, { close: true });
+  });
+
+  it('the new pr: engine wins over a stale legacy pr_autopilot.enabled', () => {
+    const cfg = buildServiceConfig(
+      {
+        tracker: { kind: 'local', root: '/tmp/issues' },
+        states: prStates,
+        pr: { enabled: false },
         pr_autopilot: { enabled: true },
       },
       '/tmp/WORKFLOW.md',
     );
-    assert.equal(absent.pr_autopilot.close_state, 'Cancelled');
-
-    // Explicit null → disabled (the close path is off).
-    const explicitNull = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
-        pr_autopilot: { enabled: true, close_state: null },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(explicitNull.pr_autopilot.close_state, null);
-
-    // Explicit empty string → disabled (treated the same as null per the
-    // template doc — "omit by setting an empty string").
-    const explicitEmpty = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
-        pr_autopilot: { enabled: true, close_state: '' },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(explicitEmpty.pr_autopilot.close_state, null);
-
-    // Whitespace-only string → disabled (trim before checking).
-    const explicitBlank = buildServiceConfig(
-      {
-        tracker: { kind: 'local', root: '/tmp/issues' },
-        states: minimalStates,
-        pr_autopilot: { enabled: true, close_state: '   ' },
-      },
-      '/tmp/WORKFLOW.md',
-    );
-    assert.equal(explicitBlank.pr_autopilot.close_state, null);
+    assert.equal(cfg.pr.enabled, false);
   });
 
-  it('pr_autopilot rejects poll_interval_ms < 0 at parse time', () => {
-    assert.throws(() =>
-      buildServiceConfig(
-        {
-          tracker: { kind: 'local', root: '/tmp/issues' },
-          states: minimalStates,
-          pr_autopilot: { enabled: true, poll_interval_ms: -1 },
-        },
-        '/tmp/WORKFLOW.md',
-      ),
-    );
-  });
-
-  it('pr_autopilot validation: rejects merge_state that is not terminal', async () => {
+  it('pr engine disabled bypasses dispatch (no resource, no routing required)', async () => {
     await withTrackerRoot(async (root) => {
       const cfg = buildServiceConfig(
-        {
-          tracker: { kind: 'local', root },
-          states: {
-            Todo: { role: 'active' },
-            Done: { role: 'terminal' },
-            Triage: { role: 'holding' },
-            Conflict: { role: 'holding' },
-          },
-          pr_autopilot: { enabled: true, merge_state: 'Todo' },
-        },
+        { tracker: { kind: 'local', root }, states: minimalStates, pr: { enabled: false } },
         '/tmp/WORKFLOW.md',
       );
-      const err = validateDispatch(cfg);
-      assert.match(err ?? '', /merge_state .* must be a terminal state/);
+      assert.equal(validateDispatch(cfg), null);
+      assert.equal(cfg.pr.enabled, false);
     });
   });
-
-  it('pr_autopilot validation: rejects conflict_route_to that is not active', async () => {
-    await withTrackerRoot(async (root) => {
-      const cfg = buildServiceConfig(
-        {
-          tracker: { kind: 'local', root },
-          states: {
-            Todo: { role: 'active' },
-            Done: { role: 'terminal' },
-            Cancelled: { role: 'terminal' },
-            Triage: { role: 'holding' },
-            Conflict: { role: 'holding' },
-          },
-          pr_autopilot: {
-            enabled: true,
-            conflict_route_to: 'Triage',
-          },
-        },
-        '/tmp/WORKFLOW.md',
-      );
-      const err = validateDispatch(cfg);
-      assert.match(err ?? '', /conflict_route_to .* must be an active state/);
-    });
-  });
-
-  it('pr_autopilot disabled bypasses cross-reference validation', async () => {
-    await withTrackerRoot(async (root) => {
-      const cfg = buildServiceConfig(
-        {
-          tracker: { kind: 'local', root },
-          states: minimalStates,
-          // enabled:false skips the state lookup, so an undeclared name does not error.
-          pr_autopilot: { enabled: false, merge_state: 'Nope' },
-        },
-        '/tmp/WORKFLOW.md',
-      );
-      const err = validateDispatch(cfg);
-      assert.equal(err, null);
-    });
-  });
-
 });
 
 describe('sleep_cycle block', () => {

@@ -306,9 +306,42 @@ Each entry has the shape:
   restricts which states agents in this state may move to via the MCP
   `symphony.transition` tool. `null` (or omitted) means "any declared state
   is reachable"; `[]` means "no transitions allowed out of this state".
+- `pr` (map, OPTIONAL) — PR autopilot routing, valid only on a `terminal`
+  state and acting only when the top-level `pr:` engine is enabled (§4.3.8).
+  The merge state declares `{ auto_merge: squash|merge|rebase, on_conflict: {
+  route_to: <active state> } }`; the close state declares `{ close: true }`.
+  The merge/close/route targets are derived by scanning states for this field —
+  at most one terminal state may declare `auto_merge`, at most one may declare
+  `close`, and an `on_conflict.route_to` naming an undeclared state is rejected
+  at parse time. Replaces the named strings of the deprecated `pr_autopilot:`
+  block (§4.3.8).
 
 Declaration order is preserved: role-filtered listings and the dashboard
 render columns in the same order.
+
+#### 4.3.8 `pr` (object)
+
+PR autopilot engine toggle. Optional; default off. The host-global half only —
+the merge/close/route targets and the auto-merge strategy live ON the terminal
+states they describe (`states.<name>.pr`, §4.3.7) and are derived by scanning
+states, not named here.
+
+- `enabled` (bool, default `false`) — when true the reconciler grows a `pr`
+  resource that arms GitHub auto-merge on the merge state's mergeable PRs,
+  routes CONFLICTING ones back to that state's `pr.on_conflict.route_to`,
+  closes the close state's open PRs, and reaps workspace + remote branch once a
+  PR merges or closes. While enabled, transitions into the merge state defer
+  the standard terminal workspace cleanup (the pr resource owns the workspace
+  until its PR merges/closes); other terminal states clean up as usual.
+- `poll_interval_ms` (integer, default `30000`; must be non-negative) — per-PR
+  `gh pr view` cache TTL.
+
+Migration: a deprecated top-level `pr_autopilot:` block (the old
+`{ enabled, merge_state, close_state, conflict_route_to, auto_merge_strategy,
+poll_interval_ms }` shape) is still read for one release — its routing is folded
+onto the states it named (a state's own `pr:` wins on conflict), its engine half
+fills this block when absent, and a single deprecation warning is logged at
+startup.
 
 ### 4.4 Prompt Template Contract
 
