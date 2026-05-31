@@ -263,6 +263,14 @@ export function buildServiceConfig(
     circuit_breaker_threshold: circuitBreakerThreshold,
   };
 
+  // Migration (issue 137): per-state concurrency now lives on the state as
+  // `states.<name>.max_concurrent`. Keep reading the deprecated by-name map
+  // `agent.max_concurrent_agents_by_state` for one release — fold each entry
+  // into the matching state's `max_concurrent` (per-state values win on
+  // conflict) and log a single deprecation warning so the orchestrator only
+  // ever reads the per-state field. Removed once dogfooding workflows migrate.
+  foldLegacyConcurrencyCaps(states, agent.max_concurrent_agents_by_state);
+
   // acp (Symphony extension; see §4.3.6). `adapter` selects
   // one of symphony's known profiles (claude, codex, opencode); symphony auto-derives the
   // launch command from the adapter profile. Credentials are NOT staged into the workspace:
@@ -541,6 +549,20 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
       }
       maxTurns = n;
     }
+    // Per-state concurrency cap (issue 137) — same positive-integer validation
+    // as max_turns. Undefined when omitted (no per-state cap; only the global
+    // agent.max_concurrent_agents ceiling applies).
+    let maxConcurrent: number | undefined;
+    if (m['max_concurrent'] !== undefined) {
+      const n = asInt(m['max_concurrent'], -1);
+      if (n <= 0) {
+        throw new WorkflowError(
+          'workflow_parse_error',
+          `state "${name}": max_concurrent must be a positive integer`,
+        );
+      }
+      maxConcurrent = n;
+    }
     let allowed: string[] | null | undefined;
     if (m['allowed_transitions'] === undefined) {
       allowed = undefined;
@@ -575,6 +597,7 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     if (model !== undefined) sc.model = model;
     if (effort !== undefined) sc.effort = effort;
     if (maxTurns !== undefined) sc.max_turns = maxTurns;
+    if (maxConcurrent !== undefined) sc.max_concurrent = maxConcurrent;
     if (allowed !== undefined) sc.allowed_transitions = allowed;
     if (stateHooks !== undefined) sc.hooks = stateHooks;
     if (stateActions !== undefined) sc.actions = stateActions;
@@ -582,6 +605,36 @@ function parseStatesBlock(raw: unknown): Record<string, StateConfig> {
     out[name] = sc;
   }
   return out;
+}
+
+/**
+ * Fold the deprecated `agent.max_concurrent_agents_by_state` by-name map into
+ * each matching state's `max_concurrent` (issue 137). Mutates the states map in
+ * place. Per-state `max_concurrent` wins on conflict — a legacy entry only fills
+ * a state that declares no explicit cap. The legacy map's keys are already
+ * lowercased (`asMapStrPosInt`); match them case-insensitively against the
+ * declared state names. Emits a single deprecation warning when the map is
+ * non-empty so the operator knows to move the cap onto the state. After this
+ * runs the orchestrator only ever reads `states.<name>.max_concurrent`.
+ */
+function foldLegacyConcurrencyCaps(
+  states: Record<string, StateConfig>,
+  legacyByState: Record<string, number>,
+): void {
+  const entries = Object.entries(legacyByState);
+  if (entries.length === 0) return;
+  log.warn(
+    'agent.max_concurrent_agents_by_state is deprecated; move the cap onto states.<name>.max_concurrent (per-state values win on conflict)',
+    { states: entries.map(([name]) => name) },
+  );
+  for (const [lowerName, cap] of entries) {
+    for (const [name, state] of Object.entries(states)) {
+      if (name.toLowerCase() === lowerName) {
+        if (state.max_concurrent === undefined) state.max_concurrent = cap;
+        break;
+      }
+    }
+  }
 }
 
 // Per-state `hooks:` block. Each field is optional and accepts either a script string
@@ -758,6 +811,10 @@ export function validateDispatch(cfg: ServiceConfig): string | null {
   // workflows without a `states:` block — so callers never need a fallback here.
   const statesError = validateStates(cfg.states);
   if (statesError) return statesError;
+  // cfg.agent is always populated by buildServiceConfig; guard for legacy
+  // hand-built ServiceConfigs (older test fixtures) that omit the block.
+  const concurrencyError = validateConcurrencyCaps(cfg.states, cfg.agent?.max_concurrent_agents);
+  if (concurrencyError) return concurrencyError;
   if (!isKnownAdapter(cfg.acp.adapter)) {
     return `acp.adapter "${cfg.acp.adapter}" is not a known profile; use one of: claude, codex, opencode`;
   }
@@ -856,6 +913,30 @@ function validatePrAutopilot(
     }
   }
 
+  return null;
+}
+
+/**
+ * Validate that the sum of per-state `max_concurrent` caps does not exceed the
+ * global `agent.max_concurrent_agents` host ceiling (issue 137). A sum greater
+ * than the ceiling can never be satisfied — the global clamp binds first — so it
+ * is almost always a misconfiguration worth surfacing at startup. Returns null
+ * when in budget or when the ceiling is unknown (legacy hand-built configs that
+ * omit `agent`). The legacy by-name map is already folded into the per-state
+ * caps by the time this runs, so its entries count toward the sum too.
+ */
+function validateConcurrencyCaps(
+  states: Record<string, StateConfig>,
+  ceiling: number | undefined,
+): string | null {
+  if (typeof ceiling !== 'number') return null;
+  let sum = 0;
+  for (const sc of Object.values(states)) {
+    if (typeof sc.max_concurrent === 'number') sum += sc.max_concurrent;
+  }
+  if (sum > ceiling) {
+    return `sum of per-state max_concurrent caps (${sum}) exceeds agent.max_concurrent_agents (${ceiling})`;
+  }
   return null;
 }
 

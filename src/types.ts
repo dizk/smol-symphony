@@ -69,6 +69,19 @@ export interface StateConfig {
   // enum so it does not drift from the adapter's own supported list.
   effort?: string | null;
   max_turns?: number;
+  /**
+   * Per-state concurrency cap (issue 137): the maximum number of agents the
+   * orchestrator runs simultaneously for issues in this state. When set, the
+   * orchestrator's per-state slot accounting reads this instead of the
+   * deprecated top-level `agent.max_concurrent_agents_by_state` by-name map —
+   * concurrency now lives on the state, symmetric with `max_turns`. Undefined
+   * means "no per-state cap; only the global `agent.max_concurrent_agents`
+   * ceiling applies". Validated as a positive integer at parse time, and the
+   * sum of per-state caps is validated against the global ceiling in
+   * `validateDispatch`. The deprecated by-name map is folded into this field at
+   * parse time (per-state values win on conflict) for one release.
+   */
+  max_concurrent?: number;
   allowed_transitions?: string[] | null;
   hooks?: StateHooksConfig;
   /**
@@ -132,9 +145,24 @@ export interface HooksConfig {
 }
 
 export interface AgentConfig {
+  /**
+   * Global host ceiling on simultaneously-running agents across every state. This is
+   * the cross-state RAM bound that memory admission (`computeMemoryAdmission`) clamps,
+   * and the value the sum of per-state `StateConfig.max_concurrent` caps is validated
+   * against. It stays top-level (not on a state) because it bounds total host memory
+   * across all VMs at once — a genuinely cross-state concern.
+   */
   max_concurrent_agents: number;
   max_turns: number;
   max_retry_backoff_ms: number;
+  /**
+   * DEPRECATED (issue 137): per-state concurrency now lives on the state as
+   * `StateConfig.max_concurrent`. This top-level by-name map is still read for one
+   * release — the parser folds its entries into the matching state's `max_concurrent`
+   * (per-state values win on conflict) and logs a single deprecation warning — then
+   * the field is removed. State keys are normalized to lowercase; invalid/non-positive
+   * entries are ignored.
+   */
   max_concurrent_agents_by_state: Record<string, number>;
   /**
    * When true, the orchestrator reads `/proc/meminfo` on every tick and clamps the

@@ -1236,3 +1236,167 @@ describe('Orchestrator sleep-cycle auto-arm (issue 125)', () => {
     }
   });
 });
+
+describe('Orchestrator per-state concurrency caps (issue 137)', () => {
+  function todoIssue(id: string, state = 'Todo'): Issue {
+    return {
+      id,
+      identifier: id,
+      title: `issue ${id}`,
+      description: null,
+      priority: null,
+      state,
+      branch_name: null,
+      url: null,
+      labels: [],
+      blocked_by: [],
+      created_at: null,
+      updated_at: null,
+    };
+  }
+
+  // Run the dispatch loop against `rawConfig` + `issues`, parking every
+  // runAttempt so dispatched issues stay in the running set and continue to
+  // occupy both their per-state and the global slot. Returns the set of distinct
+  // issue ids that were dispatched once the loop has had several ticks to
+  // settle. Uses the static concurrency cap (`memory_admission_enabled: false`)
+  // so the count is deterministic regardless of host memory.
+  async function dispatchedIds(
+    rawConfig: Record<string, unknown>,
+    issues: Issue[],
+  ): Promise<Set<string>> {
+    const fakeHome = await mkdtemp(path.join(os.tmpdir(), 'symphony-conc-home-'));
+    const trackerRoot = await mkdtemp(path.join(os.tmpdir(), 'symphony-conc-tracker-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      await mkdir(path.join(fakeHome, '.claude'), { recursive: true });
+      await writeFile(path.join(fakeHome, '.claude', '.credentials.json'), '{}');
+      const { cfg, def } = await buildCfgAndDef(rawConfig, trackerRoot);
+
+      const tracker: IssueTracker = {
+        async fetchCandidateIssues(): Promise<CandidateFetchResult> {
+          return { issues: issues.map((i) => ({ ...i })), root: trackerRoot };
+        },
+        async fetchIssuesByStates(names: string[]): Promise<Issue[]> {
+          const set = new Set(names.map((s) => s.toLowerCase()));
+          return issues.filter((i) => set.has(i.state.toLowerCase())).map((i) => ({ ...i }));
+        },
+        async fetchIssueStatesByIds(ids: string[]): Promise<Issue[]> {
+          const set = new Set(ids);
+          return issues.filter((i) => set.has(i.id)).map((i) => ({ ...i }));
+        },
+        currentRoot(): string | null {
+          return trackerRoot;
+        },
+      };
+
+      const dispatched = new Set<string>();
+      const runner = {
+        vmNameFor: (i: Issue) => `symphony-${i.identifier}`,
+        async runAttempt(issue: Issue): Promise<RunAttemptResult> {
+          dispatched.add(issue.id);
+          // Park forever so the issue keeps occupying a slot; stop() signals
+          // cancel and clears the running set without awaiting the worker.
+          return new Promise<RunAttemptResult>(() => undefined);
+        },
+      } as unknown as AgentRunner;
+
+      const fakeWorkspaces = {
+        workspacePathFor: (identifier: string) => path.join(trackerRoot, 'ws', identifier),
+        async ensureFor() {
+          return { path: path.join(trackerRoot, 'ws'), workspace_key: 'k', created_now: true };
+        },
+        async remove(): Promise<void> {
+          /* no-op */
+        },
+      } as unknown as WorkspaceManager;
+
+      const orch = new Orchestrator(
+        cfg,
+        def,
+        { onChange: () => () => undefined, current: () => ({} as any), stop: async () => undefined } as unknown as WorkflowSource,
+        tracker,
+        fakeWorkspaces,
+        runner,
+      );
+      await orch.start();
+      // Several poll ticks (interval 20ms) so any under-cap dispatch has every
+      // chance to fire; the parked runAttempts keep the running set occupied.
+      await new Promise((r) => setTimeout(r, 250));
+      await orch.stop();
+      return dispatched;
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      await rm(fakeHome, { recursive: true, force: true });
+      await rm(trackerRoot, { recursive: true, force: true });
+    }
+  }
+
+  it('caps a state to its max_concurrent even when the global ceiling has room', async () => {
+    // Global ceiling 4 (plenty of room), but Todo is capped at 1. Three Todo
+    // issues compete; only one runs because the per-state cap binds first.
+    const dispatched = await dispatchedIds(
+      {
+        acp: { adapter: 'claude' },
+        agent: { max_concurrent_agents: 4, memory_admission_enabled: false },
+        polling: { interval_ms: 20 },
+        states: {
+          Todo: { role: 'active', adapter: 'claude', max_concurrent: 1 },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      [todoIssue('c1'), todoIssue('c2'), todoIssue('c3')],
+    );
+    assert.equal(dispatched.size, 1, `Todo.max_concurrent=1 should run exactly one; ran ${dispatched.size}`);
+  });
+
+  it('still lets the global ceiling bind across states (incl. an uncapped state)', async () => {
+    // Global ceiling 1. Todo is capped at 1; Review declares no per-state cap.
+    // One issue of each: the global ceiling permits only one running agent total,
+    // so the second issue stays blocked even though its (uncapped) state has room.
+    const dispatched = await dispatchedIds(
+      {
+        acp: { adapter: 'claude' },
+        agent: { max_concurrent_agents: 1, memory_admission_enabled: false },
+        polling: { interval_ms: 20 },
+        states: {
+          Todo: { role: 'active', adapter: 'claude', max_concurrent: 1 },
+          Review: { role: 'active', adapter: 'claude' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      // 'a-todo' sorts before 'b-review', so Todo dispatches first and the
+      // uncapped Review issue is the one the global ceiling blocks.
+      [todoIssue('a-todo', 'Todo'), todoIssue('b-review', 'Review')],
+    );
+    assert.equal(dispatched.size, 1, `global ceiling 1 should run exactly one; ran ${dispatched.size}`);
+  });
+
+  it('honors the deprecated agent.max_concurrent_agents_by_state map at dispatch', async () => {
+    // The legacy by-state map is folded into the per-state cap at parse time, so
+    // a workflow that hasn't migrated still gets its Todo cap enforced: global
+    // room for 4, but the legacy Todo:1 cap runs only one of three.
+    const dispatched = await dispatchedIds(
+      {
+        acp: { adapter: 'claude' },
+        agent: {
+          max_concurrent_agents: 4,
+          memory_admission_enabled: false,
+          max_concurrent_agents_by_state: { Todo: 1 },
+        },
+        polling: { interval_ms: 20 },
+        states: {
+          Todo: { role: 'active', adapter: 'claude' },
+          Done: { role: 'terminal' },
+          Triage: { role: 'holding' },
+        },
+      },
+      [todoIssue('d1'), todoIssue('d2'), todoIssue('d3')],
+    );
+    assert.equal(dispatched.size, 1, `legacy by-state Todo:1 should run exactly one; ran ${dispatched.size}`);
+  });
+});

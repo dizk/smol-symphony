@@ -235,12 +235,20 @@ warning and the value is dropped.
 
 #### 4.3.5 `agent` (object)
 
-- `max_concurrent_agents` (integer, default `10`)
+- `max_concurrent_agents` (integer, default `10`) — the GLOBAL host ceiling on
+  simultaneously-running agents across every state. This is the cross-state RAM
+  bound memory admission clamps, and the value the sum of per-state
+  `max_concurrent` caps (§4.3.7) is validated against at startup. It stays
+  top-level because it bounds total host memory across all VMs at once.
 - `max_turns` (positive integer, default `20`) — coding-agent turns within
   one worker session.
 - `max_retry_backoff_ms` (integer, default `300000`)
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`,
-  default empty). State keys are normalized (`lowercase`) for lookup; invalid
+  default empty). DEPRECATED — per-state concurrency now lives on the state as
+  `states.<name>.max_concurrent` (§4.3.7). The map is still read for one
+  release: each entry is folded into the matching state's `max_concurrent` (a
+  per-state value wins on conflict) and a single deprecation warning is logged
+  at startup. State keys are normalized (`lowercase`) for the fold; invalid
   entries are ignored.
 
 #### 4.3.6 `acp` (object)
@@ -287,6 +295,13 @@ Each entry has the shape:
 - `model` (string or null, OPTIONAL) — overrides `acp.model` for this state.
 - `max_turns` (integer, OPTIONAL) — overrides `agent.max_turns` for this
   state.
+- `max_concurrent` (positive integer, OPTIONAL) — caps how many agents the
+  orchestrator runs simultaneously for issues in this state. Symmetric with
+  `max_turns`; omit for "no per-state cap, only the global
+  `agent.max_concurrent_agents` ceiling applies". The sum of every state's
+  `max_concurrent` must not exceed `agent.max_concurrent_agents` (validated at
+  startup). Replaces the deprecated `agent.max_concurrent_agents_by_state` map
+  (§4.3.5).
 - `allowed_transitions` (list of strings or null, OPTIONAL) — when non-null,
   restricts which states agents in this state may move to via the MCP
   `symphony.transition` tool. `null` (or omitted) means "any declared state
